@@ -499,8 +499,9 @@ async fn main() -> Result<()> {
         let _ = handle.try_send(gaviero_remote::server::HubInput::Shutdown);
     }
 
-    // Save session state before exit. Panel widths/heights ride along in the
-    // same `state.json` write (see `app/session.rs`).
+    // Save session state before exit. Panel widths/heights and the chat
+    // composer (input height + unsent draft) ride along in the same
+    // `state.json` write (see `app/session.rs`).
     app.save_session();
 
     // Explicit call so errors are reported on the happy path (the guard will

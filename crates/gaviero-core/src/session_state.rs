@@ -116,6 +116,21 @@ pub struct SessionState {
     /// Terminal tab state (tab metadata for session restore).
     #[serde(default)]
     pub terminal_session: Option<crate::terminal::session::TerminalSessionState>,
+
+    /// Agent-chat prompt box height in rows. `0` means auto-size from the
+    /// text. A manual resize is remembered so the next launch opens at the
+    /// same height.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chat_input_rows: u16,
+
+    /// Prompt text typed into the agent chat but not yet sent. Restored into
+    /// the input on the next launch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_draft: String,
+}
+
+fn is_zero(v: &u16) -> bool {
+    *v == 0
 }
 
 /// State for a single open tab.
@@ -464,6 +479,8 @@ mod tests {
             side_panel_width: None,
             terminal_split_percent: Some(30),
             terminal_session: None,
+            chat_input_rows: 9,
+            chat_draft: "unsent prompt".to_string(),
         };
 
         save_session(key, &state).unwrap();
@@ -476,6 +493,8 @@ mod tests {
         assert!(loaded.panels.terminal);
         assert_eq!(loaded.tree_expanded.len(), 2);
         assert_eq!(loaded.tree_selected, 3);
+        assert_eq!(loaded.chat_input_rows, 9);
+        assert_eq!(loaded.chat_draft, "unsent prompt");
 
         let _ = std::fs::remove_dir_all(state_dir_for(key).unwrap());
     }
@@ -512,6 +531,18 @@ mod tests {
         let json = serde_json::to_string(&SessionState::default()).unwrap();
         assert!(!json.contains("file_tree_width"), "got {json}");
         assert!(!json.contains("side_panel_width"), "got {json}");
+        assert!(!json.contains("chat_input_rows"), "got {json}");
+        assert!(!json.contains("chat_draft"), "got {json}");
+    }
+
+    #[test]
+    fn chat_composer_absent_from_older_state_json_loads_as_auto() {
+        // A `state.json` written before the prompt box was persisted must
+        // still parse, and must come back as auto-height with an empty draft.
+        let json = r#"{ "tabs": [], "active_tab": 0 }"#;
+        let state: SessionState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.chat_input_rows, 0);
+        assert!(state.chat_draft.is_empty());
     }
 
     #[test]

@@ -845,6 +845,11 @@ pub struct AgentChatState {
     pub text_input: TextInput,
     /// User-resized input area height (0 = auto-size from content).
     pub input_area_rows: u16,
+    /// `(rows, draft)` last written to session state. The tick loop flushes
+    /// when the live composer diverges, so a crash can still restore them.
+    composer_persisted: (u16, String),
+    /// When the live composer first diverged from [`Self::composer_persisted`].
+    composer_dirty_since: Option<std::time::Instant>,
     pub scroll_offset: usize,
     /// When true, the next render pass will snap scroll to the bottom.
     pub scroll_pinned_to_bottom: bool,
@@ -939,6 +944,8 @@ impl AgentChatState {
             active_conv: 0,
             text_input: TextInput::new(),
             input_area_rows: 0,
+            composer_persisted: (0, String::new()),
+            composer_dirty_since: None,
             scroll_offset: 0,
             scroll_pinned_to_bottom: false,
             history_index: None,
@@ -2632,6 +2639,74 @@ impl AgentChatState {
     }
 
     // ── Input layout + vertical cursor movement ─────────────────
+
+    /// Text to write into the session as the unsent prompt.
+    ///
+    /// Rename mode is holding a conversation title, so the last flushed draft
+    /// is what should survive. History browse shows an already-sent message;
+    /// the unsent prompt is the stash captured when browsing started.
+    pub(crate) fn draft_to_persist(&self) -> &str {
+        if self.renaming {
+            self.composer_persisted.1.as_str()
+        } else if self.history_index.is_some() {
+            self.history_stash.as_str()
+        } else {
+            self.text_input.text.as_str()
+        }
+    }
+
+    /// `Some((rows, draft))` when the composer should be written now.
+    ///
+    /// A height change, or the draft becoming empty (the prompt was sent or
+    /// cleared), flushes immediately. Other edits wait until `wait` has
+    /// elapsed since they first diverged from the last write, so typing does
+    /// not rewrite `state.json` on every keystroke.
+    pub(crate) fn take_composer_flush(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Option<(u16, String)> {
+        let rows = self.input_area_rows;
+        // `draft_to_persist` borrows all of `self`. Copy the comparison out
+        // before any write to `composer_dirty_since`, then copy the text
+        // again only when a flush actually happens.
+        let unchanged = {
+            let draft = self.draft_to_persist();
+            rows == self.composer_persisted.0 && draft == self.composer_persisted.1
+        };
+        if unchanged {
+            self.composer_dirty_since = None;
+            return None;
+        }
+        let immediate = rows != self.composer_persisted.0 || self.draft_to_persist().is_empty();
+        if !immediate {
+            let since = *self
+                .composer_dirty_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < wait {
+                return None;
+            }
+        }
+        Some((rows, self.draft_to_persist().to_string()))
+    }
+
+    pub(crate) fn note_composer_persisted(&mut self, rows: u16, draft: String) {
+        self.composer_persisted = (rows, draft);
+        self.composer_dirty_since = None;
+    }
+
+    /// Put a persisted prompt-box height and unsent draft back into the input.
+    pub(crate) fn restore_composer(&mut self, rows: u16, draft: &str) {
+        self.input_area_rows = rows;
+        if !draft.is_empty() {
+            self.text_input.text = draft.to_string();
+            self.text_input.cursor = self.text_input.char_count();
+            self.history_index = None;
+            self.history_stash.clear();
+            self.renaming = false;
+        }
+        self.composer_persisted = (rows, draft.to_string());
+        self.composer_dirty_since = None;
+    }
 
     /// Prompt label shown to the left of the input text (must match `render_input`).
     pub fn input_prompt_label(&self) -> &'static str {
@@ -7164,6 +7239,35 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], (0, 10));
         assert_eq!(lines[1], (10, 16));
+    }
+
+    #[test]
+    fn draft_to_persist_keeps_the_stash_while_browsing_history() {
+        let mut state = AgentChatState::new();
+        state.add_user_message("already sent");
+        state.text_input.text = "still typing".to_string();
+        state.history_up();
+        assert_eq!(state.text_input.text, "already sent");
+        assert_eq!(state.draft_to_persist(), "still typing");
+    }
+
+    #[test]
+    fn draft_to_persist_ignores_a_title_being_renamed() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "real draft".to_string();
+        state.note_composer_persisted(0, "real draft".to_string());
+        state.start_rename();
+        assert_eq!(state.draft_to_persist(), "real draft");
+    }
+
+    #[test]
+    fn restore_composer_puts_the_draft_back_and_the_cursor_at_the_end() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "discarded".to_string();
+        state.restore_composer(8, "picked up again");
+        assert_eq!(state.input_area_rows, 8);
+        assert_eq!(state.text_input.text, "picked up again");
+        assert_eq!(state.text_input.cursor, "picked up again".chars().count());
     }
 
     #[test]
