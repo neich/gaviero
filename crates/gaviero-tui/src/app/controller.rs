@@ -974,6 +974,22 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 &body,
             );
         }
+        // Granted earlier with `a` / `A` on this conversation's overlay:
+        // answer without parking, so no prompt, notification, or remote frame.
+        Event::PermissionRequest {
+            conv_id,
+            tool_name,
+            input,
+            respond,
+            ..
+        } if app
+            .chat_state
+            .find_conv_idx(&conv_id)
+            .is_some_and(|idx| app.chat_state.session_allows_at(idx, &tool_name, &input)) =>
+        {
+            tracing::info!("Permission for '{tool_name}' allowed by session grant");
+            let _ = respond.send(gaviero_core::observer::PermissionDecision::allow());
+        }
         Event::PermissionRequest {
             conv_id,
             tool_name,

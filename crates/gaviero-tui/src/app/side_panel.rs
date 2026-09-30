@@ -171,6 +171,19 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 Action::InsertChar('y') | Action::InsertChar('Y') => {
                     crate::app::remote::desktop_answer_active_permission(app, true);
                 }
+                // `a`: allow this tool for the rest of the conversation;
+                // `A`: every tool of its MCP server. No-op when the overlay
+                // doesn't offer it (shell / generic prompts).
+                Action::InsertChar(c @ ('a' | 'A')) => {
+                    if let Some(rule) = app.chat_state.grant_active_permission_for_session(c == 'A')
+                    {
+                        crate::app::remote::desktop_answer_active_permission(app, true);
+                        app.status_message = Some((
+                            format!("Allowed for this session: {rule} (/permissions to review)"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
                 Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
                     crate::app::remote::desktop_answer_active_permission(app, false);
                 }
