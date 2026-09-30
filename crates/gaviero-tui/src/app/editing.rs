@@ -1043,14 +1043,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 app.chat_state.chat_dragging = false;
             }
-            if app.mouse_dragging {
-                if let Some(buf) = app.buffers.get(app.active_buffer) {
-                    let text = buf.selected_text();
-                    if !text.is_empty() {
-                        app.set_clipboard(&text);
-                    }
-                }
-            }
+            // Drag-release keeps the selection. Clipboard writes are Ctrl+C
+            // and Ctrl+X; copying here made Delete/Backspace of a selected
+            // block replace the clipboard.
             app.mouse_dragging = false;
             app.scrollbar_dragging = None;
         }
@@ -2530,6 +2525,52 @@ mod tests {
             wheel_target(Focus::Terminal, &hidden_term, None),
             WheelTarget::Hover
         );
+    }
+
+    #[test]
+    fn deleting_a_selection_does_not_copy_it() {
+        // Scratch workspace under target/. App::new only needs a real folder.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("tui-sel-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = agent_edit_app(&dir);
+        // Drop the OS clipboard so this test cannot clobber it.
+        app.clipboard = None;
+        app.internal_clipboard = "keep-me".to_string();
+        app.focus = Focus::Editor;
+
+        let mut buf = Buffer::empty();
+        buf.insert_text("hello world\n");
+        buf.cursor.anchor = Some((0, 0));
+        buf.cursor.line = 0;
+        buf.cursor.col = 5;
+        app.buffers.push(buf);
+        app.active_buffer = 0;
+        app.mouse_dragging = true;
+
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            },
+        );
+
+        assert!(!app.mouse_dragging);
+        assert_eq!(app.buffers[0].selected_text(), "hello");
+        assert_eq!(app.internal_clipboard, "keep-me");
+
+        handle_editor_action(&mut app, Action::Delete);
+        assert_eq!(app.buffers[0].text.to_string(), " world\n");
+        assert!(app.buffers[0].cursor.anchor.is_none());
+        assert_eq!(app.internal_clipboard, "keep-me");
+
+        cleanup_session(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
