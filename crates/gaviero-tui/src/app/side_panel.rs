@@ -2054,9 +2054,7 @@ pub(crate) fn dispatch_prompt_core(
         let announced = app.chat_state.conversations[conv_idx]
             .messages
             .iter()
-            .any(|m| {
-                m.role == crate::panels::agent_chat::ChatRole::System && m.content == notice
-            });
+            .any(|m| m.role == crate::panels::agent_chat::ChatRole::System && m.content == notice);
         if !announced {
             app.chat_state.add_system_message_at(conv_idx, &notice);
         }
@@ -3045,8 +3043,7 @@ mod tests {
         assert!(files.iter().any(|f| f == "gaviero/.gaviero/settings.json"));
         let resolved = super::resolve_at_path(".gaviero/settings.json", &roots).unwrap();
         assert_eq!(std::fs::read_to_string(resolved).unwrap(), "workspace");
-        let member_copy =
-            super::resolve_at_path("gaviero/.gaviero/settings.json", &roots).unwrap();
+        let member_copy = super::resolve_at_path("gaviero/.gaviero/settings.json", &roots).unwrap();
         assert_eq!(std::fs::read_to_string(member_copy).unwrap(), "member");
     }
 }

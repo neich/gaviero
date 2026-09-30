@@ -1418,39 +1418,40 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // Synthesize provider configs for either path below
                 // (hosting or reusing). Agents address the endpoint, not
                 // which process owns the accept loop.
-                let synthesize_mcp_configs = |app: &App,
-                                              endpoint: &gaviero_core::mcp::McpEndpoint,
-                                              http: Option<gaviero_core::mcp::HttpSynthEndpoint>| {
-                    let codex_trust = match app
-                        .workspace
-                        .resolve_setting(
-                            gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
-                            Some(&workspace_root_for_mcp),
-                        )
-                        .as_str()
-                        .unwrap_or("unknown")
-                    {
-                        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
-                        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
-                        _ => gaviero_core::mcp::TrustConsent::Unknown,
-                    };
-                    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-                    overrides.codex_trust = Some(codex_trust);
-                    let mut synth = gaviero_core::mcp::resolve_mcp_config_synth(
-                        &app.workspace,
-                        &workspace_root_for_mcp,
-                        endpoint.clone(),
-                        &overrides,
-                    );
-                    synth.http = http;
-                    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-                        tracing::warn!(
-                            target: "mcp_server",
-                            error = %e,
-                            "failed to synthesize workspace MCP config"
+                let synthesize_mcp_configs =
+                    |app: &App,
+                     endpoint: &gaviero_core::mcp::McpEndpoint,
+                     http: Option<gaviero_core::mcp::HttpSynthEndpoint>| {
+                        let codex_trust = match app
+                            .workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
+                                Some(&workspace_root_for_mcp),
+                            )
+                            .as_str()
+                            .unwrap_or("unknown")
+                        {
+                            "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+                            "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+                            _ => gaviero_core::mcp::TrustConsent::Unknown,
+                        };
+                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+                        overrides.codex_trust = Some(codex_trust);
+                        let mut synth = gaviero_core::mcp::resolve_mcp_config_synth(
+                            &app.workspace,
+                            &workspace_root_for_mcp,
+                            endpoint.clone(),
+                            &overrides,
                         );
-                    }
-                };
+                        synth.http = http;
+                        if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
+                            tracing::warn!(
+                                target: "mcp_server",
+                                error = %e,
+                                "failed to synthesize workspace MCP config"
+                            );
+                        }
+                    };
                 // Another gaviero process (typically a first TUI, or a
                 // headless CLI) may already own this workspace endpoint.
                 // Rebinding fails on Windows (`first_pipe_instance`) and
@@ -1590,18 +1591,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                 &app.workspace,
                             ) {
                                 Ok(Some(http)) => {
-                                    let synth =
-                                        gaviero_core::mcp::http_synth_from(&http.endpoint);
+                                    let synth = gaviero_core::mcp::http_synth_from(&http.endpoint);
                                     tracing::info!(
                                         target: "mcp_http",
                                         url = %http.endpoint.url,
                                         "mcp http listening"
                                     );
                                     (
-                                        handle.with_http_listener(
-                                            http,
-                                            &workspace_root_for_mcp,
-                                        ),
+                                        handle.with_http_listener(http, &workspace_root_for_mcp),
                                         Some(synth),
                                     )
                                 }

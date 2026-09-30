@@ -2328,7 +2328,11 @@ impl AgentChatState {
         }
         let mut input = 0usize;
         let mut output = 0usize;
-        for msg in conv.messages.iter().filter(|m| m.seq >= conv.replay_from_seq) {
+        for msg in conv
+            .messages
+            .iter()
+            .filter(|m| m.seq >= conv.replay_from_seq)
+        {
             match msg.role {
                 ChatRole::User => input += count_words(&msg.content),
                 ChatRole::Assistant => {
@@ -6202,10 +6206,7 @@ mod tests {
         );
         // apply_slash_line records `/reset` as a user message (seq 3) before
         // reset_conversation_at snapshots next_message_seq (4).
-        assert_eq!(
-            state.conversations[state.active_conv].replay_from_seq,
-            4
-        );
+        assert_eq!(state.conversations[state.active_conv].replay_from_seq, 4);
     }
 
     #[test]
