@@ -1616,30 +1616,107 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     app.chat_state.update_autocomplete_matches(&files);
 }
 
+/// Roots `@` completion and `@path` resolution share with the explorer:
+/// workspace-level config dirs (`.gaviero`, `.claude` beside the workspace
+/// file) first, then member folders. Single-folder mode has no config dirs.
+fn completion_named_roots(
+    workspace: &gaviero_core::workspace::Workspace,
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut roots: Vec<(String, std::path::PathBuf)> = workspace
+        .config_roots()
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            (name, path)
+        })
+        .collect();
+    let folders = workspace.folders();
+    if folders.is_empty() && roots.is_empty() {
+        roots.push((String::new(), std::path::PathBuf::from(".")));
+    } else {
+        roots.extend(
+            folders
+                .iter()
+                .map(|f| (f.display_name().to_string(), f.path.clone())),
+        );
+    }
+    roots
+}
+
+/// Absolute path for an `@` reference. A label prefix
+/// (`.gaviero/settings.json`) is tried before a bare join, so the workspace
+/// config dir wins over a member folder that also contains `.gaviero/`.
+fn resolve_at_path(
+    rel_path: &str,
+    named_roots: &[(String, std::path::PathBuf)],
+) -> Option<std::path::PathBuf> {
+    let multi_root = named_roots.len() > 1;
+    let labels = unique_root_labels(named_roots);
+    if multi_root {
+        let mut idxs: Vec<usize> = (0..labels.len()).collect();
+        idxs.sort_by_key(|&i| std::cmp::Reverse(labels[i].len()));
+        for i in idxs {
+            let label = &labels[i];
+            if label.is_empty() {
+                continue;
+            }
+            if let Some(tail) = rel_path
+                .strip_prefix(label.as_str())
+                .and_then(|t| t.strip_prefix('/'))
+            {
+                let abs_path = named_roots[i].1.join(tail);
+                if abs_path.is_file() {
+                    return Some(abs_path);
+                }
+            }
+        }
+    }
+    for (_, root) in named_roots {
+        let abs_path = root.join(rel_path);
+        if abs_path.is_file() {
+            return Some(abs_path);
+        }
+    }
+    None
+}
+
 /// Every workspace file `@` completion offers, in the form
 /// [`dispatch_prompt_core`] resolves: root-relative, prefixed with the
 /// folder label in multi-root workspaces. Honors `files.exclude`; capped
-/// at 10 000 paths split across roots.
+/// at 10 000 paths split across roots. Includes the workspace-level
+/// `.gaviero` directory the explorer shows beside the member folders.
 pub(crate) fn workspace_completion_files(app: &App) -> Vec<String> {
-    let folders = app.workspace.folders();
-    let roots: Vec<(String, std::path::PathBuf)> = if folders.is_empty() {
-        vec![(String::new(), std::path::PathBuf::from("."))]
-    } else {
-        folders
-            .iter()
-            .map(|f| (f.display_name().to_string(), f.path.clone()))
-            .collect()
-    };
+    completion_display_paths(&completion_named_roots(&app.workspace), |root| {
+        parse_exclude_patterns(&app.workspace, Some(root))
+    })
+}
+
+fn completion_display_paths(
+    roots: &[(String, std::path::PathBuf)],
+    excludes_for: impl Fn(&std::path::Path) -> Vec<String>,
+) -> Vec<String> {
     let multi_root = roots.len() > 1;
-    let labels = unique_root_labels(&roots);
+    let labels = unique_root_labels(roots);
 
     const TOTAL_LIMIT: usize = 10_000;
     let per_root = TOTAL_LIMIT / roots.len().max(1);
     let mut seen = std::collections::HashSet::new();
     let mut files: Vec<String> = Vec::new();
     for ((_, root), label) in roots.iter().zip(labels.iter()) {
-        let excludes = parse_exclude_patterns(&app.workspace, Some(root));
-        for f in list_workspace_files(root, per_root, &excludes) {
+        let excludes = excludes_for(root);
+        // `settings.json` sits at the top of a workspace `.gaviero` config
+        // root. Directory order is unspecified and that folder can hold
+        // thousands of state files, so pin it ahead of the capped walk.
+        let mut listed = Vec::new();
+        if root.join("settings.json").is_file() && !matches_exclude("settings.json", &excludes) {
+            listed.push("settings.json".to_string());
+        }
+        listed.extend(list_workspace_files(root, per_root, &excludes));
+        for f in listed {
             let display = if multi_root && !label.is_empty() {
                 format!("{}/{}", label, f)
             } else {
@@ -1864,19 +1941,7 @@ pub(crate) fn dispatch_prompt_core(
     let tx = app.event_tx.clone();
     let wg = app.write_gate.clone();
 
-    let named_roots: Vec<(String, std::path::PathBuf)> = {
-        let folders = app.workspace.folders();
-        if folders.is_empty() {
-            vec![(String::new(), root.clone())]
-        } else {
-            folders
-                .iter()
-                .map(|f| (f.display_name().to_string(), f.path.clone()))
-                .collect()
-        }
-    };
-    let multi_root = named_roots.len() > 1;
-    let labels = unique_root_labels(&named_roots);
+    let named_roots = completion_named_roots(&app.workspace);
     let active_repo_id = focused_folder
         .as_ref()
         .map(|p| gaviero_core::memory::scope::hash_path(p));
@@ -1893,38 +1958,10 @@ pub(crate) fn dispatch_prompt_core(
     let refs = crate::panels::agent_chat::parse_file_references(&task_text);
     let mut file_refs: Vec<(String, String)> = Vec::new();
     for rel_path in &refs {
-        // If multi-root and the ref starts with "<label>/", resolve it to that root only.
-        // Labels can themselves contain '/', so we match the longest label first.
-        let mut resolved = false;
-        if multi_root {
-            let mut idxs: Vec<usize> = (0..labels.len()).collect();
-            idxs.sort_by_key(|&i| std::cmp::Reverse(labels[i].len()));
-            for i in idxs {
-                let label = &labels[i];
-                if label.is_empty() {
-                    continue;
-                }
-                if let Some(tail) = rel_path
-                    .strip_prefix(label)
-                    .and_then(|t| t.strip_prefix('/'))
-                {
-                    let abs_path = named_roots[i].1.join(tail);
-                    if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                        file_refs.push((rel_path.clone(), content));
-                        resolved = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !resolved {
-            for (_, r) in &named_roots {
-                let abs_path = r.join(rel_path);
-                if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                    file_refs.push((rel_path.clone(), content));
-                    break;
-                }
-            }
+        if let Some(abs_path) = resolve_at_path(rel_path, &named_roots)
+            && let Ok(content) = std::fs::read_to_string(&abs_path)
+        {
+            file_refs.push((rel_path.clone(), content));
         }
     }
 
@@ -2979,5 +3016,37 @@ mod tests {
         assert_eq!(display_dir_prefix("/tmp/sc"), "/tmp/");
         assert_eq!(display_dir_prefix("~/Downloads/scre"), "~/Downloads/");
         assert_eq!(display_dir_prefix("noslash"), "");
+    }
+
+    #[test]
+    fn at_completion_offers_workspace_settings_ahead_of_member_copies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let member = tmp.path().join("gaviero");
+        std::fs::create_dir_all(member.join(".gaviero")).unwrap();
+        std::fs::write(member.join(".gaviero/settings.json"), "member").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".gaviero")).unwrap();
+        std::fs::write(tmp.path().join(".gaviero/settings.json"), "workspace").unwrap();
+        let ws_path = tmp.path().join("demo.gaviero-workspace");
+        std::fs::write(
+            &ws_path,
+            serde_json::to_string(&serde_json::json!({
+                "folders": [{ "path": member, "name": "gaviero" }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let ws = gaviero_core::workspace::Workspace::load(&ws_path).unwrap();
+        let roots = super::completion_named_roots(&ws);
+        let files = super::completion_display_paths(&roots, |_| Vec::new());
+        assert!(
+            files.iter().any(|f| f == ".gaviero/settings.json"),
+            "{files:?}"
+        );
+        assert!(files.iter().any(|f| f == "gaviero/.gaviero/settings.json"));
+        let resolved = super::resolve_at_path(".gaviero/settings.json", &roots).unwrap();
+        assert_eq!(std::fs::read_to_string(resolved).unwrap(), "workspace");
+        let member_copy =
+            super::resolve_at_path("gaviero/.gaviero/settings.json", &roots).unwrap();
+        assert_eq!(std::fs::read_to_string(member_copy).unwrap(), "member");
     }
 }
