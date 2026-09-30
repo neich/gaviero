@@ -493,6 +493,74 @@ mod tests {
 
         cleanup_session(key);
     }
+
+    #[test]
+    fn chat_input_height_and_unsent_draft_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.chat_state.input_area_rows = 12;
+        app.chat_state.text_input.text = "remember\nthis".to_string();
+        app.chat_state.text_input.cursor = app.chat_state.text_input.char_count();
+        // Height changes flush immediately; the draft rides along.
+        super::flush_composer_if_due(&mut app, std::time::Duration::from_secs(60));
+
+        let mut restarted = session_app(dir.path());
+        assert_eq!(restarted.chat_state.input_area_rows, 0);
+        assert!(restarted.chat_state.text_input.text.is_empty());
+
+        restore_session(&mut restarted);
+        assert_eq!(restarted.chat_state.input_area_rows, 12);
+        assert_eq!(restarted.chat_state.text_input.text, "remember\nthis");
+        assert_eq!(
+            restarted.chat_state.text_input.cursor,
+            "remember\nthis".chars().count()
+        );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn unsent_draft_waits_out_the_debounce_then_clears_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.chat_state.text_input.text = "still typing".to_string();
+        super::flush_composer_if_due(&mut app, std::time::Duration::from_secs(60));
+        let held = session_state::load_session(&app.workspace_key());
+        assert!(
+            held.chat_draft.is_empty(),
+            "a keystroke must not rewrite state.json before the debounce"
+        );
+
+        super::flush_composer_if_due(&mut app, std::time::Duration::ZERO);
+        let flushed = session_state::load_session(&app.workspace_key());
+        assert_eq!(flushed.chat_draft, "still typing");
+
+        app.chat_state.text_input.clear();
+        super::flush_composer_if_due(&mut app, std::time::Duration::from_secs(60));
+        let cleared = session_state::load_session(&app.workspace_key());
+        assert!(
+            cleared.chat_draft.is_empty(),
+            "sending or clearing the prompt drops the stored draft without waiting"
+        );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn renaming_does_not_store_the_title_as_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.chat_state.text_input.text = "real draft".to_string();
+        super::flush_composer_if_due(&mut app, std::time::Duration::ZERO);
+
+        app.chat_state.start_rename();
+        assert_ne!(app.chat_state.text_input.text, "real draft");
+        super::save_session(&app);
+        let stored = session_state::load_session(&app.workspace_key());
+        assert_eq!(stored.chat_draft, "real draft");
+
+        cleanup_session(dir.path());
+    }
 }
 
 /// Spawn a background task that (re)builds `RepoMap` and writes it into
@@ -626,6 +694,10 @@ pub(super) fn restore_session(app: &mut App) {
     }
 
     app.chat_state.load_conversations(&key);
+    // After conversations load: an empty index creates a fresh chat and
+    // clears the input, so the draft has to be applied second.
+    app.chat_state
+        .restore_composer(state.chat_input_rows, &state.chat_draft);
 
     if !app.buffers.is_empty() {
         app.focus = Focus::Editor;
@@ -657,9 +729,7 @@ fn stored_side_panel_width(app: &App) -> Option<u16> {
     app.active_preset.is_none().then_some(app.side_panel_width)
 }
 
-pub(super) fn save_session(app: &App) {
-    let key = app.workspace_key();
-
+fn session_state_from_app(app: &App) -> SessionState {
     let tabs: Vec<TabState> = app
         .buffers
         .iter()
@@ -676,7 +746,7 @@ pub(super) fn save_session(app: &App) {
         })
         .collect();
 
-    let state = SessionState {
+    SessionState {
         tabs,
         active_tab: app.active_buffer,
         panels: session_state::PanelState {
@@ -691,11 +761,40 @@ pub(super) fn save_session(app: &App) {
         side_panel_width: stored_side_panel_width(app),
         terminal_split_percent: Some(app.terminal_split_percent),
         terminal_session: Some(app.terminal_manager.save_state()),
-    };
+        chat_input_rows: app.chat_state.input_area_rows,
+        chat_draft: app.chat_state.draft_to_persist().to_string(),
+    }
+}
 
-    if let Err(e) = session_state::save_session(&key, &state) {
+pub(super) fn save_session(app: &App) {
+    let key = app.workspace_key();
+    if let Err(e) = session_state::save_session(&key, &session_state_from_app(app)) {
         tracing::warn!("Failed to save session state: {}", e);
     }
 
     app.chat_state.save_conversations(&key);
+}
+
+/// How long a draft edit may stay dirty before it is written. The clock
+/// starts at the first change and is not reset by later keystrokes, so a
+/// long prompt is flushed about once a second while it is being typed.
+/// Height changes and a cleared draft do not wait.
+const COMPOSER_FLUSH_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Write `state.json` when the prompt box height or the unsent draft has
+/// changed. Conversations stay on the exit path — this must not checkpoint
+/// the prompt journal mid-turn.
+pub(super) fn maybe_persist_composer(app: &mut App) {
+    flush_composer_if_due(app, COMPOSER_FLUSH_AFTER);
+}
+
+fn flush_composer_if_due(app: &mut App, wait: std::time::Duration) {
+    let Some((rows, draft)) = app.chat_state.take_composer_flush(wait) else {
+        return;
+    };
+    let key = app.workspace_key();
+    match session_state::save_session(&key, &session_state_from_app(app)) {
+        Ok(()) => app.chat_state.note_composer_persisted(rows, draft),
+        Err(e) => tracing::warn!("Failed to persist chat composer: {e}"),
+    }
 }

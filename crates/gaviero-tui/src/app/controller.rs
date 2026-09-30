@@ -1734,6 +1734,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.chat_state.active_conv_busy() {
                 app.chat_state.tick_count = app.chat_state.tick_count.wrapping_add(1);
             }
+            session::maybe_persist_composer(app);
         }
     }
 }
