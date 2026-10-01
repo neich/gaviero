@@ -25,7 +25,7 @@ gaviero /path/to/workspace.gaviero-workspace   # multi-folder workspace
 
 On first run you may be prompted to create a workspace settings file.
 
-**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+H (history), Alt+G (git), Alt+M (memory). **Left panel:** Alt+E (explorer), Alt+F (find), Alt+C (changes).
+**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+H (history), Alt+G (git), Alt+M (memory). **Left panel:** Alt+E (explorer), Alt+F (find — Tab switches between file contents and file names; gitignored folders are skipped), Alt+C (changes).
 
 ## Examples
 

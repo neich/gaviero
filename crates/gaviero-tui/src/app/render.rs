@@ -834,11 +834,18 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                     )
                 }
                 LeftPanelMode::Search => {
+                    let tab_hint = match app.search_panel.mode {
+                        crate::panels::search::SearchMode::Content => "Tab: file names",
+                        crate::panels::search::SearchMode::FileName => "Tab: contents",
+                    };
                     if app.search_panel.editing {
-                        "Type to search  ↓/Enter: results  Esc: clear/back".to_string()
+                        format!("Type to search  ↓/Enter: results  {}  Esc: clear/back", tab_hint)
                     } else {
                         let count = app.search_panel.results.len();
-                        format!("{} results  Enter: open  ↑: input  Esc: input  F7: cycle", count)
+                        format!(
+                            "{} results  Enter: open  ↑: input  Esc: input  {}",
+                            count, tab_hint
+                        )
                     }
                 }
                 LeftPanelMode::Changes => {

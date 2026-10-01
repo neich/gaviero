@@ -74,6 +74,13 @@ impl GitRepo {
         self.repo.workdir()
     }
 
+    /// Whether `rel_path` (relative to the working directory, `/`-separated)
+    /// is excluded by the repo's ignore rules (`.gitignore`, `info/exclude`,
+    /// `core.excludesFile`). Errors read as "not ignored".
+    pub fn is_path_ignored(&self, rel_path: &str) -> bool {
+        self.repo.is_path_ignored(rel_path).unwrap_or(false)
+    }
+
     /// Get the current branch name (HEAD).
     pub fn current_branch(&self) -> Result<String> {
         let head = self.repo.head().context("reading HEAD")?;
@@ -1171,6 +1178,18 @@ mod tests {
         let (dir, _repo) = init_test_repo();
         let opened = GitRepo::open(dir.path());
         assert!(opened.is_ok());
+    }
+
+    #[test]
+    fn test_is_path_ignored() {
+        let (dir, repo) = init_test_repo();
+        std::fs::write(dir.path().join(".gitignore"), "tmp/\n*.log\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp/nested")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        assert!(repo.is_path_ignored("tmp"));
+        assert!(repo.is_path_ignored("tmp/nested"));
+        assert!(repo.is_path_ignored("src/debug.log"));
+        assert!(!repo.is_path_ignored("src"));
     }
 
     #[test]
