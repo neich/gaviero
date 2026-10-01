@@ -261,6 +261,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.skill_catalog.needs_rebuild_for(&path) {
                 app.rebuild_skill_catalog();
             }
+            if path.file_name().is_some_and(|n| n == ".gitignore") {
+                app.search_panel.invalidate_file_index();
+            }
             app.handle_file_changed(&path);
         }
         Event::FileTreeChanged => {

@@ -1,6 +1,12 @@
 use super::*;
 
 pub(super) fn handle_search_action(app: &mut App, action: Action) {
+    if action == Action::Tab {
+        app.search_panel.toggle_mode();
+        app.search_panel.editing = true;
+        app.run_search_from_input();
+        return;
+    }
     if app.search_panel.editing {
         match action {
             Action::InsertChar(ch) => {
@@ -99,15 +105,8 @@ pub(super) fn run_search_from_input(app: &mut App) {
 
 pub(super) fn open_selected_search_result(app: &mut App) {
     if let Some(result) = app.search_panel.selected_result().cloned() {
-        let root = app
-            .workspace
-            .roots()
-            .first()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        let abs_path = root.join(&result.path);
-        if abs_path.exists() {
-            app.open_file(&abs_path);
+        if result.abs_path.exists() {
+            app.open_file(&result.abs_path);
             app.focus = Focus::Editor;
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                 let target_line = result.line_number.saturating_sub(1);
@@ -642,4 +641,7 @@ pub(super) fn refresh_file_tree(app: &mut App) {
     let view = app.file_tree.view_state();
     app.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
     app.file_tree.restore_view(view);
+    // Files appeared, vanished, or moved: the search panel's cached file
+    // list is stale. Rebuilt lazily on the next search keystroke.
+    app.search_panel.invalidate_file_index();
 }

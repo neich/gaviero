@@ -66,6 +66,9 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Search-panel gitignore test: init a scratch repo. Same version as
+# gaviero-core's, so it adds nothing to the lockfile.
+git2 = "0.19"
 # A6 tests: self-signed certs for the availability matrix.
 rcgen = "0.13"
 # ntfy publisher tests: mock HTTP, no live POST to ntfy.sh.

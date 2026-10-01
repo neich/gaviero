@@ -1546,6 +1546,7 @@ dependencies = [
  "gaviero-core",
  "gaviero-dsl",
  "gaviero-remote",
+ "git2",
  "notify",
  "png 0.17.16",
  "portable-pty",

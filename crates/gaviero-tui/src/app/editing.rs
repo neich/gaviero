@@ -627,15 +627,8 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             if idx < app.search_panel.results.len() {
                                 app.search_panel.scroll.selected = idx;
                                 let result = app.search_panel.results[idx].clone();
-                                let root = app
-                                    .workspace
-                                    .roots()
-                                    .first()
-                                    .map(|p| p.to_path_buf())
-                                    .unwrap_or_default();
-                                let abs_path = root.join(&result.path);
-                                if abs_path.exists() {
-                                    app.open_file(&abs_path);
+                                if result.abs_path.exists() {
+                                    app.open_file(&result.abs_path);
                                     app.focus = Focus::Editor;
                                     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                                         let target = result.line_number.saturating_sub(1);
@@ -1886,7 +1879,9 @@ pub(super) fn search_selected_in_workspace(app: &mut App) {
         String::new()
     };
 
-    if !app.search_panel.results.is_empty()
+    let content_mode = app.search_panel.mode == crate::panels::search::SearchMode::Content;
+    if content_mode
+        && !app.search_panel.results.is_empty()
         && (query.trim().is_empty() || query.trim() == app.search_panel.query)
     {
         app.goto_next_search_result();
@@ -1897,6 +1892,7 @@ pub(super) fn search_selected_in_workspace(app: &mut App) {
         return;
     }
 
+    app.search_panel.mode = crate::panels::search::SearchMode::Content;
     app.search_panel.input.clear();
     app.search_panel.input.insert_str(&query);
     app.search_panel.editing = false;
@@ -1930,16 +1926,9 @@ pub(super) fn goto_next_search_result(app: &mut App) {
     app.search_panel.scroll.ensure_visible();
 
     let result = app.search_panel.results[app.search_panel.scroll.selected].clone();
-    let root = app
-        .workspace
-        .roots()
-        .first()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-    let abs_path = root.join(&result.path);
 
-    if abs_path.exists() {
-        app.open_file(&abs_path);
+    if result.abs_path.exists() {
+        app.open_file(&result.abs_path);
         app.focus = Focus::Editor;
         if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
             let target = result.line_number.saturating_sub(1);
@@ -1948,20 +1937,21 @@ pub(super) fn goto_next_search_result(app: &mut App) {
             buf.cursor.col = 0;
             buf.cursor.anchor = None;
             buf.scroll.top_line = target.saturating_sub(10);
-            buf.set_search_highlight(Some(app.search_panel.query.clone()));
+            if result.line_number > 0 {
+                buf.set_search_highlight(Some(app.search_panel.query.clone()));
+            }
         }
     }
 
     let idx = app.search_panel.scroll.selected + 1;
     let total = app.search_panel.results.len();
+    let location = if result.line_number == 0 {
+        result.path.display().to_string()
+    } else {
+        format!("{}:{}", result.path.display(), result.line_number)
+    };
     app.status_message = Some((
-        format!(
-            "Result {}/{}: {}:{}",
-            idx,
-            total,
-            result.path.display(),
-            result.line_number
-        ),
+        format!("Result {}/{}: {}", idx, total, location),
         std::time::Instant::now(),
     ));
 }
