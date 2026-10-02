@@ -93,6 +93,8 @@ Settings cascade (highest priority first):
 3. `~/.gaviero/settings.json` (same on Windows; falls back to the old XDG/AppData path if missing)
 4. Built-in defaults
 
+A settings file that is not valid JSON contributes nothing to the cascade. At startup a modal names the file, line, column, and parser message: `q` quits, `Enter` continues and opens the file with the cursor at the error.
+
 ```json
 {
   "editor": { "tabSize": 4, "insertSpaces": true, "wordWrap": false },

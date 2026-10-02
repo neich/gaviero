@@ -70,6 +70,12 @@ fn ntfy_remote_identity(app: &App) -> (String, String, String) {
 pub(super) fn handle_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) => {
+            // Ahead of terminal routing: a restored session may start with
+            // the terminal focused, and the modal must still get the key.
+            if app.settings_error_dialog.is_some() {
+                super::session::handle_settings_error_key(app, &key);
+                return;
+            }
             if app.focus == Focus::Terminal && !app.has_active_review() {
                 if let Some(inst) = app.terminal_manager.active_instance() {
                     if inst.spawned {
@@ -219,7 +225,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_action(action);
         }
         Event::Paste(text) => {
-            if app.has_active_review() {
+            if app.has_active_review() || app.settings_error_dialog.is_some() {
                 return;
             }
             // Terminal delivered a paste — cancel the Windows Ctrl+V image fallback.
@@ -238,7 +244,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             app.handle_paste(&text);
         }
-        Event::Mouse(mouse) => app.handle_mouse(mouse),
+        Event::Mouse(mouse) => {
+            if app.settings_error_dialog.is_none() {
+                app.handle_mouse(mouse);
+            }
+        }
         Event::Resize(_w, _h) => {
             app.needs_full_redraw = true;
             // Mux / WT resize is a known trigger for dropping pane mouse
