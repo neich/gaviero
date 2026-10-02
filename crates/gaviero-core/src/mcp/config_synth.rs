@@ -729,9 +729,11 @@ fn remote_mcp_servers_from_mcp_json_body(body: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Claude `.mcp.json` entry. Claude skips a `url` entry with no `type`
+/// ("has a \"url\" but no \"type\""), so URL servers carry `"type": "http"`.
 fn extra_server_json_entry(extra: &ExtraMcpServer) -> serde_json::Value {
     match &extra.transport {
-        ExtraMcpTransport::Url { url } => serde_json::json!({ "url": url }),
+        ExtraMcpTransport::Url { url } => serde_json::json!({ "type": "http", "url": url }),
         ExtraMcpTransport::Stdio { command, args } => serde_json::json!({
             "command": command,
             "args": args,
@@ -2240,6 +2242,11 @@ mod tests {
         assert_eq!(
             v["mcpServers"]["semantic-scholar"]["url"].as_str().unwrap(),
             "https://scholar.example/mcp"
+        );
+        // Claude skips a `url` entry without a `type` discriminator.
+        assert_eq!(
+            v["mcpServers"]["semantic-scholar"]["type"].as_str().unwrap(),
+            "http"
         );
 
         // Project-level .cursor/cli.json only accepts `permissions`. The

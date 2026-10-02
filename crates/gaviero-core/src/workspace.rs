@@ -489,6 +489,41 @@ pub struct Workspace {
     /// Cached user-level `~/.gaviero/settings.json` (legacy XDG/AppData
     /// path is read only when that file is missing).
     user_settings_cache: Option<serde_json::Value>,
+    /// Settings files that exist but failed to parse on the last
+    /// [`Self::reload_settings_cache`]. Each contributes nothing to the
+    /// cascade, so hosts surface these instead of letting the keys vanish.
+    settings_errors: Vec<SettingsParseError>,
+}
+
+/// A settings file that exists but is not valid JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsParseError {
+    pub path: PathBuf,
+    /// 1-based line where the parser stopped.
+    pub line: usize,
+    /// 1-based byte column where the parser stopped; 0 means before the
+    /// line's first character.
+    pub column: usize,
+    /// The parser's message without its "at line L column C" suffix.
+    pub message: String,
+    /// The file ended while an object or array was still open. The
+    /// reported position is then the end of the file, not the spot where
+    /// the closing `}` or `]` is missing.
+    pub unexpected_eof: bool,
+}
+
+impl SettingsParseError {
+    fn from_serde(path: &Path, error: &serde_json::Error) -> Self {
+        let full = error.to_string();
+        let suffix = format!(" at line {} column {}", error.line(), error.column());
+        Self {
+            path: path.to_path_buf(),
+            line: error.line(),
+            column: error.column(),
+            message: full.strip_suffix(&suffix).unwrap_or(&full).to_string(),
+            unexpected_eof: error.is_eof(),
+        }
+    }
 }
 
 impl Workspace {
@@ -531,6 +566,7 @@ impl Workspace {
             workspace_path: Some(path.to_path_buf()),
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
+            settings_errors: Vec::new(),
         };
         ws.reload_settings_cache();
         Ok(ws)
@@ -581,6 +617,7 @@ impl Workspace {
             workspace_path: None,
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
+            settings_errors: Vec::new(),
         };
         ws.reload_settings_cache();
         ws
@@ -809,8 +846,19 @@ impl Workspace {
         let gaviero_dir = path.parent().unwrap();
         std::fs::create_dir_all(&gaviero_dir)
             .with_context(|| format!("creating {}", gaviero_dir.display()))?;
+        // A file that does not parse is refused rather than replaced: writing
+        // `{}` plus one key would erase everything the user wrote in it.
         let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+            Ok(s) => serde_json::from_str(&s).map_err(|e| {
+                let err = SettingsParseError::from_serde(&path, &e);
+                anyhow::anyhow!(
+                    "{} is not valid JSON ({} at line {} column {}); fix it before saving settings",
+                    path.display(),
+                    err.message,
+                    err.line,
+                    err.column
+                )
+            })?,
             Err(_) => serde_json::json!({}),
         };
         dot_set(&mut doc, key, value);
@@ -826,17 +874,24 @@ impl Workspace {
     pub fn reload_settings_cache(&mut self) {
         // Cache per-folder settings
         self.folder_settings_cache.clear();
-        self.workspace_settings = match std::fs::read_to_string(self.settings_path()) {
+        self.settings_errors.clear();
+        let settings_path = self.settings_path();
+        self.workspace_settings = match std::fs::read_to_string(&settings_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
-                tracing::warn!(
-                    "Invalid settings at {}: {error}",
-                    self.settings_path().display()
-                );
+                tracing::warn!("Invalid settings at {}: {error}", settings_path.display());
+                self.settings_errors
+                    .push(SettingsParseError::from_serde(&settings_path, &error));
                 serde_json::Value::Null
             }),
             Err(_) => serde_json::Value::Null,
         };
-        self.user_settings_cache = load_user_settings();
+        self.user_settings_cache = match load_user_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.settings_errors.push(error);
+                None
+            }
+        };
         // Member settings and embedded workspace settings are not policy sources
         // in workspace mode, even when the authoritative file omits a key.
         if self.workspace_path.is_some() {
@@ -844,14 +899,28 @@ impl Workspace {
         }
         for folder in &self.folders {
             let settings_path = folder.path.join(".gaviero").join("settings.json");
-            if let Ok(content) = std::fs::read_to_string(&settings_path)
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            {
-                self.folder_settings_cache.insert(folder.path.clone(), val);
+            let Ok(content) = std::fs::read_to_string(&settings_path) else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(val) => {
+                    self.folder_settings_cache.insert(folder.path.clone(), val);
+                }
+                // In single-folder mode this is the authoritative file,
+                // already recorded above.
+                Err(error) if !self.settings_errors.iter().any(|e| e.path == settings_path) => {
+                    self.settings_errors
+                        .push(SettingsParseError::from_serde(&settings_path, &error));
+                }
+                Err(_) => {}
             }
         }
+    }
 
-        self.user_settings_cache = load_user_settings();
+    /// Settings files that failed to parse on the last reload, authoritative
+    /// file first. Empty when every existing settings file is valid JSON.
+    pub fn settings_errors(&self) -> &[SettingsParseError] {
+        &self.settings_errors
     }
 
     /// Resolve a setting using the cascade:
@@ -1573,20 +1642,20 @@ pub fn legacy_user_settings_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("gaviero").join("settings.json"))
 }
 
-fn load_user_settings() -> Option<serde_json::Value> {
+fn load_user_settings() -> Result<Option<serde_json::Value>, SettingsParseError> {
     load_user_settings_from(
         user_settings_path().as_deref(),
         legacy_user_settings_path().as_deref(),
     )
 }
 
-/// Canonical file wins if it exists (including unreadable JSON — that is a
-/// warn + `None`, not a silent legacy fallback). Missing canonical falls
-/// back to the XDG/AppData path so existing installs keep working.
+/// Canonical file wins if it exists (including unparseable JSON — that is
+/// an `Err`, not a silent legacy fallback). Missing canonical falls back to
+/// the XDG/AppData path so existing installs keep working.
 fn load_user_settings_from(
     canonical: Option<&Path>,
     legacy: Option<&Path>,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, SettingsParseError> {
     if let Some(path) = canonical
         && path.is_file()
     {
@@ -1601,22 +1670,24 @@ fn load_user_settings_from(
         );
         return parse_user_settings_file(path);
     }
-    None
+    Ok(None)
 }
 
-fn parse_user_settings_file(path: &Path) -> Option<serde_json::Value> {
+fn parse_user_settings_file(
+    path: &Path,
+) -> Result<Option<serde_json::Value>, SettingsParseError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("failed to read user settings {}: {}", path.display(), e);
-            return None;
+            return Ok(None);
         }
     };
     match serde_json::from_str(&content) {
-        Ok(v) => Some(v),
+        Ok(v) => Ok(Some(v)),
         Err(e) => {
             tracing::warn!("failed to parse user settings {}: {}", path.display(), e);
-            None
+            Err(SettingsParseError::from_serde(path, &e))
         }
     }
 }
@@ -1785,6 +1856,7 @@ mod tests {
             workspace_path: None,
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
+            settings_errors: Vec::new(),
         };
         assert_eq!(
             ws.resolve_setting("editor.tabSize", None),
@@ -1897,7 +1969,9 @@ mod tests {
         let legacy = dir.path().join("legacy.json");
         fs::write(&canonical, r#"{ "editor": { "tabSize": 2 } }"#).unwrap();
         fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        let val = load_user_settings_from(Some(&canonical), Some(&legacy)).unwrap();
+        let val = load_user_settings_from(Some(&canonical), Some(&legacy))
+            .unwrap()
+            .unwrap();
         assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(2)));
     }
 
@@ -1907,7 +1981,9 @@ mod tests {
         let missing = dir.path().join("canonical.json");
         let legacy = dir.path().join("legacy.json");
         fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        let val = load_user_settings_from(Some(&missing), Some(&legacy)).unwrap();
+        let val = load_user_settings_from(Some(&missing), Some(&legacy))
+            .unwrap()
+            .unwrap();
         assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(8)));
     }
 
@@ -1918,7 +1994,80 @@ mod tests {
         let legacy = dir.path().join("legacy.json");
         fs::write(&canonical, "not json").unwrap();
         fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        assert!(load_user_settings_from(Some(&canonical), Some(&legacy)).is_none());
+        let err = load_user_settings_from(Some(&canonical), Some(&legacy)).unwrap_err();
+        assert_eq!(err.path, canonical);
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn unclosed_settings_object_is_reported_with_eof_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join(".gaviero")).unwrap();
+        let settings_path = root.join(".gaviero/settings.json");
+        // `agent` is never closed — the shape of a real-world template bug.
+        fs::write(
+            &settings_path,
+            "{\n  \"agent\": {\n    \"permissions\": {}\n  },\n  \"x\": 1\n",
+        )
+        .unwrap();
+        let mut ws = Workspace::single_folder(root);
+        ws.user_settings_cache = None;
+
+        let errors: Vec<_> = ws
+            .settings_errors()
+            .iter()
+            .filter(|e| e.path == settings_path)
+            .collect();
+        assert_eq!(errors.len(), 1, "recorded once, not per cascade level");
+        let err = errors[0];
+        assert!(err.unexpected_eof);
+        assert_eq!(err.line, 6);
+        assert_eq!(err.column, 0);
+        assert_eq!(err.message, "EOF while parsing an object");
+        assert_eq!(ws.resolve_setting_opt("x", None), None);
+
+        fs::write(&settings_path, r#"{ "x": 1 }"#).unwrap();
+        ws.reload_settings_cache();
+        assert!(ws.settings_errors().iter().all(|e| e.path != settings_path));
+        assert_eq!(ws.resolve_setting_opt("x", None), Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn workspace_mode_reports_the_authoritative_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_path = dir.path().join("w.gaviero-workspace");
+        fs::write(&ws_path, r#"{ "folders": [] }"#).unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        let settings_path = dir.path().join(".gaviero/settings.json");
+        fs::write(&settings_path, "{\n  \"a\": 1,\n  \"b\" 2\n}\n").unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let err = ws
+            .settings_errors()
+            .iter()
+            .find(|e| e.path == settings_path)
+            .expect("authoritative file error recorded");
+        assert!(!err.unexpected_eof);
+        assert_eq!((err.line, err.column), (3, 7));
+        assert_eq!(err.message, "expected `:`");
+    }
+
+    #[test]
+    fn save_folder_setting_refuses_to_overwrite_unparseable_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join(".gaviero")).unwrap();
+        let settings_path = root.join(".gaviero/settings.json");
+        let broken = "{ \"keep\": \"me\"\n";
+        fs::write(&settings_path, broken).unwrap();
+        let mut ws = Workspace::single_folder(root.clone());
+
+        let err = ws
+            .save_folder_setting(&root, "mcp.gavieroServer.codexTrust", serde_json::json!("granted"))
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
+        assert_eq!(fs::read_to_string(&settings_path).unwrap(), broken);
     }
 
     #[test]
@@ -1983,6 +2132,7 @@ mod tests {
             workspace_path: None,
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
+            settings_errors: Vec::new(),
         };
         ws.reload_settings_cache();
         assert_eq!(

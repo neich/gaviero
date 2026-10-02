@@ -197,6 +197,14 @@ pub(crate) enum PendingAfterTrust {
     ChatSend,
 }
 
+/// Startup prompt for settings files that failed to parse. Gaviero runs
+/// without such a file, so the user either quits or continues and lands in
+/// the file at the parser's error position.
+#[derive(Debug, Clone)]
+pub(crate) struct SettingsErrorDialog {
+    pub errors: Vec<gaviero_core::workspace::SettingsParseError>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TreeDialogKind {
     NewFile,

@@ -384,6 +384,7 @@ async fn main() -> Result<()> {
     event_loop.spawn_terminal_bridge(terminal_rx);
 
     app.restore_session();
+    app.show_settings_errors();
 
     // Spawn background memory initialization (non-blocking).
     // Constructs the multi-DB registry: global + workspace + lazy

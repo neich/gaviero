@@ -56,6 +56,71 @@ pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyE
     }
 }
 
+/// Consume a keystroke while the settings-error modal is open. `q` quits;
+/// Enter / `c` closes the modal and opens each broken file with the cursor
+/// at the parser's error position. Every other key is swallowed.
+pub(super) fn handle_settings_error_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Ctrl+C / Alt chords must not read as `c` (continue) or `q` (quit).
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return;
+    }
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.settings_error_dialog = None;
+            app.should_quit = true;
+        }
+        KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(dialog) = app.settings_error_dialog.take() {
+                open_settings_error_locations(app, &dialog.errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Open each broken settings file at its error position. Iterates in
+/// reverse so the first (authoritative) file ends up as the active buffer.
+fn open_settings_error_locations(
+    app: &mut App,
+    errors: &[gaviero_core::workspace::SettingsParseError],
+) {
+    for err in errors.iter().rev() {
+        app.open_file(&err.path);
+        let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+            continue;
+        };
+        // `open_file` leaves the previous buffer active when the open fails.
+        if !buf
+            .path
+            .as_deref()
+            .is_some_and(|p| Buffer::paths_refer_to_same_file(p, &err.path))
+        {
+            continue;
+        }
+        let line = err
+            .line
+            .saturating_sub(1)
+            .min(buf.line_count().saturating_sub(1));
+        // The parser counts 1-based bytes (0 = line start); the cursor
+        // counts chars.
+        let rope_line = buf.text.line(line);
+        let byte = err.column.saturating_sub(1).min(rope_line.len_bytes());
+        buf.cursor.line = line;
+        buf.cursor.col = rope_line.byte_to_char(byte).min(buf.line_len(line));
+        buf.cursor.anchor = None;
+        buf.scroll.top_line = line.saturating_sub(10);
+    }
+    app.focus = Focus::Editor;
+    if app.fullscreen_panel.is_some() {
+        app.fullscreen_panel = Some(Focus::Editor);
+    }
+}
+
 /// Get the cached `RepoMap` or build it on demand.
 ///
 /// M2 extracts this from the M1 `build_graph_context` so the chat path can
@@ -560,6 +625,78 @@ mod tests {
         assert_eq!(stored.chat_draft, "real draft");
 
         cleanup_session(dir.path());
+    }
+
+    /// An `App` whose `.gaviero/settings.json` holds `settings`, with the
+    /// settings-error modal raised the way `main` raises it.
+    fn broken_settings_app(dir: &std::path::Path, settings: &str) -> App {
+        std::fs::create_dir_all(dir.join(".gaviero")).unwrap();
+        std::fs::write(dir.join(".gaviero/settings.json"), settings).unwrap();
+        let workspace = Workspace::single_folder(dir.to_path_buf());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(workspace, tx);
+        app.show_settings_errors();
+        app
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn valid_settings_raise_no_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.show_settings_errors();
+        assert!(
+            app.settings_error_dialog
+                .as_ref()
+                .is_none_or(|d| d.errors.iter().all(|e| !e.path.starts_with(dir.path())))
+        );
+    }
+
+    #[test]
+    fn continue_opens_settings_file_at_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Multi-byte char before the error: the parser's byte column must
+        // land on the right char.
+        let mut app = broken_settings_app(dir.path(), "{\n  \"ñ\": 1 \"b\": 2\n}\n");
+        assert!(app.settings_error_dialog.is_some());
+
+        handle_settings_error_key(&mut app, &key(crossterm::event::KeyCode::Enter));
+
+        assert!(app.settings_error_dialog.is_none());
+        assert!(!app.should_quit);
+        assert!(app.focus == Focus::Editor);
+        let buf = &app.buffers[app.active_buffer];
+        assert!(
+            buf.path
+                .as_deref()
+                .is_some_and(|p| p.ends_with(".gaviero/settings.json"))
+        );
+        assert_eq!(buf.cursor.line, 1);
+        let line: String = buf.text.line(1).chars().skip(buf.cursor.col).collect();
+        assert!(line.starts_with("\"b\""), "cursor at {line:?}");
+    }
+
+    #[test]
+    fn q_quits_and_ctrl_c_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = broken_settings_app(dir.path(), "{");
+        let buffers_before = app.buffers.len();
+
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_settings_error_key(&mut app, &ctrl_c);
+        handle_settings_error_key(&mut app, &key(crossterm::event::KeyCode::Char('x')));
+        assert!(app.settings_error_dialog.is_some(), "only q / Enter / c answer");
+        assert_eq!(app.buffers.len(), buffers_before);
+
+        handle_settings_error_key(&mut app, &key(crossterm::event::KeyCode::Char('q')));
+        assert!(app.should_quit);
+        assert_eq!(app.buffers.len(), buffers_before, "quitting opens nothing");
     }
 }
 

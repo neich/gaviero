@@ -38,7 +38,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         app.render_fullscreen(frame, main_area, fs_panel);
         app.render_status_bar(frame, status_area);
         render_agent_finish_toast(app, frame, main_area);
-        if fs_panel == Focus::Editor {
+        if fs_panel == Focus::Editor && app.settings_error_dialog.is_none() {
             app.update_cursor_position(frame, app.layout.editor_area);
         }
         if app.quit_confirm {
@@ -52,6 +52,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
             Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
         ) {
             app.render_bulk_op_dialog(frame, size);
+        }
+        if app.settings_error_dialog.is_some() {
+            app.render_settings_error_dialog(frame, size);
         }
         return;
     }
@@ -190,7 +193,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     }
 
     app.render_status_bar(frame, status_area);
-    app.update_cursor_position(frame, app.layout.editor_area);
+    if app.settings_error_dialog.is_none() {
+        app.update_cursor_position(frame, app.layout.editor_area);
+    }
 
     if app.quit_confirm {
         app.render_quit_confirm(frame, size);
@@ -200,6 +205,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
     ) {
         app.render_bulk_op_dialog(frame, size);
+    }
+    if app.settings_error_dialog.is_some() {
+        app.render_settings_error_dialog(frame, size);
     }
 }
 
@@ -1525,6 +1533,121 @@ pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect
             cx += 1;
         }
     }
+}
+
+/// Render the startup modal for settings files that failed to parse:
+/// file, position, and parser message for each, then quit / continue.
+pub(super) fn render_settings_error_dialog(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(dialog) = &app.settings_error_dialog else {
+        return;
+    };
+    let lines = settings_error_dialog_lines(&dialog.errors, area.width);
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let title_style = Style::default()
+        .fg(theme::FOCUS_BORDER)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+    draw_modal_box(
+        frame,
+        area,
+        &lines,
+        "Settings file",
+        bg_style,
+        title_style,
+        hint_style,
+    );
+}
+
+/// Text of the settings-error modal, wrapped to fit `area_width`.
+fn settings_error_dialog_lines(
+    errors: &[gaviero_core::workspace::SettingsParseError],
+    area_width: u16,
+) -> Vec<String> {
+    // `draw_modal_box` needs two border columns plus four columns of margin.
+    let width = (area_width as usize).saturating_sub(8).min(96);
+    let mut lines = vec![String::new()];
+    lines.extend(wrap_modal_text(
+        if errors.len() == 1 {
+            "Settings file is not valid JSON"
+        } else {
+            "Settings files are not valid JSON"
+        },
+        width,
+    ));
+    for err in errors {
+        lines.push(String::new());
+        lines.extend(wrap_modal_text(&err.path.display().to_string(), width));
+        lines.extend(wrap_modal_text(
+            &format!(
+                "Line {}, column {}: {}",
+                err.line,
+                err.column.max(1),
+                err.message
+            ),
+            width,
+        ));
+        if err.unexpected_eof {
+            lines.extend(wrap_modal_text(
+                "The file ends while an object or array is still open, so a closing } \
+                 or ] is probably missing earlier in the file.",
+                width,
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.extend(wrap_modal_text(
+        "Gaviero ignores a settings file it cannot parse: none of its settings \
+         apply until it is fixed.",
+        width,
+    ));
+    lines.push(String::new());
+    lines.extend(wrap_modal_text(
+        if errors.len() == 1 {
+            "[Enter] Continue and open the file at the error   [q] Quit gaviero"
+        } else {
+            "[Enter] Continue and open the files at the errors   [q] Quit gaviero"
+        },
+        width,
+    ));
+    lines.push(String::new());
+    lines
+}
+
+/// Greedy word wrap with a two-space indent. Words longer than the line
+/// (long paths) are split across lines.
+fn wrap_modal_text(text: &str, width: usize) -> Vec<String> {
+    const INDENT: &str = "  ";
+    let avail = width.saturating_sub(INDENT.len()).max(10);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word: Vec<char> = word.chars().collect();
+        while word.len() > avail {
+            if !line.is_empty() {
+                out.push(format!("{INDENT}{line}"));
+                line.clear();
+            }
+            let rest = word.split_off(avail);
+            out.push(format!("{INDENT}{}", word.iter().collect::<String>()));
+            word = rest;
+        }
+        let word: String = word.into_iter().collect();
+        let line_len = line.chars().count();
+        if line_len > 0 && line_len + 1 + word.chars().count() > avail {
+            out.push(format!("{INDENT}{line}"));
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(format!("{INDENT}{line}"));
+    }
+    out
 }
 
 // ── Shared helper ────────────────────────────────────────────────────────────
