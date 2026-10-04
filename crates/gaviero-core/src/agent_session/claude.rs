@@ -36,6 +36,7 @@ use crate::acp::protocol::{
     StreamEvent, ToolResultInfo, ToolUseInfo, is_background_subagent_tool, subagent_description,
 };
 use crate::acp::session::{AcpSession, AgentOptions};
+use crate::acp::turn::{BG_WAKE_GRACE, TurnCompletion, TurnProgress};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
 use crate::swarm::backend::AgentBackend as _;
@@ -44,7 +45,8 @@ use crate::swarm::backend::shared;
 use crate::write_gate::WriteGatePipeline;
 
 use super::background::{
-    PendingBg, bg_status, finish_all_pending_killed, finish_pending_bg, register_pending_bg,
+    PendingBg, background_command_label, bg_status, finish_all_pending_killed, finish_pending_bg,
+    register_pending_bg, shell_command_summary,
 };
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
@@ -318,6 +320,9 @@ impl ClaudeSession {
                 available_tools: self.available_tools.clone(),
                 approved_tools: self.approved_tools.clone(),
                 resume_session_id,
+                // Keeps a background command alive past the parent's first
+                // `result` in auto-approve mode too — see `acp::turn`.
+                stdin_prompt: true,
                 ..AgentOptions::default()
             }
         };
@@ -391,9 +396,16 @@ impl ClaudeSession {
         let mut cancelled = false;
         let mut pending_bg: Vec<PendingBg> = Vec::new();
         let mut tool_tracker = ToolCallTracker::default();
-        let mut result_seen = false;
+        let mut completion = TurnCompletion::waiting_on_shells();
+        // `tool_use` id → command line, to label background command tasks.
+        let mut shell_commands: HashMap<String, String> = HashMap::new();
 
         loop {
+            let idle_wait = if completion.awaiting_wake() {
+                BG_WAKE_GRACE
+            } else {
+                STREAM_IDLE_TIMEOUT
+            };
             // Cancellation is checked first (`biased`) so a token fired while
             // a tool call is mid-flight wins immediately over any newly
             // arrived stream event. The subprocess is killed synchronously
@@ -405,10 +417,18 @@ impl ClaudeSession {
                     cancelled = true;
                     break;
                 }
-                n = tokio::time::timeout(STREAM_IDLE_TIMEOUT, session.next_event()) => n,
+                n = tokio::time::timeout(idle_wait, session.next_event()) => n,
             };
 
             match next {
+                Err(_elapsed) if completion.awaiting_wake() => {
+                    tracing::warn!(
+                        "Claude did not resume after its background tasks finished; ending turn"
+                    );
+                    finish_all_pending_killed(&mut pending_bg, self.observer.as_ref());
+                    self.observer.on_message_complete("assistant", &full_text);
+                    break;
+                }
                 Err(_elapsed) => {
                     idle_count += 1;
                     let elapsed_secs = idle_count * STREAM_IDLE_TIMEOUT.as_secs() as u32;
@@ -440,264 +460,302 @@ impl ClaudeSession {
                 Ok(result) => {
                     idle_count = 0;
                     match result {
-                        Ok(Some(event)) => match event {
-                            StreamEvent::ThinkingDelta(text) => {
-                                if !in_thinking {
-                                    self.observer.on_stream_chunk("<think>\n");
-                                    in_thinking = true;
-                                }
-                                self.observer.on_stream_chunk(&text);
-                            }
-                            StreamEvent::ContentDelta(text) => {
-                                if in_thinking {
-                                    self.observer.on_stream_chunk("\n</think>\n");
-                                    in_thinking = false;
-                                }
-                                full_text.push_str(&text);
-                                self.observer.on_stream_chunk(&text);
-                            }
-                            StreamEvent::ToolUseStart { tool_name, .. } => {
-                                if tool_name == "Read" {
-                                    read_count += 1;
-                                }
-                                self.observer
-                                    .on_streaming_status(&format!("Using {}...", tool_name));
-                            }
-                            StreamEvent::ToolInputDelta(_) => {}
-                            StreamEvent::AssistantMessage {
-                                text,
-                                tool_uses,
-                                parent_tool_use_id,
-                            } => {
-                                if let Some(parent) = parent_tool_use_id.as_deref() {
-                                    if !text.is_empty() {
-                                        let label = pending_bg
-                                            .iter()
-                                            .find(|p| {
-                                                p.tool_use_id == parent || p.task_id == parent
-                                            })
-                                            .map(|p| p.description.as_str())
-                                            .unwrap_or("agent");
-                                        let chunk = format!("\n[{label}] {text}");
-                                        full_text.push_str(&chunk);
-                                        self.observer.on_stream_chunk(&chunk);
+                        Ok(Some(event)) => {
+                            let progress = completion.observe(&event);
+                            match event {
+                                StreamEvent::ThinkingDelta(text) => {
+                                    if !in_thinking {
+                                        self.observer.on_stream_chunk("<think>\n");
+                                        in_thinking = true;
                                     }
-                                } else if full_text.is_empty() && !text.is_empty() {
-                                    full_text = text;
+                                    self.observer.on_stream_chunk(&text);
                                 }
-                                for tu in &tool_uses {
-                                    let summary = format_tool_summary(
-                                        &tu.name,
-                                        &tu.input,
-                                        &self.workspace_root,
-                                    );
-                                    self.observer.on_tool_call_started(&summary);
-                                    tool_tracker.started(tu, &summary);
-                                    if is_background_subagent_tool(&tu.name, &tu.input) {
-                                        register_pending_bg(
-                                            &mut pending_bg,
-                                            "",
-                                            &tu.id,
-                                            &subagent_description(&tu.input),
-                                            self.observer.as_ref(),
+                                StreamEvent::ContentDelta(text) => {
+                                    if in_thinking {
+                                        self.observer.on_stream_chunk("\n</think>\n");
+                                        in_thinking = false;
+                                    }
+                                    full_text.push_str(&text);
+                                    self.observer.on_stream_chunk(&text);
+                                }
+                                StreamEvent::ToolUseStart { tool_name, .. } => {
+                                    if tool_name == "Read" {
+                                        read_count += 1;
+                                    }
+                                    self.observer
+                                        .on_streaming_status(&format!("Using {}...", tool_name));
+                                }
+                                StreamEvent::ToolInputDelta(_) => {}
+                                StreamEvent::AssistantMessage {
+                                    text,
+                                    tool_uses,
+                                    parent_tool_use_id,
+                                } => {
+                                    if let Some(parent) = parent_tool_use_id.as_deref() {
+                                        if !text.is_empty() {
+                                            let label = pending_bg
+                                                .iter()
+                                                .find(|p| {
+                                                    p.tool_use_id == parent || p.task_id == parent
+                                                })
+                                                .map(|p| p.description.as_str())
+                                                .unwrap_or("agent");
+                                            let chunk = format!("\n[{label}] {text}");
+                                            full_text.push_str(&chunk);
+                                            self.observer.on_stream_chunk(&chunk);
+                                        }
+                                    } else if full_text.is_empty() && !text.is_empty() {
+                                        full_text = text;
+                                    }
+                                    for tu in &tool_uses {
+                                        let summary = format_tool_summary(
+                                            &tu.name,
+                                            &tu.input,
+                                            &self.workspace_root,
                                         );
+                                        self.observer.on_tool_call_started(&summary);
+                                        tool_tracker.started(tu, &summary);
+                                        if let Some(cmd) = shell_command_summary(&tu.input) {
+                                            shell_commands.insert(tu.id.clone(), cmd);
+                                        }
+                                        if is_background_subagent_tool(&tu.name, &tu.input) {
+                                            register_pending_bg(
+                                                &mut pending_bg,
+                                                "",
+                                                &tu.id,
+                                                &subagent_description(&tu.input),
+                                                self.observer.as_ref(),
+                                            );
+                                        }
                                     }
-                                }
-                                for tu in &tool_uses {
-                                    if matches!(tu.name.as_str(), "Write" | "Edit" | "MultiEdit") {
-                                        if let Some(fp) =
-                                            tu.input.get("file_path").and_then(|v| v.as_str())
-                                        {
-                                            let abs_path = if Path::new(fp).is_absolute() {
-                                                PathBuf::from(fp)
-                                            } else {
-                                                self.workspace_root.join(fp)
-                                            };
-                                            if !file_snapshots.contains_key(&abs_path) {
-                                                let content = match tokio::fs::read_to_string(
-                                                    &abs_path,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(s) => Some(s),
-                                                    Err(e)
-                                                        if e.kind()
-                                                            == std::io::ErrorKind::NotFound =>
-                                                    {
-                                                        None
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "Snapshot read of {} failed ({}); treating as did-not-exist",
-                                                            abs_path.display(),
-                                                            e
-                                                        );
-                                                        None
-                                                    }
+                                    for tu in &tool_uses {
+                                        if matches!(
+                                            tu.name.as_str(),
+                                            "Write" | "Edit" | "MultiEdit"
+                                        ) {
+                                            if let Some(fp) =
+                                                tu.input.get("file_path").and_then(|v| v.as_str())
+                                            {
+                                                let abs_path = if Path::new(fp).is_absolute() {
+                                                    PathBuf::from(fp)
+                                                } else {
+                                                    self.workspace_root.join(fp)
                                                 };
-                                                tracing::info!(
-                                                    "Snapshot before tool {}: {} ({})",
-                                                    tu.name,
-                                                    abs_path.display(),
-                                                    match &content {
-                                                        Some(s) => format!("{} bytes", s.len()),
-                                                        None => "did not exist".to_string(),
-                                                    }
-                                                );
-                                                file_snapshots.insert(abs_path, content);
+                                                if !file_snapshots.contains_key(&abs_path) {
+                                                    let content = match tokio::fs::read_to_string(
+                                                        &abs_path,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(s) => Some(s),
+                                                        Err(e)
+                                                            if e.kind()
+                                                                == std::io::ErrorKind::NotFound =>
+                                                        {
+                                                            None
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Snapshot read of {} failed ({}); treating as did-not-exist",
+                                                                abs_path.display(),
+                                                                e
+                                                            );
+                                                            None
+                                                        }
+                                                    };
+                                                    tracing::info!(
+                                                        "Snapshot before tool {}: {} ({})",
+                                                        tu.name,
+                                                        abs_path.display(),
+                                                        match &content {
+                                                            Some(s) => format!("{} bytes", s.len()),
+                                                            None => "did not exist".to_string(),
+                                                        }
+                                                    );
+                                                    file_snapshots.insert(abs_path, content);
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            StreamEvent::TaskStarted {
-                                task_id,
-                                tool_use_id,
-                                description,
-                            } => {
-                                register_pending_bg(
-                                    &mut pending_bg,
-                                    &task_id,
-                                    &tool_use_id,
-                                    &description,
-                                    self.observer.as_ref(),
-                                );
-                            }
-                            StreamEvent::TaskNotification {
-                                task_id,
-                                tool_use_id,
-                                status,
-                                summary,
-                            } => {
-                                finish_pending_bg(
-                                    &mut pending_bg,
-                                    &task_id,
-                                    &tool_use_id,
-                                    &status,
-                                    &summary,
-                                    self.observer.as_ref(),
-                                );
-                                if result_seen && pending_bg.is_empty() {
-                                    self.observer.on_message_complete("assistant", &full_text);
-                                    break;
-                                }
-                            }
-                            StreamEvent::UserToolResults { results } => {
-                                tool_tracker.completed(&results, self.observer.as_ref());
-                                for result in &results {
-                                    finish_pending_bg(
+                                StreamEvent::TaskStarted {
+                                    task_id,
+                                    tool_use_id,
+                                    description,
+                                    task_type,
+                                } => {
+                                    let description = if task_type == "local_bash" {
+                                        background_command_label(
+                                            shell_commands
+                                                .get(&tool_use_id)
+                                                .unwrap_or(&description),
+                                        )
+                                    } else {
+                                        description
+                                    };
+                                    register_pending_bg(
                                         &mut pending_bg,
-                                        "",
-                                        &result.tool_use_id,
-                                        "completed",
-                                        "",
+                                        &task_id,
+                                        &tool_use_id,
+                                        &description,
                                         self.observer.as_ref(),
                                     );
                                 }
-                                if result_seen && pending_bg.is_empty() {
-                                    self.observer.on_message_complete("assistant", &full_text);
-                                    break;
+                                StreamEvent::TaskNotification {
+                                    task_id,
+                                    tool_use_id,
+                                    status,
+                                    summary,
+                                } => {
+                                    finish_pending_bg(
+                                        &mut pending_bg,
+                                        &task_id,
+                                        &tool_use_id,
+                                        &status,
+                                        &summary,
+                                        self.observer.as_ref(),
+                                    );
+                                    if completion.awaiting_wake() {
+                                        self.observer.on_streaming_status(
+                                            "Background tasks finished — waiting for Claude...",
+                                        );
+                                    }
                                 }
-                            }
-                            StreamEvent::ResultEvent {
-                                is_error,
-                                result_text,
-                                usage,
-                                ..
-                            } => {
-                                if let Some(u) = usage.as_ref() {
+                                StreamEvent::UserToolResults { results } => {
+                                    tool_tracker.completed(&results, self.observer.as_ref());
+                                    // A background launch's result is only its
+                                    // ack; it finishes on `task_notification`.
+                                    for result in results
+                                        .iter()
+                                        .filter(|r| !completion.is_launch_ack(&r.tool_use_id))
+                                    {
+                                        finish_pending_bg(
+                                            &mut pending_bg,
+                                            "",
+                                            &result.tool_use_id,
+                                            "completed",
+                                            "",
+                                            self.observer.as_ref(),
+                                        );
+                                    }
+                                }
+                                StreamEvent::ResultEvent {
+                                    is_error,
+                                    result_text,
+                                    usage,
+                                    ..
+                                } => {
+                                    if let Some(u) = usage.as_ref() {
+                                        tracing::info!(
+                                            target: "turn_metrics",
+                                            provider = "claude",
+                                            input_tokens = u.input_tokens,
+                                            cache_creation = u.cache_creation_input_tokens,
+                                            cache_read = u.cache_read_input_tokens,
+                                            output_tokens = u.output_tokens,
+                                            prefix_tokens = u.prefix_tokens(),
+                                            "turn_token_usage"
+                                        );
+                                        self.observer.on_turn_token_usage(u);
+                                    }
+                                    if is_error {
+                                        let msg = if is_auth_error(&result_text) {
+                                            format!(
+                                                "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
+                                                result_text
+                                            )
+                                        } else {
+                                            format!("Error: {}", result_text)
+                                        };
+                                        self.observer.on_message_complete("system", &msg);
+                                        break;
+                                    }
+                                    if full_text.is_empty() && !result_text.is_empty() {
+                                        full_text = result_text.clone();
+                                    }
+                                    if progress == TurnProgress::Complete {
+                                        // Leftover tasks (a subagent's own
+                                        // background work) die with the session.
+                                        finish_all_pending_killed(
+                                            &mut pending_bg,
+                                            self.observer.as_ref(),
+                                        );
+                                        self.observer.on_message_complete("assistant", &full_text);
+                                        break;
+                                    }
+                                    // Parent ended its turn while background
+                                    // agents or commands run (or before a
+                                    // queued wake-up). The prompt stays locked.
+                                    // Stay on the stream: Claude resumes the
+                                    // parent when they finish, and dropping now
+                                    // would kill_on_drop those children.
+                                    self.observer.on_streaming_status(&bg_status(&pending_bg));
+                                }
+                                StreamEvent::PermissionRequest {
+                                    tool_name,
+                                    description,
+                                    request_id,
+                                    input,
+                                } => {
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<
+                                        crate::observer::PermissionDecision,
+                                    >();
+                                    self.observer.on_permission_request(
+                                        &tool_name,
+                                        &description,
+                                        &input,
+                                        tx,
+                                    );
+                                    let decision = rx.await.unwrap_or_else(|_| {
+                                        crate::observer::PermissionDecision::deny()
+                                    });
+                                    tracing::info!(
+                                        "Permission request for '{}': {}",
+                                        tool_name,
+                                        if decision.is_allow() {
+                                            "allowed"
+                                        } else {
+                                            "denied"
+                                        }
+                                    );
+                                    session.respond_permission_decision(
+                                        &decision,
+                                        &request_id,
+                                        &input,
+                                    );
+                                    idle_count = 0;
+                                }
+                                StreamEvent::SystemInit { session_id, .. } => {
+                                    // Claude woke the parent to read finished
+                                    // agents; keep its reply apart from the last.
+                                    if progress == TurnProgress::WakeTurn && !full_text.is_empty() {
+                                        full_text.push_str("\n\n");
+                                        self.observer.on_stream_chunk("\n\n");
+                                    }
+                                    #[allow(deprecated)]
+                                    let asked = options.resume_session_id.as_deref();
+                                    let resume_accepted = match asked {
+                                        Some(asked_id)
+                                            if !asked_id.is_empty() && !session_id.is_empty() =>
+                                        {
+                                            asked_id == session_id
+                                        }
+                                        _ => false,
+                                    };
                                     tracing::info!(
                                         target: "turn_metrics",
                                         provider = "claude",
-                                        input_tokens = u.input_tokens,
-                                        cache_creation = u.cache_creation_input_tokens,
-                                        cache_read = u.cache_read_input_tokens,
-                                        output_tokens = u.output_tokens,
-                                        prefix_tokens = u.prefix_tokens(),
-                                        "turn_token_usage"
+                                        session_id = %session_id,
+                                        resume_accepted,
+                                        "session_init"
                                     );
-                                    self.observer.on_turn_token_usage(u);
-                                }
-                                if is_error {
-                                    let msg = if is_auth_error(&result_text) {
-                                        format!(
-                                            "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
-                                            result_text
-                                        )
-                                    } else {
-                                        format!("Error: {}", result_text)
-                                    };
-                                    self.observer.on_message_complete("system", &msg);
-                                    break;
-                                }
-                                if full_text.is_empty() && !result_text.is_empty() {
-                                    full_text = result_text.clone();
-                                }
-                                result_seen = true;
-                                if pending_bg.is_empty() {
-                                    self.observer.on_message_complete("assistant", &full_text);
-                                    break;
-                                }
-                                // Parent ended its turn after launching
-                                // background Task agents. Stay on the stream
-                                // until they finish or the subprocess exits —
-                                // dropping now would kill_on_drop those children.
-                                self.observer.on_streaming_status(&bg_status(&pending_bg));
-                            }
-                            StreamEvent::PermissionRequest {
-                                tool_name,
-                                description,
-                                request_id,
-                                input,
-                            } => {
-                                let (tx, rx) = tokio::sync::oneshot::channel::<
-                                    crate::observer::PermissionDecision,
-                                >();
-                                self.observer.on_permission_request(
-                                    &tool_name,
-                                    &description,
-                                    &input,
-                                    tx,
-                                );
-                                let decision = rx.await.unwrap_or_else(|_| {
-                                    crate::observer::PermissionDecision::deny()
-                                });
-                                tracing::info!(
-                                    "Permission request for '{}': {}",
-                                    tool_name,
-                                    if decision.is_allow() {
-                                        "allowed"
-                                    } else {
-                                        "denied"
+                                    if !session_id.is_empty() {
+                                        self.observer.on_claude_session_started(&session_id);
                                     }
-                                );
-                                session.respond_permission_decision(&decision, &request_id, &input);
-                                idle_count = 0;
-                            }
-                            StreamEvent::SystemInit { session_id, .. } => {
-                                #[allow(deprecated)]
-                                let asked = options.resume_session_id.as_deref();
-                                let resume_accepted = match asked {
-                                    Some(asked_id)
-                                        if !asked_id.is_empty() && !session_id.is_empty() =>
-                                    {
-                                        asked_id == session_id
-                                    }
-                                    _ => false,
-                                };
-                                tracing::info!(
-                                    target: "turn_metrics",
-                                    provider = "claude",
-                                    session_id = %session_id,
-                                    resume_accepted,
-                                    "session_init"
-                                );
-                                if !session_id.is_empty() {
-                                    self.observer.on_claude_session_started(&session_id);
                                 }
+                                StreamEvent::Unknown(_) => {}
                             }
-                            StreamEvent::Unknown(_) => {}
-                        },
+                        }
                         Ok(None) => {
                             if !pending_bg.is_empty() {
                                 let n = finish_all_pending_killed(
@@ -710,8 +768,8 @@ impl ClaudeSession {
                                 self.observer.on_message_complete(
                                     "system",
                                     &format!(
-                                        "Claude ended the turn while {n} background agent(s) were still running. \
-                                         Those agents were stopped with the session and their findings were not returned."
+                                        "Claude ended the turn while {n} background task(s) were still running. \
+                                         They were stopped with the session and their results were not returned."
                                     ),
                                 );
                             } else if !full_text.is_empty() {
@@ -786,6 +844,9 @@ impl ClaudeSession {
             // child means this should be near-instant; bound it anyway.
             let _ = tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await;
         } else {
+            // The prompt went in on stdin (`stdin_prompt`); EOF lets the CLI
+            // exit instead of waiting for another message.
+            session.close_stdin();
             // Wait for subprocess to finish.
             self.observer.on_streaming_status("Finalizing...");
             match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await {

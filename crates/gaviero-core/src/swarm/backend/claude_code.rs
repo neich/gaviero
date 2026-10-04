@@ -12,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::acp::protocol::StreamEvent;
 use crate::acp::session::{AcpSession, AgentOptions};
+use crate::acp::turn::{BG_WAKE_GRACE, TurnCompletion, TurnProgress};
 
 use super::shared::request_prompt;
 use super::{
@@ -176,9 +177,24 @@ async fn drive_session(
     // Whether the message currently being assembled arrived as
     // `ContentDelta`s — see `assistant_text_fallback`.
     let mut streamed_text = false;
-    // Set when stdout hits EOF before any `result` line.
-    let mut eof_without_result = false;
+    // Set when stdout hits EOF before the turn completed.
+    let mut eof_before_done = false;
+    // A non-error `result` arrived, so an EOF is a clean end even if the
+    // turn never reached `TurnProgress::Complete`.
+    let mut saw_result = false;
+    let mut any_text = false;
+    // A unit that launches background agents spans several parent turns;
+    // stopping at the first `result` would kill_on_drop the agents.
+    let mut completion = TurnCompletion::default();
     loop {
+        let awaiting_wake = completion.awaiting_wake();
+        let wake_grace = async move {
+            if awaiting_wake {
+                tokio::time::sleep(BG_WAKE_GRACE).await
+            } else {
+                std::future::pending().await
+            }
+        };
         // Abandonment check. `tx.send(...).is_err()` below only fires on the
         // *next* event, which never arrives when a subprocess wedges — the
         // exact case the dispatch budget exists for. Racing `closed()` against
@@ -189,34 +205,62 @@ async fn drive_session(
             biased;
             _ = tx.closed() => return Ok(()),
             e = session.next_event() => e,
+            _ = wake_grace => {
+                tracing::warn!(
+                    target: "backend.claude",
+                    "Claude did not resume after its background agents finished; ending turn"
+                );
+                let _ = tx
+                    .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
+                    .await;
+                break;
+            }
         };
         match event {
             Ok(Some(event)) => {
+                let progress = completion.observe(&event);
+                if progress == TurnProgress::WakeTurn
+                    && any_text
+                    && tx
+                        .send(Ok(UnifiedStreamEvent::TextDelta("\n\n".into())))
+                        .await
+                        .is_err()
+                {
+                    return Ok(());
+                }
+                if let StreamEvent::ResultEvent { is_error, .. } = &event {
+                    // An error ends the unit at once. Claude's cost is
+                    // cumulative per session and the runner sums `Usage`, so
+                    // only the completing `result` is forwarded.
+                    if !*is_error && progress != TurnProgress::Complete {
+                        saw_result = true;
+                        continue;
+                    }
+                }
                 if matches!(event, StreamEvent::ContentDelta(_)) {
                     streamed_text = true;
                 }
                 // Replay a whole assistant message's text when nothing
                 // streamed for it, then reset for the next message.
-                if let Some(text) = assistant_text_fallback(&event, streamed_text)
-                    && tx
-                        .send(Ok(UnifiedStreamEvent::TextDelta(text)))
-                        .await
-                        .is_err()
-                {
-                    return Ok(()); // receiver dropped
-                }
+                let fallback = assistant_text_fallback(&event, streamed_text);
                 if matches!(event, StreamEvent::AssistantMessage { .. }) {
                     streamed_text = false;
                 }
 
-                let unified = map_acp_event(&event);
+                let mut unified = map_acp_event(&event);
+                if let Some(text) = fallback {
+                    unified.insert(0, UnifiedStreamEvent::TextDelta(text));
+                }
                 for ev in unified {
+                    if matches!(ev, UnifiedStreamEvent::TextDelta(_)) {
+                        any_text = true;
+                    }
                     if tx.send(Ok(ev)).await.is_err() {
                         return Ok(()); // receiver dropped
                     }
                 }
 
-                // ResultEvent signals end of stream
+                // The completing (or an error) `result` ends the stream.
                 if matches!(event, StreamEvent::ResultEvent { .. }) {
                     break;
                 }
@@ -225,7 +269,7 @@ async fn drive_session(
                 // Emitting the terminal event is deferred until after
                 // `wait()` below, which is what tells us whether this EOF
                 // was a clean end of turn or a dead subprocess.
-                eof_without_result = true;
+                eof_before_done = true;
                 break;
             }
             Err(e) => {
@@ -242,7 +286,17 @@ async fn drive_session(
 
     let status = session.wait().await;
 
-    if eof_without_result {
+    if eof_before_done && saw_result {
+        // The parent reported its turns but the CLI exited before the
+        // background agents finished; the transcript so far stands.
+        tracing::warn!(
+            target: "backend.claude",
+            "claude exited with background agents still running"
+        );
+        let _ = tx
+            .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
+            .await;
+    } else if eof_before_done {
         // stdout closed before any `result` line: the CLI died before it
         // could report — bad flag, failed auth, crash. A non-zero exit here
         // is an error, not a clean end of turn; reporting `EndTurn` gave the
@@ -378,8 +432,8 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
         StreamEvent::TaskStarted { .. }
         | StreamEvent::TaskNotification { .. }
         | StreamEvent::UserToolResults { .. } => {
-            // Chat-path background-agent lifecycle. Swarm units run to
-            // `result` on the parent; these events are informational.
+            // Background-agent lifecycle: consumed by `TurnCompletion` in
+            // `drive_session` to decide which `result` ends the unit.
         }
         StreamEvent::Unknown(_) => {
             // Filtered out — forward-compatibility passthrough
@@ -599,5 +653,61 @@ mod tests {
             !backend.capabilities().supports_file_blocks,
             "Claude must not advertise in-band file-block support"
         );
+    }
+
+    /// Live check against the installed `claude` CLI: a unit that launches
+    /// two background agents must stream until the parent's final answer
+    /// and end with exactly one `Done`.
+    #[tokio::test]
+    #[ignore = "spawns the claude CLI and calls the API"]
+    async fn live_background_agents_finish_before_done() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = CompletionRequest {
+            prompt: "Launch two Agent subagents IN PARALLEL, each with run_in_background=true. \
+                     Agent A's task: write a four-line poem about the sea, then end its answer \
+                     with the word alpha. Agent B's task: the same about mountains, ending with \
+                     beta. Do not read their output early. After launching both, end your turn \
+                     and wait for their completion notifications. Once BOTH have finished, \
+                     reply with exactly: FINAL <A's last word> <B's last word>."
+                .into(),
+            system_prompt: None,
+            workspace_root: dir.path().to_path_buf(),
+            additional_roots: vec![],
+            allowed_tools: vec!["Agent".into()],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            extra: Vec::new(),
+            max_tokens: None,
+            auto_approve: true,
+            suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
+            exposed_tools: None,
+            write_gate: None,
+        };
+        let mut stream = ClaudeCodeBackend::new("haiku")
+            .stream_completion(request)
+            .await
+            .expect("spawn claude");
+        let mut text = String::new();
+        let mut dones = Vec::new();
+        let collect = async {
+            while let Some(ev) = stream.next().await {
+                match ev.expect("stream item") {
+                    UnifiedStreamEvent::TextDelta(t) => text.push_str(&t),
+                    UnifiedStreamEvent::Done(r) => dones.push(r),
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(300), collect)
+            .await
+            .expect("stream finished");
+        assert_eq!(dones, vec![StopReason::EndTurn], "transcript: {text}");
+        assert!(text.contains("FINAL alpha beta"), "transcript: {text}");
     }
 }

@@ -159,6 +159,9 @@ pub enum StreamEvent {
         task_id: String,
         tool_use_id: String,
         description: String,
+        /// Claude's `task_type` (`local_bash` for a background shell
+        /// command; empty when the CLI omitted it).
+        task_type: String,
     },
 
     /// Background / subagent task reached a terminal state
@@ -299,6 +302,7 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                             d.to_string()
                         }
                     },
+                    task_type: opt_str(&v, "task_type").to_string(),
                 })
             } else if subtype == "task_notification" {
                 Ok(StreamEvent::TaskNotification {
@@ -968,10 +972,12 @@ mod tests {
                 task_id,
                 tool_use_id,
                 description,
+                task_type,
             } => {
                 assert_eq!(task_id, "task_abc");
                 assert_eq!(tool_use_id, "toolu_abc");
                 assert_eq!(description, "Running background analysis");
+                assert_eq!(task_type, "background");
             }
             _ => panic!("Expected TaskStarted, got {:?}", event),
         }

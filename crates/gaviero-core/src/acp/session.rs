@@ -95,6 +95,13 @@ pub struct AgentOptions {
     /// MCP tools advertised to this session (`mcp.gavieroServer.exposedTools`).
     /// Drives the retrieval stanza; `None` keeps the backend default.
     pub exposed_tools: Option<Vec<String>>,
+    /// Send the prompt as a stream-json stdin message even when
+    /// `auto_approve` is set (interactive turns always do). A positional
+    /// `--print` prompt makes the CLI stop every background shell at the
+    /// parent's first `result`, so a turn that waits on one can never be
+    /// resumed. Callers that set this must call [`AcpSession::close_stdin`]
+    /// once the turn completes, or the CLI waits for another message.
+    pub stdin_prompt: bool,
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -118,6 +125,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("suppress_hooks", &self.suppress_hooks)
             .field("agents_json", &self.agents_json.as_ref().map(|_| "<set>"))
             .field("exposed_tools", &self.exposed_tools)
+            .field("stdin_prompt", &self.stdin_prompt)
             .finish()
     }
 }
@@ -140,6 +148,7 @@ impl Default for AgentOptions {
             suppress_hooks: false,
             agents_json: None,
             exposed_tools: None,
+            stdin_prompt: false,
         }
     }
 }
@@ -352,13 +361,16 @@ impl AcpSession {
         // the host can answer. Auto-approve keeps the classic `--print`
         // one-shot shape with `--dangerously-skip-permissions`.
         let interactive_permissions = !options.auto_approve;
+        let prompt_on_stdin = interactive_permissions || options.stdin_prompt;
         cmd.arg("--print")
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
             .arg("--include-partial-messages");
-        if interactive_permissions {
+        if prompt_on_stdin {
             cmd.arg("--input-format").arg("stream-json");
+        }
+        if interactive_permissions {
             cmd.arg("--permission-prompt-tool").arg("stdio");
             cmd.arg("--permission-mode").arg("default");
             // Project/local Claude settings stay loaded on purpose. Gaviero
@@ -499,8 +511,9 @@ impl AcpSession {
         // Interactive turns: prompt goes on stdin as a stream-json user
         // message so the control channel stays bidirectional. Auto-approve
         // keeps the classic positional argv prompt (stdin still piped for
-        // any late control traffic, but unused).
-        if !interactive_permissions {
+        // any late control traffic, but unused) unless the caller asked for
+        // stdin so background shells survive the parent's first `result`.
+        if !prompt_on_stdin {
             cmd.arg("--").arg(&argv_prompt);
         }
 
@@ -560,7 +573,7 @@ impl AcpSession {
         // stream-json line. Dropping the sender closes stdin.
         let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            if interactive_permissions {
+            if prompt_on_stdin {
                 let user_line = serde_json::json!({
                     "type": "user",
                     "message": { "role": "user", "content": argv_prompt },
@@ -654,6 +667,13 @@ impl AcpSession {
             Ok(Some(_)) => true,
             _ => false,
         }
+    }
+
+    /// Close the subprocess stdin. A stream-json-input CLI waits for another
+    /// user message after each `result`; EOF tells it the session is over.
+    /// Permission replies are impossible afterwards.
+    pub fn close_stdin(&mut self) {
+        self.stdin_tx = None;
     }
 
     /// Kill the subprocess (for cancellation).

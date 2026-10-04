@@ -1,4 +1,5 @@
-//! Host-side tracking of provider subagents (Claude Task, Cursor Task, …).
+//! Host-side tracking of provider subagents (Claude Task, Cursor Task, …)
+//! and of background shell commands the agent waits on.
 //!
 //! The TUI locks the prompt and lists running agents from
 //! [`crate::observer::AcpObserver::on_background_task_started`]. Every
@@ -18,11 +19,47 @@ pub(crate) struct PendingBg {
     pub description: String,
 }
 
+/// Marks a background shell command's description (`$ <command>`), so the
+/// task list and status line read as a command, not an agent.
+const COMMAND_PREFIX: &str = "$ ";
+
+/// Description for a background shell command task.
+pub(crate) fn background_command_label(command: &str) -> String {
+    format!("{COMMAND_PREFIX}{}", command.trim())
+}
+
+/// First line of a shell tool call's `command`, capped at 80 chars. Claude's
+/// `task_started` describes a command by its `description` prose when the
+/// model gave one, so the label is taken from the launch instead.
+pub(crate) fn shell_command_summary(input: &serde_json::Value) -> Option<String> {
+    let line = input
+        .get("command")?
+        .as_str()?
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?;
+    let mut s: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        s.push('…');
+    }
+    Some(s)
+}
+
 pub(crate) fn bg_status(pending: &[PendingBg]) -> String {
-    match pending.len() {
-        0 => "Thinking...".into(),
-        1 => format!("Background agent: {}", pending[0].description),
-        n => format!("{n} background agents running"),
+    let commands = pending
+        .iter()
+        .filter(|p| p.description.starts_with(COMMAND_PREFIX))
+        .count();
+    match (pending.len(), commands) {
+        (0, _) => "Thinking...".into(),
+        (1, 1) => format!(
+            "Waiting for background command: {}",
+            &pending[0].description[COMMAND_PREFIX.len()..]
+        ),
+        (1, _) => format!("Background agent: {}", pending[0].description),
+        (n, c) if c == n => format!("Waiting for {n} background commands"),
+        (n, 0) => format!("{n} background agents running"),
+        (n, _) => format!("Waiting for {n} background tasks"),
     }
 }
 
@@ -163,6 +200,44 @@ mod tests {
         ];
         assert_eq!(bg_status(&pending), "2 background agents running");
         assert_eq!(bg_status(&pending[..1]), "Background agent: one");
+    }
+
+    #[test]
+    fn bg_status_says_the_agent_waits_on_background_commands() {
+        let task = |id: &str, description: String| PendingBg {
+            host_id: id.into(),
+            task_id: id.into(),
+            tool_use_id: id.into(),
+            description,
+        };
+        let cmd = task("u1", background_command_label(" cargo test "));
+        assert_eq!(cmd.description, "$ cargo test");
+        assert_eq!(
+            bg_status(std::slice::from_ref(&cmd)),
+            "Waiting for background command: cargo test"
+        );
+        let two = [
+            cmd.clone(),
+            task("u2", background_command_label("npm run build")),
+        ];
+        assert_eq!(bg_status(&two), "Waiting for 2 background commands");
+        let mixed = [cmd, task("u3", "search papers".into())];
+        assert_eq!(bg_status(&mixed), "Waiting for 2 background tasks");
+    }
+
+    #[test]
+    fn shell_command_summary_takes_the_first_line() {
+        let input = serde_json::json!({"command": "\n  cargo build --release\ncargo test", "description": "Build"});
+        assert_eq!(
+            shell_command_summary(&input).as_deref(),
+            Some("cargo build --release")
+        );
+        let long = serde_json::json!({"command": "x".repeat(100)});
+        assert_eq!(shell_command_summary(&long).unwrap().chars().count(), 81);
+        assert_eq!(
+            shell_command_summary(&serde_json::json!({"prompt": "go"})),
+            None
+        );
     }
 
     #[test]
