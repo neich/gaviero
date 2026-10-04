@@ -625,16 +625,23 @@ impl ClaudeSession {
                                     tool_tracker.completed(&results, self.observer.as_ref());
                                     // A background launch's result is only its
                                     // ack; it finishes on `task_notification`.
+                                    // A refused launch is no longer tracked by
+                                    // `completion`, so its error lands here.
                                     for result in results
                                         .iter()
                                         .filter(|r| !completion.is_launch_ack(&r.tool_use_id))
                                     {
+                                        let (status, summary) = if result.is_error {
+                                            ("failed", result.content.as_str())
+                                        } else {
+                                            ("completed", "")
+                                        };
                                         finish_pending_bg(
                                             &mut pending_bg,
                                             "",
                                             &result.tool_use_id,
-                                            "completed",
-                                            "",
+                                            status,
+                                            summary,
                                             self.observer.as_ref(),
                                         );
                                     }

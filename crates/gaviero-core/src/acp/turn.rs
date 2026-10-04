@@ -22,7 +22,9 @@
 //!
 //! A background launch's `tool_result` arrives immediately ("Async agent
 //! launched successfully") and is only an ack; the agent finishes on its
-//! `task_notification`.
+//! `task_notification`. A refused launch (e.g. an unknown `subagent_type`)
+//! answers with an error `tool_result` instead and never notifies, so it
+//! stops counting there.
 //!
 //! A `run_in_background` shell command behaves the same way under stream-json
 //! stdin (Claude Code 2.1.287): `task_started` (`task_type: local_bash`), an
@@ -127,6 +129,16 @@ impl TurnCompletion {
             StreamEvent::TaskNotification { tool_use_id, .. } => {
                 if self.running.remove(tool_use_id) {
                     self.owed_wakes += 1;
+                }
+            }
+            // A launch Claude refused (unknown agent type, bad input) answers
+            // with an error `tool_result` instead of an ack and never gets a
+            // `task_notification`, so it must stop holding the turn here.
+            StreamEvent::UserToolResults { results } => {
+                for r in results.iter().filter(|r| r.is_error) {
+                    if self.bg_agents.remove(&r.tool_use_id) {
+                        self.running.remove(&r.tool_use_id);
+                    }
                 }
             }
             StreamEvent::ResultEvent { .. } => {
@@ -399,6 +411,42 @@ mod tests {
         let na = notify("ta", "tu_a");
         let lines: &[&str] = &[INIT, &la, &sa, &aa, nested, RESULT, &na, INIT, RESULT];
         assert_eq!(completes_at(lines), (Some(8), false));
+    }
+
+    /// A background launch Claude refused (here an unknown `subagent_type`)
+    /// gets an error `tool_result` and never a `task_notification`. It used
+    /// to stay in `running` forever, so the turn never completed and the
+    /// wake-up grace never armed: the chat hung after its final answer.
+    #[test]
+    fn a_refused_background_launch_does_not_hold_the_turn() {
+        let (la, sa, aa) = (launch("tu_a"), started("ta", "tu_a"), ack("tu_a"));
+        let na = notify("ta", "tu_a");
+        let lx = launch("tu_x");
+        let refused = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu_x","type":"tool_result","is_error":true,"content":"<tool_use_error>Agent type 'nonexistent-skip' not found.</tool_use_error>"}]}}"#;
+        let lines: &[&str] = &[
+            INIT, &la, &sa, &aa, &lx, refused, RESULT, // 6: tu_a still running
+            &na, INIT, RESULT, // 9
+        ];
+        assert_eq!(completes_at(&lines[..7]), (None, false));
+        assert_eq!(completes_at(lines), (Some(9), false));
+
+        let mut c = TurnCompletion::default();
+        for line in &lines[..6] {
+            c.observe(&parse_stream_line(line).unwrap());
+        }
+        assert!(!c.is_launch_ack("tu_x"), "refused launch is no longer an ack");
+        assert!(c.is_launch_ack("tu_a"));
+    }
+
+    /// The only refused launch in a turn: the first `result` ends it.
+    #[test]
+    fn a_turn_whose_only_background_launch_was_refused_completes() {
+        let lx = launch("tu_x");
+        let refused = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu_x","type":"tool_result","is_error":true,"content":"not found"}]}}"#;
+        assert_eq!(
+            completes_at(&[INIT, &lx, refused, RESULT]),
+            (Some(3), false)
+        );
     }
 
     #[test]
