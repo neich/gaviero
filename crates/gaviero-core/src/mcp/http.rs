@@ -16,10 +16,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use rand::RngCore;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
-use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
@@ -108,10 +108,7 @@ pub fn ensure_http_token(root: &Path) -> Result<String> {
 fn generate_token(_root: &Path) -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn write_token_file(path: &Path, token: &str) -> Result<()> {
@@ -135,20 +132,16 @@ fn write_token_file(path: &Path, token: &str) -> Result<()> {
 pub fn http_health_workspace_id(port: u16) -> Option<String> {
     use std::io::{Read, Write};
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &addr,
-        std::time::Duration::from_millis(200),
-    )
-    .ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).ok()?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_millis(250)))
         .ok()?;
     stream
         .set_write_timeout(Some(std::time::Duration::from_millis(250)))
         .ok()?;
-    let req = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let req =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok()?;
@@ -200,8 +193,8 @@ pub fn spawn_http_listener(
     std_listener
         .set_nonblocking(true)
         .context("MCP HTTP listener nonblocking")?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .context("adopting MCP HTTP listener")?;
+    let listener =
+        tokio::net::TcpListener::from_std(std_listener).context("adopting MCP HTTP listener")?;
 
     let cancel = CancellationToken::new();
     let url = format!("http://127.0.0.1:{port}/mcp");
@@ -237,12 +230,13 @@ pub fn spawn_http_listener(
         workspace_id: workspace_id.clone(),
         pid: std::process::id(),
     };
-    let mcp_router = Router::new()
-        .fallback_service(mcp_service)
-        .layer(middleware::from_fn_with_state(
-            token.clone(),
-            require_bearer,
-        ));
+    let mcp_router =
+        Router::new()
+            .fallback_service(mcp_service)
+            .layer(middleware::from_fn_with_state(
+                token.clone(),
+                require_bearer,
+            ));
     let app = Router::new()
         .route("/health", get(health_handler))
         .nest("/mcp", mcp_router)
@@ -340,7 +334,7 @@ pub fn apply_codex_http_token(cmd: &mut tokio::process::Command, root: &Path) {
 }
 
 fn bind_loopback_window(start: u16) -> Result<(StdTcpListener, u16)> {
-    let last = start.saturating_add(FALLBACK_WINDOW).min(65535);
+    let last = start.saturating_add(FALLBACK_WINDOW);
     let mut last_err = None;
     for port in start..=last {
         match StdTcpListener::bind(("127.0.0.1", port)) {
@@ -378,9 +372,7 @@ async fn require_bearer(
 fn bearer_matches(header: &str, token: &str) -> bool {
     let header = header.trim();
     let prefix = "Bearer ";
-    if header.len() < prefix.len()
-        || !header[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
+    if header.len() < prefix.len() || !header[..prefix.len()].eq_ignore_ascii_case(prefix) {
         return false;
     }
     let got = header[prefix.len()..].trim().as_bytes();
@@ -394,9 +386,9 @@ fn bearer_matches(header: &str, token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embedder::Embedder;
-    use crate::memory::MemoryStores;
     use crate::mcp::server::GavieroMcpServer;
+    use crate::memory::MemoryStores;
+    use crate::memory::embedder::Embedder;
     use anyhow::Result as AResult;
 
     struct MockEmbedder;
@@ -453,13 +445,8 @@ mod tests {
         let preferred = std_l.local_addr().unwrap().port();
         drop(std_l);
 
-        let handle = spawn_http_listener(
-            fixture_server(),
-            dir.path(),
-            preferred,
-            token.clone(),
-        )
-        .unwrap();
+        let handle =
+            spawn_http_listener(fixture_server(), dir.path(), preferred, token.clone()).unwrap();
         let port = handle.endpoint.port;
         let client = reqwest::Client::new();
 

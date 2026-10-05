@@ -82,11 +82,10 @@ pub use agent_defs::{
 pub use config_synth::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, HttpSynthEndpoint,
     ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
-    TrustConsent, claude_mcp_config_json,
-    claude_settings_permissions, codex_mcp_config_toml, codex_mcp_overrides_from_config_file,
-    codex_synth_has_any_mcp, codex_synth_has_remote_mcp, host_from_mcp_url,
-    mcp_json_has_remote_urls, synth_has_remote_url_servers, synthesize_for_worktree,
-    worktree_has_remote_mcp_urls,
+    TrustConsent, claude_mcp_config_json, claude_settings_permissions, codex_mcp_config_toml,
+    codex_mcp_overrides_from_config_file, codex_synth_has_any_mcp, codex_synth_has_remote_mcp,
+    host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
+    synthesize_for_worktree, worktree_has_remote_mcp_urls,
 };
 pub use endpoint_file::{
     McpEndpointDescriptor, find_descriptor_upwards, read_descriptor, remove_descriptor,
@@ -95,6 +94,11 @@ pub use endpoint_file::{
 pub use external_memory::{
     ExternalMemoryServer, detect_external_memory_servers, disable_external_memory_servers,
     import_server_memory_jsonl,
+};
+pub use http::{
+    CODEX_HTTP_TOKEN_ENV, HttpEndpoint, HttpListenerHandle, apply_codex_http_token,
+    ensure_http_token, http_health_workspace_id, http_synth_from, maybe_spawn_http_listener,
+    resolve_http_port, reuse_http_endpoint, spawn_http_listener, token_path,
 };
 pub use observer::{FanOutMcpObserver, McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
 pub use preflight::{
@@ -129,11 +133,6 @@ pub use tools::{
     SymbolDocInput, SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS,
     TOOL_MEMORY_FLAG, TOOL_MEMORY_GET, TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC,
     TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
-};
-pub use http::{
-    CODEX_HTTP_TOKEN_ENV, HttpEndpoint, HttpListenerHandle, ensure_http_token,
-    http_health_workspace_id, http_synth_from, maybe_spawn_http_listener, resolve_http_port,
-    reuse_http_endpoint, spawn_http_listener, token_path, apply_codex_http_token,
 };
 pub use transport::McpEndpoint;
 pub use user_scope::{

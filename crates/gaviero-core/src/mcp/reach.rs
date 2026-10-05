@@ -23,7 +23,8 @@ pub const REACH_RECORD_VERSION: u32 = 1;
 pub const REACH_FILENAME: &str = "mcp_reach.json";
 
 fn cached_cli_version(bin: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
+        std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(version) = cache.lock().ok()?.get(bin).cloned() {
         return version;
@@ -106,7 +107,9 @@ impl ReachStore {
     }
 
     pub fn copy_to_worktree(root: &Path, worktree: &Path) -> Result<()> {
-        if root != worktree && let Some(record) = Self::load(root)? {
+        if root != worktree
+            && let Some(record) = Self::load(root)?
+        {
             Self::save(worktree, &record)?;
         }
         Ok(())

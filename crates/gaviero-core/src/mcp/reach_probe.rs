@@ -320,7 +320,11 @@ fn ingest_workspace_telemetry(ledger: &ProbeLedger, workspace_root: &Path, nonce
 
 fn allowed_tools_for(provider: &str) -> Vec<String> {
     // Restrict built-ins to delegation; MCP exposure is configured separately.
-    if provider == "claude" { vec!["Agent".into()] } else { Vec::new() }
+    if provider == "claude" {
+        vec!["Agent".into()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn probe_request(
@@ -381,6 +385,7 @@ pub async fn drain_backend(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn result_from_ledger(
     ledger: &ProbeLedger,
     nonce: &str,
@@ -422,30 +427,33 @@ pub async fn run_reach_probe(
         ReachTransport::Stdio => &["stdio"],
     };
     if transports.contains(&"http") && synth.http.is_none() {
-        anyhow::bail!("HTTP reach probe requires a live HTTP endpoint; enable mcp.gavieroServer.http.enabled");
+        anyhow::bail!(
+            "HTTP reach probe requires a live HTTP endpoint; enable mcp.gavieroServer.http.enabled"
+        );
     }
     let mut providers = BTreeMap::new();
     for transport_label in transports {
         let mut transport_synth = synth.clone();
-        transport_synth.transport.default = super::config_synth::McpTransportKind::parse(transport_label);
+        transport_synth.transport.default =
+            super::config_synth::McpTransportKind::parse(transport_label);
         transport_synth.transport.per_vendor.clear();
         let (agent_root, _guard) = prepare_probe_worktree(workspace_root, &transport_synth)?;
-    for provider in &cfg.providers {
-        let row = probe_one_provider(
-            provider,
-            workspace_root,
-            &agent_root,
-            ledger,
-            cfg,
-            transport_label,
-            LiveBackendFactory,
-        )
-        .await;
-        if transports.len() > 1 {
-            providers.insert(format!("{provider}@{transport_label}"), row.clone());
+        for provider in &cfg.providers {
+            let row = probe_one_provider(
+                provider,
+                workspace_root,
+                &agent_root,
+                ledger,
+                cfg,
+                transport_label,
+                LiveBackendFactory,
+            )
+            .await;
+            if transports.len() > 1 {
+                providers.insert(format!("{provider}@{transport_label}"), row.clone());
+            }
+            providers.insert(provider.clone(), row);
         }
-        providers.insert(provider.clone(), row);
-    }
     }
 
     Ok(ReachReport {

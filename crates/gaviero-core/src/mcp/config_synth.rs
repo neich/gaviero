@@ -35,8 +35,10 @@ use crate::context_planner::types::McpCapabilities;
 /// persists the answer in `settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TrustConsent {
     /// Consent not yet requested.
+    #[default]
     Unknown,
     /// User accepted: Codex may receive `.codex/config.toml`.
     Granted,
@@ -45,23 +47,12 @@ pub enum TrustConsent {
     Denied,
 }
 
-impl Default for TrustConsent {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 /// How a vendor is told to reach the gaviero MCP server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpTransportKind {
+    #[default]
     Stdio,
     Http,
-}
-
-impl Default for McpTransportKind {
-    fn default() -> Self {
-        Self::Stdio
-    }
 }
 
 impl McpTransportKind {
@@ -82,10 +73,7 @@ pub struct McpTransportChoice {
 
 impl McpTransportChoice {
     pub fn for_vendor(&self, vendor: &str) -> McpTransportKind {
-        self.per_vendor
-            .get(vendor)
-            .copied()
-            .unwrap_or(self.default)
+        self.per_vendor.get(vendor).copied().unwrap_or(self.default)
     }
 }
 
@@ -621,7 +609,7 @@ impl Default for McpConfigSynth {
 pub fn claude_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     let servers = managed_mcp_json_servers(synth)?;
     let body = serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) });
-    Ok(serde_json::to_string_pretty(&body).context("serialising .mcp.json")?)
+    serde_json::to_string_pretty(&body).context("serialising .mcp.json")
 }
 
 /// Claude's managed `.mcp.json` servers, resolved through the provider table.
@@ -801,8 +789,8 @@ fn managed_cursor_mcp_json_servers_with(
     // Omit the stdio gaviero shim when a remote URL extra is configured
     // (stdio competes with streamable HTTP at Cursor startup). An HTTP
     // gaviero entry does not have that problem — keep it.
-    let http_entry = synth.transport.for_vendor("cursor") == McpTransportKind::Http
-        && synth.http.is_some();
+    let http_entry =
+        synth.transport.for_vendor("cursor") == McpTransportKind::Http && synth.http.is_some();
     let stdio_entry = !has_remote_extra && shim_binary_resolvable(&synth.shim_binary);
     let include_gaviero = synth.gaviero_enabled
         && synth.permissions.server_allowed("gaviero")
@@ -837,7 +825,7 @@ fn managed_cursor_mcp_json_servers_with(
 pub fn cursor_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     let servers = managed_cursor_mcp_json_servers(synth)?;
     let body = serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) });
-    Ok(serde_json::to_string_pretty(&body).context("serialising .cursor/mcp.json")?)
+    serde_json::to_string_pretty(&body).context("serialising .cursor/mcp.json")
 }
 
 fn gaviero_server_entry_for(synth: &McpConfigSynth, vendor: &str) -> serde_json::Value {
@@ -1692,10 +1680,10 @@ fn write_if_changed(path: &Path, body: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == body {
-            return Ok(());
-        }
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == body
+    {
+        return Ok(());
     }
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
@@ -1785,7 +1773,10 @@ mod tests {
     #[test]
     fn cursor_http_gaviero_is_kept_when_a_remote_extra_exists() {
         let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
-        synth.transport.per_vendor.insert("cursor".into(), McpTransportKind::Http);
+        synth
+            .transport
+            .per_vendor
+            .insert("cursor".into(), McpTransportKind::Http);
         synth.http = Some(HttpSynthEndpoint {
             url: "http://127.0.0.1:9/mcp".into(),
             token: "t".into(),
@@ -1892,8 +1883,8 @@ mod tests {
             "expected gaviero-worker.toml among {:?}",
             files
         );
-        let body = std::fs::read_to_string(dir.path().join(".codex/agents/gaviero-worker.toml"))
-            .unwrap();
+        let body =
+            std::fs::read_to_string(dir.path().join(".codex/agents/gaviero-worker.toml")).unwrap();
         assert!(body.contains("mcp_servers = [\"gaviero\"]"));
     }
 
@@ -2245,7 +2236,9 @@ mod tests {
         );
         // Claude skips a `url` entry without a `type` discriminator.
         assert_eq!(
-            v["mcpServers"]["semantic-scholar"]["type"].as_str().unwrap(),
+            v["mcpServers"]["semantic-scholar"]["type"]
+                .as_str()
+                .unwrap(),
             "http"
         );
 
@@ -2947,9 +2940,7 @@ mod tests {
 
     #[test]
     fn cursor_surface_deny_rules_follow_the_tool_surface() {
-        let restricted = cursor_surface_deny_rules(&surface_of(Some(&[
-            "Read", "Write", "Edit",
-        ])));
+        let restricted = cursor_surface_deny_rules(&surface_of(Some(&["Read", "Write", "Edit"])));
         assert!(restricted.contains(&"Shell(*)".to_string()));
         assert!(!restricted.iter().any(|r| r.starts_with("Write(")));
         let no_write = cursor_surface_deny_rules(&surface_of(Some(&["Read", "Bash"])));
@@ -3189,10 +3180,16 @@ mod tests {
         // Claude — `.mcp.json`.
         let full = managed_mcp_json_servers_with(&synth, allow).unwrap();
         let gated = managed_mcp_json_servers_with(&synth, restrict).unwrap();
-        assert!(full.contains_key("context7"), "fixture must register context7");
+        assert!(
+            full.contains_key("context7"),
+            "fixture must register context7"
+        );
         assert!(full.contains_key("semantic-scholar"));
         assert!(!gated.contains_key("context7"), "claude: context7 leaked");
-        assert!(!gated.contains_key("semantic-scholar"), "claude: extra leaked");
+        assert!(
+            !gated.contains_key("semantic-scholar"),
+            "claude: extra leaked"
+        );
         assert!(
             gated.contains_key("gaviero"),
             "gaviero is the provider-independent integration; the table has no \
@@ -3206,7 +3203,10 @@ mod tests {
         assert!(full.contains_key("context7"));
         assert!(full.contains_key("semantic-scholar"));
         assert!(!gated.contains_key("context7"), "cursor: context7 leaked");
-        assert!(!gated.contains_key("semantic-scholar"), "cursor: extra leaked");
+        assert!(
+            !gated.contains_key("semantic-scholar"),
+            "cursor: extra leaked"
+        );
 
         // Codex — `.codex/config.toml`. TOML has no map to inspect, so the
         // assertion is on the rendered table headers.
@@ -3214,7 +3214,10 @@ mod tests {
         let gated = codex_mcp_config_toml_with(&synth, restrict).unwrap();
         assert!(full.contains("[mcp_servers.context7]"));
         assert!(full.contains("[mcp_servers.semantic-scholar]"));
-        assert!(!gated.contains("[mcp_servers.context7]"), "codex: context7 leaked");
+        assert!(
+            !gated.contains("[mcp_servers.context7]"),
+            "codex: context7 leaked"
+        );
         assert!(
             !gated.contains("[mcp_servers.semantic-scholar]"),
             "codex: extra leaked"

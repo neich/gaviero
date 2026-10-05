@@ -412,7 +412,10 @@ fn resolve_transport_choice(
             }
         }
     }
-    McpTransportChoice { default, per_vendor }
+    McpTransportChoice {
+        default,
+        per_vendor,
+    }
 }
 
 /// `mcp.gavieroServer.exposedTools` after the workspace cascade.
@@ -433,7 +436,11 @@ pub fn resolve_exposed_tools(workspace: &Workspace, root: Option<&Path>) -> Vec<
                 .map(|s| (*s).to_string())
                 .collect()
         });
-    if !workspace.resolve_setting(S::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED, root).as_bool().unwrap_or(false) {
+    if !workspace
+        .resolve_setting(S::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED, root)
+        .as_bool()
+        .unwrap_or(false)
+    {
         tools.retain(|tool| !matches!(tool.as_str(), "symbol_search" | "symbol_doc"));
     }
     if !tools

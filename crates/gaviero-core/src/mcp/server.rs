@@ -784,7 +784,7 @@ impl GavieroMcpServer {
             ));
         }
         let depth = clamp_blast_depth(input.depth);
-        let mode = BlastRadiusMode::from_str(input.mode.as_deref().unwrap_or("all"));
+        let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
         let paths = input.paths.clone();
         let workspace_root = self.workspace_root.clone();
         let graph_db = self.graph_db_path.clone();
@@ -1242,7 +1242,7 @@ impl GavieroMcpServer {
         let started = Instant::now();
         self.ensure_tool_allowed("repo_outline")?;
         let budget = clamp_repo_outline_token_cap(input.token_cap) as usize;
-        let mode = BlastRadiusMode::from_str(input.mode.as_deref().unwrap_or("all"));
+        let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
         // Empty / omitted seeds → "." which the ranker treats as
         // match-all (every file is owned; whole-workspace outline).
         let seeds: Vec<String> = match &input.seed_paths {

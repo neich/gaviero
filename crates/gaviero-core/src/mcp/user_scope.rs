@@ -90,11 +90,7 @@ pub fn claude_unregister_argv() -> Vec<String> {
 }
 
 pub fn codex_unregister_argv() -> Vec<String> {
-    vec![
-        "mcp".into(),
-        "remove".into(),
-        USER_SCOPE_SERVER_NAME.into(),
-    ]
+    vec!["mcp".into(), "remove".into(), USER_SCOPE_SERVER_NAME.into()]
 }
 
 pub fn claude_get_argv() -> Vec<String> {
@@ -107,7 +103,10 @@ pub fn codex_list_argv() -> Vec<String> {
 
 pub fn register_user_scope(vendor: UserScopeVendor, shim_abs: &Path) -> Result<UserScopeOutcome> {
     if !shim_abs.is_absolute() || !shim_abs.is_file() {
-        bail!("user-scope registration requires an existing absolute shim path: {}", shim_abs.display());
+        bail!(
+            "user-scope registration requires an existing absolute shim path: {}",
+            shim_abs.display()
+        );
     }
     let shim = shim_abs
         .to_str()

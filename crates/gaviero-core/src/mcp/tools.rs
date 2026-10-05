@@ -522,7 +522,10 @@ mod tests {
         assert_eq!(TOOL_MEMORY_FLAG, "memory_flag");
         assert_eq!(TOOL_MEMORY_PING, "memory_ping");
         assert_eq!(ALL_MCP_TOOLS.len(), 9);
-        assert_eq!(LEAN_EXPOSED_TOOLS, [TOOL_MEMORY_SEARCH, TOOL_MEMORY_GET, TOOL_MEMORY_PING]);
+        assert_eq!(
+            LEAN_EXPOSED_TOOLS,
+            [TOOL_MEMORY_SEARCH, TOOL_MEMORY_GET, TOOL_MEMORY_PING]
+        );
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }
