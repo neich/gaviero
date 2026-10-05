@@ -44,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 use crate::acp::client::propose_write;
 use crate::acp::session::AgentOptions;
 use crate::agent_session::reconcile::{DirectWrite, read_text_capped, reconcile_direct_writes};
+use crate::context_planner::compaction::CompactionPolicy;
 use crate::context_planner::types::McpCapabilities;
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::observer::{AcpObserver, PermissionDecision};
@@ -56,6 +57,7 @@ use crate::types::FileScope;
 use crate::write_gate::WriteGatePipeline;
 
 use super::registry::SessionConstruction;
+use super::replay_compaction::compact_turn_replay;
 use super::{AgentSession, Turn};
 use dsh::{DshLaunchSpec, mcp_servers_for_session, registers_gaviero};
 use rpc::{IncomingRequest, JsonRpcChild, JsonRpcHandle};
@@ -74,6 +76,8 @@ pub struct AcpClientSession {
     /// rather than re-derived at `session/new` so the table stays the single
     /// source for "can this provider receive context7 / extraServers".
     capabilities: McpCapabilities,
+    /// `ProviderProfile::max_context_tokens`, for the replay bound.
+    max_context_tokens: Option<usize>,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     observer: Arc<dyn AcpObserver>,
     cancel_token: CancellationToken,
@@ -123,6 +127,7 @@ impl AcpClientSession {
             options,
             file_scope,
             capabilities: profile.mcp_capabilities(),
+            max_context_tokens: profile.max_context_tokens,
             write_gate,
             observer: Arc::from(observer),
             cancel_token,
@@ -160,6 +165,7 @@ impl AcpClientSession {
             options,
             file_scope,
             capabilities: profile.mcp_capabilities(),
+            max_context_tokens: profile.max_context_tokens,
             write_gate,
             observer,
             cancel_token,
@@ -1242,8 +1248,16 @@ async fn reconcile_out_of_band_writes(
 impl AgentSession for AcpClientSession {
     async fn send_turn(
         &mut self,
-        turn: Turn,
+        mut turn: Turn,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
+        // Chat replays the transcript into every fresh dsh session; bound it
+        // like the other replaying sessions.
+        compact_turn_replay(
+            &mut turn,
+            &CompactionPolicy::default(),
+            self.max_context_tokens,
+            "dsh",
+        );
         let auto_approve = turn.auto_approve || self.options.auto_approve;
         let effort = turn
             .effort
