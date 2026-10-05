@@ -1117,22 +1117,19 @@ fn prepare_swarm_workspace(
         .iter()
         .find(|(k, _)| k == "PLAN_FILE")
         .map(|(_, v)| v.as_str())
+        && let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value)
     {
-        if let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value) {
-            let repo_canon =
-                std::fs::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
-            apply_out_dir_default_from_plan(&mut vars, &repo_canon, &plan_host);
-        }
+        let repo_canon = std::fs::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
+        apply_out_dir_default_from_plan(&mut vars, &repo_canon, &plan_host);
     }
 
-    if execution_mode == ExecutionMode::Document {
-        if let Some(out) = vars
+    if execution_mode == ExecutionMode::Document
+        && let Some(out) = vars
             .iter()
             .find(|(k, _)| k == "OUT_DIR")
             .map(|(_, v)| v.as_str())
-        {
-            eprintln!("[execution] OUT_DIR={out} (versioned artefacts; not for commit)");
-        }
+    {
+        eprintln!("[execution] OUT_DIR={out} (versioned artefacts; not for commit)");
     }
 
     Ok(SwarmWorkspacePrep {
@@ -1176,7 +1173,7 @@ fn path_spec_for_worktree(repo: &std::path::Path, host: &std::path::Path) -> Str
     let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let host_canon = std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf());
     if let Ok(rel) = host_canon.strip_prefix(&ws) {
-        normalize_rel(rel.as_ref())
+        normalize_rel(rel)
     } else {
         host.to_string_lossy().to_string()
     }
@@ -1224,7 +1221,7 @@ fn collect_cli_worktree_context_paths(
 /// `.gaviero/injected/` and rewrite the var so agents and worktrees can read it.
 fn materialize_external_vars_for_repo(
     repo: &std::path::Path,
-    vars: &mut Vec<(String, String)>,
+    vars: &mut [(String, String)],
 ) -> Result<()> {
     let injected_dir = repo.join(".gaviero/injected");
     let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
@@ -1558,7 +1555,7 @@ fn prepare_mcp_for_swarm(
                     .filter(|s| !s.is_empty() && *s != "inherit")
                     .map(str::to_string),
             )
-            .with_graph_excludes(parse_workspace_exclude_patterns(&workspace, Some(repo)));
+            .with_graph_excludes(parse_workspace_exclude_patterns(workspace, Some(repo)));
             // D3: memory_flag ships enabled, but it needs a writer to
             // signal. No writer → leave it unwired.
             let flag_enabled = workspace
@@ -1978,8 +1975,10 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
     .await
     .context("init memory stores (sleeptime)")??;
 
-    let mut cfg = gaviero_core::memory::SleeptimeConfig::default();
-    cfg.dry_run = dry_run;
+    let cfg = gaviero_core::memory::SleeptimeConfig {
+        dry_run,
+        ..Default::default()
+    };
     let _ = stores.open_all_folders().await;
     let mut targets = vec![stores.workspace().clone()];
     for store in stores.opened_folder_stores().await {
@@ -2035,8 +2034,8 @@ async fn run_deletions_last_cli(ws: &state::Discovered, n: usize) -> Result<()> 
         return Ok(());
     }
     println!(
-        "{:>4}  {:>6}  {:<14}  {:<8}  {:<19}  {}",
-        "id", "mem_id", "deleted_by", "kind", "deleted_at", "reason"
+        "{:>4}  {:>6}  {:<14}  {:<8}  {:<19}  reason",
+        "id", "mem_id", "deleted_by", "kind", "deleted_at"
     );
     for r in rows {
         println!(
@@ -2193,7 +2192,7 @@ async fn run_forget_cli(
 
 /// Tier C / C2.4: drive `/forget-history` from the CLI. Two-step
 /// confirmation is enforced via the `--redact-confirm REDACT` literal
-/// + a non-empty `--redact-reason`. Without both, the call aborts
+/// plus a non-empty `--redact-reason`. Without both, the call aborts
 /// with a preview of the row.
 async fn run_forget_history_cli(
     ws: &state::Discovered,
@@ -2257,8 +2256,8 @@ async fn run_utilization_cli(
     }
     println!("─── Utilization @ scope_level={scope_level} ───────────────────");
     println!(
-        "{:>5}  {:>9}  {:>5}  {:>5}  {:>6}  {}",
-        "id", "rate", "inj", "used", "unused", "last_used"
+        "{:>5}  {:>9}  {:>5}  {:>5}  {:>6}  last_used",
+        "id", "rate", "inj", "used", "unused"
     );
     for (id, util) in rows {
         println!(
@@ -2320,7 +2319,11 @@ async fn bootstrap_eval_fixture(
 /// workspace `memory.db` using the JSONL fixture. Compares against
 /// `<fixture>.baseline.json` (if present) and exits non-zero if
 /// recall@5 drops more than `cli.eval_tolerance` on any tag or globally.
-async fn run_eval_smoke_test(repo: &std::path::Path, fixture: &PathBuf, cli: &Cli) -> Result<()> {
+async fn run_eval_smoke_test(
+    repo: &std::path::Path,
+    fixture: &std::path::Path,
+    cli: &Cli,
+) -> Result<()> {
     use gaviero_core::memory::eval::{
         EvalReport, build_report, load_fixture, run_live, worst_recall5_drop,
     };
@@ -2354,16 +2357,15 @@ async fn run_eval_smoke_test(repo: &std::path::Path, fixture: &PathBuf, cli: &Cl
         .eval_report_out
         .clone()
         .unwrap_or_else(|| fixture.with_extension("last.json"));
-    if let Ok(json) = serde_json::to_string_pretty(&report) {
-        if let Err(e) = ensure_parent_dir(&report_out)
+    if let Ok(json) = serde_json::to_string_pretty(&report)
+        && let Err(e) = ensure_parent_dir(&report_out)
             .and_then(|()| std::fs::write(&report_out, json).map_err(Into::into))
-        {
-            tracing::warn!(
-                "failed to write eval report to {}: {}",
-                report_out.display(),
-                e
-            );
-        }
+    {
+        tracing::warn!(
+            "failed to write eval report to {}: {}",
+            report_out.display(),
+            e
+        );
     }
 
     let baseline_path = fixture.with_extension("baseline.json");
@@ -2422,7 +2424,7 @@ fn resolve_eval_embedder(repo: &std::path::Path) -> String {
     workspace
         .resolve_setting(
             gaviero_core::workspace::settings::MEMORY_EMBEDDER_MODEL,
-            Some(&repo.to_path_buf()),
+            Some(repo),
         )
         .as_str()
         .map(|s| s.trim().to_string())
@@ -2466,7 +2468,7 @@ async fn open_eval_store(
 /// writer task's normal store_with_options dedup path.
 async fn run_seed_corpus_from_paths(
     repo: &std::path::Path,
-    fixture: &PathBuf,
+    fixture: &std::path::Path,
     doc_chars: usize,
     embedder_name: Option<&str>,
 ) -> Result<()> {
@@ -2492,10 +2494,10 @@ async fn run_seed_corpus_from_paths(
     let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for case in &cases {
         for r in &case.gold_must {
-            if let GoldRef::File(p) = r {
-                if !p.ends_with('/') {
-                    paths.insert(p.clone());
-                }
+            if let GoldRef::File(p) = r
+                && !p.ends_with('/')
+            {
+                paths.insert(p.clone());
             }
         }
     }
@@ -2694,7 +2696,7 @@ fn extract_leading_doc(source: &str, max_chars: usize) -> String {
 /// the dev can see whether narrowing scope improves Precision@K.
 async fn run_eval_scope_matrix(
     repo: &std::path::Path,
-    fixture: &PathBuf,
+    fixture: &std::path::Path,
     scopes_csv: &str,
 ) -> Result<()> {
     use gaviero_core::memory::MemoryScope;
@@ -2762,7 +2764,7 @@ fn print_scope_matrix(
 /// embedder choice (we only read `injection_manifests`).
 async fn run_eval_from_manifests(
     repo: &std::path::Path,
-    fixture: &PathBuf,
+    fixture: &std::path::Path,
     n: usize,
 ) -> Result<()> {
     use gaviero_core::memory::eval::{load_fixture, run_from_manifests};
@@ -2863,7 +2865,10 @@ type EmbedderArm = (
 /// ranking metrics (Δ vs the `nomic` incumbent) **and** per-arm CPU
 /// embed latency (p50/p95/mean ms/query), since PR-4's flip gate is
 /// "code-recall + CPU-latency vs incumbent".
-async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
+async fn run_eval_embedder_ablation(
+    repo: &std::path::Path,
+    fixture: &std::path::Path,
+) -> Result<()> {
     use gaviero_core::memory::eval::{EvalReport, load_fixture, run_scope_matrix};
     use gaviero_core::memory::{
         MemoryScope, Reranker, build_reranker, hash_path, init_workspace_with_embedder_name,
@@ -2908,15 +2913,15 @@ async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -
             .unwrap_or_else(|| "minilm".to_string());
         let threads = rerank_cfg.threads;
         eprintln!("[gaviero-eval] loading reranker `{model_name}` for embedder ablation…");
-        let built = tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
+
+        tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
             .await
-            .context("loading reranker (embedder ablation)")??;
-        built.map(std::sync::Arc::from)
+            .context("loading reranker (embedder ablation)")??
     };
-    if let Some(ref rr) = reranker_arc {
-        if let Err(e) = rr.warmup().await {
-            tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
-        }
+    if let Some(ref rr) = reranker_arc
+        && let Err(e) = rr.warmup().await
+    {
+        tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
     }
 
     let scope_ctx = MemoryScope {
@@ -3114,7 +3119,7 @@ fn percentiles_ms(mut samples: Vec<f64>) -> (f64, f64, f64) {
 /// On `build_reranker` failure (no model file, network unavailable),
 /// the ablation aborts with a clear message — the off-mode alone is
 /// just `--eval-fixture` without this flag, so we don't double-run.
-async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
+async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &std::path::Path) -> Result<()> {
     use gaviero_core::memory::eval::{load_fixture, run_live};
     use gaviero_core::memory::{MemoryScope, Reranker, RetrievalConfig, build_reranker, hash_path};
 
@@ -3278,7 +3283,11 @@ fn parse_workspace_exclude_patterns(
 }
 
 /// KB-efficiency S1.3: sweep chat `max_items` and graph budget knobs.
-async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &Cli) -> Result<()> {
+async fn run_eval_budget_sweep(
+    repo: &std::path::Path,
+    fixture: &std::path::Path,
+    cli: &Cli,
+) -> Result<()> {
     use gaviero_core::memory::eval::{load_fixture, run_s13_budget_sweep};
     use gaviero_core::memory::{MemoryScope, Reranker, build_reranker, hash_path};
     use gaviero_core::repo_map::RepoMap;
@@ -3310,17 +3319,17 @@ async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &
             .unwrap_or_else(|| "minilm".to_string());
         let threads = rerank_cfg.threads;
         eprintln!("[gaviero-eval] loading reranker `{model_name}` for chat-path sweep…");
-        let built = tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
+
+        tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
             .await
-            .context("loading reranker (budget sweep)")??;
-        built.map(std::sync::Arc::from)
+            .context("loading reranker (budget sweep)")??
     } else {
         None
     };
-    if let Some(ref rr) = reranker_arc {
-        if let Err(e) = rr.warmup().await {
-            tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
-        }
+    if let Some(ref rr) = reranker_arc
+        && let Err(e) = rr.warmup().await
+    {
+        tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
     }
 
     eprintln!("[gaviero-eval] building RepoMap for graph budget sweep (may take a minute)…");
@@ -4945,7 +4954,7 @@ async fn main() -> Result<()> {
             model: coordinator_model
                 .clone()
                 .unwrap_or_else(|| execution_model.clone()),
-            ollama_base_url: ollama_base_url,
+            ollama_base_url,
             ..Default::default()
         };
         eprintln!("[mode] coordinated — planning DSL ({})", coord_config.model);
