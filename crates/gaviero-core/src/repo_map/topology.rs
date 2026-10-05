@@ -67,6 +67,7 @@ pub fn build_folder_topology(
     Ok(truncate_to_budget(lines.join("\n"), cfg.max_token_budget))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_dirs(
     workspace: &Path,
     dir: &Path,

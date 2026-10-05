@@ -380,15 +380,15 @@ impl Theme {
 
 fn style_from_def(def: &StyleDef) -> Style {
     let mut style = Style::default();
-    if let Some(fg) = &def.fg {
-        if let Some(color) = parse_hex_color(fg) {
-            style = style.fg(color);
-        }
+    if let Some(fg) = &def.fg
+        && let Some(color) = parse_hex_color(fg)
+    {
+        style = style.fg(color);
     }
-    if let Some(bg) = &def.bg {
-        if let Some(color) = parse_hex_color(bg) {
-            style = style.bg(color);
-        }
+    if let Some(bg) = &def.bg
+        && let Some(color) = parse_hex_color(bg)
+    {
+        style = style.bg(color);
     }
     if def.bold {
         style = style.add_modifier(Modifier::BOLD);

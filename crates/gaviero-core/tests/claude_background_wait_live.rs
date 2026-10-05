@@ -117,7 +117,7 @@ async fn run(auto_approve: bool) {
     };
 
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(240), session.send_turn(turn))
+    let _ = tokio::time::timeout(Duration::from_secs(240), session.send_turn(turn))
         .await
         .expect("turn finished")
         .expect("send_turn");

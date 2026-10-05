@@ -35,6 +35,7 @@ pub enum IndentHeuristic {
 /// that layer's tree and query. The indent engine has no injection knowledge.
 ///
 /// If `tree` or `indent_query` is None, falls back to bracket counting.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_indent(
     doc: &ropey::Rope,
     tree: Option<&tree_sitter::Tree>,

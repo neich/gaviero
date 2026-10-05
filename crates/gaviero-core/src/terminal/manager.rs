@@ -76,12 +76,11 @@ impl TerminalManager {
             .env_overrides
             .insert("HISTFILE".into(), histfile.to_string_lossy().into_owned());
 
-        if shell_config.enable_integration {
-            if let Ok(init_path) =
+        if shell_config.enable_integration
+            && let Ok(init_path) =
                 super::shell_integration::create_init_file(&shell_config.shell_type, &id, &histfile)
-            {
-                super::shell_integration::build_shell_args(&mut shell_config, &init_path);
-            }
+        {
+            super::shell_integration::build_shell_args(&mut shell_config, &init_path);
         }
 
         let mut instance = TerminalInstance::new(
@@ -122,12 +121,11 @@ impl TerminalManager {
             .env_overrides
             .insert("HISTFILE".into(), histfile.to_string_lossy().into_owned());
 
-        if shell_config.enable_integration {
-            if let Ok(init_path) =
+        if shell_config.enable_integration
+            && let Ok(init_path) =
                 super::shell_integration::create_init_file(&shell_config.shell_type, &id, &histfile)
-            {
-                super::shell_integration::build_shell_args(&mut shell_config, &init_path);
-            }
+        {
+            super::shell_integration::build_shell_args(&mut shell_config, &init_path);
         }
 
         let instance = TerminalInstance::new(
@@ -151,12 +149,11 @@ impl TerminalManager {
 
     /// Ensure the active tab is spawned (lazy spawn on focus).
     pub fn ensure_active_spawned(&mut self) -> Result<()> {
-        if let Some(id) = self.active_tab {
-            if let Some(inst) = self.terminals.get_mut(&id) {
-                if !inst.spawned {
-                    inst.spawn(self.event_tx.clone())?;
-                }
-            }
+        if let Some(id) = self.active_tab
+            && let Some(inst) = self.terminals.get_mut(&id)
+            && !inst.spawned
+        {
+            inst.spawn(self.event_tx.clone())?;
         }
         Ok(())
     }
@@ -209,10 +206,10 @@ impl TerminalManager {
         self.active_tab = Some(id);
 
         // Lazy resize: if this tab's dimensions don't match the viewport, resize it
-        if let Some(inst) = self.terminals.get_mut(&id) {
-            if inst.rows != self.viewport_rows || inst.cols != self.viewport_cols {
-                inst.resize(self.viewport_rows, self.viewport_cols);
-            }
+        if let Some(inst) = self.terminals.get_mut(&id)
+            && (inst.rows != self.viewport_rows || inst.cols != self.viewport_cols)
+        {
+            inst.resize(self.viewport_rows, self.viewport_cols);
         }
     }
 
@@ -371,14 +368,14 @@ fn extract_command_from_screen(screen: &vt100::Screen) -> String {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
     }
     // Trim the line; the command is typically after the prompt
     // Look for common prompt endings: $, %, >, #
     let trimmed = line.trim_end();
-    if let Some(pos) = trimmed.rfind(|c| matches!(c, '$' | '%' | '>' | '#')) {
+    if let Some(pos) = trimmed.rfind(['$', '%', '>', '#']) {
         trimmed[pos + 1..].trim().to_string()
     } else {
         trimmed.to_string()

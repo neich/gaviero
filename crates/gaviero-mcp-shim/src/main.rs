@@ -82,9 +82,7 @@ async fn run(cli: Cli) -> Result<()> {
 #[cfg(windows)]
 async fn run(cli: Cli) -> Result<()> {
     if cli.socket.is_some() {
-        anyhow::bail!(
-            "gaviero-mcp-shim: --socket is Unix-only; use --pipe <name> on Windows"
-        );
+        anyhow::bail!("gaviero-mcp-shim: --socket is Unix-only; use --pipe <name> on Windows");
     }
     let pipe = if cli.resolve {
         resolve::pipe_from_descriptor()?
@@ -303,7 +301,11 @@ mod resolve {
             return false;
         };
         const ERROR_PIPE_BUSY: i32 = 231;
-        match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
+        {
             Ok(_) => true,
             Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
         }

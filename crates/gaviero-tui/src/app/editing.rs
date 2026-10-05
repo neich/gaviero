@@ -380,18 +380,18 @@ fn clipboard_looks_tilde_truncated(got: &str, want: &str) -> bool {
 }
 
 pub(super) fn get_clipboard(app: &mut App) -> String {
-    if let Some(cb) = &mut app.clipboard {
-        if let Ok(text) = cb.get_text() {
-            let internal = &app.internal_clipboard;
-            // If the OS clipboard was truncated at `~` but we still hold the
-            // full copy from [`set_clipboard`], prefer the internal buffer so
-            // paste (and Windows Event::Paste clipboard substitution) sees the
-            // complete payload.
-            if clipboard_looks_tilde_truncated(&text, internal) {
-                return internal.clone();
-            }
-            return text;
+    if let Some(cb) = &mut app.clipboard
+        && let Ok(text) = cb.get_text()
+    {
+        let internal = &app.internal_clipboard;
+        // If the OS clipboard was truncated at `~` but we still hold the
+        // full copy from [`set_clipboard`], prefer the internal buffer so
+        // paste (and Windows Event::Paste clipboard substitution) sees the
+        // complete payload.
+        if clipboard_looks_tilde_truncated(&text, internal) {
+            return internal.clone();
         }
+        return text;
     }
     app.internal_clipboard.clone()
 }
@@ -533,156 +533,154 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(ref mut review) = app.diff_review {
-                if app.layout.editor_area.contains((col, row).into())
-                    && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
-                {
-                    let relative_row = (row - app.layout.editor_area.y) as usize;
-                    if let Some(hunk_idx) = diff_overlay::hunk_at_row(review, relative_row) {
-                        let current = review
-                            .proposal
-                            .structural_hunks
-                            .get(hunk_idx)
-                            .map(|h| h.status.clone());
-                        match current {
-                            Some(gaviero_core::types::HunkStatus::Accepted) => {
-                                review.reject_hunk(hunk_idx);
-                            }
-                            _ => {
-                                review.accept_hunk(hunk_idx);
-                            }
+            if let Some(ref mut review) = app.diff_review
+                && app.layout.editor_area.contains((col, row).into())
+                && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
+            {
+                let relative_row = (row - app.layout.editor_area.y) as usize;
+                if let Some(hunk_idx) = diff_overlay::hunk_at_row(review, relative_row) {
+                    let current = review
+                        .proposal
+                        .structural_hunks
+                        .get(hunk_idx)
+                        .map(|h| h.status.clone());
+                    match current {
+                        Some(gaviero_core::types::HunkStatus::Accepted) => {
+                            review.reject_hunk(hunk_idx);
                         }
-                        return;
+                        _ => {
+                            review.accept_hunk(hunk_idx);
+                        }
                     }
-                }
-            }
-
-            if let Some(hdr) = app.layout.left_header_area {
-                if hdr.contains((col, row).into()) {
-                    let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
-                    if col >= arrow_zone {
-                        app.focus = Focus::FileTree;
-                        app.left_panel = match app.left_panel {
-                            LeftPanelMode::FileTree => LeftPanelMode::Search,
-                            LeftPanelMode::Search => LeftPanelMode::Review,
-                            LeftPanelMode::Review => LeftPanelMode::Changes,
-                            LeftPanelMode::Changes if !app.pending_turn_reviews.is_empty() => {
-                                LeftPanelMode::TurnReview
-                            }
-                            LeftPanelMode::Changes | LeftPanelMode::TurnReview => {
-                                LeftPanelMode::FileTree
-                            }
-                        };
-                        return;
-                    }
-                    app.focus = Focus::FileTree;
                     return;
                 }
             }
 
-            if let Some(hdr) = app.layout.side_header_area {
-                if hdr.contains((col, row).into()) {
-                    let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
-                    if col >= arrow_zone {
-                        app.focus = Focus::SidePanel;
-                        app.side_panel = app.side_panel.next_in_header_cycle();
-                        if app.side_panel == SidePanelMode::HistoryPanel {
-                            app.refresh_history_panel();
+            if let Some(hdr) = app.layout.left_header_area
+                && hdr.contains((col, row).into())
+            {
+                let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
+                if col >= arrow_zone {
+                    app.focus = Focus::FileTree;
+                    app.left_panel = match app.left_panel {
+                        LeftPanelMode::FileTree => LeftPanelMode::Search,
+                        LeftPanelMode::Search => LeftPanelMode::Review,
+                        LeftPanelMode::Review => LeftPanelMode::Changes,
+                        LeftPanelMode::Changes if !app.pending_turn_reviews.is_empty() => {
+                            LeftPanelMode::TurnReview
                         }
-                        return;
-                    }
+                        LeftPanelMode::Changes | LeftPanelMode::TurnReview => {
+                            LeftPanelMode::FileTree
+                        }
+                    };
+                    return;
+                }
+                app.focus = Focus::FileTree;
+                return;
+            }
+
+            if let Some(hdr) = app.layout.side_header_area
+                && hdr.contains((col, row).into())
+            {
+                let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
+                if col >= arrow_zone {
                     app.focus = Focus::SidePanel;
+                    app.side_panel = app.side_panel.next_in_header_cycle();
+                    if app.side_panel == SidePanelMode::HistoryPanel {
+                        app.refresh_history_panel();
+                    }
                     return;
                 }
+                app.focus = Focus::SidePanel;
+                return;
             }
 
-            if let Some(area) = app.layout.file_tree_area {
-                if area.contains((col, row).into()) {
-                    app.focus = Focus::FileTree;
+            if let Some(area) = app.layout.file_tree_area
+                && area.contains((col, row).into())
+            {
+                app.focus = Focus::FileTree;
 
-                    let scrollbar_x = area.x + area.width.saturating_sub(1);
-                    if col == scrollbar_x {
-                        app.scrollbar_dragging = Some(ScrollbarTarget::LeftPanel);
-                        app.scroll_panel_to_row(ScrollbarTarget::LeftPanel, row);
-                        return;
-                    }
-
-                    let relative_row = (row - area.y) as usize;
-
-                    match app.left_panel {
-                        LeftPanelMode::FileTree => {
-                            app.file_tree.click_row(relative_row);
-                            let is_file = app.file_tree.selected_is_file();
-                            if is_file {
-                                if let Some(path) = app.file_tree.selected_path() {
-                                    let path = path.to_path_buf();
-                                    app.open_file(&path);
-                                }
-                            } else {
-                                app.file_tree.toggle_expand();
-                            }
-                        }
-                        LeftPanelMode::Search => {
-                            if relative_row == 0 {
-                                app.search_panel.editing = true;
-                                return;
-                            }
-                            let idx =
-                                app.search_panel.scroll.offset + relative_row.saturating_sub(2);
-                            if idx < app.search_panel.results.len() {
-                                app.search_panel.scroll.selected = idx;
-                                let result = app.search_panel.results[idx].clone();
-                                if result.abs_path.exists() {
-                                    app.open_file(&result.abs_path);
-                                    app.focus = Focus::Editor;
-                                    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                                        let target = result.line_number.saturating_sub(1);
-                                        let max = buf.line_count().saturating_sub(1);
-                                        buf.cursor.line = target.min(max);
-                                        buf.cursor.col = 0;
-                                        buf.cursor.anchor = None;
-                                        buf.scroll.top_line = target.saturating_sub(10);
-                                    }
-                                }
-                            }
-                        }
-                        LeftPanelMode::Review => {
-                            if let Some(ref mut br) = app.batch_review {
-                                let idx = br.scroll_offset + relative_row;
-                                if idx < br.proposals.len() {
-                                    br.selected_index = idx;
-                                    br.diff_scroll = 0;
-                                }
-                            }
-                        }
-                        LeftPanelMode::Changes => {
-                            if let Some(ref mut cs) = app.changes_state {
-                                let idx = cs.scroll_offset + relative_row;
-                                if idx < cs.entries.len() {
-                                    cs.selected_index = idx;
-                                    cs.diff_scroll = 0;
-                                }
-                            }
-                        }
-                        LeftPanelMode::TurnReview => {
-                            super::turn_review::click_row(app, relative_row);
-                        }
-                    }
+                let scrollbar_x = area.x + area.width.saturating_sub(1);
+                if col == scrollbar_x {
+                    app.scrollbar_dragging = Some(ScrollbarTarget::LeftPanel);
+                    app.scroll_panel_to_row(ScrollbarTarget::LeftPanel, row);
                     return;
                 }
+
+                let relative_row = (row - area.y) as usize;
+
+                match app.left_panel {
+                    LeftPanelMode::FileTree => {
+                        app.file_tree.click_row(relative_row);
+                        let is_file = app.file_tree.selected_is_file();
+                        if is_file {
+                            if let Some(path) = app.file_tree.selected_path() {
+                                let path = path.to_path_buf();
+                                app.open_file(&path);
+                            }
+                        } else {
+                            app.file_tree.toggle_expand();
+                        }
+                    }
+                    LeftPanelMode::Search => {
+                        if relative_row == 0 {
+                            app.search_panel.editing = true;
+                            return;
+                        }
+                        let idx = app.search_panel.scroll.offset + relative_row.saturating_sub(2);
+                        if idx < app.search_panel.results.len() {
+                            app.search_panel.scroll.selected = idx;
+                            let result = app.search_panel.results[idx].clone();
+                            if result.abs_path.exists() {
+                                app.open_file(&result.abs_path);
+                                app.focus = Focus::Editor;
+                                if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+                                    let target = result.line_number.saturating_sub(1);
+                                    let max = buf.line_count().saturating_sub(1);
+                                    buf.cursor.line = target.min(max);
+                                    buf.cursor.col = 0;
+                                    buf.cursor.anchor = None;
+                                    buf.scroll.top_line = target.saturating_sub(10);
+                                }
+                            }
+                        }
+                    }
+                    LeftPanelMode::Review => {
+                        if let Some(ref mut br) = app.batch_review {
+                            let idx = br.scroll_offset + relative_row;
+                            if idx < br.proposals.len() {
+                                br.selected_index = idx;
+                                br.diff_scroll = 0;
+                            }
+                        }
+                    }
+                    LeftPanelMode::Changes => {
+                        if let Some(ref mut cs) = app.changes_state {
+                            let idx = cs.scroll_offset + relative_row;
+                            if idx < cs.entries.len() {
+                                cs.selected_index = idx;
+                                cs.diff_scroll = 0;
+                            }
+                        }
+                    }
+                    LeftPanelMode::TurnReview => {
+                        super::turn_review::click_row(app, relative_row);
+                    }
+                }
+                return;
             }
-            if let Some(preview) = app.layout.preview_area {
-                if preview.contains((col, row).into()) {
-                    app.focus = Focus::Editor;
-                    let scrollbar_x = preview.x + preview.width.saturating_sub(1);
-                    if col == scrollbar_x {
-                        app.scrollbar_dragging = Some(ScrollbarTarget::MarkdownPreview);
-                        app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
-                        return;
-                    }
-                    follow_preview_link_at(app, col, row);
+            if let Some(preview) = app.layout.preview_area
+                && preview.contains((col, row).into())
+            {
+                app.focus = Focus::Editor;
+                let scrollbar_x = preview.x + preview.width.saturating_sub(1);
+                if col == scrollbar_x {
+                    app.scrollbar_dragging = Some(ScrollbarTarget::MarkdownPreview);
+                    app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
                     return;
                 }
+                follow_preview_link_at(app, col, row);
+                return;
             }
             if app.layout.editor_area.contains((col, row).into()) {
                 app.focus = Focus::Editor;
@@ -729,86 +727,85 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 return;
             }
-            if let Some(area) = app.layout.side_panel_area {
-                if area.contains((col, row).into()) {
-                    app.focus = Focus::SidePanel;
+            if let Some(area) = app.layout.side_panel_area
+                && area.contains((col, row).into())
+            {
+                app.focus = Focus::SidePanel;
 
-                    if app.side_panel == SidePanelMode::AgentChat && row == area.y {
-                        let tab_area_x = area.x + 1;
-                        if let Some(idx) = app.chat_state.conv_tab_at_x(col, tab_area_x) {
-                            if idx == app.chat_state.conversations.len() {
-                                app.chat_state.new_conversation();
-                            } else if idx != app.chat_state.active_conv {
-                                app.chat_state.switch_conversation(idx);
-                            }
-                            return;
+                if app.side_panel == SidePanelMode::AgentChat && row == area.y {
+                    let tab_area_x = area.x + 1;
+                    if let Some(idx) = app.chat_state.conv_tab_at_x(col, tab_area_x) {
+                        if idx == app.chat_state.conversations.len() {
+                            app.chat_state.new_conversation();
+                        } else if idx != app.chat_state.active_conv {
+                            app.chat_state.switch_conversation(idx);
                         }
+                        return;
                     }
+                }
 
-                    if app.side_panel == SidePanelMode::AgentChat {
-                        if let Some(index) = app.chat_state.attachment_close_at(col, row) {
-                            if let Some(name) = app.chat_state.remove_attachment_at(index) {
-                                app.chat_state
-                                    .add_system_message(&format!("Removed: {}", name));
-                            }
-                            return;
+                if app.side_panel == SidePanelMode::AgentChat
+                    && let Some(index) = app.chat_state.attachment_close_at(col, row)
+                {
+                    if let Some(name) = app.chat_state.remove_attachment_at(index) {
+                        app.chat_state
+                            .add_system_message(&format!("Removed: {}", name));
+                    }
+                    return;
+                }
+
+                if app.side_panel == SidePanelMode::GitPanel {
+                    let rel_y = row.saturating_sub(area.y);
+                    if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height) {
+                        app.git_panel.select_file(region, idx);
+                        super::side_panel::open_selected_git_file(app);
+                        return;
+                    }
+                }
+
+                let scrollbar_x = area.x + area.width.saturating_sub(1);
+                if col == scrollbar_x {
+                    app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
+                    app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
+                    return;
+                }
+
+                if app.side_panel == SidePanelMode::AgentChat {
+                    // Prompt input: place cursor / start drag-select.
+                    if !app.chat_state.active_conv_busy()
+                        && app
+                            .chat_state
+                            .input_area_cache
+                            .is_some_and(|a| a.contains((col, row).into()))
+                    {
+                        if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
+                            app.chat_state.start_input_mouse_selection(ci);
                         }
-                    }
-
-                    if app.side_panel == SidePanelMode::GitPanel {
-                        let rel_y = row.saturating_sub(area.y);
-                        if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height)
-                        {
-                            app.git_panel.select_file(region, idx);
-                            super::side_panel::open_selected_git_file(app);
-                            return;
-                        }
-                    }
-
-                    let scrollbar_x = area.x + area.width.saturating_sub(1);
-                    if col == scrollbar_x {
-                        app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
-                        app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
                         return;
                     }
 
-                    if app.side_panel == SidePanelMode::AgentChat {
-                        // Prompt input: place cursor / start drag-select.
-                        if !app.chat_state.active_conv_busy()
-                            && app
-                                .chat_state
-                                .input_area_cache
-                                .is_some_and(|a| a.contains((col, row).into()))
-                        {
-                            if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
-                                app.chat_state.start_input_mouse_selection(ci);
-                            }
-                            return;
-                        }
-
-                        if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
-                            app.chat_state.start_text_selection(line, ci);
-                        } else {
-                            app.chat_state.clear_text_selection();
-                        }
+                    if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
+                        app.chat_state.start_text_selection(line, ci);
+                    } else {
+                        app.chat_state.clear_text_selection();
                     }
-                    return;
                 }
+                return;
             }
-            if let Some(area) = app.layout.terminal_area {
-                if area.contains((col, row).into()) {
-                    app.focus = Focus::Terminal;
-                    app.terminal_selection.clear();
-                    let content_y_start = area.y + 1;
-                    if row >= content_y_start && row < area.y + area.height {
-                        let vt_row = row - content_y_start;
-                        let vt_col = col.saturating_sub(area.x);
-                        if let Some(inst) = app.terminal_manager.active_instance() {
-                            app.terminal_selection.start(vt_row, vt_col, inst.screen());
-                        }
+            if let Some(area) = app.layout.terminal_area
+                && area.contains((col, row).into())
+            {
+                app.focus = Focus::Terminal;
+                app.terminal_selection.clear();
+                let content_y_start = area.y + 1;
+                if row >= content_y_start && row < area.y + area.height {
+                    let vt_row = row - content_y_start;
+                    let vt_col = col.saturating_sub(area.x);
+                    if let Some(inst) = app.terminal_manager.active_instance() {
+                        app.terminal_selection.start(vt_row, vt_col, inst.screen());
                     }
-                    return;
                 }
+                return;
             }
             if app.layout.tab_area.contains((col, row).into()) {
                 let titles: Vec<(String, bool, bool)> = app
@@ -820,12 +817,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     titles: &titles,
                     active: app.active_buffer,
                 };
-                if let Some(idx) = tab_bar.tab_at_x(col, app.layout.tab_area.x) {
-                    if idx < app.buffers.len() && idx != app.active_buffer {
-                        app.active_buffer = idx;
-                        app.focus = Focus::Editor;
-                        sync_preview_mode_for_active_buffer(app);
-                    }
+                if let Some(idx) = tab_bar.tab_at_x(col, app.layout.tab_area.x)
+                    && idx < app.buffers.len()
+                    && idx != app.active_buffer
+                {
+                    app.active_buffer = idx;
+                    app.focus = Focus::Editor;
+                    sync_preview_mode_for_active_buffer(app);
                 }
             }
         }
@@ -851,17 +849,17 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 WheelTarget::Hover => {}
             }
             // Stale focus (the focused panel is hidden): route by pointer.
-            if let Some(area) = app.layout.file_tree_area {
-                if area.contains((col, row).into()) {
-                    scroll_left_panel(app, up);
-                    return;
-                }
+            if let Some(area) = app.layout.file_tree_area
+                && area.contains((col, row).into())
+            {
+                scroll_left_panel(app, up);
+                return;
             }
-            if let Some(area) = app.layout.side_panel_area {
-                if area.contains((col, row).into()) {
-                    scroll_side_panel(app, up, col, row);
-                    return;
-                }
+            if let Some(area) = app.layout.side_panel_area
+                && area.contains((col, row).into())
+            {
+                scroll_side_panel(app, up, col, row);
+                return;
             }
             // Source and preview are one wheel target: the preview follows the
             // editor, so both halves of the split take the same path.
@@ -873,10 +871,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 scroll_editor_group(app, up);
                 return;
             }
-            if let Some(area) = app.layout.terminal_area {
-                if area.contains((col, row).into()) {
-                    scroll_terminal_scrollback(app, up);
-                }
+            if let Some(area) = app.layout.terminal_area
+                && area.contains((col, row).into())
+            {
+                scroll_terminal_scrollback(app, up);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -983,10 +981,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if app.mouse_dragging {
                 let area = app.layout.editor_area;
-                if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    if buf.cursor.anchor.is_none() {
-                        buf.cursor.anchor = Some((buf.cursor.line, buf.cursor.col));
-                    }
+                if let Some(buf) = app.buffers.get_mut(app.active_buffer)
+                    && buf.cursor.anchor.is_none()
+                {
+                    buf.cursor.anchor = Some((buf.cursor.line, buf.cursor.col));
                 }
                 if row < area.y {
                     // Dragging above editor: scroll up and move cursor to top visible line.
@@ -1031,10 +1029,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 app.terminal_selection.dragging = false;
             }
             if app.chat_state.input_dragging {
-                if let Some(text) = app.chat_state.text_input.selected_text().map(str::to_owned) {
-                    if !text.is_empty() {
-                        app.set_clipboard(&text);
-                    }
+                if let Some(text) = app.chat_state.text_input.selected_text().map(str::to_owned)
+                    && !text.is_empty()
+                {
+                    app.set_clipboard(&text);
                 }
                 app.chat_state.end_input_mouse_selection();
             }
@@ -1364,43 +1362,42 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 return;
             }
 
-            if let Some(hdr) = app.layout.side_header_area {
-                if hdr.contains((col, row).into()) {
-                    app.focus = Focus::SidePanel;
-                    return;
-                }
+            if let Some(hdr) = app.layout.side_header_area
+                && hdr.contains((col, row).into())
+            {
+                app.focus = Focus::SidePanel;
+                return;
             }
 
-            if let Some(area) = app.layout.side_panel_area {
-                if area.contains((col, row).into())
-                    && matches!(app.side_panel, SidePanelMode::AgentChat)
-                {
-                    app.focus = Focus::SidePanel;
-                    let scrollbar_x = area.x + area.width.saturating_sub(1);
-                    if col == scrollbar_x {
-                        app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
-                        app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
-                        return;
-                    }
-                    if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
-                        app.chat_state.start_text_selection(line, ci);
-                    } else {
-                        app.chat_state.clear_text_selection();
-                    }
+            if let Some(area) = app.layout.side_panel_area
+                && area.contains((col, row).into())
+                && matches!(app.side_panel, SidePanelMode::AgentChat)
+            {
+                app.focus = Focus::SidePanel;
+                let scrollbar_x = area.x + area.width.saturating_sub(1);
+                if col == scrollbar_x {
+                    app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
+                    app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
                     return;
                 }
+                if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
+                    app.chat_state.start_text_selection(line, ci);
+                } else {
+                    app.chat_state.clear_text_selection();
+                }
+                return;
             }
 
             if let (Some(area), Some(ref mut br)) =
                 (app.layout.file_tree_area, app.batch_review.as_mut())
+                && app.left_panel == LeftPanelMode::Review
+                && area.contains((col, row).into())
             {
-                if app.left_panel == LeftPanelMode::Review && area.contains((col, row).into()) {
-                    let relative_row = row.saturating_sub(area.y) as usize;
-                    let idx = br.scroll_offset + relative_row;
-                    if idx < br.proposals.len() {
-                        br.selected_index = idx;
-                        br.diff_scroll = 0;
-                    }
+                let relative_row = row.saturating_sub(area.y) as usize;
+                let idx = br.scroll_offset + relative_row;
+                if idx < br.proposals.len() {
+                    br.selected_index = idx;
+                    br.diff_scroll = 0;
                 }
             }
         }
@@ -1408,16 +1405,15 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if let Some(ref mut br) = app.batch_review {
                 if app.layout.editor_area.contains((col, row).into()) {
                     br.diff_scroll = br.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                } else if let Some(area) = app.layout.file_tree_area {
-                    if area.contains((col, row).into()) {
-                        br.scroll_offset =
-                            br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                    }
+                } else if let Some(area) = app.layout.file_tree_area
+                    && area.contains((col, row).into())
+                {
+                    br.scroll_offset = br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 }
-            } else if let Some(ref mut review) = app.diff_review {
-                if app.layout.editor_area.contains((col, row).into()) {
-                    review.scroll_top = review.scroll_top.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                }
+            } else if let Some(ref mut review) = app.diff_review
+                && app.layout.editor_area.contains((col, row).into())
+            {
+                review.scroll_top = review.scroll_top.saturating_sub(theme::MOUSE_SCROLL_DELTA);
             }
             if side_panel_chat_scroll_at(app, col, row) {
                 scroll_chat_output(app, -(theme::MOUSE_SCROLL_DELTA as i32));
@@ -1427,16 +1423,16 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if let Some(ref mut br) = app.batch_review {
                 if app.layout.editor_area.contains((col, row).into()) {
                     br.diff_scroll += theme::MOUSE_SCROLL_DELTA;
-                } else if let Some(area) = app.layout.file_tree_area {
-                    if area.contains((col, row).into()) {
-                        let max = br.proposals.len().saturating_sub(1);
-                        br.scroll_offset = (br.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
-                    }
+                } else if let Some(area) = app.layout.file_tree_area
+                    && area.contains((col, row).into())
+                {
+                    let max = br.proposals.len().saturating_sub(1);
+                    br.scroll_offset = (br.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
                 }
-            } else if let Some(ref mut review) = app.diff_review {
-                if app.layout.editor_area.contains((col, row).into()) {
-                    review.scroll_top += theme::MOUSE_SCROLL_DELTA;
-                }
+            } else if let Some(ref mut review) = app.diff_review
+                && app.layout.editor_area.contains((col, row).into())
+            {
+                review.scroll_top += theme::MOUSE_SCROLL_DELTA;
             }
             if side_panel_chat_scroll_at(app, col, row) {
                 scroll_chat_output(app, theme::MOUSE_SCROLL_DELTA as i32);
@@ -2031,12 +2027,11 @@ pub(super) fn open_diff_view(app: &mut App, path: &Path, original: String, curre
             let word_wrap = app.workspace.resolve_setting(settings::WORD_WRAP, None);
             buf.word_wrap = word_wrap.as_bool().unwrap_or(false);
 
-            if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language) {
-                if !app.highlight_configs.contains_key(lang_name) {
-                    if let Ok(config) = load_highlight_config(language.clone(), lang_name) {
-                        app.highlight_configs.insert(lang_name.clone(), config);
-                    }
-                }
+            if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language)
+                && !app.highlight_configs.contains_key(lang_name)
+                && let Ok(config) = load_highlight_config(language.clone(), lang_name)
+            {
+                app.highlight_configs.insert(lang_name.clone(), config);
             }
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;

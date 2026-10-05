@@ -567,10 +567,10 @@ fn remap_selected_index_after_sort(
     if proposals.is_empty() {
         return 0;
     }
-    if let Some(path) = selected_path {
-        if let Some(idx) = proposals.iter().position(|p| p.path == path) {
-            return idx;
-        }
+    if let Some(path) = selected_path
+        && let Some(idx) = proposals.iter().position(|p| p.path == path)
+    {
+        return idx;
     }
     0
 }

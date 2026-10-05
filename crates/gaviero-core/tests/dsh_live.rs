@@ -10,8 +10,8 @@ use gaviero_core::acp::session::AgentOptions;
 use gaviero_core::agent_session::agent_client_protocol::AcpClientSession;
 use gaviero_core::agent_session::registry::SessionConstruction;
 use gaviero_core::agent_session::{AgentSession, Turn};
-use gaviero_core::context_planner::{PlannerMetadata, RuntimeConfig, build_provider_profile};
 use gaviero_core::context_planner::types::ModelSpec;
+use gaviero_core::context_planner::{PlannerMetadata, RuntimeConfig, build_provider_profile};
 use gaviero_core::observer::{AcpObserver, WriteGateObserver};
 use gaviero_core::swarm::backend::UnifiedStreamEvent;
 use gaviero_core::types::{FileScope, WriteProposal};
@@ -104,7 +104,10 @@ async fn dsh_acp_smoke() {
             Err(_) => panic!("dsh_acp_smoke timed out"),
         }
     }
-    assert!(saw_text && saw_done, "saw_text={saw_text} saw_done={saw_done}");
+    assert!(
+        saw_text && saw_done,
+        "saw_text={saw_text} saw_done={saw_done}"
+    );
 }
 
 #[test]
@@ -126,7 +129,9 @@ fn dsh_nested_reach() {
         .status();
     match status {
         Ok(s) if s.success() => {}
-        other => panic!("dsh_nested_reach: gaviero-cli --mcp-reach-probe --reach-providers dsh failed: {other:?}"),
+        other => panic!(
+            "dsh_nested_reach: gaviero-cli --mcp-reach-probe --reach-providers dsh failed: {other:?}"
+        ),
     }
 }
 

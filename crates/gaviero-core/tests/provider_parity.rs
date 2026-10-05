@@ -162,7 +162,11 @@ fn provider_rows_and_the_vendor_lookup_share_one_source() {
 fn declared_enforcement_and_prompt_axes_match_the_real_mechanism() {
     let expected: &[(&str, ToolEnforcement, PromptKind)] = &[
         // Build-time argv; AskUserQuestion + y/n.
-        ("claude:sonnet", ToolEnforcement::Argv, PromptKind::MultiChoice),
+        (
+            "claude:sonnet",
+            ToolEnforcement::Argv,
+            PromptKind::MultiChoice,
+        ),
         // `codex exec` is non-interactive and carries no tool list.
         ("codex:x", ToolEnforcement::Unenforced, PromptKind::None),
         // Runtime host approval; y/n only.

@@ -28,7 +28,10 @@ pub struct Manifest {
 
 impl Manifest {
     /// Entries under any of `roots`.
-    pub fn in_scope<'a>(&'a self, roots: &'a [PathBuf]) -> impl Iterator<Item = (&'a PathBuf, &'a Entry)> {
+    pub fn in_scope<'a>(
+        &'a self,
+        roots: &'a [PathBuf],
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a Entry)> {
         self.entries
             .iter()
             .filter(move |(p, _)| under_any(p, roots))

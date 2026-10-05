@@ -636,10 +636,7 @@ fn template_update_docs() {
         .expect("inventory");
     // Default profile is doc-cursor.gaviero (inventory → grok). The Cursor CLI
     // id embeds the effort level, so `clients.gaviero` pins the full id.
-    assert_eq!(
-        inventory.model.as_deref(),
-        Some("cursor:grok-4.7-high")
-    );
+    assert_eq!(inventory.model.as_deref(), Some("cursor:grok-4.7-high"));
     let readme = units
         .iter()
         .find(|u| u.id == "write_readme_md")
@@ -721,10 +718,7 @@ fn template_plan_refinement() {
     }
     assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
     assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.6-sol"));
-    assert_eq!(
-        urefine.model.as_deref(),
-        Some("cursor:grok-4.7-high")
-    );
+    assert_eq!(urefine.model.as_deref(), Some("cursor:grok-4.7-high"));
 
     assert!(
         crefine
@@ -1006,8 +1000,8 @@ fn compile_file_generic_consensus_with_reviewers() {
         .into_iter()
         .map(|u| u.id.as_str())
         .collect();
-    assert!(ids.iter().any(|id| *id == "claude-init"));
-    assert!(ids.iter().any(|id| *id == "codex-refine"));
+    assert!(ids.contains(&"claude-init"));
+    assert!(ids.contains(&"codex-refine"));
     assert_eq!(plan.loop_configs.len(), 1);
     assert_eq!(
         plan.loop_configs[0].consensus_mode,

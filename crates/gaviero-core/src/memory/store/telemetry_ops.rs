@@ -41,6 +41,7 @@ impl MemoryStore {
     }
 
     /// B6: persist one classification row from the telemetry pass.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_retrieval_use(
         &self,
         memory_id: i64,

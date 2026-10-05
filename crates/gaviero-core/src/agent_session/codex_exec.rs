@@ -33,6 +33,9 @@ use super::{AgentSession, LegacyAgentSession, Turn};
 pub struct CodexExecSession(LegacyAgentSession);
 
 impl CodexExecSession {
+    // The chat registry routes every `codex:` profile to
+    // `CodexAppServerSession`; this constructor stays until M10 deletes the type.
+    #[allow(dead_code)]
     pub(super) fn new(args: SessionConstruction) -> Self {
         Self(LegacyAgentSession::new(
             args.write_gate,

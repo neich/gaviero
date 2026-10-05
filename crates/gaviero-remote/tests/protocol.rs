@@ -13,7 +13,9 @@ use gaviero_remote::version::{PROTOCOL_VERSION, ProtocolVersion};
 use serde_json::Value;
 
 fn fixture_dir(side: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(side)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(side)
 }
 
 fn fixtures(side: &str) -> Vec<(String, String)> {
@@ -39,8 +41,8 @@ fn client_fixtures_round_trip() {
     assert_eq!(fixtures.len(), 17, "one fixture per client frame type");
     for (name, text) in fixtures {
         let parsed: Value = serde_json::from_str(&text).unwrap();
-        let env: ClientEnvelope = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+        let env: ClientEnvelope =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
         let back = serde_json::to_value(&env).unwrap();
         assert_eq!(back, parsed, "{name}: re-encoded JSON differs");
         let again: ClientEnvelope = serde_json::from_value(back).unwrap();
@@ -54,8 +56,8 @@ fn server_fixtures_round_trip() {
     assert_eq!(fixtures.len(), 23, "one fixture per server frame type");
     for (name, text) in fixtures {
         let parsed: Value = serde_json::from_str(&text).unwrap();
-        let env: ServerEnvelope = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+        let env: ServerEnvelope =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
         let back = serde_json::to_value(&env).unwrap();
         assert_eq!(back, parsed, "{name}: re-encoded JSON differs");
     }
@@ -86,7 +88,10 @@ fn unknown_frame_types_are_classified_not_fatal() {
         "payload": {}
     }"#;
     match decode_client_frame(json).expect("classified, not an error") {
-        ClientDecode::UnknownType { frame_type, command_id } => {
+        ClientDecode::UnknownType {
+            frame_type,
+            command_id,
+        } => {
             assert_eq!(frame_type, "rotate_token");
             assert_eq!(command_id.as_deref(), Some("cmd-77"));
         }
@@ -164,8 +169,16 @@ fn hello_machine_is_optional() {
     };
     let machine = h.machine.as_ref().expect("1.1 fixture carries machine");
     assert_eq!(machine.host, "host.tailnet.ts.net");
-    assert!(h.capabilities.iter().any(|c| c == gaviero_remote::version::capability::LATEST_PAGE));
-    assert!(h.capabilities.iter().any(|c| c == gaviero_remote::version::capability::INSTANCES));
+    assert!(
+        h.capabilities
+            .iter()
+            .any(|c| c == gaviero_remote::version::capability::LATEST_PAGE)
+    );
+    assert!(
+        h.capabilities
+            .iter()
+            .any(|c| c == gaviero_remote::version::capability::INSTANCES)
+    );
 
     let mut v: Value = serde_json::from_str(&text).unwrap();
     v["payload"].as_object_mut().unwrap().remove("machine");
@@ -176,7 +189,10 @@ fn hello_machine_is_optional() {
     };
     assert!(h.machine.is_none());
     let back = serde_json::to_value(&env).unwrap();
-    assert!(back["payload"].get("machine").is_none(), "None is omitted, never null");
+    assert!(
+        back["payload"].get("machine").is_none(),
+        "None is omitted, never null"
+    );
 }
 
 /// The `GET /v1/instances` body has its own fixture and round-trips.
@@ -225,14 +241,17 @@ fn message_complete_fixture_offsets_are_utf8_correct() {
     };
     let content = &mc.message.content;
     assert!(
-        content.chars().any(|c| !c.is_ascii()),
+        !content.is_ascii(),
         "fixture must contain non-ASCII content — the offset bug is invisible in ASCII"
     );
     for block in &mc.message.code_blocks {
         let (start, end) = (block.start_byte as usize, block.end_byte as usize);
         assert!(content.is_char_boundary(start) && content.is_char_boundary(end));
         let slice = &content[start..end];
-        assert!(slice.starts_with("```"), "block range includes the opening fence");
+        assert!(
+            slice.starts_with("```"),
+            "block range includes the opening fence"
+        );
         for span in &block.spans {
             let (s, e) = (span.start_byte as usize, span.end_byte as usize);
             assert!(content.is_char_boundary(s) && content.is_char_boundary(e));

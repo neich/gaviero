@@ -49,13 +49,13 @@ impl AgentBackend for OllamaStreamBackend {
         let mut messages = Vec::new();
 
         // System message
-        if let Some(ref sys) = request.system_prompt {
-            if !sys.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": sys,
-                }));
-            }
+        if let Some(ref sys) = request.system_prompt
+            && !sys.is_empty()
+        {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys,
+            }));
         }
 
         // User message
@@ -232,10 +232,9 @@ pub fn parse_ollama_chunk(line: &str) -> Vec<UnifiedStreamEvent> {
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
+            && !content.is_empty()
         {
-            if !content.is_empty() {
-                out.push(UnifiedStreamEvent::TextDelta(content.to_string()));
-            }
+            out.push(UnifiedStreamEvent::TextDelta(content.to_string()));
         }
 
         // Thinking content (if model supports it)
@@ -243,10 +242,9 @@ pub fn parse_ollama_chunk(line: &str) -> Vec<UnifiedStreamEvent> {
             .get("message")
             .and_then(|m| m.get("thinking"))
             .and_then(|t| t.as_str())
+            && !thinking.is_empty()
         {
-            if !thinking.is_empty() {
-                out.push(UnifiedStreamEvent::ThinkingDelta(thinking.to_string()));
-            }
+            out.push(UnifiedStreamEvent::ThinkingDelta(thinking.to_string()));
         }
     } else {
         // Final chunk: extract usage metrics

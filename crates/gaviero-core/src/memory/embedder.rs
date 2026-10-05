@@ -360,7 +360,7 @@ pub mod embedder_battery {
         // for the same input. Tolerance accounts for f32 reduction-order
         // differences in batched ONNX kernels.
         let texts = ["alpha", "beta", "gamma payload"];
-        let refs: Vec<&str> = texts.iter().copied().collect();
+        let refs: Vec<&str> = texts.to_vec();
         let batched = embedder
             .embed_batch(&refs, EmbeddingPurpose::Document)
             .await

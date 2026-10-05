@@ -66,7 +66,11 @@ impl BlobStore {
         self.gc_with_grace(keep, GC_GRACE)
     }
 
-    pub(crate) fn gc_with_grace(&self, keep: &HashSet<String>, grace: std::time::Duration) -> usize {
+    pub(crate) fn gc_with_grace(
+        &self,
+        keep: &HashSet<String>,
+        grace: std::time::Duration,
+    ) -> usize {
         let mut removed = 0;
         let Ok(shards) = std::fs::read_dir(&self.dir) else {
             return 0;
@@ -155,7 +159,11 @@ mod tests {
         assert_eq!(store.put(b"alpha").unwrap(), a, "idempotent");
         assert_eq!(store.get(&a).unwrap(), b"alpha");
         let keep: HashSet<String> = [a.clone()].into_iter().collect();
-        assert_eq!(store.gc(&keep), 0, "fresh blobs are inside the grace window");
+        assert_eq!(
+            store.gc(&keep),
+            0,
+            "fresh blobs are inside the grace window"
+        );
         assert_eq!(store.gc_with_grace(&keep, std::time::Duration::ZERO), 1);
         assert!(store.contains(&a));
         assert!(!store.contains(&b));

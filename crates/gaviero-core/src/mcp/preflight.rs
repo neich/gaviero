@@ -364,9 +364,11 @@ mod tests {
             }],
             None,
         );
-        let mut synth = McpConfigSynth::default();
-        synth.extra_servers = synth_with_extra_url("https://example.com/mcp").extra_servers;
-        synth.codex_trust = TrustConsent::Unknown;
+        let synth = McpConfigSynth {
+            extra_servers: synth_with_extra_url("https://example.com/mcp").extra_servers,
+            codex_trust: TrustConsent::Unknown,
+            ..Default::default()
+        };
         assert!(validate_codex_trust_for_extras(&synth, &plan, "claude:sonnet").is_err());
     }
 

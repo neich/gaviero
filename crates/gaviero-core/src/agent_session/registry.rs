@@ -500,7 +500,7 @@ mod tests {
             false,
         );
 
-        session.send_turn(empty_turn()).await.unwrap();
+        let _ = session.send_turn(empty_turn()).await.unwrap();
 
         let recorded = recording.snapshot();
         assert!(recorded.iter().any(|event| event == "chunk:<think>\n"));
@@ -541,7 +541,7 @@ mod tests {
             true,
         );
 
-        session.send_turn(empty_turn()).await.unwrap();
+        let _ = session.send_turn(empty_turn()).await.unwrap();
 
         let gate = write_gate.lock().await;
         let active = gate.active_proposal_ids();
@@ -573,7 +573,7 @@ mod tests {
             false,
         );
 
-        session.send_turn(empty_turn()).await.unwrap();
+        let _ = session.send_turn(empty_turn()).await.unwrap();
         assert!(write_gate.lock().await.active_proposal_ids().is_empty());
     }
 

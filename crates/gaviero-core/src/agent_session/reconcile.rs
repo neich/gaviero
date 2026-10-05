@@ -360,7 +360,10 @@ mod tests {
         .await;
 
         assert_eq!(outcome.proposed, vec![PathBuf::from("new.rs")]);
-        assert!(!root.join("new.rs").exists(), "created file must be removed");
+        assert!(
+            !root.join("new.rs").exists(),
+            "created file must be removed"
+        );
         let proposals = pending(&gate).await;
         assert_eq!(proposals.len(), 1);
         assert!(proposals[0].original_content.is_empty());
@@ -496,7 +499,10 @@ mod tests {
             root,
             "deepseek",
             None,
-            vec![DirectWrite::new(PathBuf::from("blob.bin"), Some("x".into()))],
+            vec![DirectWrite::new(
+                PathBuf::from("blob.bin"),
+                Some("x".into()),
+            )],
         )
         .await;
 

@@ -349,7 +349,14 @@ impl MemoryStore {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         });
@@ -1019,7 +1026,7 @@ pub(crate) fn hours_since(last_accessed: &Option<String>, updated_at: &str, now:
 fn parse_sqlite_datetime_diff_hours(from: &str, to: &str) -> Option<f64> {
     // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
     let parse = |s: &str| -> Option<i64> {
-        let parts: Vec<&str> = s.split(|c| c == '-' || c == ' ' || c == ':').collect();
+        let parts: Vec<&str> = s.split(['-', ' ', ':']).collect();
         if parts.len() < 6 {
             return None;
         }
@@ -1101,7 +1108,7 @@ pub(crate) fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 }
 
 pub(crate) fn blob_to_embedding(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(blob.len() / 4);
@@ -2005,10 +2012,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut cfg = crate::memory::sleeptime::SleeptimeConfig::default();
-        cfg.dry_run = true;
-        // Use a low threshold so the mock embedder's outputs trip it.
-        cfg.near_dup_threshold = 0.0;
+        let cfg = crate::memory::sleeptime::SleeptimeConfig {
+            dry_run: true,
+            // Use a low threshold so the mock embedder's outputs trip it.
+            near_dup_threshold: 0.0,
+            ..Default::default()
+        };
         let report: crate::memory::SleeptimeReport =
             crate::memory::sleeptime::run_sleeptime(&store, &cfg, None)
                 .await
@@ -3288,7 +3297,7 @@ mod tests {
             std::path::Path::new(&backup).exists(),
             "backup file present"
         );
-        assert!(backup.ends_with(".db") == false);
+        assert!(!backup.ends_with(".db"));
         assert!(backup.contains(".bak."));
     }
 }

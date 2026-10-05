@@ -48,6 +48,7 @@ pub fn compile_ast(
 
 /// Like [`compile_ast`] but accepts additional variable overrides that take
 /// precedence over script-level `vars {}` declarations (but not agent-level vars).
+#[allow(clippy::too_many_arguments)]
 pub fn compile_ast_with_vars(
     script: &Script,
     source: &str,
@@ -375,23 +376,23 @@ pub fn compile_ast_with_sources(
     // ── Phase 4: validate depends_on references ───────────────────
 
     for wu in work_units.iter().chain(loop_judge_units.iter()) {
-        if let Some(decl) = agent_map.get(wu.id.as_str()) {
-            if let Some((deps, _)) = &decl.depends_on {
-                for (dep_name, dep_span) in deps {
-                    if !agent_map.contains_key(dep_name.as_str()) {
-                        compile_errors.push(DslError::Compile {
-                            src: src_for(decl.file_id),
-                            span: (
-                                dep_span.start,
-                                dep_span.end.saturating_sub(dep_span.start).max(1),
-                            )
-                                .into(),
-                            reason: format!(
-                                "agent `{}` depends_on `{}` which is not defined",
-                                wu.id, dep_name
-                            ),
-                        });
-                    }
+        if let Some(decl) = agent_map.get(wu.id.as_str())
+            && let Some((deps, _)) = &decl.depends_on
+        {
+            for (dep_name, dep_span) in deps {
+                if !agent_map.contains_key(dep_name.as_str()) {
+                    compile_errors.push(DslError::Compile {
+                        src: src_for(decl.file_id),
+                        span: (
+                            dep_span.start,
+                            dep_span.end.saturating_sub(dep_span.start).max(1),
+                        )
+                            .into(),
+                        reason: format!(
+                            "agent `{}` depends_on `{}` which is not defined",
+                            wu.id, dep_name
+                        ),
+                    });
                 }
             }
         }
@@ -423,28 +424,27 @@ pub fn compile_ast_with_sources(
     // preceding steps in the workflow `steps [...]` list, so the loop never
     // starts before earlier phases complete. Agent-to-agent steps are left
     // independent (no implicit sequential ordering between bare agent refs).
-    if let Some(wf) = selected_workflow {
-        if let Some((steps, _)) = &wf.steps {
-            let mut preceding: Vec<String> = Vec::new();
-            for step in steps {
-                match step {
-                    StepItem::Agent(name, _) => preceding.push(name.clone()),
-                    StepItem::Loop(lb) => {
-                        let loop_ids: Vec<String> =
-                            lb.agents.iter().map(|(n, _)| n.clone()).collect();
-                        if !preceding.is_empty() {
-                            for wu in work_units.iter_mut() {
-                                if loop_ids.contains(&wu.id) {
-                                    for dep in &preceding {
-                                        if !wu.depends_on.contains(dep) {
-                                            wu.depends_on.push(dep.clone());
-                                        }
+    if let Some(wf) = selected_workflow
+        && let Some((steps, _)) = &wf.steps
+    {
+        let mut preceding: Vec<String> = Vec::new();
+        for step in steps {
+            match step {
+                StepItem::Agent(name, _) => preceding.push(name.clone()),
+                StepItem::Loop(lb) => {
+                    let loop_ids: Vec<String> = lb.agents.iter().map(|(n, _)| n.clone()).collect();
+                    if !preceding.is_empty() {
+                        for wu in work_units.iter_mut() {
+                            if loop_ids.contains(&wu.id) {
+                                for dep in &preceding {
+                                    if !wu.depends_on.contains(dep) {
+                                        wu.depends_on.push(dep.clone());
                                     }
                                 }
                             }
                         }
-                        preceding.extend(loop_ids);
                     }
+                    preceding.extend(loop_ids);
                 }
             }
         }
@@ -495,56 +495,54 @@ pub fn compile_ast_with_sources(
     plan.execution_mode = workflow_execution;
 
     // Pattern sugar → fanout_ops (map_reduce only in v1).
-    if let Some(wf) = selected_workflow {
-        if let Some(pattern) = &wf.pattern {
-            match patterns::expand_fanout_ops(pattern) {
-                Ok(ops) => {
-                    // Soft-check: discover / reduce agents should exist in the plan.
-                    for op in &ops {
-                        if !agent_map.contains_key(op.after_unit.as_str()) {
-                            let span = match pattern {
-                                PatternDecl::MapReduce(mr) => mr.discover.1,
-                            };
+    if let Some(wf) = selected_workflow
+        && let Some(pattern) = &wf.pattern
+    {
+        match patterns::expand_fanout_ops(pattern) {
+            Ok(ops) => {
+                // Soft-check: discover / reduce agents should exist in the plan.
+                for op in &ops {
+                    if !agent_map.contains_key(op.after_unit.as_str()) {
+                        let span = match pattern {
+                            PatternDecl::MapReduce(mr) => mr.discover.1,
+                        };
+                        errors.push(DslError::Compile {
+                            src: src_for(wf.file_id),
+                            span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+                            reason: format!(
+                                "`pattern map_reduce` discover agent `{}` is not defined",
+                                op.after_unit
+                            ),
+                        });
+                    }
+                }
+                match pattern {
+                    PatternDecl::MapReduce(mr) => {
+                        if !mr.reduce.0.is_empty() && !agent_map.contains_key(mr.reduce.0.as_str())
+                        {
                             errors.push(DslError::Compile {
                                 src: src_for(wf.file_id),
-                                span: (span.start, span.end.saturating_sub(span.start).max(1))
+                                span: (
+                                    mr.reduce.1.start,
+                                    mr.reduce.1.end.saturating_sub(mr.reduce.1.start).max(1),
+                                )
                                     .into(),
                                 reason: format!(
-                                    "`pattern map_reduce` discover agent `{}` is not defined",
-                                    op.after_unit
+                                    "`pattern map_reduce` reduce agent `{}` is not defined",
+                                    mr.reduce.0
                                 ),
                             });
                         }
                     }
-                    match pattern {
-                        PatternDecl::MapReduce(mr) => {
-                            if !mr.reduce.0.is_empty()
-                                && !agent_map.contains_key(mr.reduce.0.as_str())
-                            {
-                                errors.push(DslError::Compile {
-                                    src: src_for(wf.file_id),
-                                    span: (
-                                        mr.reduce.1.start,
-                                        mr.reduce.1.end.saturating_sub(mr.reduce.1.start).max(1),
-                                    )
-                                        .into(),
-                                    reason: format!(
-                                        "`pattern map_reduce` reduce agent `{}` is not defined",
-                                        mr.reduce.0
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    plan.fanout_ops = ops;
                 }
-                Err(e) => {
-                    errors.push(DslError::Compile {
-                        src: src_for(wf.file_id),
-                        span: (e.span.start, e.span.end.saturating_sub(e.span.start).max(1)).into(),
-                        reason: e.reason,
-                    });
-                }
+                plan.fanout_ops = ops;
+            }
+            Err(e) => {
+                errors.push(DslError::Compile {
+                    src: src_for(wf.file_id),
+                    span: (e.span.start, e.span.end.saturating_sub(e.span.start).max(1)).into(),
+                    reason: e.reason,
+                });
             }
         }
     }
@@ -865,6 +863,7 @@ fn apply_vars(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
@@ -2300,10 +2299,10 @@ mod tests {
             .into_iter()
             .map(|u| u.id.as_str())
             .collect();
-        assert!(ids.iter().any(|id| *id == "a-init"));
-        assert!(ids.iter().any(|id| *id == "b-init"));
-        assert!(ids.iter().any(|id| *id == "a-refine"));
-        assert!(ids.iter().any(|id| *id == "b-refine"));
+        assert!(ids.contains(&"a-init"));
+        assert!(ids.contains(&"b-init"));
+        assert!(ids.contains(&"a-refine"));
+        assert!(ids.contains(&"b-refine"));
         assert_eq!(
             plan.loop_configs[0].agent_ids,
             ["a-refine".to_string(), "b-refine".to_string()]

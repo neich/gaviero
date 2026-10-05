@@ -7,6 +7,7 @@
 //!   1. pulls    — which gold files it fetched via the tools (from MCP telemetry),
 //!   2. answer   — whether the final answer names the gold files/symbols,
 //!   3. judge    — an LLM PASS/FAIL on whether the answer used the right code.
+//!
 //! Then we compare the anchor arm vs the push arm.
 //!
 //! Safety: `claude` runs in an empty temp cwd with NO file tools (only the 3
@@ -254,14 +255,13 @@ fn append_case_ndjson(path: &Path, cr: &CaseResult) {
             "answer_chars": a.answer_chars,
         })).collect::<Vec<_>>(),
     });
-    if let Ok(line) = serde_json::to_string(&doc) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(line) = serde_json::to_string(&doc)
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            let _ = writeln!(f, "{line}");
-        }
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 

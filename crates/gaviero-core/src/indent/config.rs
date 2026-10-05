@@ -10,6 +10,12 @@ pub struct IndentQueryCache {
     cache: HashMap<String, Option<Arc<tree_sitter::Query>>>,
 }
 
+impl Default for IndentQueryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndentQueryCache {
     pub fn new() -> Self {
         Self {

@@ -9,13 +9,15 @@ use gaviero_core::acp::session::AgentOptions;
 use gaviero_core::agent_session::agent_client_protocol::AcpClientSession;
 use gaviero_core::agent_session::registry::SessionConstruction;
 use gaviero_core::agent_session::{AgentSession, Turn};
-use gaviero_core::context_planner::{PlannerMetadata, ReplayPayload, RuntimeConfig, build_provider_profile};
 use gaviero_core::context_planner::ledger::Role;
 use gaviero_core::context_planner::types::ModelSpec;
+use gaviero_core::context_planner::{
+    PlannerMetadata, ReplayPayload, RuntimeConfig, build_provider_profile,
+};
 use gaviero_core::observer::{AcpObserver, PermissionDecision, WriteGateObserver};
 use gaviero_core::swarm::backend::{
-    CompletionRequest, StopReason, UnifiedStreamEvent, WriteGateHandle, create_backend,
-    BackendConfig,
+    BackendConfig, CompletionRequest, StopReason, UnifiedStreamEvent, WriteGateHandle,
+    create_backend,
 };
 use gaviero_core::types::{FileScope, WriteProposal};
 use gaviero_core::write_gate::{WriteGatePipeline, WriteMode};
@@ -98,7 +100,11 @@ fn fake_bin() -> String {
 fn workspace() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\nversion=\"0.0.0\"\n").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"t\"\nversion=\"0.0.0\"\n",
+    )
+    .unwrap();
     let _ = git2::Repository::init(dir.path());
     dir
 }
@@ -163,7 +169,8 @@ fn commit_all(dir: &Path) {
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
     let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
 }
 
 fn deferred_gate() -> Arc<TokioMutex<WriteGatePipeline>> {
@@ -174,7 +181,6 @@ fn deferred_gate() -> Arc<TokioMutex<WriteGatePipeline>> {
         }),
     )))
 }
-
 
 fn extra(scenario: &str) -> Vec<(String, String)> {
     vec![
@@ -187,19 +193,37 @@ fn extra(scenario: &str) -> Vec<(String, String)> {
 async fn consecutive_turns_reuse_child_and_forward_session_configuration() {
     let dir = workspace();
     let paths = Arc::new(Mutex::new(Vec::new()));
-    let mut args = construction(dir.path(), Box::new(NoopAcp), Box::new(RecWrite { paths }), true);
+    let mut args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite { paths }),
+        true,
+    );
     args.additional_roots = vec![dir.path().join("additional")];
-    let mut session = AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect")).with_system_prompt(Some("Return exactly the requested JSON.".into()));
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("inspect"))
+        .with_system_prompt(Some("Return exactly the requested JSON.".into()));
     for expected in [1, 2] {
         let events = drain(&mut session, true).await;
-        let report = events.iter().find_map(|event| match event {
-            UnifiedStreamEvent::TextDelta(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
-            _ => None,
-        }).expect("fake inspection report");
+        let report = events
+            .iter()
+            .find_map(|event| match event {
+                UnifiedStreamEvent::TextDelta(text) => {
+                    serde_json::from_str::<serde_json::Value>(text).ok()
+                }
+                _ => None,
+            })
+            .expect("fake inspection report");
         assert_eq!(report["turn"], expected);
         assert_eq!(report["model"]["modelId"], "deepseek-v4-flash");
-        assert_eq!(report["new"]["additionalDirectories"][0], dir.path().join("additional").to_string_lossy().as_ref());
-        assert_eq!(report["prompt"][0]["text"], "Return exactly the requested JSON.");
+        assert_eq!(
+            report["new"]["additionalDirectories"][0],
+            dir.path().join("additional").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            report["prompt"][0]["text"],
+            "Return exactly the requested JSON."
+        );
     }
     Box::new(session).close().await;
 }
@@ -280,8 +304,8 @@ async fn session_new_uses_enclosing_cwd_for_sibling_folders() {
         true,
     );
     args.additional_roots = vec![sibling.clone()];
-    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
-        .with_extra(extra("inspect"));
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect"));
     let report = inspect_prompt(&drain(&mut session, true).await);
     let cwd = PathBuf::from(report["new"]["cwd"].as_str().expect("cwd"));
     assert_eq!(
@@ -336,7 +360,9 @@ async fn session_set_config_option_uses_advertised_opaque_model_value() {
     let report = events
         .iter()
         .find_map(|event| match event {
-            UnifiedStreamEvent::TextDelta(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
+            UnifiedStreamEvent::TextDelta(text) => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
             _ => None,
         })
         .expect("fake catalog report");
@@ -349,10 +375,7 @@ async fn session_set_config_option_uses_advertised_opaque_model_value() {
     Box::new(session).close().await;
 }
 
-async fn drain_turn(
-    session: &mut AcpClientSession,
-    turn: Turn,
-) -> Vec<UnifiedStreamEvent> {
+async fn drain_turn(session: &mut AcpClientSession, turn: Turn) -> Vec<UnifiedStreamEvent> {
     let mut stream = session.send_turn(turn).await.expect("send_turn");
     let mut out = Vec::new();
     loop {
@@ -392,8 +415,8 @@ async fn fresh_session_prompt_carries_host_replay_reused_session_does_not() {
         Box::new(RecWrite { paths }),
         true,
     );
-    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
-        .with_extra(extra("inspect"));
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect"));
     let mut first = turn("new question", true);
     first.replay_history = Some(ReplayPayload {
         entries: vec![
@@ -435,10 +458,7 @@ async fn fresh_session_prompt_carries_host_replay_reused_session_does_not() {
         texts.iter().all(|t| !t.contains("old q")),
         "reused ACP session must not restuff host replay: {texts:?}"
     );
-    assert!(
-        texts.iter().any(|t| t.contains("follow up")),
-        "{texts:?}"
-    );
+    assert!(texts.iter().any(|t| t.contains("follow up")), "{texts:?}");
     Box::new(session).close().await;
 }
 
@@ -456,10 +476,7 @@ fn turn(msg: &str, auto_approve: bool) -> Turn {
     }
 }
 
-async fn drain(
-    session: &mut AcpClientSession,
-    auto_approve: bool,
-) -> Vec<UnifiedStreamEvent> {
+async fn drain(session: &mut AcpClientSession, auto_approve: bool) -> Vec<UnifiedStreamEvent> {
     let mut stream = session
         .send_turn(turn("hello", auto_approve))
         .await
@@ -489,9 +506,7 @@ async fn happy_turn_maps_chunks_tools_and_usage() {
     let args = construction(
         dir.path(),
         Box::new(NoopAcp),
-        Box::new(RecWrite {
-            paths: rec.clone(),
-        }),
+        Box::new(RecWrite { paths: rec.clone() }),
         true,
     );
     let mut session = AcpClientSession::new_with_scope(
@@ -510,9 +525,9 @@ async fn happy_turn_maps_chunks_tools_and_usage() {
         "{events:?}"
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, UnifiedStreamEvent::TextDelta(t) if t.contains("hello from fake acp"))),
+        events.iter().any(
+            |e| matches!(e, UnifiedStreamEvent::TextDelta(t) if t.contains("hello from fake acp"))
+        ),
         "{events:?}"
     );
     assert!(
@@ -528,7 +543,10 @@ async fn happy_turn_maps_chunks_tools_and_usage() {
         "{events:?}"
     );
     assert!(
-        matches!(events.last(), Some(UnifiedStreamEvent::Done(StopReason::EndTurn))),
+        matches!(
+            events.last(),
+            Some(UnifiedStreamEvent::Done(StopReason::EndTurn))
+        ),
         "{events:?}"
     );
 }
@@ -540,9 +558,7 @@ async fn write_goes_through_write_gate() {
     let args = construction(
         dir.path(),
         Box::new(NoopAcp),
-        Box::new(RecWrite {
-            paths: rec.clone(),
-        }),
+        Box::new(RecWrite { paths: rec.clone() }),
         true,
     );
     let mut session = AcpClientSession::new_with_scope(
@@ -569,9 +585,7 @@ async fn write_outside_scope_is_refused() {
     let args = construction(
         dir.path(),
         Box::new(NoopAcp),
-        Box::new(RecWrite {
-            paths: rec.clone(),
-        }),
+        Box::new(RecWrite { paths: rec.clone() }),
         true,
     );
     let mut session = AcpClientSession::new_with_scope(
@@ -632,7 +646,10 @@ async fn die_mid_turn_emits_error_and_done() {
         "{events:?}"
     );
     assert!(
-        matches!(events.last(), Some(UnifiedStreamEvent::Done(StopReason::Error))),
+        matches!(
+            events.last(),
+            Some(UnifiedStreamEvent::Done(StopReason::Error))
+        ),
         "{events:?}"
     );
 }
@@ -653,7 +670,10 @@ async fn cancel_token_ends_the_turn() {
         AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("happy"));
     let events = drain(&mut session, true).await;
     assert!(
-        matches!(events.last(), Some(UnifiedStreamEvent::Done(StopReason::Timeout))),
+        matches!(
+            events.last(),
+            Some(UnifiedStreamEvent::Done(StopReason::Timeout))
+        ),
         "{events:?}"
     );
 }
@@ -665,9 +685,7 @@ async fn direct_write_outside_fs_channel_emits_paths_modified() {
     let args = construction(
         dir.path(),
         Box::new(NoopAcp),
-        Box::new(RecWrite {
-            paths: rec.clone(),
-        }),
+        Box::new(RecWrite { paths: rec.clone() }),
         true,
     );
     let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
@@ -724,7 +742,13 @@ async fn direct_writes_become_deferred_proposals() {
     let pending = gate.lock().await.pending_proposals().to_vec();
     let mut names: Vec<String> = pending
         .iter()
-        .map(|p| p.file_path.file_name().unwrap().to_string_lossy().into_owned())
+        .map(|p| {
+            p.file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     assert_eq!(names, vec!["Cargo.toml", "new_file.rs", "obsolete.rs"]);
@@ -840,9 +864,9 @@ async fn dsh_backend_happy_turn_with_fake_agent() {
         }
     }
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, UnifiedStreamEvent::TextDelta(t) if t.contains("hello from fake acp"))),
+        events.iter().any(
+            |e| matches!(e, UnifiedStreamEvent::TextDelta(t) if t.contains("hello from fake acp"))
+        ),
         "{events:?}"
     );
 }

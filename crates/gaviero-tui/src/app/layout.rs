@@ -343,25 +343,25 @@ pub(super) fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
     if let Some(obj) = val.as_object() {
         for k in 1..=9u8 {
             let key = k.to_string();
-            if let Some(arr) = obj.get(&key).and_then(|v| v.as_array()) {
-                if arr.len() >= 3 {
-                    let ft = arr[0].as_u64().unwrap_or(0) as u16;
-                    let ed = arr[1].as_u64().unwrap_or(100) as u16;
-                    let sp = arr[2].as_u64().unwrap_or(0) as u16;
-                    let idx = (k - 1) as usize;
-                    while presets.len() <= idx {
-                        presets.push(LayoutPreset {
-                            file_tree_pct: 0,
-                            editor_pct: 100,
-                            side_panel_pct: 0,
-                        });
-                    }
-                    presets[idx] = LayoutPreset {
-                        file_tree_pct: ft,
-                        editor_pct: ed,
-                        side_panel_pct: sp,
-                    };
+            if let Some(arr) = obj.get(&key).and_then(|v| v.as_array())
+                && arr.len() >= 3
+            {
+                let ft = arr[0].as_u64().unwrap_or(0) as u16;
+                let ed = arr[1].as_u64().unwrap_or(100) as u16;
+                let sp = arr[2].as_u64().unwrap_or(0) as u16;
+                let idx = (k - 1) as usize;
+                while presets.len() <= idx {
+                    presets.push(LayoutPreset {
+                        file_tree_pct: 0,
+                        editor_pct: 100,
+                        side_panel_pct: 0,
+                    });
                 }
+                presets[idx] = LayoutPreset {
+                    file_tree_pct: ft,
+                    editor_pct: ed,
+                    side_panel_pct: sp,
+                };
             }
         }
     }
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(preset.editor_pct, 0);
         assert_eq!(preset.side_panel_pct, 80);
         assert!(preset.file_tree_pct > 0);
-        assert_eq!(preset.editor_pct > 0, false);
+        assert!(!(preset.editor_pct > 0));
         assert!(preset.side_panel_pct > 0);
     }
 

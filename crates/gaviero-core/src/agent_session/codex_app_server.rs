@@ -75,11 +75,11 @@ fn codex_native_edit_capabilities() -> Capabilities {
         max_context_tokens: 200_000,
         supports_system_prompt: true,
         supports_file_blocks: false,
-            retrieval: RetrievalToolset {
-                graph_and_memory: true,
-                symbols: false,
-                exposed: vec![],
-            },
+        retrieval: RetrievalToolset {
+            graph_and_memory: true,
+            symbols: false,
+            exposed: vec![],
+        },
     }
 }
 
@@ -87,8 +87,13 @@ fn codex_native_edit_developer_instructions(cwd: &Path, additional_roots: &[Path
     codex_instructions_with_tools(cwd, additional_roots, None)
 }
 
-fn codex_instructions_with_tools(cwd: &Path, additional_roots: &[PathBuf], exposed: Option<&[String]>) -> String {
-    let mut instructions = default_editor_system_prompt(&codex_native_edit_capabilities().with_exposed_tools(exposed));
+fn codex_instructions_with_tools(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    exposed: Option<&[String]>,
+) -> String {
+    let mut instructions =
+        default_editor_system_prompt(&codex_native_edit_capabilities().with_exposed_tools(exposed));
     instructions.push_str(
         "\n\nFor Codex, `apply_patch` is the native file-edit tool. Use it for all \
          source-file additions, updates, moves, and deletions. Do not write files \
@@ -439,8 +444,7 @@ impl CodexAppServerSession {
         for arg in codex_app_server_args(&self.workspace_root) {
             cmd.arg(arg);
         }
-        cmd.current_dir(&self.workspace_root)
-            .env("NO_COLOR", "1");
+        cmd.current_dir(&self.workspace_root).env("NO_COLOR", "1");
         crate::mcp::apply_codex_http_token(&mut cmd, &self.workspace_root);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -659,6 +663,7 @@ fn render_turn_prompt(turn: Turn) -> String {
     build_enriched_prompt(&prompt_parts.join("\n\n"), &history, &text_refs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handshake(
     stdin: &mut BufWriter<ChildStdin>,
     lines: &mut Lines<BufReader<ChildStdout>>,
@@ -694,7 +699,11 @@ async fn handshake(
         ),
     };
 
-    params["developerInstructions"] = serde_json::json!(codex_instructions_with_tools(cwd, additional_roots, exposed_tools));
+    params["developerInstructions"] = serde_json::json!(codex_instructions_with_tools(
+        cwd,
+        additional_roots,
+        exposed_tools
+    ));
     let request_id = next_id();
     write_msg(stdin, &rpc_request(method, request_id, params)).await?;
     read_thread_id(lines).await
@@ -2119,7 +2128,7 @@ url = "https://example/mcp/"
             .enumerate()
             .filter(|(_, arg)| arg.as_str() == "--config")
             .map(|(index, _)| index)
-            .last()
+            .next_back()
             .expect("config override");
 
         assert!(last_config_index < app_server_index);
@@ -2651,7 +2660,10 @@ url = "https://example/mcp/"
         tokio::fs::write(&changed, "after\n").await.unwrap();
         finalize_native_edits(&review, snapshot).await.unwrap();
 
-        assert_eq!(tokio::fs::read_to_string(&changed).await.unwrap(), "after\n");
+        assert_eq!(
+            tokio::fs::read_to_string(&changed).await.unwrap(),
+            "after\n"
+        );
         assert!(gate.lock().await.pending_proposals().is_empty());
         assert!(gate.lock().await.active_proposal_ids().is_empty());
     }

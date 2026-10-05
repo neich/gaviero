@@ -364,18 +364,18 @@ pub async fn run_sleeptime(
 
     // Step 5 — telemetry retention prune (90-day default).
     let prune_cutoff_days: u32 = 90;
-    if !cfg.dry_run {
-        if let Ok(rows_removed) = store.sleeptime_prune_telemetry(prune_cutoff_days).await {
-            let op = SleeptimeOperation::TelemetryPruned {
-                cutoff_days: prune_cutoff_days,
-                rows_removed,
-            };
-            audit(store, &run_id, &op, cfg.dry_run).await;
-            if let Some(o) = observer {
-                o.on_operation(&op);
-            }
-            report.telemetry_pruned = rows_removed;
+    if !cfg.dry_run
+        && let Ok(rows_removed) = store.sleeptime_prune_telemetry(prune_cutoff_days).await
+    {
+        let op = SleeptimeOperation::TelemetryPruned {
+            cutoff_days: prune_cutoff_days,
+            rows_removed,
+        };
+        audit(store, &run_id, &op, cfg.dry_run).await;
+        if let Some(o) = observer {
+            o.on_operation(&op);
         }
+        report.telemetry_pruned = rows_removed;
     }
 
     // Step 6 — KG node-doc refresh stub (Tier D1).
@@ -386,47 +386,47 @@ pub async fn run_sleeptime(
     // rows; only moves the body from `content` to `content_blob`.
     // Skipped entirely on dry-run (the trigger-disable window must
     // not fire on advisory passes).
-    if !cfg.dry_run && cfg.compress_history_after_days > 0 {
-        if let Ok(ids) = store
+    if !cfg.dry_run
+        && cfg.compress_history_after_days > 0
+        && let Ok(ids) = store
             .list_history_rows_to_compress(
                 cfg.compress_history_after_days,
                 cfg.compress_history_batch,
             )
             .await
-        {
-            for id in ids {
-                let content = match store.read_history_content(id).await {
-                    Ok(Some(s)) => s,
-                    _ => continue,
-                };
-                let original_len = content.len();
-                match store.compress_history_row(id).await {
-                    Ok(true) => {
-                        let compressed_len = store
-                            .history_compressed_blob_len(id)
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or(0);
-                        let op = SleeptimeOperation::HistoryCompressed {
-                            memory_id: id,
-                            original_len,
-                            compressed_len,
-                        };
-                        audit(store, &run_id, &op, false).await;
-                        if let Some(o) = observer {
-                            o.on_operation(&op);
-                        }
-                        report.history_compressed += 1;
+    {
+        for id in ids {
+            let content = match store.read_history_content(id).await {
+                Ok(Some(s)) => s,
+                _ => continue,
+            };
+            let original_len = content.len();
+            match store.compress_history_row(id).await {
+                Ok(true) => {
+                    let compressed_len = store
+                        .history_compressed_blob_len(id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or(0);
+                    let op = SleeptimeOperation::HistoryCompressed {
+                        memory_id: id,
+                        original_len,
+                        compressed_len,
+                    };
+                    audit(store, &run_id, &op, false).await;
+                    if let Some(o) = observer {
+                        o.on_operation(&op);
                     }
-                    Ok(false) => { /* already compressed or not history */ }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "memory_history",
-                            memory_id = id,
-                            error = %e,
-                            "history compression failed; row left uncompressed"
-                        );
-                    }
+                    report.history_compressed += 1;
+                }
+                Ok(false) => { /* already compressed or not history */ }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "memory_history",
+                        memory_id = id,
+                        error = %e,
+                        "history compression failed; row left uncompressed"
+                    );
                 }
             }
         }

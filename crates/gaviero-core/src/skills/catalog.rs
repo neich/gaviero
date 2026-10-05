@@ -179,10 +179,10 @@ impl SkillCatalog {
                 .extra_label_for(skill)
                 .unwrap_or_else(|| "extra".to_string()),
             SCOPE_REPO => {
-                if let Some(root) = repo_root_for_skill(skill) {
-                    if let Some(label) = self.folder_index.get(&root) {
-                        return label.clone();
-                    }
+                if let Some(root) = repo_root_for_skill(skill)
+                    && let Some(label) = self.folder_index.get(&root)
+                {
+                    return label.clone();
                 }
                 "repo".to_string()
             }
@@ -212,17 +212,16 @@ impl SkillCatalog {
 
         let mut ordered: Vec<&Skill> = skills.iter().collect();
 
-        if let Some(repo_id) = active_repo_id {
-            if let Some(active) = ordered
+        if let Some(repo_id) = active_repo_id
+            && let Some(active) = ordered
                 .iter()
                 .find(|s| {
                     s.scope_level == SCOPE_REPO
                         && self.repo_id_for_skill(s).as_deref() == Some(repo_id)
                 })
                 .copied()
-            {
-                return Some(active);
-            }
+        {
+            return Some(active);
         }
 
         ordered.sort_by_key(|s| (s.scope_level, s.source_path.clone()));

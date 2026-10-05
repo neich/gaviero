@@ -145,7 +145,7 @@ pub fn classify(turn_id: &str, prompt: &str) -> PromptDigest {
         }
     }
 
-    hits.sort_by(|a, b| a.1.cmp(&b.1));
+    hits.sort_by_key(|a| a.1);
 
     let mut sections: Vec<Section> = hits
         .into_iter()

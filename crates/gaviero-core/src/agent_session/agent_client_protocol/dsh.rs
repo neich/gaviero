@@ -4,8 +4,8 @@
 //! `dsh --profile acp` from `@deepseek-ai/dsh`.
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -31,9 +31,7 @@ pub struct DshLaunchSpec {
 
 impl DshLaunchSpec {
     pub fn from_workspace_root(root: &Path, extra: &[(String, String)]) -> Self {
-        if let Some((_, cmd)) = extra
-            .iter()
-            .find(|(k, _)| k == DSH_COMMAND_OVERRIDE_KEY)
+        if let Some((_, cmd)) = extra.iter().find(|(k, _)| k == DSH_COMMAND_OVERRIDE_KEY)
             && !cmd.trim().is_empty()
         {
             return Self {
@@ -108,10 +106,9 @@ impl DshLaunchSpec {
         if !self.skip_api_key {
             let cfg = ApiClientConfig::resolve_deepseek(workspace_root, None, None).with_context(
                 || {
-                    format!(
-                        "dsh: missing DeepSeek API key (set DEEPSEEK_API_KEY or \
+                    "dsh: missing DeepSeek API key (set DEEPSEEK_API_KEY or \
                          .gaviero/secrets.toml [deepseek] api_key)"
-                    )
+                        .to_string()
                 },
             )?;
             cmd.env("DEEPSEEK_API_KEY", cfg.api_key.expose());
@@ -124,7 +121,9 @@ impl DshLaunchSpec {
 
 fn args_already_set_profile(args: &[String]) -> bool {
     args.windows(2).any(|w| w[0] == "--profile")
-        || args.iter().any(|a| a == "--profile" || a.starts_with("--profile="))
+        || args
+            .iter()
+            .any(|a| a == "--profile" || a.starts_with("--profile="))
 }
 
 fn is_fake_agent(command: &str) -> bool {
@@ -160,7 +159,7 @@ pub fn probe_version(command: &str) -> Option<String> {
     {
         return Some(v.clone());
     }
-    let output = std::process::Command::from(crate::util::spawn::agent_command_std(command))
+    let output = crate::util::spawn::agent_command_std(command)
         .arg("--version")
         .output()
         .ok()?;
@@ -329,7 +328,10 @@ mod tests {
         assert_eq!(spec.command, "dsh");
         assert_eq!(spec.profile, "acp");
         assert!(spec.args.is_empty());
-        assert!(args_already_set_profile(&["--profile".into(), "acp".into()]));
+        assert!(args_already_set_profile(&[
+            "--profile".into(),
+            "acp".into()
+        ]));
         assert!(!args_already_set_profile(&[]));
     }
 

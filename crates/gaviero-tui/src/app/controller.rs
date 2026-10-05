@@ -76,46 +76,44 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 super::session::handle_settings_error_key(app, &key);
                 return;
             }
-            if app.focus == Focus::Terminal && !app.has_active_review() {
-                if let Some(inst) = app.terminal_manager.active_instance() {
-                    if inst.spawned {
-                        use crate::panels::terminal::{is_terminal_escape_key, key_event_to_bytes};
+            if app.focus == Focus::Terminal
+                && !app.has_active_review()
+                && let Some(inst) = app.terminal_manager.active_instance()
+                && inst.spawned
+            {
+                use crate::panels::terminal::{is_terminal_escape_key, key_event_to_bytes};
 
-                        // Intercept Ctrl+C when a terminal selection is active: copy instead of sending ^C.
-                        let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
-                            && key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL);
-                        if is_ctrl_c && app.terminal_selection.has_selection() {
-                            let text =
-                                if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                                    app.terminal_selection.extract_text(inst.screen_mut())
-                                } else {
-                                    None
-                                };
-                            if let Some(text) = text {
-                                app.set_clipboard(&text);
-                            }
-                            app.terminal_selection.clear();
-                            return;
-                        }
+                // Intercept Ctrl+C when a terminal selection is active: copy instead of sending ^C.
+                let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL);
+                if is_ctrl_c && app.terminal_selection.has_selection() {
+                    let text = if let Some(inst) = app.terminal_manager.active_instance_mut() {
+                        app.terminal_selection.extract_text(inst.screen_mut())
+                    } else {
+                        None
+                    };
+                    if let Some(text) = text {
+                        app.set_clipboard(&text);
+                    }
+                    app.terminal_selection.clear();
+                    return;
+                }
 
-                        if is_terminal_escape_key(&key) {
-                            let action = Keymap::resolve(&key);
-                            app.handle_action(action);
-                        } else {
-                            let bytes =
-                                key_event_to_bytes(&key, inst.screen().application_cursor());
-                            if !bytes.is_empty() {
-                                app.terminal_selection.clear();
-                                let inst = app.terminal_manager.active_instance_mut().unwrap();
-                                inst.screen_mut().set_scrollback(0);
-                                inst.write_input(&bytes);
-                            }
-                        }
-                        return;
+                if is_terminal_escape_key(&key) {
+                    let action = Keymap::resolve(&key);
+                    app.handle_action(action);
+                } else {
+                    let bytes = key_event_to_bytes(&key, inst.screen().application_cursor());
+                    if !bytes.is_empty() {
+                        app.terminal_selection.clear();
+                        let inst = app.terminal_manager.active_instance_mut().unwrap();
+                        inst.screen_mut().set_scrollback(0);
+                        inst.write_input(&bytes);
                     }
                 }
+                return;
             }
 
             if app.codex_trust_dialog.is_some() {
@@ -230,17 +228,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             // Terminal delivered a paste — cancel the Windows Ctrl+V image fallback.
             app.clear_windows_ctrl_v_pending();
-            if app.focus == Focus::Terminal {
-                if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                    if inst.spawned {
-                        let bytes = crate::panels::terminal::paste_bytes(
-                            inst.screen().bracketed_paste(),
-                            &text,
-                        );
-                        inst.write_input(&bytes);
-                        return;
-                    }
-                }
+            if app.focus == Focus::Terminal
+                && let Some(inst) = app.terminal_manager.active_instance_mut()
+                && inst.spawned
+            {
+                let bytes =
+                    crate::panels::terminal::paste_bytes(inst.screen().bracketed_paste(), &text);
+                inst.write_input(&bytes);
+                return;
             }
             app.handle_paste(&text);
         }
@@ -671,18 +666,18 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             }
         }
-        Event::MemoryWriteEnqueued { kind: _ } => {
+        Event::MemoryWriteEnqueued => {
             // Count only; the committed callback drives the refresh.
             app.memory_panel.write_activity_counter =
                 app.memory_panel.write_activity_counter.wrapping_add(1);
         }
-        Event::MemoryWriteCommitted { kind: _ } => {
+        Event::MemoryWriteCommitted => {
             // Debounce bootstrap + extractor-burst storms.
             let now = std::time::Instant::now();
-            if let Some(prev) = app.memory_panel.last_recent_refresh {
-                if now.duration_since(prev) < crate::panels::memory_panel::RECENT_REFRESH_DEBOUNCE {
-                    return;
-                }
+            if let Some(prev) = app.memory_panel.last_recent_refresh
+                && now.duration_since(prev) < crate::panels::memory_panel::RECENT_REFRESH_DEBOUNCE
+            {
+                return;
             }
             app.memory_panel.last_recent_refresh = Some(now);
             // C1.5: Section 2 query honors the active kind tab so the
@@ -734,18 +729,15 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 std::time::Instant::now(),
             ));
         }
-        Event::MemoryManifestPersisted {
-            turn_id,
-            session_id: _,
-        } => {
+        Event::MemoryManifestPersisted { turn_id } => {
             // Re-fetch the full row by turn_id.
             if let Some(mem) = app.memory.clone() {
                 let tx = app.event_tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(rows) = mem.workspace().manifests_for_turn(&turn_id).await {
-                        if let Some(row) = rows.into_iter().next() {
-                            let _ = tx.send(Event::MemoryManifestReady { row });
-                        }
+                    if let Ok(rows) = mem.workspace().manifests_for_turn(&turn_id).await
+                        && let Some(row) = rows.into_iter().next()
+                    {
+                        let _ = tx.send(Event::MemoryManifestReady { row });
                     }
                 });
             }
@@ -864,7 +856,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.conversations[idx].last_turn_cost_usd = cost_usd;
             }
         }
-        Event::ToolAgentEditsPending { conv_id: _, paths } => {
+        Event::ToolAgentEditsPending { paths } => {
             // The turn's files are already on disk. Sync the editor to them as
             // one set; nothing here offers to take an individual file back.
             // `paths` is the full set the turn wrote, so this is the one place
@@ -1451,8 +1443,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
                             _ => gaviero_core::mcp::TrustConsent::Unknown,
                         };
-                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-                        overrides.codex_trust = Some(codex_trust);
+                        let overrides = gaviero_core::mcp::McpConfigOverrides {
+                            codex_trust: Some(codex_trust),
+                            ..Default::default()
+                        };
                         let mut synth = gaviero_core::mcp::resolve_mcp_config_synth(
                             &app.workspace,
                             &workspace_root_for_mcp,
@@ -1914,22 +1908,19 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
     }
 
-    if app.focus == Focus::Terminal {
-        if let Action::Paste = action {
-            let text = app.get_clipboard();
-            if !text.is_empty() {
-                if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                    if inst.spawned {
-                        let bytes = crate::panels::terminal::paste_bytes(
-                            inst.screen().bracketed_paste(),
-                            &text,
-                        );
-                        inst.write_input(&bytes);
-                    }
-                }
-            }
-            return;
+    if app.focus == Focus::Terminal
+        && let Action::Paste = action
+    {
+        let text = app.get_clipboard();
+        if !text.is_empty()
+            && let Some(inst) = app.terminal_manager.active_instance_mut()
+            && inst.spawned
+        {
+            let bytes =
+                crate::panels::terminal::paste_bytes(inst.screen().bracketed_paste(), &text);
+            inst.write_input(&bytes);
         }
+        return;
     }
 
     if app.focus == Focus::SidePanel {
@@ -2011,15 +2002,15 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             }
         }
         Action::CloseTerminal => {
-            if app.focus == Focus::Terminal {
-                if let Some(id) = app.terminal_manager.active_tab() {
-                    if app.terminal_manager.tab_count() > 1 {
-                        app.terminal_manager.close_tab(id);
-                    } else {
-                        app.terminal_manager.close_tab(id);
-                        app.panel_visible.terminal = false;
-                        app.focus = Focus::Editor;
-                    }
+            if app.focus == Focus::Terminal
+                && let Some(id) = app.terminal_manager.active_tab()
+            {
+                if app.terminal_manager.tab_count() > 1 {
+                    app.terminal_manager.close_tab(id);
+                } else {
+                    app.terminal_manager.close_tab(id);
+                    app.panel_visible.terminal = false;
+                    app.focus = Focus::Editor;
                 }
             }
         }
@@ -2218,7 +2209,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.find_bar_active = true;
             app.find_input.select_all();
             app.focus = Focus::Editor;
-            return;
         }
         Action::SearchInWorkspace => {
             if app.find_bar_active {
@@ -2229,7 +2219,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 return;
             }
             app.search_selected_in_workspace();
-            return;
         }
         _ if app.focus == Focus::FileTree => match app.left_panel {
             LeftPanelMode::FileTree => app.handle_file_tree_action(action),

@@ -93,10 +93,11 @@ pub async fn run_turn(
 
     let modified_paths = snapshot.lock().await.touched_paths();
     let failed = outcome.error.is_some() || cancel.is_cancelled();
-    if failed && !modified_paths.is_empty() {
-        if let Err(e) = snapshot.lock().await.revert_all().await {
-            tracing::warn!("swarm tool-agent revert on error/cancel failed: {e:#}");
-        }
+    if failed
+        && !modified_paths.is_empty()
+        && let Err(e) = snapshot.lock().await.revert_all().await
+    {
+        tracing::warn!("swarm tool-agent revert on error/cancel failed: {e:#}");
     }
 
     SwarmTurnOutcome {

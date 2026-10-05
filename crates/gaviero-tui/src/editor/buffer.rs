@@ -12,21 +12,11 @@ use super::fold::{FoldMap, FoldMarker, HiddenLines};
 use super::markdown::MarkdownPreviewMode;
 use super::wrap::{VisualSegment, char_display_width};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Cursor {
     pub line: usize,                    // 0-indexed line in rope
     pub col: usize,                     // 0-indexed grapheme offset within line
     pub anchor: Option<(usize, usize)>, // Selection start (line, col), None if no selection
-}
-
-impl Default for Cursor {
-    fn default() -> Self {
-        Self {
-            line: 0,
-            col: 0,
-            anchor: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -259,13 +249,13 @@ impl Buffer {
         {
             return true;
         }
-        if self.text.to_string() == disk_content {
+        if self.text == disk_content {
             return true;
         }
-        if let Some(wrote_at) = self.last_self_write {
-            if wrote_at.elapsed() < std::time::Duration::from_secs(2) {
-                return true;
-            }
+        if let Some(wrote_at) = self.last_self_write
+            && wrote_at.elapsed() < std::time::Duration::from_secs(2)
+        {
+            return true;
         }
         false
     }
@@ -529,7 +519,7 @@ impl Buffer {
         self.cursor = transaction.cursor_before.clone();
         self.redo_stack.push(Transaction {
             changes: transaction.changes,
-            cursor_before: cursor_before,
+            cursor_before,
         });
         self.reparse();
         self.invalidate_folds();
@@ -562,7 +552,7 @@ impl Buffer {
         self.cursor = transaction.cursor_before.clone();
         self.undo_stack.push(Transaction {
             changes: transaction.changes,
-            cursor_before: cursor_before,
+            cursor_before,
         });
         self.reparse();
         self.invalidate_folds();
@@ -1588,15 +1578,11 @@ impl Buffer {
 
     /// Normal (1): One field per line, short lists inline, everything else expanded.
     fn format_normal(&mut self, lang: &str, content: &str) -> String {
-        match lang {
-            "json" => {
-                if let Some(formatted) =
-                    format_json_smart(content, &self.indent_unit, JsonCompactness::Normal)
-                {
-                    return self.apply_formatted(content, &formatted, "normal");
-                }
-            }
-            _ => {}
+        if lang == "json"
+            && let Some(formatted) =
+                format_json_smart(content, &self.indent_unit, JsonCompactness::Normal)
+        {
+            return self.apply_formatted(content, &formatted, "normal");
         }
         let expanded = expand_single_line_constructs(content, ExpandMode::All);
         let split = self.split_fields_in_blocks(&expanded);
@@ -1653,23 +1639,22 @@ impl Buffer {
     /// Parse content with tree-sitter and insert newlines between sibling
     /// fields within block nodes that share a line.
     fn split_fields_in_blocks(&mut self, content: &str) -> String {
-        if let Some(parser) = &mut self.parser {
-            if let Some(tree) = parser.parse(content, None) {
-                return split_block_fields(content, &tree);
-            }
+        if let Some(parser) = &mut self.parser
+            && let Some(tree) = parser.parse(content, None)
+        {
+            return split_block_fields(content, &tree);
         }
         content.to_string()
     }
 
     /// Parse the text with tree-sitter and reindent, falling back to bracket counting.
     fn reindent_and_apply(&mut self, original: &str, text: &str, method: &str) -> String {
-        if let Some(parser) = &mut self.parser {
-            if let Some(new_tree) = parser.parse(text, None) {
-                if let Some(query) = &self.indent_query {
-                    let reindented = treesitter_reindent(text, &new_tree, query, &self.indent_unit);
-                    return self.apply_formatted(original, &reindented, method);
-                }
-            }
+        if let Some(parser) = &mut self.parser
+            && let Some(new_tree) = parser.parse(text, None)
+            && let Some(query) = &self.indent_query
+        {
+            let reindented = treesitter_reindent(text, &new_tree, query, &self.indent_unit);
+            return self.apply_formatted(original, &reindented, method);
         }
         let reindented = gaviero_core::indent::bracket::reindent_document(text, &self.indent_unit);
         self.apply_formatted(original, &reindented, method)
@@ -2007,10 +1992,10 @@ impl Buffer {
                 result.push('\n');
                 if line.trim().is_empty() {
                     // Blank line — just add newline
-                } else if line.starts_with(paste_base_indent) {
+                } else if let Some(rest) = line.strip_prefix(paste_base_indent) {
                     // Replace the pasted base indent with target indent
                     result.push_str(&target_indent);
-                    result.push_str(&line[paste_base_indent.len()..]);
+                    result.push_str(rest);
                 } else {
                     // Line has less indent than base — insert as-is
                     result.push_str(line);
@@ -2230,7 +2215,7 @@ impl Buffer {
                     .text
                     .line(line)
                     .as_str()
-                    .map_or(false, |s| s.ends_with('\n'))
+                    .is_some_and(|s| s.ends_with('\n'))
             {
                 line_chars - 1
             } else {
@@ -2666,10 +2651,10 @@ fn collect_field_boundaries(node: gaviero_core::Node, splits: &mut Vec<usize>) {
         for i in 0..count {
             if let Some(child) = node.named_child(i) {
                 let start_row = child.start_position().row;
-                if let Some(prev_row) = prev_end_row {
-                    if start_row == prev_row {
-                        splits.push(child.start_byte());
-                    }
+                if let Some(prev_row) = prev_end_row
+                    && start_row == prev_row
+                {
+                    splits.push(child.start_byte());
                 }
                 prev_end_row = Some(child.end_position().row);
             }
@@ -2826,8 +2811,8 @@ fn expand_single_line_constructs(content: &str, mode: ExpandMode) -> String {
 
 /// Check if there is non-whitespace content between position `start` and the next newline.
 fn has_content_before_eol(chars: &[char], start: usize) -> bool {
-    for j in start..chars.len() {
-        match chars[j] {
+    for &c in chars.iter().skip(start) {
+        match c {
             '\n' => return false,
             c if c.is_whitespace() => continue,
             _ => return true,
@@ -2934,8 +2919,8 @@ fn find_collapsible_block(
     let mut depth = 1i32;
     let mut inner_parts: Vec<String> = Vec::new();
 
-    for j in (start_line + 1)..lines.len() {
-        let trimmed = lines[j].trim();
+    for (j, line) in lines.iter().enumerate().skip(start_line + 1) {
+        let trimmed = line.trim();
 
         if trimmed.is_empty() {
             continue;
@@ -3052,7 +3037,7 @@ fn json_write_value(
                     // and the result would be short
                     let all_simple = arr.iter().all(|v| !v.is_object() && !v.is_array());
                     let est_len: usize =
-                        arr.iter().map(|v| estimate_json_len(v)).sum::<usize>() + arr.len() * 2 + 2;
+                        arr.iter().map(estimate_json_len).sum::<usize>() + arr.len() * 2 + 2;
                     all_simple && est_len <= 80
                 }
                 JsonCompactness::Expanded => false,
@@ -3178,10 +3163,10 @@ fn format_toml(content: &str) -> Option<String> {
 fn atomic_write_to_path(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let tmp = save_temp_sibling_path(path);
@@ -3223,10 +3208,10 @@ mod tests {
     use super::*;
 
     fn collect_numbers(node: gaviero_core::Node, source: &[u8], out: &mut Vec<String>) {
-        if node.kind() == "number" {
-            if let Ok(s) = std::str::from_utf8(&source[node.start_byte()..node.end_byte()]) {
-                out.push(s.to_string());
-            }
+        if node.kind() == "number"
+            && let Ok(s) = std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
+        {
+            out.push(s.to_string());
         }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {

@@ -12,10 +12,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, interval, timeout};
 
 use super::AppState;
+use crate::close_code;
 use crate::dto::ClientHello;
 use crate::envelope::{ClientDecode, ClientEnvelope, ClientFrame, decode_client_frame};
 use crate::version::PROTOCOL_VERSION;
-use crate::close_code;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,13 +42,18 @@ pub(crate) struct Registration {
 
 #[derive(Debug)]
 pub(crate) enum ConnIn {
-    Command { conn_id: u64, envelope: Box<ClientEnvelope> },
+    Command {
+        conn_id: u64,
+        envelope: Box<ClientEnvelope>,
+    },
     UnknownCommand {
         conn_id: u64,
         frame_type: String,
         command_id: Option<String>,
     },
-    Closed { conn_id: u64 },
+    Closed {
+        conn_id: u64,
+    },
 }
 
 enum HelloOutcome {
@@ -69,7 +74,10 @@ pub(crate) async fn run(mut socket: WebSocket, state: AppState) {
         Err(_) => {
             let _ = send_close(
                 &mut socket,
-                CloseSignal { code: close_code::PROTOCOL_ERROR, reason: "client_hello timeout" },
+                CloseSignal {
+                    code: close_code::PROTOCOL_ERROR,
+                    reason: "client_hello timeout",
+                },
             )
             .await;
             return;
@@ -77,10 +85,16 @@ pub(crate) async fn run(mut socket: WebSocket, state: AppState) {
     };
 
     // Wrong major closes 4002 *before* registration, so it cannot evict.
-    if PROTOCOL_VERSION.check_compatible(&hello.protocol_version).is_err() {
+    if PROTOCOL_VERSION
+        .check_compatible(&hello.protocol_version)
+        .is_err()
+    {
         let _ = send_close(
             &mut socket,
-            CloseSignal { code: close_code::UNSUPPORTED_VERSION, reason: "unsupported protocol major" },
+            CloseSignal {
+                code: close_code::UNSUPPORTED_VERSION,
+                reason: "unsupported protocol major",
+            },
         )
         .await;
         return;
@@ -93,7 +107,12 @@ pub(crate) async fn run(mut socket: WebSocket, state: AppState) {
     let (close_tx, mut close_rx) = watch::channel::<Option<CloseSignal>>(None);
     if state
         .registration_tx
-        .send(Registration { conn_id, client_hello: hello, outbound_tx, close_tx })
+        .send(Registration {
+            conn_id,
+            client_hello: hello,
+            outbound_tx,
+            close_tx,
+        })
         .await
         .is_err()
     {
@@ -199,21 +218,37 @@ pub(crate) async fn run(mut socket: WebSocket, state: AppState) {
 /// signal for protocol violations.
 async fn handle_text(conn_id: u64, text: &str, state: &AppState) -> Option<CloseSignal> {
     if text.len() > state.max_frame_bytes {
-        return Some(CloseSignal { code: close_code::FRAME_TOO_LARGE, reason: "frame too large" });
+        return Some(CloseSignal {
+            code: close_code::FRAME_TOO_LARGE,
+            reason: "frame too large",
+        });
     }
     match decode_client_frame(text) {
         Ok(ClientDecode::Frame(envelope)) => {
-            let _ = state.inbound_tx.send(ConnIn::Command { conn_id, envelope }).await;
-            None
-        }
-        Ok(ClientDecode::UnknownType { frame_type, command_id }) => {
             let _ = state
                 .inbound_tx
-                .send(ConnIn::UnknownCommand { conn_id, frame_type, command_id })
+                .send(ConnIn::Command { conn_id, envelope })
                 .await;
             None
         }
-        Err(_) => Some(CloseSignal { code: close_code::PROTOCOL_ERROR, reason: "malformed frame" }),
+        Ok(ClientDecode::UnknownType {
+            frame_type,
+            command_id,
+        }) => {
+            let _ = state
+                .inbound_tx
+                .send(ConnIn::UnknownCommand {
+                    conn_id,
+                    frame_type,
+                    command_id,
+                })
+                .await;
+            None
+        }
+        Err(_) => Some(CloseSignal {
+            code: close_code::PROTOCOL_ERROR,
+            reason: "malformed frame",
+        }),
     }
 }
 
@@ -255,7 +290,10 @@ async fn read_client_hello(socket: &mut WebSocket, state: &AppState) -> HelloOut
 
 async fn send_close(socket: &mut WebSocket, sig: CloseSignal) -> Result<(), axum::Error> {
     let sent = socket
-        .send(Message::Close(Some(CloseFrame { code: sig.code, reason: sig.reason.into() })))
+        .send(Message::Close(Some(CloseFrame {
+            code: sig.code,
+            reason: sig.reason.into(),
+        })))
         .await;
     // Same RST-avoidance drain as the main loop's exit path.
     let _ = timeout(Duration::from_millis(250), async {

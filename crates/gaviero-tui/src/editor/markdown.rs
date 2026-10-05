@@ -134,15 +134,16 @@ pub fn highlight_markdown(
                 // Closing fence — emit span if it overlaps visible range
                 in_code_block = false;
                 let block_end = line_end;
-                if block_end >= byte_range.start && code_block_start < byte_range.end {
-                    if let Some(style) = theme.highlight_style("markup.code.block") {
-                        spans.push(StyledSpan {
-                            priority: 0,
-                            start_byte: code_block_start,
-                            end_byte: block_end,
-                            style,
-                        });
-                    }
+                if block_end >= byte_range.start
+                    && code_block_start < byte_range.end
+                    && let Some(style) = theme.highlight_style("markup.code.block")
+                {
+                    spans.push(StyledSpan {
+                        priority: 0,
+                        start_byte: code_block_start,
+                        end_byte: block_end,
+                        style,
+                    });
                 }
             } else {
                 in_code_block = true;
@@ -157,15 +158,17 @@ pub fn highlight_markdown(
     }
 
     // Handle unclosed code block
-    if in_code_block && len >= byte_range.start && code_block_start < byte_range.end {
-        if let Some(style) = theme.highlight_style("markup.code.block") {
-            spans.push(StyledSpan {
-                priority: 0,
-                start_byte: code_block_start,
-                end_byte: len,
-                style,
-            });
-        }
+    if in_code_block
+        && len >= byte_range.start
+        && code_block_start < byte_range.end
+        && let Some(style) = theme.highlight_style("markup.code.block")
+    {
+        spans.push(StyledSpan {
+            priority: 0,
+            start_byte: code_block_start,
+            end_byte: len,
+            style,
+        });
     }
 
     spans.sort_by_key(|s| s.start_byte);
@@ -189,7 +192,7 @@ fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut
         if hashes <= 6
             && trimmed
                 .get(hashes..hashes + 1)
-                .map_or(true, |c| c == " " || c.is_empty())
+                .is_none_or(|c| c == " " || c.is_empty())
         {
             if let Some(style) = theme.highlight_style("markup.heading") {
                 spans.push(StyledSpan {
@@ -245,19 +248,20 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
 
     while i < len {
         // Inline code: `...`
-        if bytes[i] == b'`' && !matches!(bytes.get(i + 1), Some(b'`')) {
-            if let Some(end) = find_closing(line, i + 1, b'`') {
-                if let Some(style) = theme.highlight_style("markup.code") {
-                    spans.push(StyledSpan {
-                        priority: 0,
-                        start_byte: offset + i,
-                        end_byte: offset + end + 1,
-                        style,
-                    });
-                }
-                i = end + 1;
-                continue;
+        if bytes[i] == b'`'
+            && !matches!(bytes.get(i + 1), Some(b'`'))
+            && let Some(end) = find_closing(line, i + 1, b'`')
+        {
+            if let Some(style) = theme.highlight_style("markup.code") {
+                spans.push(StyledSpan {
+                    priority: 0,
+                    start_byte: offset + i,
+                    end_byte: offset + end + 1,
+                    style,
+                });
             }
+            i = end + 1;
+            continue;
         }
 
         // Bold: **...** or __...__
@@ -300,31 +304,30 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
         }
 
         // Links: [text](url)
-        if bytes[i] == b'[' {
-            if let Some(bracket_end) = find_closing(line, i + 1, b']') {
-                if bracket_end + 1 < len && bytes[bracket_end + 1] == b'(' {
-                    if let Some(paren_end) = find_closing(line, bracket_end + 2, b')') {
-                        if let Some(style) = theme.highlight_style("markup.link") {
-                            spans.push(StyledSpan {
-                                priority: 0,
-                                start_byte: offset + i,
-                                end_byte: offset + bracket_end + 1,
-                                style,
-                            });
-                        }
-                        if let Some(style) = theme.highlight_style("markup.link.url") {
-                            spans.push(StyledSpan {
-                                priority: 0,
-                                start_byte: offset + bracket_end + 1,
-                                end_byte: offset + paren_end + 1,
-                                style,
-                            });
-                        }
-                        i = paren_end + 1;
-                        continue;
-                    }
-                }
+        if bytes[i] == b'['
+            && let Some(bracket_end) = find_closing(line, i + 1, b']')
+            && bracket_end + 1 < len
+            && bytes[bracket_end + 1] == b'('
+            && let Some(paren_end) = find_closing(line, bracket_end + 2, b')')
+        {
+            if let Some(style) = theme.highlight_style("markup.link") {
+                spans.push(StyledSpan {
+                    priority: 0,
+                    start_byte: offset + i,
+                    end_byte: offset + bracket_end + 1,
+                    style,
+                });
             }
+            if let Some(style) = theme.highlight_style("markup.link.url") {
+                spans.push(StyledSpan {
+                    priority: 0,
+                    start_byte: offset + bracket_end + 1,
+                    end_byte: offset + paren_end + 1,
+                    style,
+                });
+            }
+            i = paren_end + 1;
+            continue;
         }
 
         i += 1;
@@ -333,22 +336,12 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
 
 pub(crate) fn find_closing(line: &str, start: usize, marker: u8) -> Option<usize> {
     let bytes = line.as_bytes();
-    for i in start..bytes.len() {
-        if bytes[i] == marker && (i == 0 || bytes[i - 1] != b'\\') {
-            return Some(i);
-        }
-    }
-    None
+    (start..bytes.len()).find(|&i| bytes[i] == marker && (i == 0 || bytes[i - 1] != b'\\'))
 }
 
 pub(crate) fn find_double_closing(line: &str, start: usize, marker: u8) -> Option<usize> {
     let bytes = line.as_bytes();
-    for i in start..bytes.len().saturating_sub(1) {
-        if bytes[i] == marker && bytes[i + 1] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..bytes.len().saturating_sub(1)).find(|&i| bytes[i] == marker && bytes[i + 1] == marker)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,76 +368,78 @@ pub(crate) fn parse_inline(text: &str) -> Vec<TextSegment> {
 
     while i < len {
         // Inline code
-        if bytes[i] == b'`' {
-            if let Some(end) = find_closing(text, i + 1, b'`') {
-                flush_plain(&mut current, &mut segments);
-                segments.push(TextSegment {
-                    text: text[i + 1..end].to_string(),
-                    kind: SegmentKind::Code,
-                });
-                i = end + 1;
-                continue;
-            }
+        if bytes[i] == b'`'
+            && let Some(end) = find_closing(text, i + 1, b'`')
+        {
+            flush_plain(&mut current, &mut segments);
+            segments.push(TextSegment {
+                text: text[i + 1..end].to_string(),
+                kind: SegmentKind::Code,
+            });
+            i = end + 1;
+            continue;
         }
 
         // Bold
-        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            if let Some(end) = find_double_closing(text, i + 2, b'*') {
-                flush_plain(&mut current, &mut segments);
-                segments.push(TextSegment {
-                    text: text[i + 2..end].to_string(),
-                    kind: SegmentKind::Bold,
-                });
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < len
+            && bytes[i] == b'*'
+            && bytes[i + 1] == b'*'
+            && let Some(end) = find_double_closing(text, i + 2, b'*')
+        {
+            flush_plain(&mut current, &mut segments);
+            segments.push(TextSegment {
+                text: text[i + 2..end].to_string(),
+                kind: SegmentKind::Bold,
+            });
+            i = end + 2;
+            continue;
         }
 
         // Italic
-        if bytes[i] == b'*' && !matches!(bytes.get(i + 1), Some(b'*')) {
-            if let Some(end) = find_closing(text, i + 1, b'*') {
-                flush_plain(&mut current, &mut segments);
-                segments.push(TextSegment {
-                    text: text[i + 1..end].to_string(),
-                    kind: SegmentKind::Italic,
-                });
-                i = end + 1;
-                continue;
-            }
+        if bytes[i] == b'*'
+            && !matches!(bytes.get(i + 1), Some(b'*'))
+            && let Some(end) = find_closing(text, i + 1, b'*')
+        {
+            flush_plain(&mut current, &mut segments);
+            segments.push(TextSegment {
+                text: text[i + 1..end].to_string(),
+                kind: SegmentKind::Italic,
+            });
+            i = end + 1;
+            continue;
         }
 
         // Links: [text](url)
-        if bytes[i] == b'[' {
-            if let Some(bracket_end) = find_closing(text, i + 1, b']') {
-                if bracket_end + 1 < len && bytes[bracket_end + 1] == b'(' {
-                    if let Some(paren_end) = find_closing(text, bracket_end + 2, b')') {
-                        flush_plain(&mut current, &mut segments);
-                        let link_text = text[i + 1..bracket_end].to_string();
-                        let url = text[bracket_end + 2..paren_end].to_string();
-                        segments.push(TextSegment {
-                            text: link_text,
-                            kind: SegmentKind::Link(url),
-                        });
-                        i = paren_end + 1;
-                        continue;
-                    }
-                }
-            }
+        if bytes[i] == b'['
+            && let Some(bracket_end) = find_closing(text, i + 1, b']')
+            && bracket_end + 1 < len
+            && bytes[bracket_end + 1] == b'('
+            && let Some(paren_end) = find_closing(text, bracket_end + 2, b')')
+        {
+            flush_plain(&mut current, &mut segments);
+            let link_text = text[i + 1..bracket_end].to_string();
+            let url = text[bracket_end + 2..paren_end].to_string();
+            segments.push(TextSegment {
+                text: link_text,
+                kind: SegmentKind::Link(url),
+            });
+            i = paren_end + 1;
+            continue;
         }
 
         // Autolinks: <https://…>, <http://…>, <mailto:…>
-        if bytes[i] == b'<' {
-            if let Some(end) = find_closing(text, i + 1, b'>') {
-                let inner = &text[i + 1..end];
-                if is_autolink_url(inner) {
-                    flush_plain(&mut current, &mut segments);
-                    segments.push(TextSegment {
-                        text: inner.to_string(),
-                        kind: SegmentKind::Link(inner.to_string()),
-                    });
-                    i = end + 1;
-                    continue;
-                }
+        if bytes[i] == b'<'
+            && let Some(end) = find_closing(text, i + 1, b'>')
+        {
+            let inner = &text[i + 1..end];
+            if is_autolink_url(inner) {
+                flush_plain(&mut current, &mut segments);
+                segments.push(TextSegment {
+                    text: inner.to_string(),
+                    kind: SegmentKind::Link(inner.to_string()),
+                });
+                i = end + 1;
+                continue;
             }
         }
 

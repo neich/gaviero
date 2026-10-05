@@ -641,6 +641,18 @@ impl MemoryStore {
     pub async fn update_memory_text(&self, memory_id: i64, new_text: &str) -> Result<i64> {
         // Read the row's scope + meta so we can reinsert at the same
         // position. Outside the write lock.
+        type MetaRow = (
+            i32,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            f32,
+            f32,
+            String,
+            Option<String>,
+        );
         let (
             scope_level,
             scope_path,
@@ -652,18 +664,7 @@ impl MemoryStore {
             trust_score,
             source_str,
             tag,
-        ): (
-            i32,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            f32,
-            f32,
-            String,
-            Option<String>,
-        ) = {
+        ): MetaRow = {
             let conn = self.conn.lock().await;
             conn.query_row(
                 "SELECT scope_level, scope_path, repo_id, module_path, run_id,

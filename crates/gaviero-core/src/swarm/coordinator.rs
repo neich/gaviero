@@ -488,10 +488,10 @@ async fn run_coordinator_request(
 
 fn extract_run_id(prompt: &str) -> Option<String> {
     for word in prompt.split_whitespace() {
-        if let Some(id) = word.strip_prefix("run:") {
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
+        if let Some(id) = word.strip_prefix("run:")
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
         }
     }
     None
@@ -565,7 +565,7 @@ fn parse_task_dag_lenient(json_str: &str) -> Result<TaskDAG> {
     // dependency_graph — optional, extract from units.depends_on if not present
     let dependency_graph = obj
         .get("dependency_graph")
-        .and_then(|v| parse_dep_graph(v))
+        .and_then(parse_dep_graph)
         .unwrap_or_default();
 
     Ok(TaskDAG {
@@ -782,18 +782,18 @@ fn parse_dep_graph(v: &serde_json::Value) -> Option<Vec<(String, String)>> {
     let mut edges = Vec::new();
     for item in arr {
         if let Some(pair) = item.as_array() {
-            if pair.len() >= 2 {
-                if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
-                    edges.push((a.to_string(), b.to_string()));
-                }
+            if pair.len() >= 2
+                && let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str())
+            {
+                edges.push((a.to_string(), b.to_string()));
             }
-        } else if let Some(obj) = item.as_object() {
-            if let (Some(from), Some(to)) = (
+        } else if let Some(obj) = item.as_object()
+            && let (Some(from), Some(to)) = (
                 obj.get("from").and_then(|v| v.as_str()),
                 obj.get("to").and_then(|v| v.as_str()),
-            ) {
-                edges.push((from.to_string(), to.to_string()));
-            }
+            )
+        {
+            edges.push((from.to_string(), to.to_string()));
         }
     }
     Some(edges)
@@ -803,10 +803,10 @@ fn parse_dep_graph(v: &serde_json::Value) -> Option<Vec<(String, String)>> {
 
 fn get_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(v) = obj.get(*key) {
-            if let Some(s) = v.as_str() {
-                return Some(s.to_string());
-            }
+        if let Some(v) = obj.get(*key)
+            && let Some(s) = v.as_str()
+        {
+            return Some(s.to_string());
         }
     }
     None

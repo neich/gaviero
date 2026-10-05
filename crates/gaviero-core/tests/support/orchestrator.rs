@@ -99,7 +99,7 @@ pub async fn run_parallel(
         );
     }
     let mut handles = Vec::with_capacity(scripts.len());
-    for (script, ctx) in scripts.into_iter().zip(contexts.into_iter()) {
+    for (script, ctx) in scripts.into_iter().zip(contexts) {
         handles.push(tokio::spawn(async move { run_script(script, ctx).await }));
     }
     let mut reports = Vec::with_capacity(handles.len());
@@ -117,10 +117,9 @@ async fn run_script(script: ScriptedSession, ctx: ParallelContext) -> Result<Ses
         records: Vec::new(),
     };
     let mut resume_session_id: Option<String> = None;
-    let mut step_idx: usize = 0;
     let mut turn_counter: u32 = 0;
 
-    for step in script.steps.into_iter() {
+    for (step_idx, step) in script.steps.into_iter().enumerate() {
         match step {
             Step::User(prompt) => {
                 turn_counter += 1;
@@ -176,18 +175,17 @@ async fn run_script(script: ScriptedSession, ctx: ParallelContext) -> Result<Ses
                     .into_iter()
                     .rev()
                     .find(|e| e.turn_id.starts_with(&format!("{session_label}/")));
-                if let Some(ev) = last_ev {
-                    if ev.prompt.len() > max_bytes {
-                        anyhow::bail!(
-                            "session {session_label} step {step_idx}: prompt {} B exceeds max {} B",
-                            ev.prompt.len(),
-                            max_bytes
-                        );
-                    }
+                if let Some(ev) = last_ev
+                    && ev.prompt.len() > max_bytes
+                {
+                    anyhow::bail!(
+                        "session {session_label} step {step_idx}: prompt {} B exceeds max {} B",
+                        ev.prompt.len(),
+                        max_bytes
+                    );
                 }
             }
         }
-        step_idx += 1;
     }
 
     Ok(report)

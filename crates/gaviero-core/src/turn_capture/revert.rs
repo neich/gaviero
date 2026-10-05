@@ -16,9 +16,9 @@ use anyhow::{Context, Result};
 use crate::diff_engine::compute_hunks;
 use crate::types::DiffHunk;
 
+use super::TurnCapture;
 use super::changeset::FileChange;
 use super::store::{atomic_write, hash_file};
-use super::TurnCapture;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevertOutcome {
@@ -185,8 +185,14 @@ mod tests {
         let hunks = compute_hunks(before, after);
         assert_eq!(hunks.len(), 2, "{hunks:?}");
         assert_eq!(splice(after, &hunks, &[]), after);
-        assert_eq!(splice(after, &hunks, &[0]), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nK\nl");
-        assert_eq!(splice(after, &hunks, &[1]), "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n");
+        assert_eq!(
+            splice(after, &hunks, &[0]),
+            "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nK\nl"
+        );
+        assert_eq!(
+            splice(after, &hunks, &[1]),
+            "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"
+        );
         assert_eq!(splice(after, &hunks, &[0, 1]), before);
     }
 }

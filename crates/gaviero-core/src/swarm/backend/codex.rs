@@ -100,7 +100,8 @@ impl AgentBackend for CodexBackend {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
         let system_prompt = request.system_prompt.clone().unwrap_or_else(|| {
             default_editor_system_prompt(
-                &self.capabilities()
+                &self
+                    .capabilities()
                     .with_exposed_tools(request.exposed_tools.as_deref()),
             )
         });
@@ -136,13 +137,13 @@ impl AgentBackend for CodexBackend {
             .env("NO_COLOR", "1");
         crate::mcp::apply_codex_http_token(&mut cmd, &request.workspace_root);
         cmd.stdin(if use_stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
         let prompt_len = combined_prompt.len();
         let mut child = cmd.spawn().map_err(|e| {
@@ -1378,8 +1379,7 @@ url = "https://example/mcp/"
 
     #[test]
     fn test_format_exit_error_with_stderr() {
-        let err: std::io::Result<std::process::ExitStatus> =
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "bad"));
+        let err: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::other("bad"));
         let msg = format_exit_error(&err, "auth failure\n");
         assert!(msg.contains("bad"));
         assert!(msg.contains("auth failure"));

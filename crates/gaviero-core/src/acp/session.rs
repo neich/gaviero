@@ -330,6 +330,7 @@ impl AcpSession {
     /// swarm worktrees.
     // M6: reads `options.resume_session_id` (deprecated); allow stays until M10.
     #[allow(deprecated)]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         model: &str,
         cwd: &Path,
@@ -684,10 +685,7 @@ impl AcpSession {
     /// Check if the subprocess has already exited (non-blocking).
     /// Returns `true` if the process has exited, `false` if still running.
     pub fn try_wait_exited(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(Some(_)) => true,
-            _ => false,
-        }
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     /// Close the subprocess stdin. A stream-json-input CLI waits for another
@@ -902,7 +900,11 @@ mod tests {
             AgentToolSurface::resolve_available(None),
             DEFAULT_AVAILABLE_TOOLS
         );
-        assert!(!AgentToolSurface::resolve_available(None).iter().any(|t| t == "Bash"));
+        assert!(
+            !AgentToolSurface::resolve_available(None)
+                .iter()
+                .any(|t| t == "Bash")
+        );
         assert!(AgentToolSurface::resolve_available(Some(Vec::new())).is_empty());
     }
 
@@ -1104,7 +1106,12 @@ mod tests {
     #[test]
     fn host_capture_approves_available_edit_tools_but_not_bash() {
         let opts = AgentOptions {
-            available_tools: Some(vec!["Read".into(), "Write".into(), "Edit".into(), "Bash".into()]),
+            available_tools: Some(vec![
+                "Read".into(),
+                "Write".into(),
+                "Edit".into(),
+                "Bash".into(),
+            ]),
             approved_tools: Some(vec!["Read".into()]),
             host_capture: true,
             ..AgentOptions::default()

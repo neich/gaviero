@@ -375,14 +375,14 @@ fn collect_rust_references(node: tree_sitter::Node, source: &[u8], out: &mut Vec
         // `impl Trait for Type { ... }`
         "impl_item" => {
             // Look for trait name in `impl <trait> for <type>`
-            if let Some(trait_node) = node.child_by_field_name("trait") {
-                if let Ok(trait_name) = trait_node.utf8_text(source) {
-                    out.push(RawReference {
-                        target_name: trait_name.to_string(),
-                        kind: RefKind::Implements,
-                        line: node.start_position().row,
-                    });
-                }
+            if let Some(trait_node) = node.child_by_field_name("trait")
+                && let Ok(trait_name) = trait_node.utf8_text(source)
+            {
+                out.push(RawReference {
+                    target_name: trait_name.to_string(),
+                    kind: RefKind::Implements,
+                    line: node.start_position().row,
+                });
             }
         }
 
@@ -606,7 +606,7 @@ pub fn is_test_file(file_path: &str) -> bool {
     // Directory-aware: a path component literally named `tests`, `test`,
     // `__tests__`, or `spec` (any path separator) makes this a test path.
     file_path
-        .split(|c| c == '/' || c == '\\')
+        .split(['/', '\\'])
         .any(|seg| matches!(seg, "tests" | "test" | "__tests__" | "spec"))
 }
 

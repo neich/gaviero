@@ -1401,6 +1401,7 @@ fn pick_recommended_graph_budget(rows: &[GraphBudgetSweepRow]) -> usize {
 }
 
 /// Run the full S1.3 sweep and assemble recommendations.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_s13_budget_sweep(
     store: &Arc<MemoryStore>,
     scope_ctx: &MemoryScope,

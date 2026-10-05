@@ -434,7 +434,10 @@ mod tests {
         for line in &lines[..6] {
             c.observe(&parse_stream_line(line).unwrap());
         }
-        assert!(!c.is_launch_ack("tu_x"), "refused launch is no longer an ack");
+        assert!(
+            !c.is_launch_ack("tu_x"),
+            "refused launch is no longer an ack"
+        );
         assert!(c.is_launch_ack("tu_a"));
     }
 

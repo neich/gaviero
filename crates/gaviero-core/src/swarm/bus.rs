@@ -23,6 +23,12 @@ pub struct AgentBus {
     inboxes: HashMap<String, mpsc::UnboundedSender<BusMessage>>,
 }
 
+impl Default for AgentBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentBus {
     pub fn new() -> Self {
         const BUS_CHANNEL_CAPACITY: usize = 256;

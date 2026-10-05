@@ -189,18 +189,18 @@ impl MemoryStores {
         let mut seen = std::collections::HashSet::new();
 
         let global_path = super::global_db_path()?;
-        if let Some(p) = super::store::probe_c1_migration(&global_path)? {
-            if seen.insert(p.db_path.clone()) {
-                out.push(p);
-            }
+        if let Some(p) = super::store::probe_c1_migration(&global_path)?
+            && seen.insert(p.db_path.clone())
+        {
+            out.push(p);
         }
 
         let workspace_path = workspace_root.join(".gaviero/memory.db");
         let workspace_canonical = canonicalize(workspace_root);
-        if let Some(p) = super::store::probe_c1_migration(&workspace_path)? {
-            if seen.insert(p.db_path.clone()) {
-                out.push(p);
-            }
+        if let Some(p) = super::store::probe_c1_migration(&workspace_path)?
+            && seen.insert(p.db_path.clone())
+        {
+            out.push(p);
         }
 
         for folder in workspace.folders() {
@@ -210,10 +210,10 @@ impl MemoryStores {
                 continue;
             }
             let folder_db = canonical.join(".gaviero/memory.db");
-            if let Some(p) = super::store::probe_c1_migration(&folder_db)? {
-                if seen.insert(p.db_path.clone()) {
-                    out.push(p);
-                }
+            if let Some(p) = super::store::probe_c1_migration(&folder_db)?
+                && seen.insert(p.db_path.clone())
+            {
+                out.push(p);
             }
         }
 
@@ -661,7 +661,7 @@ fn migrate_one_folder(workspace_db: &Path, folder_db: &Path, repo_id: &str) -> R
     let folder = Connection::open(folder_db).context("open folder DB")?;
 
     // Collect rows to migrate.
-    let rows: Vec<(
+    type LegacyRow = (
         i64,             // id
         String,          // namespace
         String,          // key
@@ -680,7 +680,8 @@ fn migrate_one_folder(workspace_db: &Path, folder_db: &Path, repo_id: &str) -> R
         String,          // privacy
         String,          // source
         f32,             // trust_score
-    )> = {
+    );
+    let rows: Vec<LegacyRow> = {
         let mut stmt = ws.prepare(
             "SELECT id, namespace, key, content, embedding, model_id,
                     scope_level, scope_path, module_path, run_id,

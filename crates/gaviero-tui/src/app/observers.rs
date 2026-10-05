@@ -202,7 +202,6 @@ impl AcpObserver for TuiAcpObserver {
 
     fn on_tool_agent_edits(&self, paths: &[std::path::PathBuf]) {
         let _ = self.tx.send(Event::ToolAgentEditsPending {
-            conv_id: self.conv_id.clone(),
             paths: paths.to_vec(),
         });
     }
@@ -217,15 +216,11 @@ pub(super) struct TuiMemoryObserver {
 }
 
 impl gaviero_core::memory::MemoryObserver for TuiMemoryObserver {
-    fn on_write_enqueued(&self, kind: &str) {
-        let _ = self.tx.send(Event::MemoryWriteEnqueued {
-            kind: kind.to_string(),
-        });
+    fn on_write_enqueued(&self, _kind: &str) {
+        let _ = self.tx.send(Event::MemoryWriteEnqueued);
     }
-    fn on_write_committed(&self, kind: &str, _result: &gaviero_core::memory::WriteResult) {
-        let _ = self.tx.send(Event::MemoryWriteCommitted {
-            kind: kind.to_string(),
-        });
+    fn on_write_committed(&self, _kind: &str, _result: &gaviero_core::memory::WriteResult) {
+        let _ = self.tx.send(Event::MemoryWriteCommitted);
     }
     fn on_write_failed(&self, kind: &str, error: &str) {
         let _ = self.tx.send(Event::MemoryWriteFailed {
@@ -243,10 +238,9 @@ pub(super) struct TuiManifestObserver {
 }
 
 impl gaviero_core::memory::observer::ManifestObserver for TuiManifestObserver {
-    fn on_manifest_persisted(&self, turn_id: &str, session_id: &str) {
+    fn on_manifest_persisted(&self, turn_id: &str, _session_id: &str) {
         let _ = self.tx.send(Event::MemoryManifestPersisted {
             turn_id: turn_id.to_string(),
-            session_id: session_id.to_string(),
         });
     }
 }

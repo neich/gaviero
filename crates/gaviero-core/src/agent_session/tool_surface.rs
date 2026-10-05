@@ -91,7 +91,11 @@ impl AgentToolSurface {
         if let Some(approved) = options.approved_tools.as_ref() {
             policy.approved_tools = approved.clone();
         }
-        Self::from_parts(options.available_tools.clone(), policy, options.auto_approve)
+        Self::from_parts(
+            options.available_tools.clone(),
+            policy,
+            options.auto_approve,
+        )
     }
 
     /// Assemble from already-resolved parts.
@@ -277,7 +281,10 @@ mod tests {
         let s = surface(None, &[], &[], &[]);
         assert_eq!(s.available(), default_available_tools());
         assert!(!s.bash_available(), "unset must not grant shell access");
-        assert!(s.write_available(), "the default surface keeps the write tools");
+        assert!(
+            s.write_available(),
+            "the default surface keeps the write tools"
+        );
         assert_eq!(
             s.decide_command("git status"),
             CommandDecision::Deny,

@@ -48,12 +48,13 @@ pub fn substitute(
 
             if body[token_start..].starts_with("ARGUMENTS") {
                 let after = token_start + "ARGUMENTS".len();
-                if after < len && bytes[after] == b'[' {
-                    if let Some((idx, end)) = parse_bracket_index(&body[after..]) {
-                        push_arg(&mut out, args, idx);
-                        i = after + end;
-                        continue;
-                    }
+                if after < len
+                    && bytes[after] == b'['
+                    && let Some((idx, end)) = parse_bracket_index(&body[after..])
+                {
+                    push_arg(&mut out, args, idx);
+                    i = after + end;
+                    continue;
                 }
                 saw_bare_arguments = true;
                 out.push_str(raw_arguments);

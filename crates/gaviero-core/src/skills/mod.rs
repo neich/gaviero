@@ -96,10 +96,10 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| warn("missing or empty description"))?;
 
-    if let Some(declared) = fm_map.get("name") {
-        if declared != stem {
-            return Err(warn("frontmatter name does not match folder name"));
-        }
+    if let Some(declared) = fm_map.get("name")
+        && declared != stem
+    {
+        return Err(warn("frontmatter name does not match folder name"));
     }
 
     let arguments = fm_map

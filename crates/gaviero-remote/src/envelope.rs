@@ -422,7 +422,9 @@ pub enum ServerDecode {
     Frame(Box<ServerEnvelope>),
     /// A frame type this version does not know. Ignore it (log a warning);
     /// this is how minor-version additions stay compatible.
-    UnknownType { frame_type: String },
+    UnknownType {
+        frame_type: String,
+    },
 }
 
 /// Result of decoding a frame received *by the server*.

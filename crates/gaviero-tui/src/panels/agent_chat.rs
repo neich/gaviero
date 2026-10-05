@@ -527,8 +527,9 @@ impl std::fmt::Debug for PendingPermission {
 /// * `Force` — reserved for callers that always want the transcript in;
 ///   not wired up today, but the explicit variant keeps the semantics
 ///   readable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TranscriptInlineMode {
+    #[default]
     Auto,
     Suppress,
     /// Reserved variant: callers that want to *guarantee* transcript
@@ -538,12 +539,6 @@ pub enum TranscriptInlineMode {
     /// is a one-line change rather than a refactor.
     #[allow(dead_code)]
     Force,
-}
-
-impl Default for TranscriptInlineMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// One conversation (tab) in the chat panel.
@@ -1565,7 +1560,7 @@ impl AgentChatState {
             &estimate_ctx.hints,
         );
         let model = self.effective_model();
-        let hidden = hidden_provider_overhead_tokens(&model);
+        let hidden = hidden_provider_overhead_tokens(model);
         let composite = bootstrap_total.saturating_add(hidden);
 
         let mut msg = format!(
@@ -1902,11 +1897,9 @@ impl AgentChatState {
                     let prefix = u.prefix_tokens() as usize;
                     let total =
                         u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens;
-                    let cache_hit_pct = if total > 0 {
-                        (u.cache_read_input_tokens * 100 / total) as usize
-                    } else {
-                        0
-                    };
+                    let cache_hit_pct = (u.cache_read_input_tokens * 100)
+                        .checked_div(total)
+                        .map_or(0, |pct| pct as usize);
                     msg.push_str(&format!(
                         "\n\nProvider usage (last turn):\n  prefix: {} | output: {}\n  \
                          input: {} | cache_creation: {} | cache_read: {} | cache hit: {}%",
@@ -2279,11 +2272,9 @@ impl AgentChatState {
             (composite, ContextBarSource::CompositeEstimate)
         };
 
-        let pct = if limit > 0 {
-            (tokens * 100 / limit).min(100)
-        } else {
-            0
-        };
+        let pct = (tokens * 100)
+            .checked_div(limit)
+            .map_or(0, |pct| pct.min(100));
 
         ContextPressure {
             tokens,
@@ -2931,10 +2922,11 @@ impl AgentChatState {
         cursor_char_pos: usize,
     ) -> (usize, usize) {
         for (i, &(start, len)) in lines.iter().enumerate() {
-            if cursor_char_pos >= start && cursor_char_pos <= start + len {
-                if cursor_char_pos < start + len || i == lines.len() - 1 {
-                    return (i, cursor_char_pos - start);
-                }
+            if cursor_char_pos >= start
+                && cursor_char_pos <= start + len
+                && (cursor_char_pos < start + len || i == lines.len() - 1)
+            {
+                return (i, cursor_char_pos - start);
             }
             if i + 1 < lines.len() && cursor_char_pos == lines[i + 1].0 {
                 return (i + 1, 0);
@@ -3336,15 +3328,15 @@ impl AgentChatState {
         let before_cursor = &text[..byte_pos];
 
         // ── /model <provider:model> completion ───────────────────────────
-        if let Some(rest) = before_cursor.strip_prefix("/model ") {
-            if !rest.contains('\n') {
-                self.autocomplete.active = true;
-                self.autocomplete.mode = AutocompleteMode::ModelSpec;
-                self.autocomplete.at_pos = "/model ".len();
-                self.autocomplete.query = rest.to_string();
-                self.autocomplete.selected = 0;
-                return;
-            }
+        if let Some(rest) = before_cursor.strip_prefix("/model ")
+            && !rest.contains('\n')
+        {
+            self.autocomplete.active = true;
+            self.autocomplete.mode = AutocompleteMode::ModelSpec;
+            self.autocomplete.at_pos = "/model ".len();
+            self.autocomplete.query = rest.to_string();
+            self.autocomplete.selected = 0;
+            return;
         }
 
         // ── /attach <path> completion ────────────────────────────────────
@@ -3367,15 +3359,15 @@ impl AgentChatState {
         }
 
         // ── /detach <name|all> completion ────────────────────────────────
-        if let Some(rest) = before_cursor.strip_prefix("/detach ") {
-            if !rest.contains('\n') {
-                self.autocomplete.active = true;
-                self.autocomplete.mode = AutocompleteMode::DetachName;
-                self.autocomplete.at_pos = "/detach ".len();
-                self.autocomplete.query = rest.to_string();
-                self.autocomplete.selected = 0;
-                return;
-            }
+        if let Some(rest) = before_cursor.strip_prefix("/detach ")
+            && !rest.contains('\n')
+        {
+            self.autocomplete.active = true;
+            self.autocomplete.mode = AutocompleteMode::DetachName;
+            self.autocomplete.at_pos = "/detach ".len();
+            self.autocomplete.query = rest.to_string();
+            self.autocomplete.selected = 0;
+            return;
         }
 
         // ── $skill invocation completion ────────────────────────────────
@@ -3631,10 +3623,10 @@ impl AgentChatState {
             matches.push("all".to_string());
         }
         for a in &self.attachments {
-            if q.is_empty() || a.display_name.to_lowercase().contains(&q) {
-                if !matches.iter().any(|m| m == &a.display_name) {
-                    matches.push(a.display_name.clone());
-                }
+            if (q.is_empty() || a.display_name.to_lowercase().contains(&q))
+                && !matches.iter().any(|m| m == &a.display_name)
+            {
+                matches.push(a.display_name.clone());
             }
         }
         self.autocomplete.matches = matches;
@@ -3706,14 +3698,14 @@ impl AgentChatState {
         self.conversations[idx].streaming_status = "Writing...".to_string();
         let clean = crate::widgets::render_utils::strip_ansi(text);
         let conv = &mut self.conversations[idx];
-        if let Some(last) = conv.messages.last_mut() {
-            if last.role == ChatRole::Assistant {
-                last.content.push_str(&clean);
-                if idx == self.active_conv {
-                    self.auto_scroll_during_stream();
-                }
-                return;
+        if let Some(last) = conv.messages.last_mut()
+            && last.role == ChatRole::Assistant
+        {
+            last.content.push_str(&clean);
+            if idx == self.active_conv {
+                self.auto_scroll_during_stream();
             }
+            return;
         }
         conv.push_message(ChatRole::Assistant, clean, Vec::new());
         if idx == self.active_conv {
@@ -3730,12 +3722,12 @@ impl AgentChatState {
         // Inline tool call markers into the message content so they appear
         // in chronological order alongside text (not grouped at the end).
         let marker = format!("\n[{}]", tool_name);
-        if let Some(last) = conv.messages.last_mut() {
-            if last.role == ChatRole::Assistant {
-                last.content.push_str(&marker);
-                last.tool_calls.push(tool_name.to_string());
-                return;
-            }
+        if let Some(last) = conv.messages.last_mut()
+            && last.role == ChatRole::Assistant
+        {
+            last.content.push_str(&marker);
+            last.tool_calls.push(tool_name.to_string());
+            return;
         }
         conv.push_message(ChatRole::Assistant, marker, vec![tool_name.to_string()]);
     }
@@ -3801,14 +3793,14 @@ impl AgentChatState {
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         let summary = format!("\n[wrote {} +{} -{}]", rel, additions, deletions);
         let conv = &mut self.conversations[idx];
-        if let Some(last) = conv.messages.last_mut() {
-            if last.role == ChatRole::Assistant {
-                last.content.push_str(&summary);
-                if idx == self.active_conv {
-                    self.auto_scroll_during_stream();
-                }
-                return;
+        if let Some(last) = conv.messages.last_mut()
+            && last.role == ChatRole::Assistant
+        {
+            last.content.push_str(&summary);
+            if idx == self.active_conv {
+                self.auto_scroll_during_stream();
             }
+            return;
         }
         // No assistant message yet — create one with just the summary
         conv.push_message(ChatRole::Assistant, summary, Vec::new());
@@ -3869,20 +3861,20 @@ impl AgentChatState {
             return;
         }
 
-        if let Some(last) = msgs.last_mut() {
-            if last.role == chat_role {
-                if !clean.is_empty() {
-                    last.content = clean.clone();
-                }
-                self.conversations[idx].is_streaming = false;
-                self.conversations[idx].streaming_status.clear();
-                self.conversations[idx].streaming_started_at = None;
-                self.conversations[idx].background_agents.clear();
-                if idx == self.active_conv {
-                    self.scroll_to_bottom();
-                }
-                return;
+        if let Some(last) = msgs.last_mut()
+            && last.role == chat_role
+        {
+            if !clean.is_empty() {
+                last.content = clean.clone();
             }
+            self.conversations[idx].is_streaming = false;
+            self.conversations[idx].streaming_status.clear();
+            self.conversations[idx].streaming_started_at = None;
+            self.conversations[idx].background_agents.clear();
+            if idx == self.active_conv {
+                self.scroll_to_bottom();
+            }
+            return;
         }
 
         if !clean.is_empty() {
@@ -3904,10 +3896,11 @@ impl AgentChatState {
             return;
         };
         let msgs = &mut self.conversations[idx].messages;
-        if let Some(last) = msgs.last_mut() {
-            if last.role == ChatRole::Assistant && last.content.contains("<file path=\"") {
-                last.content = collapse_file_blocks(&last.content);
-            }
+        if let Some(last) = msgs.last_mut()
+            && last.role == ChatRole::Assistant
+            && last.content.contains("<file path=\"")
+        {
+            last.content = collapse_file_blocks(&last.content);
         }
     }
 
@@ -4028,10 +4021,10 @@ impl AgentChatState {
         }
 
         // Set active conversation
-        if let Some(ref active_id) = index.active_id {
-            if let Some(idx) = self.conversations.iter().position(|c| c.id == *active_id) {
-                self.active_conv = idx;
-            }
+        if let Some(ref active_id) = index.active_id
+            && let Some(idx) = self.conversations.iter().position(|c| c.id == *active_id)
+        {
+            self.active_conv = idx;
         }
 
         // Splice back anything the previous session failed to save. Runs
@@ -4883,7 +4876,7 @@ impl AgentChatState {
                             && y < buf.area().bottom()
                         {
                             let ch_style =
-                                if sel_range.map_or(false, |(s, e)| ch_idx >= s && ch_idx < e) {
+                                if sel_range.is_some_and(|(s, e)| ch_idx >= s && ch_idx < e) {
                                     Style::default().fg(fg).bg(theme::SELECTION_BG)
                                 } else {
                                     style
@@ -5128,10 +5121,10 @@ fn normalize_model_spec(arg: &str) -> String {
     // Already provider-prefixed but invalid (e.g. `deepseek:deepseek-v4`) —
     // return verbatim so validation surfaces the real error instead of
     // rewriting to `claude:deepseek:…`.
-    if let Some((prefix, _)) = trimmed.split_once(':') {
-        if gaviero_core::swarm::backend::shared::SUPPORTED_PROVIDER_PREFIXES.contains(&prefix) {
-            return trimmed.to_string();
-        }
+    if let Some((prefix, _)) = trimmed.split_once(':')
+        && gaviero_core::swarm::backend::shared::SUPPORTED_PROVIDER_PREFIXES.contains(&prefix)
+    {
+        return trimmed.to_string();
     }
     // Back-compat aliases for the legacy bare/dashed shorthand.
     let canonical = match trimmed {
@@ -5506,7 +5499,7 @@ mod tests {
                 "arguments: [{}]\n",
                 arguments
                     .iter()
-                    .map(|a| format!("{a}"))
+                    .map(|a| a.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             )

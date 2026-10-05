@@ -305,40 +305,40 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
 ///
 /// Returns `Ok(())` if valid, or an error message if the combination is invalid.
 pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
-    if unit.privacy == PrivacyLevel::LocalOnly {
-        if let Some(ref model) = unit.model {
-            // Only local models are acceptable for LocalOnly units.
-            // Claude, Codex, and Cursor are all API-backed and therefore not allowed.
-            if shared::is_codex_model(model) {
-                return Err(format!(
-                    "unit '{}': LocalOnly privacy with Codex API model override '{}'",
-                    unit.id, model
-                ));
-            }
-            if shared::is_cursor_model(model) {
-                return Err(format!(
-                    "unit '{}': LocalOnly privacy with Cursor API model override '{}'",
-                    unit.id, model
-                ));
-            }
-            if shared::is_deepseek_model(model) {
-                return Err(format!(
-                    "unit '{}': LocalOnly privacy with DeepSeek API model override '{}'",
-                    unit.id, model
-                ));
-            }
-            if shared::is_dsh_model(model) {
-                return Err(format!(
-                    "unit '{}': LocalOnly privacy with dsh API model override '{}'",
-                    unit.id, model
-                ));
-            }
-            if !shared::is_ollama_model(model) && !model.contains("qwen") {
-                return Err(format!(
-                    "unit '{}': LocalOnly privacy with API model override '{}'",
-                    unit.id, model
-                ));
-            }
+    if unit.privacy == PrivacyLevel::LocalOnly
+        && let Some(ref model) = unit.model
+    {
+        // Only local models are acceptable for LocalOnly units.
+        // Claude, Codex, and Cursor are all API-backed and therefore not allowed.
+        if shared::is_codex_model(model) {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with Codex API model override '{}'",
+                unit.id, model
+            ));
+        }
+        if shared::is_cursor_model(model) {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with Cursor API model override '{}'",
+                unit.id, model
+            ));
+        }
+        if shared::is_deepseek_model(model) {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with DeepSeek API model override '{}'",
+                unit.id, model
+            ));
+        }
+        if shared::is_dsh_model(model) {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with dsh API model override '{}'",
+                unit.id, model
+            ));
+        }
+        if !shared::is_ollama_model(model) && !model.contains("qwen") {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with API model override '{}'",
+                unit.id, model
+            ));
         }
     }
     Ok(())
@@ -559,8 +559,10 @@ mod tests {
 
     #[test]
     fn test_cheap_tier_routes_to_deepseek_when_configured() {
-        let mut config = TierConfig::default();
-        config.cheap_model = "deepseek:deepseek-v4-pro".into();
+        let config = TierConfig {
+            cheap_model: "deepseek:deepseek-v4-pro".into(),
+            ..Default::default()
+        };
         let router = TierRouter::new(config, false);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert_eq!(

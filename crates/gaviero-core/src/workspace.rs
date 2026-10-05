@@ -544,10 +544,10 @@ impl Workspace {
     /// `<primary-root>/.gaviero/remote`; multi-folder:
     /// `<workspace-file-parent>/.gaviero/remote`.
     pub fn remote_state_dir(&self) -> Option<PathBuf> {
-        if self.folders.len() > 1 {
-            if let Some(ws_path) = &self.workspace_path {
-                return ws_path.parent().map(|p| p.join(".gaviero").join("remote"));
-            }
+        if self.folders.len() > 1
+            && let Some(ws_path) = &self.workspace_path
+        {
+            return ws_path.parent().map(|p| p.join(".gaviero").join("remote"));
         }
         self.roots()
             .first()
@@ -844,7 +844,7 @@ impl Workspace {
             root.join(".gaviero").join("settings.json")
         };
         let gaviero_dir = path.parent().unwrap();
-        std::fs::create_dir_all(&gaviero_dir)
+        std::fs::create_dir_all(gaviero_dir)
             .with_context(|| format!("creating {}", gaviero_dir.display()))?;
         // A file that does not parse is refused rather than replaced: writing
         // `{}` plus one key would erase everything the user wrote in it.
@@ -1673,9 +1673,7 @@ fn load_user_settings_from(
     Ok(None)
 }
 
-fn parse_user_settings_file(
-    path: &Path,
-) -> Result<Option<serde_json::Value>, SettingsParseError> {
+fn parse_user_settings_file(path: &Path) -> Result<Option<serde_json::Value>, SettingsParseError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -2030,7 +2028,10 @@ mod tests {
         fs::write(&settings_path, r#"{ "x": 1 }"#).unwrap();
         ws.reload_settings_cache();
         assert!(ws.settings_errors().iter().all(|e| e.path != settings_path));
-        assert_eq!(ws.resolve_setting_opt("x", None), Some(serde_json::json!(1)));
+        assert_eq!(
+            ws.resolve_setting_opt("x", None),
+            Some(serde_json::json!(1))
+        );
     }
 
     #[test]
@@ -2064,7 +2065,11 @@ mod tests {
         let mut ws = Workspace::single_folder(root.clone());
 
         let err = ws
-            .save_folder_setting(&root, "mcp.gavieroServer.codexTrust", serde_json::json!("granted"))
+            .save_folder_setting(
+                &root,
+                "mcp.gavieroServer.codexTrust",
+                serde_json::json!("granted"),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         assert_eq!(fs::read_to_string(&settings_path).unwrap(), broken);

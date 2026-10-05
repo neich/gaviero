@@ -60,10 +60,10 @@ fn walk_dir(
 
         if path.is_dir() {
             walk_dir(&path, workspace, graph, excludes)?;
-        } else if path.is_file() {
-            if let Some(node) = build_node(&path, super::normalize_rel_path(rel)) {
-                graph.add_node(node);
-            }
+        } else if path.is_file()
+            && let Some(node) = build_node(&path, super::normalize_rel_path(rel))
+        {
+            graph.add_node(node);
         }
     }
 
@@ -139,15 +139,15 @@ fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     }
 
     // Skip files that are too large to be source code (binary data, build artifacts, etc.)
-    if let Ok(meta) = std::fs::metadata(abs_path) {
-        if meta.len() > MAX_FILE_BYTES {
-            tracing::debug!(
-                "repo_map: skipping large file ({} bytes): {}",
-                meta.len(),
-                abs_path.display()
-            );
-            return None;
-        }
+    if let Ok(meta) = std::fs::metadata(abs_path)
+        && meta.len() > MAX_FILE_BYTES
+    {
+        tracing::debug!(
+            "repo_map: skipping large file ({} bytes): {}",
+            meta.len(),
+            abs_path.display()
+        );
+        return None;
     }
 
     let content = match std::fs::read_to_string(abs_path) {
@@ -222,16 +222,15 @@ const DEF_KINDS: &[&str] = &[
 ];
 
 fn collect_symbols(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Symbol>) {
-    if DEF_KINDS.contains(&node.kind()) {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            if let Ok(name) = name_node.utf8_text(source) {
-                out.push(Symbol {
-                    name: name.to_string(),
-                    kind: node.kind().to_string(),
-                    line: node.start_position().row,
-                });
-            }
-        }
+    if DEF_KINDS.contains(&node.kind())
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+    {
+        out.push(Symbol {
+            name: name.to_string(),
+            kind: node.kind().to_string(),
+            line: node.start_position().row,
+        });
     }
 
     let mut cursor = node.walk();

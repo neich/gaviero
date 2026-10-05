@@ -29,10 +29,13 @@ pub struct IncomingRequest {
     pub params: Value,
 }
 
+/// In-flight requests keyed by JSON-RPC id, each awaiting its response.
+type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>>;
+
 #[derive(Clone)]
 pub struct JsonRpcHandle {
     stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>>,
+    pending: PendingMap,
     next_id: Arc<AtomicU64>,
 }
 
@@ -132,7 +135,12 @@ impl JsonRpcHandle {
         .await
     }
 
-    pub async fn respond_error(&self, id: Value, code: i64, message: impl Into<String>) -> Result<()> {
+    pub async fn respond_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: impl Into<String>,
+    ) -> Result<()> {
         self.write_line(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -172,8 +180,7 @@ impl JsonRpcChild {
             });
         }
 
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
         let (notif_tx, notif_rx) = mpsc::channel(256);
         let pending_reader = pending.clone();
@@ -236,7 +243,7 @@ fn id_key(id: &Value) -> String {
 
 async fn dispatch_line(
     value: Value,
-    pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>>,
+    pending: &PendingMap,
     incoming: &mpsc::Sender<IncomingRequest>,
     notifs: &mpsc::Sender<Value>,
 ) {
@@ -285,8 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_correlates_response_to_pending() {
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (incoming_tx, mut incoming_rx) = mpsc::channel(4);
         let (notif_tx, mut notif_rx) = mpsc::channel(4);
         let (tx, rx) = oneshot::channel();
@@ -307,8 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_routes_notification_and_incoming_request() {
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (incoming_tx, mut incoming_rx) = mpsc::channel(4);
         let (notif_tx, mut notif_rx) = mpsc::channel(4);
 

@@ -222,7 +222,7 @@ where
     // Used at top level (Item::Vars) and inside agent declarations.
     // Keys are identifiers (or contextual keywords); values are strings.
 
-    let vars_pair = ident.then(string.clone()).map(|(k, v)| (k, v));
+    let vars_pair = ident.then(string).map(|(k, v)| (k, v));
 
     let vars_block = just(Token::KwVars).ignore_then(
         vars_pair
@@ -399,7 +399,7 @@ where
             .ignore_then(str_list.clone())
             .map(MemoryField::ReadNs),
         just(Token::KwWriteNs)
-            .ignore_then(string.clone())
+            .ignore_then(string)
             .map(MemoryField::WriteNs),
         just(Token::KwImportance)
             .ignore_then(float_lit)
@@ -408,13 +408,13 @@ where
             .ignore_then(str_list.clone())
             .map(MemoryField::StalenessSources),
         just(Token::KwReadQuery)
-            .ignore_then(string.clone())
+            .ignore_then(string)
             .map(MemoryField::ReadQuery),
         just(Token::KwReadLimit)
             .ignore_then(integer)
             .map(|n| MemoryField::ReadLimit(n as usize)),
         just(Token::KwWriteContent)
-            .ignore_then(string.clone())
+            .ignore_then(string)
             .map(MemoryField::WriteContent),
     ));
 
@@ -490,10 +490,10 @@ where
     // ── verify block ──────────────────────────────────────────────
 
     let verify_field = {
-        let b1 = bool_lit.clone();
-        let b2 = bool_lit.clone();
-        let b3 = bool_lit.clone();
-        let b4 = bool_lit.clone();
+        let b1 = bool_lit;
+        let b2 = bool_lit;
+        let b3 = bool_lit;
+        let b4 = bool_lit;
         choice((
             just(Token::KwCompile)
                 .ignore_then(b1)
@@ -718,10 +718,10 @@ where
 
     // until condition: verify block | agent <name> | command "..."
     let until_condition = {
-        let b1 = bool_lit.clone();
-        let b2 = bool_lit.clone();
-        let b3 = bool_lit.clone();
-        let b4 = bool_lit.clone();
+        let b1 = bool_lit;
+        let b2 = bool_lit;
+        let b3 = bool_lit;
+        let b4 = bool_lit;
         let until_verify_field = choice((
             just(Token::KwCompile)
                 .ignore_then(b1)
@@ -856,9 +856,7 @@ where
     // references a workflow `param` declaration.
     let reviewers_source = choice((
         reviewer_literal_list.clone().map(ReviewerSource::Literal),
-        ident
-            .clone()
-            .map_with(|name, e| ReviewerSource::ParamRef(name, e.span())),
+        ident.map_with(|name, e| ReviewerSource::ParamRef(name, e.span())),
     ));
 
     let loop_field = choice((

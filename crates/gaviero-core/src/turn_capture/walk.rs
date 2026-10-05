@@ -220,7 +220,10 @@ mod tests {
         });
         assert!(got.contains(&"src/lib.rs".to_string()));
         assert!(got.contains(&".gitignore".to_string()));
-        assert!(got.contains(&".env".to_string()), "sensitive carve-out: {got:?}");
+        assert!(
+            got.contains(&".env".to_string()),
+            "sensitive carve-out: {got:?}"
+        );
         assert!(got.contains(&".gaviero/settings.json".to_string()));
         assert!(!got.iter().any(|r| r.starts_with("target/")), "{got:?}");
         assert!(!got.contains(&"a.log".to_string()));

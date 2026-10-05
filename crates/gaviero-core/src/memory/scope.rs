@@ -397,7 +397,7 @@ impl MemoryScope {
         let workspace_db = workspace_root.join(".gaviero/memory.db");
         let workspace_id = hash_path(workspace_root);
 
-        let repo_id = folder.map(|f| hash_path(f));
+        let repo_id = folder.map(hash_path);
         let repo_db = folder.map(|f| f.join(".gaviero/memory.db"));
 
         // Module = longest common prefix of owned_paths
@@ -419,21 +419,21 @@ impl MemoryScope {
     pub fn levels(&self) -> Vec<ScopeFilter> {
         let mut levels = Vec::with_capacity(5);
 
-        if let Some(run_id) = &self.run_id {
-            if let Some(repo_id) = &self.repo_id {
-                levels.push(ScopeFilter::Run {
-                    repo_id: repo_id.clone(),
-                    run_id: run_id.clone(),
-                });
-            }
+        if let Some(run_id) = &self.run_id
+            && let Some(repo_id) = &self.repo_id
+        {
+            levels.push(ScopeFilter::Run {
+                repo_id: repo_id.clone(),
+                run_id: run_id.clone(),
+            });
         }
-        if let Some(module_path) = &self.module_path {
-            if let Some(repo_id) = &self.repo_id {
-                levels.push(ScopeFilter::Module {
-                    repo_id: repo_id.clone(),
-                    module_path: module_path.clone(),
-                });
-            }
+        if let Some(module_path) = &self.module_path
+            && let Some(repo_id) = &self.repo_id
+        {
+            levels.push(ScopeFilter::Module {
+                repo_id: repo_id.clone(),
+                module_path: module_path.clone(),
+            });
         }
         if let Some(repo_id) = &self.repo_id {
             levels.push(ScopeFilter::Repo {
@@ -486,10 +486,9 @@ fn common_prefix(paths: &[String]) -> Option<String> {
     let mut prefix = paths[0].clone();
     for path in &paths[1..] {
         while !path.starts_with(&prefix) {
-            if let Some(pos) = prefix.rfind('/') {
+            {
+                let pos = prefix.rfind('/')?;
                 prefix.truncate(pos);
-            } else {
-                return None;
             }
         }
     }

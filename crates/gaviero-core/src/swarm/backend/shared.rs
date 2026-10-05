@@ -9,8 +9,9 @@ use super::{
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
-    &["claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh"];
+pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
+    "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh",
+];
 
 /// DeepSeek HTTP API model ids (without the `deepseek:` / `dsh:` provider
 /// prefix). Same list for both routes.

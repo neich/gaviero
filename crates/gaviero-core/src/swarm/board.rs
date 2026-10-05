@@ -120,6 +120,7 @@ impl SharedBoard {
 
     /// Publish a typed artifact. When the run is bound, copies/writes under
     /// `artifacts/<kind>/<key>` (sanitized). Returns the registered artifact.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish(
         &self,
         kind: ArtifactKind,
@@ -328,17 +329,17 @@ impl Default for SharedBoard {
 pub fn parse_discoveries(from_agent: &str, text: &str) -> Vec<SharedEntry> {
     let mut entries = Vec::new();
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("[discovery:") {
-            if let Some((tag_part, content)) = rest.split_once(']') {
-                let tag = tag_part.trim().to_string();
-                let content = content.trim().to_string();
-                if !content.is_empty() {
-                    entries.push(SharedEntry {
-                        from_agent: from_agent.to_string(),
-                        content,
-                        tags: vec![tag],
-                    });
-                }
+        if let Some(rest) = line.strip_prefix("[discovery:")
+            && let Some((tag_part, content)) = rest.split_once(']')
+        {
+            let tag = tag_part.trim().to_string();
+            let content = content.trim().to_string();
+            if !content.is_empty() {
+                entries.push(SharedEntry {
+                    from_agent: from_agent.to_string(),
+                    content,
+                    tags: vec![tag],
+                });
             }
         }
     }

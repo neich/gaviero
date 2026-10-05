@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -110,6 +110,8 @@ pub struct RemoteHandle {
 }
 
 impl RemoteHandle {
+    // The error hands the (unboxed, see `HubInput`) input back to the caller.
+    #[allow(clippy::result_large_err)]
     pub fn try_send(&self, input: HubInput) -> Result<(), mpsc::error::TrySendError<HubInput>> {
         self.input_tx.try_send(input)
     }
@@ -253,8 +255,7 @@ pub async fn spawn(config: RemoteServerConfig) -> Result<SpawnedServer, ServerEr
     let mut handles = vec![axum_handle];
     for addr in &config.extra_bind_addrs {
         let handle = axum_server::Handle::new();
-        let server = axum_server::bind_rustls(*addr, rustls_config.clone())
-            .handle(handle.clone());
+        let server = axum_server::bind_rustls(*addr, rustls_config.clone()).handle(handle.clone());
         tokio::spawn(server.serve(instance_router(shared.clone()).into_make_service()));
         if handle.listening().await.is_none() {
             tracing::warn!(%addr, "extra remote listener failed to bind");
@@ -314,8 +315,8 @@ async fn directory_leader_loop(
         let mut handles = Vec::new();
         for addr in &addrs {
             let handle = axum_server::Handle::new();
-            let server = axum_server::bind_rustls(*addr, rustls_config.clone())
-                .handle(handle.clone());
+            let server =
+                axum_server::bind_rustls(*addr, rustls_config.clone()).handle(handle.clone());
             tokio::spawn(server.serve(directory_router(shared.clone()).into_make_service()));
             if handle.listening().await.is_some() {
                 handles.push(handle);

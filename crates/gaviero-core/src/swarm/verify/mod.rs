@@ -51,19 +51,15 @@ impl Default for VerificationStrategy {
 /// How to batch diffs for the LLM diff reviewer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BatchStrategy {
     /// One Sonnet call per WorkUnit.
     PerUnit,
     /// Group units sharing a dependency tier into one review call.
+    #[default]
     PerDependencyTier,
     /// Single review call for all diffs.
     Aggregate,
-}
-
-impl Default for BatchStrategy {
-    fn default() -> Self {
-        Self::PerDependencyTier
-    }
 }
 
 /// Identifies which verification step is running.

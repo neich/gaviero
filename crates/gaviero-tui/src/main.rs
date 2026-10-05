@@ -504,6 +504,9 @@ async fn main() -> Result<()> {
     // composer (input height + unsent draft) ride along in the same
     // `state.json` write (see `app/session.rs`).
     app.save_session();
+    // Land queued turn-review saves/archives, or a finished review would
+    // reopen as pending next launch.
+    app.turn_capture.flush();
 
     // Explicit call so errors are reported on the happy path (the guard will
     // run it again, but that's harmless — the calls are idempotent).

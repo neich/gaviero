@@ -192,17 +192,13 @@ pub enum ModelTier {
 /// Privacy classification for routing decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PrivacyLevel {
     /// Can be sent to any API-based model
+    #[default]
     Public,
     /// Must stay on local model only
     LocalOnly,
-}
-
-impl Default for PrivacyLevel {
-    fn default() -> Self {
-        Self::Public
-    }
 }
 
 /// Coordinator-produced task with tier annotation.

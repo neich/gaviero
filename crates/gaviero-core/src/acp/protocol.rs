@@ -654,11 +654,8 @@ pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
     let mut results = Vec::new();
     let mut search_from = 0;
 
-    loop {
-        // Find opening tag: <file path="...">
-        let Some(rel) = text[search_from..].find("<file path=\"") else {
-            break;
-        };
+    // Find opening tag: <file path="...">
+    while let Some(rel) = text[search_from..].find("<file path=\"") {
         let tag_start = search_from + rel;
 
         if let Some(end) = region_end_containing(&regions, tag_start) {

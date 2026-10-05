@@ -58,8 +58,14 @@ mod tests {
     #[test]
     fn same_major_accepts_any_minor() {
         let ours = PROTOCOL_VERSION;
-        assert!(ours.check_compatible(&ProtocolVersion { major: 1, minor: 0 }).is_ok());
-        assert!(ours.check_compatible(&ProtocolVersion { major: 1, minor: 9 }).is_ok());
+        assert!(
+            ours.check_compatible(&ProtocolVersion { major: 1, minor: 0 })
+                .is_ok()
+        );
+        assert!(
+            ours.check_compatible(&ProtocolVersion { major: 1, minor: 9 })
+                .is_ok()
+        );
     }
 
     #[test]

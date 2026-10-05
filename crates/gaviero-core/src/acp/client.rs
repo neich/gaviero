@@ -45,6 +45,7 @@ pub struct AcpPipeline {
 }
 
 impl AcpPipeline {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         write_gate: Arc<Mutex<WriteGatePipeline>>,
         observer: Box<dyn AcpObserver>,

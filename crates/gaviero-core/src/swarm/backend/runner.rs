@@ -39,6 +39,7 @@ const SWARM_BASE_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Write", "Edit", "Mu
 /// that opts in explicitly):
 ///   1. If `dsl_extras` is non-empty, it wins; `workspace_extras` is ignored.
 ///   2. Otherwise `workspace_extras` fills in.
+///
 /// Names already in [`SWARM_BASE_TOOLS`] are deduped silently.
 pub(super) fn resolve_swarm_tools(
     dsl_extras: &[String],
@@ -376,9 +377,7 @@ async fn run_backend_inner(
             Some(fix) => format!("{}\n\n{}", base_prompt, fix),
         };
 
-        let capabilities = backend
-            .capabilities()
-            .with_exposed_tools(exposed_tools);
+        let capabilities = backend.capabilities().with_exposed_tools(exposed_tools);
         let allowed_tools = if capabilities.tool_use {
             resolve_swarm_tools(&work_unit.extra_allowed_tools, workspace_extra_tools)
         } else {

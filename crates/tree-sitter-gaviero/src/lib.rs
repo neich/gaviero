@@ -315,8 +315,8 @@ mod tests {
         let lang: tree_sitter::Language = LANGUAGE.into();
         parser.set_language(&lang).unwrap();
 
-        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../gaviero-dsl/examples");
+        let examples_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gaviero-dsl/examples");
         let entries = std::fs::read_dir(&examples_dir)
             .unwrap_or_else(|e| panic!("read examples dir {}: {}", examples_dir.display(), e));
 
@@ -336,7 +336,11 @@ mod tests {
             );
             count += 1;
         }
-        assert!(count > 0, "no .gaviero examples found in {}", examples_dir.display());
+        assert!(
+            count > 0,
+            "no .gaviero examples found in {}",
+            examples_dir.display()
+        );
     }
 
     #[test]

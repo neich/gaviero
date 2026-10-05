@@ -150,30 +150,29 @@ pub async fn perform_injection_with_module(
     };
 
     let mut manifest_payload = None;
-    if let Some(ref inj) = injection {
-        if req.manifests_enabled
-            && let Some(writer) = req.writer
-        {
-            let payload = build_manifest_payload(
-                req.user_prompt,
-                inj,
-                req.capture_candidate_pool,
-                req.embedder_name,
-                req.reranker_name,
+    if let Some(ref inj) = injection
+        && req.manifests_enabled
+        && let Some(writer) = req.writer
+    {
+        let payload = build_manifest_payload(
+            req.user_prompt,
+            inj,
+            req.capture_candidate_pool,
+            req.embedder_name,
+            req.reranker_name,
+        );
+        manifest_payload = Some(payload.clone());
+        if let Err(e) = writer.enqueue(WriterMessage::InjectionManifest {
+            turn_id: req.turn_id.to_string(),
+            session_id: req.session_id.to_string(),
+            payload,
+        }) {
+            tracing::warn!(
+                target: "memory_chat_injection",
+                error = %e,
+                turn_id = req.turn_id,
+                "manifest enqueue failed (writer task terminated?)"
             );
-            manifest_payload = Some(payload.clone());
-            if let Err(e) = writer.enqueue(WriterMessage::InjectionManifest {
-                turn_id: req.turn_id.to_string(),
-                session_id: req.session_id.to_string(),
-                payload,
-            }) {
-                tracing::warn!(
-                    target: "memory_chat_injection",
-                    error = %e,
-                    turn_id = req.turn_id,
-                    "manifest enqueue failed (writer task terminated?)"
-                );
-            }
         }
     }
 

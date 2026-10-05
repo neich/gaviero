@@ -18,7 +18,7 @@ pub enum ReplanDecision {
     /// Retry the listed work units with adjusted prompts.
     RetryFailed(Vec<String>),
     /// Replace the remaining plan with an Opus-generated revision.
-    RevisePlan(CompiledPlan),
+    RevisePlan(Box<CompiledPlan>),
     /// Unrecoverable failure; abort with explanation.
     Abort(String),
 }

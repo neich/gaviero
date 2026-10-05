@@ -71,8 +71,7 @@ impl FileIndex {
         for &root in roots {
             // Same label the file tree shows for each root; omitted when
             // there is only one root, where it would be noise.
-            let label =
-                (roots.len() > 1).then(|| root.file_name().map(Path::new).unwrap_or(root));
+            let label = (roots.len() > 1).then(|| root.file_name().map(Path::new).unwrap_or(root));
             let git = RootGit::open(root);
             collect_files(root, root, label, excludes, git.as_ref(), &mut files);
         }
@@ -115,7 +114,8 @@ impl RootGit {
         if self.prefix.is_empty() {
             self.repo.is_path_ignored(rel_str)
         } else {
-            self.repo.is_path_ignored(&format!("{}/{}", self.prefix, rel_str))
+            self.repo
+                .is_path_ignored(&format!("{}/{}", self.prefix, rel_str))
         }
     }
 }
@@ -372,27 +372,23 @@ impl SearchPanelState {
                 SearchMode::FileName => "type a file name...  (Tab: contents)",
             };
             let hint_style = Style::default().fg(theme::TEXT_DIM).bg(input_bg);
-            let mut hx = text_x;
-            for ch in hint.chars() {
+            for (hx, ch) in (text_x..).zip(hint.chars()) {
                 if hx >= area.right() {
                     break;
                 }
                 if input_y < buf.area().bottom() {
                     buf[(hx, input_y)].set_char(ch).set_style(hint_style);
                 }
-                hx += 1;
             }
         } else {
             let input_style = Style::default().fg(fg).bg(input_bg);
-            let mut ix = text_x;
-            for ch in self.input.text.chars() {
+            for (ix, ch) in (text_x..).zip(self.input.text.chars()) {
                 if ix >= area.right() {
                     break;
                 }
                 if input_y < buf.area().bottom() {
                     buf[(ix, input_y)].set_char(ch).set_style(input_style);
                 }
-                ix += 1;
             }
         }
 
@@ -579,7 +575,11 @@ mod tests {
 
         panel.toggle_mode();
         panel.search("search", &[root], &[]);
-        assert_eq!(panel.results.len(), 2, "content mode hits search.rs and other.rs");
+        assert_eq!(
+            panel.results.len(),
+            2,
+            "content mode hits search.rs and other.rs"
+        );
     }
 
     #[test]
@@ -597,7 +597,11 @@ mod tests {
             .iter()
             .find(|r| r.abs_path == b.path().join("beta.rs"))
             .expect("second-root match");
-        assert_eq!(beta.path, b_label.join("beta.rs"), "prefixed with root folder name");
+        assert_eq!(
+            beta.path,
+            b_label.join("beta.rs"),
+            "prefixed with root folder name"
+        );
 
         panel.mode = SearchMode::FileName;
         panel.search("beta", &[a.path(), b.path()], &[]);
@@ -658,7 +662,11 @@ mod tests {
 
         std::fs::write(root.join("second.rs"), "").unwrap();
         panel.search(".rs", &[root], &[]);
-        assert_eq!(panel.results.len(), 1, "cached index; no re-walk per keystroke");
+        assert_eq!(
+            panel.results.len(),
+            1,
+            "cached index; no re-walk per keystroke"
+        );
 
         panel.invalidate_file_index();
         panel.search(".rs", &[root], &[]);

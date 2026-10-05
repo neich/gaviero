@@ -249,16 +249,15 @@ async fn run_combined(
             if matches!(
                 failure.severity,
                 FailureSeverity::ParseError | FailureSeverity::MissingSymbol { .. }
-            ) {
-                if let Some(unit) = find_unit_for_file(units, manifests, &failure.path) {
-                    escalations.push(EscalationRecord {
-                        unit_id: unit.id.clone(),
-                        reason: EscalationReason::StructuralParseError,
-                        from_tier: unit.tier,
-                        to_tier: unit.escalation_tier.unwrap_or(ModelTier::Expensive),
-                        succeeded: false, // Not attempted in this pass
-                    });
-                }
+            ) && let Some(unit) = find_unit_for_file(units, manifests, &failure.path)
+            {
+                escalations.push(EscalationRecord {
+                    unit_id: unit.id.clone(),
+                    reason: EscalationReason::StructuralParseError,
+                    from_tier: unit.tier,
+                    to_tier: unit.escalation_tier.unwrap_or(ModelTier::Expensive),
+                    succeeded: false, // Not attempted in this pass
+                });
             }
         }
 
@@ -415,12 +414,10 @@ fn find_unit_for_file<'a>(
         }
     }
     // Fallback: check owned_paths
-    for unit in units {
-        if unit.scope.is_owned(&file_str) {
-            return Some(unit);
-        }
-    }
-    None
+    units
+        .iter()
+        .find(|&unit| unit.scope.is_owned(&file_str))
+        .map(|v| v as _)
 }
 
 #[cfg(test)]

@@ -160,10 +160,11 @@ fn infer_server_name(body: &str, needle: &str) -> String {
     }) {
         return name;
     }
-    if let Some(name) = head.rsplit('"').nth(1).map(|s| s.to_string()) {
-        if !name.is_empty() && !name.contains('/') {
-            return name;
-        }
+    if let Some(name) = head.rsplit('"').nth(1).map(|s| s.to_string())
+        && !name.is_empty()
+        && !name.contains('/')
+    {
+        return name;
     }
     needle.to_string()
 }
@@ -267,7 +268,7 @@ mod tests {
             r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","@modelcontextprotocol/server-memory"]}}}"#,
         )
         .unwrap();
-        let hits = detect_external_memory_servers(&[cfg.clone()]);
+        let hits = detect_external_memory_servers(std::slice::from_ref(&cfg));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source_tag, "server-memory");
     }
@@ -290,7 +291,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = disable_external_memory_servers(&[cfg.clone()]).unwrap();
+        let hits = disable_external_memory_servers(std::slice::from_ref(&cfg)).unwrap();
         assert_eq!(hits.len(), 1);
         let updated = std::fs::read_to_string(&cfg).unwrap();
         assert!(!updated.contains("@modelcontextprotocol/server-memory"));
