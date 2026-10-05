@@ -134,11 +134,12 @@ async fn ingest_rustdoc_item(
     }
 
     let file_hash = store.get_file_hash(&rel_path)?;
-    if let Some(existing) = store.symbol_doc(&qn)? {
-        if existing.file_hash == file_hash && !existing.signature.is_empty() {
-            result.symbols_skipped_hash += 1;
-            return Ok(());
-        }
+    if let Some(existing) = store.symbol_doc(&qn)?
+        && existing.file_hash == file_hash
+        && !existing.signature.is_empty()
+    {
+        result.symbols_skipped_hash += 1;
+        return Ok(());
     }
 
     let (signature, bounds, role_summary) = extract_item_fields(item);

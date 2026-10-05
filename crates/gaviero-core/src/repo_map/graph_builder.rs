@@ -103,7 +103,7 @@ fn incremental_build(
         .iter()
         .map(|(_, rel)| rel.to_string_lossy().to_string())
         .collect();
-    for (stored_file, _) in &existing_hashes {
+    for stored_file in existing_hashes.keys() {
         if !current_files.contains(stored_file) {
             store.delete_file(stored_file)?;
             result.files_removed += 1;

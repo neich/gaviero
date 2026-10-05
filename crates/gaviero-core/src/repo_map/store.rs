@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS graph_meta (
 ///
 /// Pre-C4 databases stored edges with either NULL `kind` (very old
 /// schema) or the legacy aliases `'Contains'`/`'TestedBy'`. The
-/// in-memory `EdgeKind::from_str` already handles those aliases
+/// in-memory `EdgeKind::parse` already handles those aliases
 /// transparently, but the persisted rows are still untyped from a
 /// query-planner perspective: `mode=callers` wouldn't match a
 /// NULL-kind edge.
@@ -138,7 +138,7 @@ impl NodeKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "File" => Some(Self::File),
             "Function" => Some(Self::Function),
@@ -187,7 +187,7 @@ impl EdgeKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "Calls" => Some(Self::Calls),
             "Imports" => Some(Self::Imports),
@@ -202,23 +202,18 @@ impl EdgeKind {
 }
 
 /// Query intent for graph blast-radius traversal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BlastRadiusMode {
     Impact,
     Callers,
     Tests,
     Implementations,
+    #[default]
     All,
 }
 
-impl Default for BlastRadiusMode {
-    fn default() -> Self {
-        Self::All
-    }
-}
-
 impl BlastRadiusMode {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "impact" => Self::Impact,
             "callers" => Self::Callers,
@@ -278,7 +273,7 @@ impl BlastRadiusMode {
 ///
 /// Plan presets:
 /// - `Impact`:           Calls=1.0, Implements=0.9, Defines=0.8,
-///                       Imports=0.5, TestOf=0.3, others=0.2
+///   Imports=0.5, TestOf=0.3, others=0.2
 /// - `Callers`:          Calls=1.0, others=0.0
 /// - `Tests`:            TestOf=1.0, others=0.0
 /// - `Implementations`:  Implements=1.0, others=0.0
@@ -486,6 +481,7 @@ impl GraphStore {
     // ── Node operations ──────────────────────────────────────────
 
     /// Insert or update a node. Returns the node id.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_node(
         &self,
         kind: NodeKind,
@@ -1025,7 +1021,7 @@ impl GraphStore {
             if src == tgt {
                 continue;
             }
-            if let Some(kind) = EdgeKind::from_str(&kind_s) {
+            if let Some(kind) = EdgeKind::parse(&kind_s) {
                 out.push((src, tgt, kind));
             }
         }
