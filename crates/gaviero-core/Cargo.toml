@@ -81,6 +81,9 @@ toml = "0.8"
 chrono = "0.4.44"
 regex = "1"
 walkdir = "2"
+# Turn change capture: `.gitignore` / `files.exclude` aware walk that needs no
+# git repository (`require_git(false)`).
+ignore = { workspace = true }
 rustdoc-types = "0.57"
 syn = { version = "2", features = ["full", "parsing"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }

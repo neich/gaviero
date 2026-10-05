@@ -44,6 +44,7 @@ mod review;
 pub(crate) mod session;
 mod side_panel;
 mod state;
+mod turn_review;
 
 use self::observers::{TuiAcpObserver, TuiWriteGateObserver};
 use self::state::{
@@ -186,6 +187,16 @@ pub struct App {
     pub batch_review: Option<BatchReviewState>,
     /// Git changes panel state — populated when cycling to Changes mode via F7.
     pub changes_state: Option<ChangesState>,
+    /// Host-side capture of every file a chat turn changes
+    /// (`<root>/.gaviero/turns`). Shared by all conversations.
+    pub turn_capture: Arc<gaviero_core::turn_capture::TurnCapture>,
+    /// Turns whose changes await the mandatory review, oldest first. A
+    /// conversation listed here cannot send its next prompt.
+    pub pending_turn_reviews: Vec<gaviero_core::turn_capture::PendingReview>,
+    /// Cursor state of the review shown in the TURN REVIEW panel.
+    pub(crate) turn_review_view: turn_review::TurnReviewView,
+    /// HISTORY → FILES `u`: the turn armed for undo and when (confirm window).
+    pub(crate) history_undo_armed: Option<(String, std::time::Instant)>,
 
     // Agent chat
     pub chat_state: AgentChatState,
@@ -394,6 +405,12 @@ impl App {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         );
+        // Turn capture state sits beside history under the same root.
+        let turn_capture = gaviero_core::turn_capture::TurnCapture::for_workspace(
+            graph_workspace_root
+                .as_deref()
+                .unwrap_or_else(|| Path::new(".")),
+        );
 
         let observer = TuiWriteGateObserver {
             tx: event_tx.clone(),
@@ -465,6 +482,10 @@ impl App {
             diff_review: None,
             batch_review: None,
             changes_state: None,
+            turn_capture,
+            pending_turn_reviews: Vec::new(),
+            turn_review_view: turn_review::TurnReviewView::default(),
+            history_undo_armed: None,
             chat_state: {
                 let mut cs = AgentChatState::new();
                 cs.agent_settings = crate::panels::agent_chat::AgentSettings {
@@ -510,6 +531,7 @@ impl App {
             windows_paste_settle_until: None,
         };
         emit_extra_root_skill_warnings(&mut app, &skill_load_warnings);
+        turn_review::restore_on_startup(&mut app);
         app
     }
 

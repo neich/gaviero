@@ -113,6 +113,8 @@ pub enum HistoryKind {
     McpCall(McpCall),
     MemoryInjection(MemoryInjection),
     TurnEnd(TurnEnd),
+    FilesChanged(FilesChanged),
+    TurnReview(TurnReview),
 }
 
 impl HistoryKind {
@@ -124,8 +126,60 @@ impl HistoryKind {
             Self::McpCall(_) => "mcp_call",
             Self::MemoryInjection(_) => "memory_injection",
             Self::TurnEnd(_) => "turn_end",
+            Self::FilesChanged(_) => "files_changed",
+            Self::TurnReview(_) => "turn_review",
         }
     }
+}
+
+/// One file a turn changed. Mirrors `turn_capture::FileChange` so this module
+/// never depends on the capture types; the call site converts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// Root-relative path, `/`-separated.
+    pub path: String,
+    /// `added` | `modified` | `deleted`.
+    pub change: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sha256: Option<String>,
+    #[serde(default)]
+    pub revertible: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlap_with: Vec<String>,
+}
+
+/// What a turn changed on disk (host-side turn capture), or — with
+/// `between_turns` — what changed outside any turn before it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesChanged {
+    /// `completed` | `cancelled` | `failed`.
+    pub outcome: String,
+    pub files: Vec<ChangedFile>,
+    /// Sensitive paths the host restored automatically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_reverted: Vec<String>,
+    /// Paths changed between the previous capture and this turn's start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub between_turns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// The user's review of a turn's changes, written when it is finalized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReview {
+    pub decisions: Vec<ReviewDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDecision {
+    pub path: String,
+    /// `kept` | `reverted` | `reverted_hunks` | `failed`.
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A complete line of `turns.ndjson`.

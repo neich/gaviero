@@ -20,6 +20,7 @@ pub mod skills;
 pub mod swarm;
 pub mod terminal;
 pub mod tree_sitter;
+pub mod turn_capture;
 pub mod types;
 pub mod util;
 pub mod validation_gate;

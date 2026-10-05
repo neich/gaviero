@@ -875,6 +875,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 super::agent_writes::WriteOrigin::AgentTurn { source: "agent" },
             );
         }
+        Event::TurnReviewPending { review, overlapped } => {
+            super::turn_review::on_turn_review_pending(app, review, overlapped);
+        }
         Event::AcpTaskCompleted { conv_id, proposals } => {
             tracing::info!(
                 "ACP task completed for conv {} with {} proposals",
@@ -1457,12 +1460,19 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             &overrides,
                         );
                         synth.http = http;
-                        if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-                            tracing::warn!(
+                        match gaviero_core::mcp::synthesize_for_worktree(&synth) {
+                            // Host writes: a turn running while memory comes
+                            // up must not review gaviero's own config files.
+                            Ok(written) => {
+                                for path in &written {
+                                    super::turn_review::note_host_write(app, path);
+                                }
+                            }
+                            Err(e) => tracing::warn!(
                                 target: "mcp_server",
                                 error = %e,
                                 "failed to synthesize workspace MCP config"
-                            );
+                            ),
                         }
                     };
                 // Another gaviero process (typically a first TUI, or a
@@ -2140,6 +2150,18 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     .conversations
                     .get(app.chat_state.active_conv)
                     .map(|c| c.id.clone());
+                // A pending turn review belongs to its conversation: closing
+                // the tab would orphan it (still pending, nothing to unblock).
+                if let Some(ref id) = closing_conv_id
+                    && super::turn_review::conv_has_pending_review(app, id)
+                {
+                    super::turn_review::open_for_conv(app, Some(id));
+                    app.status_message = Some((
+                        "Finalize this conversation's turn review before closing it".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                    return;
+                }
                 if let Some(ref id) = closing_conv_id {
                     super::chat_memory::consolidate_conversation(app, id);
                 }
@@ -2215,6 +2237,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             LeftPanelMode::Review => {}
             LeftPanelMode::Changes => {
                 app.handle_changes_action(&action);
+            }
+            LeftPanelMode::TurnReview => {
+                super::turn_review::handle_turn_review_action(app, &action);
             }
         },
         _ if app.focus == Focus::Editor && app.find_bar_active => {

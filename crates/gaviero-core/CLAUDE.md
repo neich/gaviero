@@ -14,7 +14,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Architecture
 
-**27 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
+**28 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
 
 | Area | Entry | Notes |
 |---|---|---|
@@ -22,7 +22,8 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | Agent session | [`agent_session/`](src/agent_session) | `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, [`tool_agent/`](src/agent_session/tool_agent) (`deepseek:`), [`agent_client_protocol/`](src/agent_session/agent_client_protocol) (`dsh:`), `registry`. |
 | MCP | [`mcp/`](src/mcp) | Nine tools — eight read-only (incl. `memory_ping`) + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); stdio endpoint via [`transport.rs`](src/mcp/transport.rs); loopback HTTP ([`http.rs`](src/mcp/http.rs)); reach probe; user-scope registration; signal sink ([`signal.rs`](src/mcp/signal.rs)). |
 | Memory | [`memory/`](src/memory) | Multi-DB ONNX store; single writer task ([`writer.rs`](src/memory/writer.rs)); merged multi-scope hybrid retrieval (RRF). |
-| Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
+| Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. Swarm, CLI, and the TUI's fallback when turn capture is unavailable. |
+| Turn capture | [`turn_capture/`](src/turn_capture) | Host-side, git-free record of everything a chat turn changed: baseline manifest + SHA-256 blob store (`<root>/.gaviero/turns`, blobs ≤ 8 MiB), `begin`/`end` diff, host-write ledger, overlap marking, sensitive auto-revert, byte-exact file/hunk revert, persisted pending reviews, retention (last 5 reviewed turns + pending). Sessions honour it via `AgentOptions::host_capture`. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
 | Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam, opt-in constitution emit ([`skills/emit.rs`](src/skills/emit.rs)). |
 | History | [`history/`](src/history) | Per-turn NDJSON log (`.gaviero/history/turns.ndjson`): record model, the single `HistoryRecorder` (keys every capture by `turn_id`), tolerant reader shared by the TUI panel and `gaviero-cli --history`, the one token estimator. Write-only from host capture points; nothing under `memory/`, `context_planner/`, `mcp/`, `agent_session/`, `swarm/` imports it. Size-rotated through [`util::ndjson`](src/util/ndjson.rs), shared with the MCP telemetry sink. |
@@ -31,7 +32,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 `tree-sitter` types are re-exported here; downstream crates **must not** depend on `tree-sitter` directly.
 
-**DeepSeek path:** `deepseek:<id>` → [`BackendConfig::Deepseek`](src/swarm/backend/mod.rs) → [`DeepseekBackend`](src/swarm/backend/deepseek.rs) → [`tool_agent`](src/agent_session/tool_agent) (in-process fallback). `dsh:<id>` → [`DshBackend`](src/swarm/backend/dsh.rs) → [`AcpClientSession`](src/agent_session/agent_client_protocol) over `dsh --profile acp` (`@deepseek-ai/dsh`; `@deepseek-ai/dsh-acp` is a library). Writes for `dsh:` go through ACP `fs/write_text_file` when the child asks, otherwise git dirty-set minus gate-written paths (`PathsModified`). Allowed model ids: `DEEPSEEK_API_MODELS` in [`shared.rs`](src/swarm/backend/shared.rs).
+**DeepSeek path:** `deepseek:<id>` → [`BackendConfig::Deepseek`](src/swarm/backend/mod.rs) → [`DeepseekBackend`](src/swarm/backend/deepseek.rs) → [`tool_agent`](src/agent_session/tool_agent) (in-process fallback). `dsh:<id>` → [`DshBackend`](src/swarm/backend/dsh.rs) → [`AcpClientSession`](src/agent_session/agent_client_protocol) over `dsh --profile acp` (`@deepseek-ai/dsh`; `@deepseek-ai/dsh-acp` is a library). Outside host capture (swarm), writes for `dsh:` go through ACP `fs/write_text_file` when the child asks, otherwise git dirty-set minus gate-written paths (`PathsModified`); in TUI chat both providers simply write and `turn_capture` records the turn. Allowed model ids: `DEEPSEEK_API_MODELS` in [`shared.rs`](src/swarm/backend/shared.rs).
 
 **MCP endpoint:** `<workspace>/.gaviero/mcp.sock` (Unix) or `\\.\pipe\gaviero-<hash>` (Windows), described in `.gaviero/mcp-endpoint.json`. Subprocess agents reach it via `gaviero-mcp-shim` (optionally `--resolve`). Loopback HTTP: `127.0.0.1:<derived-port>/mcp` with a bearer token in `.gaviero/mcp-http-token`. `deepseek:` does not use the shim; `dsh:` mounts gaviero MCP on `session/new`.
 
@@ -48,6 +49,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Rules
 
+- **Turn capture owns TUI chat review.** A session must not revert or re-propose anything when `AgentOptions::host_capture` is set — the host diffs the tree after the session is gone. A new session type that keeps its own snapshot must gate it on that flag.
 - **Every write goes through the writer task or the Write Gate.** No MCP tool may touch a store directly. The read-only surface is the default posture, not a hard rule — `memory_flag` is the one write-adjacent tool, and it signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. Each added tool costs ~150–250 prompt tokens on every subprocess turn; make it earn that.
 - **No UI deps.** Compiles without `ratatui` / `crossterm`. `vt100`/`portable-pty` are allowed (embedded terminal lives here).
 - **No DSL deps.** Must not depend on `gaviero-dsl`.
@@ -66,6 +68,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - `rmcp 1.5` + `schemars 1.2` + `axum 0.8` — in-process MCP server (stdio + streamable HTTP).
 - `zstd 0.13` + `bincode 1.3` — History compression.
 - `windows-sys 0.59` (Windows only) — kill-on-close Job Objects ([`util::spawn`](src/util/spawn.rs)).
+- `ignore 0.4` — turn capture's `.gitignore` / `files.exclude` walk with `require_git(false)` (no repository needed).
 - `reqwest`, `async-trait`, `futures`, `tokio-stream`, `tokio-util`, `chrono`, `regex`, `walkdir`, `toml`, `tempfile`, `ropey`, `similar`, …
 - Dev: `wiremock 0.6`, `insta 1` ([tests/snapshots/](tests/snapshots)).
 

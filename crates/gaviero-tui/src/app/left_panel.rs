@@ -470,6 +470,7 @@ pub(super) fn confirm_tree_dialog(app: &mut App) {
             if let Err(e) = std::fs::write(&path, "") {
                 tracing::error!("Failed to create file {}: {}", path.display(), e);
             } else {
+                super::turn_review::note_host_write(app, &path);
                 app.refresh_file_tree();
                 app.select_path_in_tree(&path);
                 app.open_file(&path);

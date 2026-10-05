@@ -1263,14 +1263,22 @@ impl AgentSession for AcpClientSession {
         let thinking_settable = live.thinking_settable;
         Self::apply_effort(&handle, &session_id, thinking_settable, &effort).await;
 
-        let mut dirty_roots = Vec::with_capacity(1 + self.additional_roots.len());
-        dirty_roots.push(self.workspace_root.clone());
-        dirty_roots.extend(self.additional_roots.iter().cloned());
-        let before_dirty =
-            tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots)).await?;
-        // Baseline for the post-turn reconcile. Captured now because a path that
-        // is already dirty has no other record of its turn-start bytes.
-        let pre_turn = capture_pre_turn_content(&self.workspace_root, &before_dirty).await;
+        // Host capture: the host diffs the tree itself after the turn, so the
+        // git dirty-set baseline and the out-of-band reconcile are skipped.
+        let host_capture = self.options.host_capture;
+        let (before_dirty, pre_turn) = if host_capture {
+            (HashSet::new(), PreTurnContent::default())
+        } else {
+            let mut dirty_roots = Vec::with_capacity(1 + self.additional_roots.len());
+            dirty_roots.push(self.workspace_root.clone());
+            dirty_roots.extend(self.additional_roots.iter().cloned());
+            let before_dirty =
+                tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots)).await?;
+            // Baseline for the post-turn reconcile. Captured now because a path
+            // that is already dirty has no other record of its turn-start bytes.
+            let pre_turn = capture_pre_turn_content(&self.workspace_root, &before_dirty).await;
+            (before_dirty, pre_turn)
+        };
         let started = Instant::now();
 
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(256);
@@ -1357,6 +1365,11 @@ impl AgentSession for AcpClientSession {
             }
             let reusable = matches!(&prompt_result, Some(Ok(_)));
             match prompt_result {
+                Some(Ok(result)) if host_capture => {
+                    let _ = tx
+                        .send(Ok(UnifiedStreamEvent::Done(map::map_stop_reason(&result))))
+                        .await;
+                }
                 Some(Ok(result)) => {
                     let dirty_roots_after = {
                         let mut roots = vec![workspace_root.clone()];

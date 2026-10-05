@@ -1,0 +1,31 @@
+{
+  "version": { "major": 1, "minor": 2 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 21,
+  "revision": 17,
+  "type": "turn_review_pending",
+  "payload": {
+    "review": {
+      "turn_id": "conv-3-1759600000000",
+      "conv_id": "conv-3",
+      "outcome": "completed",
+      "files": [
+        {
+          "path": "src/parser.rs",
+          "change": "modified",
+          "decision": "keep",
+          "revertible": true,
+          "binary": false
+        },
+        {
+          "path": "assets/logo.png",
+          "change": "added",
+          "decision": "keep",
+          "revertible": true,
+          "binary": true,
+          "overlap_with": ["conv-1-1759599990000"]
+        }
+      ]
+    }
+  }
+}

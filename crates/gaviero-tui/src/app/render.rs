@@ -254,6 +254,8 @@ pub(super) fn left_panel_title(app: &App, fullscreen: bool) -> &'static str {
         (LeftPanelMode::Review, true) => "REVIEW (fullscreen)",
         (LeftPanelMode::Changes, false) => "CHANGES",
         (LeftPanelMode::Changes, true) => "CHANGES (fullscreen)",
+        (LeftPanelMode::TurnReview, false) => "TURN REVIEW",
+        (LeftPanelMode::TurnReview, true) => "TURN REVIEW (fullscreen)",
     }
 }
 
@@ -300,6 +302,9 @@ pub(super) fn render_left_panel_content(
         LeftPanelMode::Changes => {
             app.render_changes_file_list(frame, area, focused);
         }
+        LeftPanelMode::TurnReview => {
+            super::turn_review::render_turn_review_list(app, frame, area, focused);
+        }
     }
 }
 
@@ -340,6 +345,11 @@ pub(super) fn render_editor(app: &mut App, frame: &mut Frame, area: Rect) {
 
     if app.left_panel == LeftPanelMode::Changes && app.changes_state.is_some() {
         app.render_changes_diff(frame, area);
+        return;
+    }
+
+    if app.left_panel == LeftPanelMode::TurnReview && !app.pending_turn_reviews.is_empty() {
+        super::turn_review::render_turn_review_diff(app, frame, area);
         return;
     }
 
@@ -750,6 +760,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             LeftPanelMode::Search => "FIND",
             LeftPanelMode::Review => "REVIEW",
             LeftPanelMode::Changes => "CHANGES",
+            LeftPanelMode::TurnReview => "TURN REVIEW",
         },
         Focus::SidePanel => "CHAT",
         Focus::Terminal => "TERM",
@@ -867,6 +878,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                         n
                     )
                 }
+                LeftPanelMode::TurnReview => super::turn_review::status_hint(app),
             },
             Focus::SidePanel => {
                 let conv_count = app.chat_state.conversations.len();

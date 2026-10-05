@@ -102,7 +102,19 @@ pub struct AgentOptions {
     /// resumed. Callers that set this must call [`AcpSession::close_stdin`]
     /// once the turn completes, or the CLI waits for another message.
     pub stdin_prompt: bool,
+    /// The host captures this turn's file changes itself
+    /// ([`crate::turn_capture`]) and reviews them after the turn. Sessions
+    /// then let edits land without snapshot / revert / re-propose, and the
+    /// file-edit tools need no permission prompt ([`HOST_CAPTURED_EDIT_TOOLS`]).
+    /// Shell commands keep their own policy. Default `false`: swarm and CLI
+    /// keep the Write Gate path.
+    pub host_capture: bool,
 }
+
+/// Edit tools approved without a prompt when the host reviews the turn's
+/// changes afterwards — the content is reviewed, so asking first would be a
+/// second approval of the same edit.
+pub const HOST_CAPTURED_EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 impl std::fmt::Debug for AgentOptions {
     // M6: `resume_session_id` deprecated; keep visible in Debug for
@@ -126,6 +138,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("agents_json", &self.agents_json.as_ref().map(|_| "<set>"))
             .field("exposed_tools", &self.exposed_tools)
             .field("stdin_prompt", &self.stdin_prompt)
+            .field("host_capture", &self.host_capture)
             .finish()
     }
 }
@@ -149,6 +162,7 @@ impl Default for AgentOptions {
             agents_json: None,
             exposed_tools: None,
             stdin_prompt: false,
+            host_capture: false,
         }
     }
 }
@@ -217,7 +231,7 @@ impl AgentOptions {
     pub fn resolved_tools(&self) -> (Vec<String>, Vec<String>) {
         let available: Vec<String> =
             AgentToolSurface::resolve_available(self.available_tools.clone());
-        let approved: Vec<String> = match self.approved_tools.as_ref() {
+        let mut approved: Vec<String> = match self.approved_tools.as_ref() {
             Some(list) => list
                 .iter()
                 .filter(|name| available.iter().any(|a| a == *name))
@@ -230,6 +244,13 @@ impl AgentOptions {
                 .filter(|name| available.contains(name))
                 .collect(),
         };
+        if self.host_capture {
+            for tool in HOST_CAPTURED_EDIT_TOOLS {
+                if available.iter().any(|a| a == tool) && !approved.iter().any(|a| a == tool) {
+                    approved.push((*tool).to_string());
+                }
+            }
+        }
         (available, approved)
     }
 }
@@ -1078,6 +1099,22 @@ mod tests {
         assert_eq!(available, vec!["Read".to_string(), "Bash".to_string()]);
         // "Edit" silently dropped — not in the available set.
         assert_eq!(approved, vec!["Read".to_string(), "Bash".to_string()]);
+    }
+
+    #[test]
+    fn host_capture_approves_available_edit_tools_but_not_bash() {
+        let opts = AgentOptions {
+            available_tools: Some(vec!["Read".into(), "Write".into(), "Edit".into(), "Bash".into()]),
+            approved_tools: Some(vec!["Read".into()]),
+            host_capture: true,
+            ..AgentOptions::default()
+        };
+        let (_, approved) = opts.resolved_tools();
+        assert_eq!(
+            approved,
+            vec!["Read".to_string(), "Write".to_string(), "Edit".to_string()],
+            "edits are reviewed after the turn; Bash keeps its own policy"
+        );
     }
 }
 

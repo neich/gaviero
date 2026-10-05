@@ -41,18 +41,22 @@ review src/auth/session.rs for race conditions
 /model claude:opus
 ```
 
-**Inspect what a turn did** (history panel, Alt+H): pick a turn, then `Tab` / `1`–`5` through PROMPT, TOOLS, MCP, MEMORY, TOTALS; `Enter` expands a section, `/` filters, `a` toggles all / active conversation, `r` reloads, `c` copies the section's records. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported. The same log is readable headless with `gaviero-cli --history`.
+**Inspect what a turn did** (history panel, Alt+H): pick a turn, then `Tab` / `1`–`6` through PROMPT, TOOLS, MCP, MEMORY, TOTALS, FILES (what the turn changed on disk and how its review resolved; `u` twice restores a reviewed turn's files, last 5 turns only); `Enter` expands a section, `/` filters, `a` toggles all / active conversation, `r` reloads, `c` copies the section's records. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported. The same log is readable headless with `gaviero-cli --history`.
 
 DSL workflows and multi-agent swarms run from the CLI: `gaviero-cli --script workflows/refactor.gaviero --prompt "…"`.
 
-**Write Gate review** — when an agent proposes changes, a diff overlay opens:
+**Turn review** — agents edit files directly while they work (edit tools, shell commands, formatters — whatever they need to test). When a turn ends, gaviero compares the workspace with a snapshot taken before the prompt (no git needed; `.gitignore` and `files.exclude` paths are skipped) and, if anything changed, opens the TURN REVIEW panel. That conversation cannot send its next prompt until every changed file is accepted or rejected; other conversations keep working. Accepted edits stay as the agent left them; rejected ones go back to the pre-prompt version. Sensitive files (`.env`, keys) an agent changed are restored automatically. Cancelled and failed turns are reviewed too.
+
+Four decisions, each applied immediately — the review ends when every file has one:
 
 | Key | Action |
 |---|---|
-| `]h` / `[h` | Next / previous hunk |
-| `a` / `r` | Accept / reject current hunk |
-| `A` / `R` | Accept / reject all |
-| `f` / `q` | Finalize (write to disk) / exit |
+| `a` / `r` | Accept / reject the selected file (reject = back to its pre-prompt version) |
+| `A` / `R` | Accept / reject the whole turn (every file not decided yet) |
+
+`j` / `k` move between files, `J` / `K` scroll the diff, `Tab` switches between pending reviews. Rejecting a file you changed after the turn asks you to press the key again.
+
+Pending reviews survive a restart. The phone (remote) has the same four decisions. When an agent proposes changes outside chat turns (or turn capture is unavailable), the classic Write Gate diff overlay opens instead: `]h`/`[h` navigate, `a`/`r` accept/reject a hunk, `A`/`R` all, `f` finalize, `q` exit.
 
 ### Chat commands
 

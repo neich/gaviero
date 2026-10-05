@@ -381,6 +381,82 @@ pub enum ErrorCode {
     RateLimited,
     DuplicateCommand,
     InternalError,
+    // 1.2: `send_prompt` on a conversation whose previous turn's file changes
+    // await review. (Plain comments: doc comments would turn the schema's
+    // string `enum` into a `oneOf`.)
+    TurnReviewPending,
+    // 1.2: `turn_review_action` names no pending review (finalized already,
+    // possibly by the desktop).
+    UnknownTurnReview,
+}
+
+// ── Turn review (1.2) ────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFileChange {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFileDecision {
+    /// Not decided yet.
+    Pending,
+    /// Accepted: the agent's version stays.
+    Keep,
+    /// Rejected: back to the pre-prompt version (already applied on disk).
+    Revert,
+    /// Some hunks reverted. The desktop no longer produces it (its review
+    /// is whole-file only); kept so 1.2 clients that know it still decode.
+    RevertHunks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// One file a turn changed on disk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnReviewFile {
+    /// Workspace-folder-relative, `/`-separated.
+    pub path: String,
+    pub change: TurnFileChange,
+    pub decision: TurnFileDecision,
+    /// False when the pre-turn content was not stored: keep is the only option.
+    pub revertible: bool,
+    pub binary: bool,
+    /// Turn ids whose window overlapped this turn and changed the same path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlap_with: Vec<String>,
+}
+
+/// A turn whose file changes await the mandatory review.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnReview {
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_id: Option<String>,
+    pub outcome: TurnOutcome,
+    pub files: Vec<TurnReviewFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnReviewActionKind {
+    KeepFile,
+    RevertFile,
+    KeepAll,
+    RevertAll,
+    Finalize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

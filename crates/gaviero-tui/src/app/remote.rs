@@ -300,6 +300,8 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             }
             ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
+            ClientFrame::TurnReviewAction(a) => apply_turn_review_action(app, &a)
+                .map(|()| (CommandStatus::Completed, None)),
             ClientFrame::RequestMessages(r) => {
                 // 1.1 `latest_page`: an absent cursor means the newest page.
                 crate::app::projection::build_message_page(app, &r.conv_id, r.before_seq, r.limit)
@@ -546,6 +548,12 @@ pub fn apply_remote_prompt(
             "conversation is already streaming",
         ));
     }
+    if crate::app::turn_review::conv_has_pending_review(app, conv_id) {
+        return Err(CommandFailure::new(
+            ErrorCode::TurnReviewPending,
+            "the previous turn's file changes await review — keep or revert them first",
+        ));
+    }
     // No desktop draft, no attachments, no one-shot auto-approve (§2.4);
     // the shared core still consumes lite/workspace/no-inject one-shots.
     let turn_id = crate::app::side_panel::dispatch_prompt_core(
@@ -558,6 +566,42 @@ pub fn apply_remote_prompt(
     .map_err(|reason| CommandFailure::new(ErrorCode::InternalError, reason))?;
     app.remote.bump_global();
     Ok(turn_id)
+}
+
+// ── Turn review (1.2) ───────────────────────────────────────────────
+
+/// Phone decision on a pending turn review. Whole-file and turn-level only;
+/// a revert of a file changed after the turn is refused (the drift
+/// confirmation is desktop-only).
+pub fn apply_turn_review_action(
+    app: &mut App,
+    action: &gaviero_remote::envelope::TurnReviewAction,
+) -> Result<(), CommandFailure> {
+    use gaviero_remote::dto::TurnReviewActionKind as K;
+    if !app
+        .pending_turn_reviews
+        .iter()
+        .any(|r| r.set.turn_id == action.turn_id)
+    {
+        return Err(CommandFailure::new(
+            ErrorCode::UnknownTurnReview,
+            "no pending review for that turn — it was finalized already",
+        ));
+    }
+    let kind = match action.action {
+        K::KeepFile => "keep_file",
+        K::RevertFile => "revert_file",
+        K::KeepAll => "keep_all",
+        K::RevertAll => "revert_all",
+        K::Finalize => "finalize",
+    };
+    crate::app::turn_review::apply_remote_action(
+        app,
+        &action.turn_id,
+        kind,
+        action.path.as_deref(),
+    )
+    .map_err(|reason| CommandFailure::new(ErrorCode::InvalidPayload, reason))
 }
 
 // ── Slash commands (§5.1) ───────────────────────────────────────────

@@ -104,6 +104,8 @@ pub struct TurnSummary {
     pub bootstrap_tokens_est: Option<usize>,
     pub exact_usage: Option<ProviderUsage>,
     pub status: TurnStatus,
+    /// Files the turn changed on disk (`files_changed` record), 0 if none.
+    pub files_changed: usize,
 }
 
 impl TurnSummary {
@@ -238,6 +240,7 @@ fn empty_summary(record: &HistoryRecord, turn_id: Option<String>, attributed: bo
         bootstrap_tokens_est: None,
         exact_usage: None,
         status: TurnStatus::Incomplete,
+        files_changed: 0,
     }
 }
 
@@ -288,6 +291,10 @@ fn apply_to_summary(summary: &mut TurnSummary, record: &HistoryRecord) {
                 TurnStatus::Complete
             };
         }
+        HistoryKind::FilesChanged(f) => {
+            summary.files_changed = f.files.len();
+        }
+        HistoryKind::TurnReview(_) => {}
     }
 }
 
