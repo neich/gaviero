@@ -891,7 +891,7 @@ mod tests {
         assert!(out.contains("sibling: /work/lib-b"));
         // The dedup rule: workspace root must not show up as a sibling
         // even when the caller mistakenly passes it.
-        let sibling_workspace = format!("sibling: /work/proj");
+        let sibling_workspace = "sibling: /work/proj".to_string();
         assert!(
             !out.contains(&sibling_workspace),
             "workspace root must not be listed as a sibling"

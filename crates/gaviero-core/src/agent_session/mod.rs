@@ -106,8 +106,8 @@
 //! approvals must run with `approvalPolicy: "never"` until a future event
 //! variant is added.
 
-pub(crate) mod background;
 pub mod agent_client_protocol;
+pub(crate) mod background;
 pub mod claude;
 pub mod codex_app_server;
 pub mod codex_exec;
@@ -266,6 +266,7 @@ impl LegacyAgentSession {
     /// [`registry::create_session`] rather than calling this directly.
     // M6: reads deprecated `resume_session_id`; allow stays until M10.
     #[allow(deprecated)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         write_gate: Arc<Mutex<WriteGatePipeline>>,
         observer: Box<dyn AcpObserver>,

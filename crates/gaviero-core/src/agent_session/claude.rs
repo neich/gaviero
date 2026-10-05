@@ -541,48 +541,50 @@ impl ClaudeSession {
                                         if matches!(
                                             tu.name.as_str(),
                                             "Write" | "Edit" | "MultiEdit"
-                                        ) {
-                                            if let Some(fp) =
-                                                tu.input.get("file_path").and_then(|v| v.as_str())
+                                        ) && let Some(fp) =
+                                            tu.input.get("file_path").and_then(|v| v.as_str())
+                                        {
+                                            let abs_path = if Path::new(fp).is_absolute() {
+                                                PathBuf::from(fp)
+                                            } else {
+                                                self.workspace_root.join(fp)
+                                            };
+                                            if let std::collections::hash_map::Entry::Vacant(
+                                                entry,
+                                            ) = file_snapshots.entry(abs_path)
                                             {
-                                                let abs_path = if Path::new(fp).is_absolute() {
-                                                    PathBuf::from(fp)
-                                                } else {
-                                                    self.workspace_root.join(fp)
-                                                };
-                                                if !file_snapshots.contains_key(&abs_path) {
-                                                    let content = match tokio::fs::read_to_string(
-                                                        &abs_path,
-                                                    )
-                                                    .await
+                                                let abs_path = entry.key();
+                                                let content = match tokio::fs::read_to_string(
+                                                    abs_path,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(s) => Some(s),
+                                                    Err(e)
+                                                        if e.kind()
+                                                            == std::io::ErrorKind::NotFound =>
                                                     {
-                                                        Ok(s) => Some(s),
-                                                        Err(e)
-                                                            if e.kind()
-                                                                == std::io::ErrorKind::NotFound =>
-                                                        {
-                                                            None
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                "Snapshot read of {} failed ({}); treating as did-not-exist",
-                                                                abs_path.display(),
-                                                                e
-                                                            );
-                                                            None
-                                                        }
-                                                    };
-                                                    tracing::info!(
-                                                        "Snapshot before tool {}: {} ({})",
-                                                        tu.name,
-                                                        abs_path.display(),
-                                                        match &content {
-                                                            Some(s) => format!("{} bytes", s.len()),
-                                                            None => "did not exist".to_string(),
-                                                        }
-                                                    );
-                                                    file_snapshots.insert(abs_path, content);
-                                                }
+                                                        None
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Snapshot read of {} failed ({}); treating as did-not-exist",
+                                                            abs_path.display(),
+                                                            e
+                                                        );
+                                                        None
+                                                    }
+                                                };
+                                                tracing::info!(
+                                                    "Snapshot before tool {}: {} ({})",
+                                                    tu.name,
+                                                    abs_path.display(),
+                                                    match &content {
+                                                        Some(s) => format!("{} bytes", s.len()),
+                                                        None => "did not exist".to_string(),
+                                                    }
+                                                );
+                                                entry.insert(content);
                                             }
                                         }
                                     }
