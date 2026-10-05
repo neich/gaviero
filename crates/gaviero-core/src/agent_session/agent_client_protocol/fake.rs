@@ -124,9 +124,7 @@ where
                 }
             }
             "session/set_config_option" | "session/set_model" => {
-                if method == "session/set_model"
-                    || msg["params"]["configId"] == "model"
-                {
+                if method == "session/set_model" || msg["params"]["configId"] == "model" {
                     model_params = msg["params"].clone();
                 }
                 write_json(
@@ -380,7 +378,10 @@ async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn emit_update<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, update: Value) -> Result<()> {
+async fn emit_update<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    update: Value,
+) -> Result<()> {
     write_json(
         writer,
         &json!({

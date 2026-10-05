@@ -43,19 +43,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::client::propose_write;
 use crate::acp::session::AgentOptions;
-use crate::agent_session::reconcile::{
-    DirectWrite, reconcile_direct_writes, read_text_capped,
-};
+use crate::agent_session::reconcile::{DirectWrite, read_text_capped, reconcile_direct_writes};
+use crate::context_planner::types::McpCapabilities;
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::observer::{AcpObserver, PermissionDecision};
 use crate::scope_enforcer::ScopeEnforcer;
 use crate::swarm::backend::shared::{
     default_editor_system_prompt, render_graph_block, render_memory_block, render_skill_block,
 };
-use crate::swarm::backend::{
-    Capabilities, RetrievalToolset, StopReason, UnifiedStreamEvent,
-};
-use crate::context_planner::types::McpCapabilities;
+use crate::swarm::backend::{Capabilities, RetrievalToolset, StopReason, UnifiedStreamEvent};
 use crate::types::FileScope;
 use crate::write_gate::WriteGatePipeline;
 
@@ -152,7 +148,6 @@ impl AcpClientSession {
             options,
             cancel_token,
             profile,
-            observer: _,
             ..
         } = args;
         Self {
@@ -244,7 +239,8 @@ impl AcpClientSession {
         // tools. Clearing it otherwise would advertise tools that are absent.
         if !registers_gaviero(&servers) {
             self.options.exposed_tools = Some(Vec::new());
-            self.observer.on_streaming_status("dsh: no MCP endpoint available; retrieval tools disabled");
+            self.observer
+                .on_streaming_status("dsh: no MCP endpoint available; retrieval tools disabled");
         }
         let new = session_new(
             &rpc.handle,
@@ -307,7 +303,12 @@ impl AcpClientSession {
         Ok(true)
     }
 
-    async fn apply_effort(handle: &JsonRpcHandle, session_id: &str, thinking_settable: bool, effort: &str) {
+    async fn apply_effort(
+        handle: &JsonRpcHandle,
+        session_id: &str,
+        thinking_settable: bool,
+        effort: &str,
+    ) {
         if !thinking_settable {
             tracing::info!("dsh: effort not settable over ACP");
             return;
@@ -315,10 +316,7 @@ impl AcpClientSession {
         let on = !matches!(effort, "off" | "auto" | "");
         // Official dsh-acp advertises `reasoning_effort`; the in-tree fake
         // agent advertises `thinking`. Try both.
-        for (config_id, value) in [
-            ("reasoning_effort", json!(effort)),
-            ("thinking", json!(on)),
-        ] {
+        for (config_id, value) in [("reasoning_effort", json!(effort)), ("thinking", json!(on))] {
             if handle
                 .request(
                     "session/set_config_option",
@@ -419,9 +417,8 @@ async fn apply_session_model(
         if option_already_selects_model(option, requested) {
             return Ok(());
         }
-        let value = match_advertised_model(option, requested).ok_or_else(|| {
-            anyhow::anyhow!("dsh catalog has no option for {requested}")
-        })?;
+        let value = match_advertised_model(option, requested)
+            .ok_or_else(|| anyhow::anyhow!("dsh catalog has no option for {requested}"))?;
         handle
             .request(
                 "session/set_config_option",
@@ -537,7 +534,7 @@ fn model_id_from_option_value(value: &str) -> String {
 }
 
 fn model_ids_equivalent(left: &str, right: &str) -> bool {
-    equivalent_dsh_model_ids(left).iter().any(|id| *id == right)
+    equivalent_dsh_model_ids(left).contains(&right)
 }
 
 fn equivalent_dsh_model_ids(id: &str) -> Vec<&str> {
@@ -715,7 +712,11 @@ fn workspace_folders_hint(
 fn config_option_named(value: &Value, name: &str) -> bool {
     value
         .get("configOptions")
-        .or_else(|| value.get("agentCapabilities").and_then(|c| c.get("configOptions")))
+        .or_else(|| {
+            value
+                .get("agentCapabilities")
+                .and_then(|c| c.get("configOptions"))
+        })
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
@@ -772,16 +773,14 @@ fn build_prompt_blocks(
     // the only continuity; `/reset` clears it by watermarking the panel
     // transcript. A reused live child (swarm, consecutive send_turn on one
     // session) already holds that history — restuffing it would duplicate.
-    if include_replay {
-        if let Some(payload) = &turn.replay_history {
-            for (role, content) in &payload.entries {
-                let tag = match role {
-                    crate::context_planner::ledger::Role::User => "user",
-                    crate::context_planner::ledger::Role::Assistant => "assistant",
-                    crate::context_planner::ledger::Role::System => "system",
-                };
-                parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
-            }
+    if include_replay && let Some(payload) = &turn.replay_history {
+        for (role, content) in &payload.entries {
+            let tag = match role {
+                crate::context_planner::ledger::Role::User => "user",
+                crate::context_planner::ledger::Role::Assistant => "assistant",
+                crate::context_planner::ledger::Role::System => "system",
+            };
+            parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
         }
     }
     if let Some(hint) = workspace_folders_hint(workspace_root, additional_roots, session_cwd) {
@@ -802,8 +801,14 @@ fn rel_to_workspace(root: &Path, path: &Path) -> PathBuf {
     if let Ok(rel) = path.strip_prefix(root) {
         return norm_rel(rel);
     }
-    let root_s = root.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-    let path_s = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let root_s = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path_s = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     let root_s = root_s.trim_end_matches('/');
     if let Some(rest) = path_s.strip_prefix(root_s) {
         return PathBuf::from(rest.trim_start_matches('/'));
@@ -1072,7 +1077,10 @@ async fn capture_pre_turn_content(root: &Path, dirty: &HashSet<PathBuf>) -> PreT
         } else {
             root.join(rel)
         };
-        let size = tokio::fs::metadata(&abs).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&abs)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         if size > budget {
             tracing::debug!(
                 path = %rel.display(),
@@ -1210,7 +1218,10 @@ async fn reconcile_out_of_band_writes(
             }
         };
 
-        writes.push(DirectWrite { rel_path: rel, before });
+        writes.push(DirectWrite {
+            rel_path: rel,
+            before,
+        });
     }
 
     let outcome = reconcile_direct_writes(
@@ -1337,7 +1348,10 @@ impl AgentSession for AcpClientSession {
                         prompt_result = Some(result);
                     }
                 }
-                if prompt_result.is_some() && live.rpc.incoming.is_empty() && live.rpc.notifications.is_empty() {
+                if prompt_result.is_some()
+                    && live.rpc.incoming.is_empty()
+                    && live.rpc.notifications.is_empty()
+                {
                     break;
                 }
             }
@@ -1376,9 +1390,10 @@ impl AgentSession for AcpClientSession {
                         roots.extend(additional_roots.iter().cloned());
                         roots
                     };
-                    let after = tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_after))
-                        .await
-                        .unwrap_or_default();
+                    let after =
+                        tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_after))
+                            .await
+                            .unwrap_or_default();
                     let extra: Vec<PathBuf> = after
                         .difference(&before_dirty)
                         .filter(|p| !live.gate_written.contains(*p))
@@ -1412,9 +1427,10 @@ impl AgentSession for AcpClientSession {
                             roots.extend(additional_roots.iter().cloned());
                             roots
                         };
-                        let now = tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_now))
-                            .await
-                            .unwrap_or_default();
+                        let now =
+                            tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_now))
+                                .await
+                                .unwrap_or_default();
                         for path in now.difference(&before_dirty) {
                             if !live.gate_written.contains(path) && !reported.contains(path) {
                                 reported.push(path.clone());
@@ -1433,11 +1449,17 @@ impl AgentSession for AcpClientSession {
                         .await;
                 }
                 Some(Err(e)) => {
-                    let _ = tx.send(Ok(UnifiedStreamEvent::Error(format!("{e:#}")))).await;
-                    let _ = tx.send(Ok(UnifiedStreamEvent::Done(StopReason::Error))).await;
+                    let _ = tx
+                        .send(Ok(UnifiedStreamEvent::Error(format!("{e:#}"))))
+                        .await;
+                    let _ = tx
+                        .send(Ok(UnifiedStreamEvent::Done(StopReason::Error)))
+                        .await;
                 }
                 None => {
-                    let _ = tx.send(Ok(UnifiedStreamEvent::Done(StopReason::Timeout))).await;
+                    let _ = tx
+                        .send(Ok(UnifiedStreamEvent::Done(StopReason::Timeout)))
+                        .await;
                 }
             }
             // Dropping `live` kills the child. Chat wants ProcessBound reuse —
@@ -1446,7 +1468,6 @@ impl AgentSession for AcpClientSession {
             // constructs a new session per turn today as well when the
             // wrapper consumes send_turn to completion; the handle still
             // round-trips via ContinuityHandle::AcpSessionId.
-            drop(prompt_fut);
             if reusable { Some(live) } else { None }
         }));
 
@@ -1491,7 +1512,9 @@ mod tests {
         assert!(session_new_mcp_rejected(
             "ACP RPC session/new error -32602: non-empty mcpServers rejected"
         ));
-        assert!(session_new_mcp_rejected("MCP server declaration not allowed"));
+        assert!(session_new_mcp_rejected(
+            "MCP server declaration not allowed"
+        ));
         assert!(!session_new_mcp_rejected("cwd must be absolute"));
         assert!(!session_new_mcp_rejected(
             "ACP RPC session/new error -32602: Invalid params: additionalDirectories is not supported"
@@ -1506,7 +1529,9 @@ mod tests {
         assert!(session_new_additional_dirs_rejected(
             "additional directories are not supported"
         ));
-        assert!(!session_new_additional_dirs_rejected("cwd must be absolute"));
+        assert!(!session_new_additional_dirs_rejected(
+            "cwd must be absolute"
+        ));
         assert!(!session_new_additional_dirs_rejected(
             "ACP RPC session/new error -32602: non-empty mcpServers rejected"
         ));
@@ -1617,14 +1642,7 @@ mod tests {
     #[test]
     fn fresh_session_prompt_includes_host_replay() {
         let turn = sample_turn_with_replay();
-        let blocks = build_prompt_blocks(
-            &turn,
-            None,
-            true,
-            Path::new("."),
-            &[],
-            Path::new("."),
-        );
+        let blocks = build_prompt_blocks(&turn, None, true, Path::new("."), &[], Path::new("."));
         let texts = prompt_texts(&blocks);
         assert!(
             texts.iter().any(|t| t.contains("<user>\nold q\n</user>")),
@@ -1642,19 +1660,9 @@ mod tests {
     #[test]
     fn reused_session_prompt_skips_host_replay() {
         let turn = sample_turn_with_replay();
-        let blocks = build_prompt_blocks(
-            &turn,
-            None,
-            false,
-            Path::new("."),
-            &[],
-            Path::new("."),
-        );
+        let blocks = build_prompt_blocks(&turn, None, false, Path::new("."), &[], Path::new("."));
         let texts = prompt_texts(&blocks);
-        assert!(
-            texts.iter().all(|t| !t.contains("old q")),
-            "{texts:?}"
-        );
+        assert!(texts.iter().all(|t| !t.contains("old q")), "{texts:?}");
         assert_eq!(*texts.last().unwrap(), "now");
     }
 
@@ -1670,7 +1678,7 @@ mod tests {
         let b = parent.path().join("gaviero-flutter");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let cwd = enclosing_workspace_cwd(&a, &[b.clone()]).expect("enclosing cwd");
+        let cwd = enclosing_workspace_cwd(&a, std::slice::from_ref(&b)).expect("enclosing cwd");
         assert!(path_is_under(&cwd, &a), "cwd={cwd:?} a={a:?}");
         assert!(path_is_under(&cwd, &b), "cwd={cwd:?} b={b:?}");
         assert!(!is_filesystem_root(&cwd));
@@ -1710,14 +1718,7 @@ mod tests {
         std::fs::create_dir_all(&primary).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         let turn = sample_turn_with_replay();
-        let blocks = build_prompt_blocks(
-            &turn,
-            None,
-            false,
-            &primary,
-            &[sibling],
-            parent.path(),
-        );
+        let blocks = build_prompt_blocks(&turn, None, false, &primary, &[sibling], parent.path());
         let texts = prompt_texts(&blocks);
         let hint = texts
             .iter()

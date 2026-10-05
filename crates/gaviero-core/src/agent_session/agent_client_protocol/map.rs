@@ -7,7 +7,10 @@ use crate::swarm::backend::{StopReason, TokenUsage, UnifiedStreamEvent};
 
 /// Map one `session/update` notification (or its inner `update` object)
 /// into zero or more stream events.
-pub fn map_session_update(value: &Value, workspace_root: &std::path::Path) -> Vec<UnifiedStreamEvent> {
+pub fn map_session_update(
+    value: &Value,
+    workspace_root: &std::path::Path,
+) -> Vec<UnifiedStreamEvent> {
     let update = value
         .get("params")
         .and_then(|p| p.get("update"))
@@ -97,10 +100,7 @@ fn tool_end(update: &Value) -> Vec<UnifiedStreamEvent> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let status = update
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("");
     if status == "in_progress" {
         return Vec::new();
     }
