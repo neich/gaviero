@@ -244,9 +244,7 @@ mod tests {
         assert!(is_tailscale_addr(&"100.101.102.103".parse().unwrap()));
         assert!(!is_tailscale_addr(&"100.10.0.1".parse().unwrap()));
         assert!(!is_tailscale_addr(&"192.168.1.10".parse().unwrap()));
-        assert!(is_tailscale_addr(
-            &"fd7a:115c:a1e0::1234".parse().unwrap()
-        ));
+        assert!(is_tailscale_addr(&"fd7a:115c:a1e0::1234".parse().unwrap()));
         assert!(!is_tailscale_addr(&"fd00::1".parse().unwrap()));
     }
 

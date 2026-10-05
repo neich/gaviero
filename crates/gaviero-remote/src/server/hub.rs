@@ -28,6 +28,9 @@ const RECENT_COMMAND_IDS: usize = 1024;
 
 /// Host → hub. Sent with `try_send` only; a full channel means the host
 /// marks itself snapshot-dirty and moves on (invariant 11).
+// `Event` carries nearly all traffic; boxing it would allocate per frame
+// just to shrink the rare control variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum HubInput {
     /// One projected lifecycle event, stamped with the global revision at
@@ -91,6 +94,7 @@ pub(crate) struct RemoteHub {
 }
 
 impl RemoteHub {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: RemoteServerConfig,
         token: Arc<Mutex<String>>,
@@ -197,7 +201,9 @@ impl RemoteHub {
     /// something to depend on for a security transition. `tokio::fs` keeps
     /// the actor off the blocking path.
     async fn poll_token_file(&mut self) {
-        let Some(path) = self.token_path.clone() else { return };
+        let Some(path) = self.token_path.clone() else {
+            return;
+        };
         let Ok(text) = tokio::fs::read_to_string(&path).await else {
             return; // transient (mid-rename) or removed: keep the current token
         };
@@ -224,7 +230,10 @@ impl RemoteHub {
         // Newest authenticated + version-compatible client wins (§3.5).
         if self.active.take().is_some_and(|old| {
             old.close_tx
-                .send(Some(CloseSignal { code: close_code::REPLACED, reason: "replaced" }))
+                .send(Some(CloseSignal {
+                    code: close_code::REPLACED,
+                    reason: "replaced",
+                }))
                 .is_ok()
         }) {
             let _ = self.output_tx.send(HubOutput::ClientDisconnected).await;
@@ -251,7 +260,11 @@ impl RemoteHub {
                     let _ = self.output_tx.send(HubOutput::ClientDisconnected).await;
                 }
             }
-            ConnIn::UnknownCommand { conn_id, frame_type, command_id } => {
+            ConnIn::UnknownCommand {
+                conn_id,
+                frame_type,
+                command_id,
+            } => {
                 if !self.is_active(conn_id) {
                     return;
                 }
@@ -325,8 +338,7 @@ impl RemoteHub {
                 match frame {
                     ServerFrame::StreamChunk(chunk) => {
                         let key = (chunk.conv_id, chunk.turn_id);
-                        if let Some((_, buf)) =
-                            self.chunk_bufs.iter_mut().find(|(k, _)| *k == key)
+                        if let Some((_, buf)) = self.chunk_bufs.iter_mut().find(|(k, _)| *k == key)
                         {
                             buf.push_str(&chunk.text);
                         } else {
@@ -345,7 +357,7 @@ impl RemoteHub {
                         // Order rule (§6.2): a non-chunk event flushes the
                         // chunk run that must precede it.
                         match frame_conv_id(&frame) {
-                            Some(conv) => self.flush_conversation(&conv.to_string()),
+                            Some(conv) => self.flush_conversation(conv),
                             None => self.flush_chunks(),
                         }
                         self.emit(frame);

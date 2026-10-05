@@ -59,8 +59,7 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     let tls = issue_cert();
 
     // 1. The certificate the TUI would load passes the availability check.
-    let info = pairing::inspect_cert(&tls.cert_pem, MAGIC_DNS_HOST)
-        .expect("certificate parses");
+    let info = pairing::inspect_cert(&tls.cert_pem, MAGIC_DNS_HOST).expect("certificate parses");
     assert!(info.covers_host, "cert must cover the MagicDNS host");
     assert!(!info.is_expired());
 
@@ -261,7 +260,9 @@ async fn a_stale_qr_token_cannot_pair() {
         request,
         stream,
         None,
-        Some(tokio_tungstenite::Connector::Rustls(tls.client_config.clone())),
+        Some(tokio_tungstenite::Connector::Rustls(
+            tls.client_config.clone(),
+        )),
     )
     .await;
     assert!(
@@ -325,7 +326,9 @@ async fn a_token_in_the_query_string_is_not_accepted() {
         request,
         stream,
         None,
-        Some(tokio_tungstenite::Connector::Rustls(tls.client_config.clone())),
+        Some(tokio_tungstenite::Connector::Rustls(
+            tls.client_config.clone(),
+        )),
     )
     .await;
     assert!(

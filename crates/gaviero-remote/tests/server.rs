@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gaviero_remote::dto::{ClientHello, Limits, WorkspaceInfo};
 use gaviero_remote::envelope::{
-    ClientEnvelope, ClientFrame, SendPrompt, ServerEnvelope, ServerFrame, Snapshot, StreamChunk,
+    ClientEnvelope, ClientFrame, SendPrompt, ServerEnvelope, ServerFrame, StreamChunk,
     StreamingStatus,
 };
 use gaviero_remote::server::{HubInput, HubOutput, RemoteServerConfig, SpawnedServer, spawn};
@@ -38,7 +38,11 @@ fn make_tls() -> TestTls {
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    TestTls { cert_pem, key_pem, client_config: Arc::new(client_config) }
+    TestTls {
+        cert_pem,
+        key_pem,
+        client_config: Arc::new(client_config),
+    }
 }
 
 fn test_config(tls: &TestTls) -> RemoteServerConfig {
@@ -50,7 +54,10 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         token: TOKEN.to_string(),
         instance_id: INSTANCE.to_string(),
         tui_version: "0.1.0-test".to_string(),
-        workspace: WorkspaceInfo { id: "4b156f1de41da274".into(), display_name: "gaviero".into() },
+        workspace: WorkspaceInfo {
+            id: "4b156f1de41da274".into(),
+            display_name: "gaviero".into(),
+        },
         capabilities: vec![],
         machine: None,
         token_path: None,
@@ -60,7 +67,12 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
         directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
-        confirm_required: vec!["/autoapprove".into(), "/yolo".into(), "/reset".into(), "/clear".into()],
+        confirm_required: vec![
+            "/autoapprove".into(),
+            "/yolo".into(),
+            "/reset".into(),
+            "/clear".into(),
+        ],
         allowed_slash_commands: vec!["/model".into(), "/help".into()],
         limits: Limits {
             max_frame_bytes: 262_144,
@@ -157,7 +169,9 @@ async fn connect_ok(tls: &TestTls, addr: SocketAddr) -> Ws {
     let mut ws = connect_raw(tls, addr, TEST_HOST, Some(TOKEN), Some(SUBPROTOCOL))
         .await
         .expect("handshake");
-    ws.send(Message::Text(client_hello_frame(1).into())).await.unwrap();
+    ws.send(Message::Text(client_hello_frame(1).into()))
+        .await
+        .unwrap();
     let hello = next_frame(&mut ws).await;
     assert_eq!(hello.instance_id, INSTANCE);
     let ServerFrame::Hello(h) = &hello.frame else {
@@ -245,7 +259,10 @@ async fn certificate_hostname_is_verified() {
     .await
     .expect_err("hostname mismatch must fail TLS");
     let msg = format!("{err:?}");
-    assert!(msg.contains("Tls") || msg.contains("Io"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("Tls") || msg.contains("Io"),
+        "unexpected error: {msg}"
+    );
 }
 
 // ── Handshake, versioning, eviction ──────────────────────────────
@@ -261,11 +278,22 @@ async fn wrong_major_closed_4002_without_evicting_live_client() {
     expect_output(&mut server, "SnapshotNeeded").await;
 
     // Wrong-major client: closed 4002 before registration.
-    let mut bad = connect_raw(&tls, server.local_addr, TEST_HOST, Some(TOKEN), Some(SUBPROTOCOL))
+    let mut bad = connect_raw(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some(TOKEN),
+        Some(SUBPROTOCOL),
+    )
+    .await
+    .unwrap();
+    bad.send(Message::Text(client_hello_frame(2).into()))
         .await
         .unwrap();
-    bad.send(Message::Text(client_hello_frame(2).into())).await.unwrap();
-    assert_eq!(next_close_code(&mut bad).await, close_code::UNSUPPORTED_VERSION);
+    assert_eq!(
+        next_close_code(&mut bad).await,
+        close_code::UNSUPPORTED_VERSION
+    );
 
     // The live client was not evicted: it still receives events.
     server
@@ -311,19 +339,36 @@ async fn token_rotation_closes_4006_and_old_token_stops_working() {
 
     server
         .handle
-        .try_send(HubInput::TokenRotated { new_token: "rotated-token".into() })
+        .try_send(HubInput::TokenRotated {
+            new_token: "rotated-token".into(),
+        })
         .unwrap();
     assert_eq!(next_close_code(&mut ws).await, close_code::TOKEN_ROTATED);
     expect_output(&mut server, "ClientDisconnected").await;
 
-    let err = connect_raw(&tls, server.local_addr, TEST_HOST, Some(TOKEN), Some(SUBPROTOCOL))
-        .await
-        .expect_err("old token must be rejected");
-    assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)));
+    let err = connect_raw(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some(TOKEN),
+        Some(SUBPROTOCOL),
+    )
+    .await
+    .expect_err("old token must be rejected");
+    assert!(matches!(
+        err,
+        tokio_tungstenite::tungstenite::Error::Http(_)
+    ));
 
-    let _ws = connect_raw(&tls, server.local_addr, TEST_HOST, Some("rotated-token"), Some(SUBPROTOCOL))
-        .await
-        .expect("new token accepted");
+    let _ws = connect_raw(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some("rotated-token"),
+        Some(SUBPROTOCOL),
+    )
+    .await
+    .expect("new token accepted");
 }
 
 // ── Ordering and coalescing ──────────────────────────────────────
@@ -364,19 +409,33 @@ async fn token_file_change_rotates_and_closes_4006() {
     expect_output(&mut server, "ClientDisconnected").await;
 
     // Old token is dead, new token pairs.
-    let err = connect_raw(&tls, server.local_addr, TEST_HOST, Some(TOKEN), Some(SUBPROTOCOL))
-        .await
-        .expect_err("old token must be rejected after a file rotation");
+    let err = connect_raw(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some(TOKEN),
+        Some(SUBPROTOCOL),
+    )
+    .await
+    .expect_err("old token must be rejected after a file rotation");
     assert!(matches!(
         err,
         tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 401
     ));
-    let mut ws2 = connect_raw(&tls, server.local_addr, TEST_HOST, Some(new_token), Some(SUBPROTOCOL))
-        .await
-        .expect("new token pairs");
+    let mut ws2 = connect_raw(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some(new_token),
+        Some(SUBPROTOCOL),
+    )
+    .await
+    .expect("new token pairs");
     {
         use futures::SinkExt;
-        ws2.send(Message::Text(client_hello_frame(1).into())).await.unwrap();
+        ws2.send(Message::Text(client_hello_frame(1).into()))
+            .await
+            .unwrap();
     }
     let hello = next_frame(&mut ws2).await;
     assert!(matches!(hello.frame, ServerFrame::Hello(_)));
@@ -400,10 +459,22 @@ async fn interleaved_chunks_coalesce_per_conversation_in_order() {
             text: text.into(),
         }),
     };
-    server.handle.try_send(chunk("conv-a", "turn-a", "a1 ")).unwrap();
-    server.handle.try_send(chunk("conv-b", "turn-b", "b1 ")).unwrap();
-    server.handle.try_send(chunk("conv-a", "turn-a", "a2")).unwrap();
-    server.handle.try_send(chunk("conv-b", "turn-b", "b2")).unwrap();
+    server
+        .handle
+        .try_send(chunk("conv-a", "turn-a", "a1 "))
+        .unwrap();
+    server
+        .handle
+        .try_send(chunk("conv-b", "turn-b", "b1 "))
+        .unwrap();
+    server
+        .handle
+        .try_send(chunk("conv-a", "turn-a", "a2"))
+        .unwrap();
+    server
+        .handle
+        .try_send(chunk("conv-b", "turn-b", "b2"))
+        .unwrap();
 
     let mut seen = Vec::new();
     let mut last_seq = 0;
@@ -411,7 +482,9 @@ async fn interleaved_chunks_coalesce_per_conversation_in_order() {
         let env = next_frame(&mut ws).await;
         assert!(env.seq > last_seq, "seq must be monotonic");
         last_seq = env.seq;
-        let ServerFrame::StreamChunk(c) = env.frame else { panic!("expected chunk") };
+        let ServerFrame::StreamChunk(c) = env.frame else {
+            panic!("expected chunk")
+        };
         seen.push((c.conv_id, c.text));
     }
     seen.sort();
@@ -479,15 +552,25 @@ async fn newer_snapshot_replaces_queued_snapshot() {
         )
         .unwrap();
         let env: ServerEnvelope = serde_json::from_str(&text).unwrap();
-        let ServerFrame::Snapshot(mut s) = env.frame else { unreachable!() };
+        let ServerFrame::Snapshot(mut s) = env.frame else {
+            unreachable!()
+        };
         s.revision = revision;
         Box::new(s)
     };
-    server.handle.try_send(HubInput::Snapshot(snap(10))).unwrap();
-    server.handle.try_send(HubInput::Snapshot(snap(11))).unwrap();
+    server
+        .handle
+        .try_send(HubInput::Snapshot(snap(10)))
+        .unwrap();
+    server
+        .handle
+        .try_send(HubInput::Snapshot(snap(11)))
+        .unwrap();
 
     let env = next_frame(&mut ws).await;
-    let ServerFrame::Snapshot(s) = env.frame else { panic!("expected snapshot") };
+    let ServerFrame::Snapshot(s) = env.frame else {
+        panic!("expected snapshot")
+    };
     assert_eq!(s.revision, 11, "older queued snapshot must be replaced");
 }
 
@@ -502,17 +585,31 @@ async fn commands_flow_and_duplicates_are_dropped() {
     expect_output(&mut server, "ClientConnected").await;
     expect_output(&mut server, "SnapshotNeeded").await;
 
-    ws.send(Message::Text(send_prompt_envelope("cmd-1").into())).await.unwrap();
-    ws.send(Message::Text(send_prompt_envelope("cmd-1").into())).await.unwrap();
-    ws.send(Message::Text(send_prompt_envelope("cmd-2").into())).await.unwrap();
+    ws.send(Message::Text(send_prompt_envelope("cmd-1").into()))
+        .await
+        .unwrap();
+    ws.send(Message::Text(send_prompt_envelope("cmd-1").into()))
+        .await
+        .unwrap();
+    ws.send(Message::Text(send_prompt_envelope("cmd-2").into()))
+        .await
+        .unwrap();
 
     let out = tokio::time::timeout(Duration::from_secs(5), server.outputs.recv())
-        .await.unwrap().unwrap();
-    let HubOutput::Command(env) = out else { panic!("expected command") };
+        .await
+        .unwrap()
+        .unwrap();
+    let HubOutput::Command(env) = out else {
+        panic!("expected command")
+    };
     assert_eq!(env.command_id, "cmd-1");
     let out = tokio::time::timeout(Duration::from_secs(5), server.outputs.recv())
-        .await.unwrap().unwrap();
-    let HubOutput::Command(env) = out else { panic!("duplicate must be dropped silently") };
+        .await
+        .unwrap()
+        .unwrap();
+    let HubOutput::Command(env) = out else {
+        panic!("duplicate must be dropped silently")
+    };
     assert_eq!(env.command_id, "cmd-2");
 }
 
@@ -530,7 +627,9 @@ async fn unknown_command_type_answered_with_command_error() {
     );
     ws.send(Message::Text(raw.into())).await.unwrap();
     let env = next_frame(&mut ws).await;
-    let ServerFrame::CommandError(e) = env.frame else { panic!("expected command_error") };
+    let ServerFrame::CommandError(e) = env.frame else {
+        panic!("expected command_error")
+    };
     assert_eq!(e.command_id, "cmd-x");
     assert_eq!(e.code, gaviero_remote::dto::ErrorCode::UnknownType);
 }
@@ -548,11 +647,18 @@ async fn wrong_instance_id_rejected_as_invalid_payload() {
         version: PROTOCOL_VERSION,
         instance_id: Some("stale-instance".into()),
         command_id: "cmd-stale".into(),
-        frame: ClientFrame::SendPrompt(SendPrompt { conv_id: "c".into(), text: "hi".into() }),
+        frame: ClientFrame::SendPrompt(SendPrompt {
+            conv_id: "c".into(),
+            text: "hi".into(),
+        }),
     };
-    ws.send(Message::Text(serde_json::to_string(&env).unwrap().into())).await.unwrap();
+    ws.send(Message::Text(serde_json::to_string(&env).unwrap().into()))
+        .await
+        .unwrap();
     let frame = next_frame(&mut ws).await;
-    let ServerFrame::CommandError(e) = frame.frame else { panic!("expected command_error") };
+    let ServerFrame::CommandError(e) = frame.frame else {
+        panic!("expected command_error")
+    };
     assert_eq!(e.code, gaviero_remote::dto::ErrorCode::InvalidPayload);
 }
 
@@ -568,7 +674,11 @@ async fn command_flood_hits_rate_limit() {
     expect_output(&mut server, "SnapshotNeeded").await;
 
     for i in 0..6 {
-        ws.send(Message::Text(send_prompt_envelope(&format!("cmd-{i}")).into())).await.unwrap();
+        ws.send(Message::Text(
+            send_prompt_envelope(&format!("cmd-{i}")).into(),
+        ))
+        .await
+        .unwrap();
     }
     let mut rate_limited = false;
     for _ in 0..6 {
@@ -615,7 +725,9 @@ async fn binary_frame_closed_4003() {
     let tls = make_tls();
     let server = spawn(test_config(&tls)).await.unwrap();
     let mut ws = connect_ok(&tls, server.local_addr).await;
-    ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
+    ws.send(Message::Binary(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
     assert_eq!(next_close_code(&mut ws).await, close_code::PROTOCOL_ERROR);
 }
 
@@ -644,10 +756,10 @@ async fn slow_client_is_dropped() {
             }),
         });
         tokio::time::sleep(Duration::from_millis(1)).await;
-        if let Ok(out) = server.outputs.try_recv() {
-            if matches!(out, HubOutput::ClientDisconnected) {
-                return; // dropped as slow — pass
-            }
+        if let Ok(out) = server.outputs.try_recv()
+            && matches!(out, HubOutput::ClientDisconnected)
+        {
+            return; // dropped as slow — pass
         }
     }
     expect_output(&mut server, "ClientDisconnected").await;
@@ -685,9 +797,9 @@ async fn shutdown_closes_with_4007() {
 
 // ── Plan C C3: registry + GET /v1/instances + directory port ──────
 
+use gaviero_remote::INSTANCES_PATH;
 use gaviero_remote::dto::{InstanceDirectory, InstanceInfo, MachineInfo};
 use gaviero_remote::server::registry::{self, RegistryConfig};
-use gaviero_remote::INSTANCES_PATH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn free_loopback_port() -> u16 {
@@ -739,7 +851,11 @@ async fn https_get(
     (status, head.to_string(), body.to_string())
 }
 
-fn with_registry(mut config: RemoteServerConfig, dir: &std::path::Path, id: &str) -> RemoteServerConfig {
+fn with_registry(
+    mut config: RemoteServerConfig,
+    dir: &std::path::Path,
+    id: &str,
+) -> RemoteServerConfig {
     let port = 1; // rewritten after bind is unknown; heartbeat uses this until first write after spawn — tests wait for heartbeat and re-check url/port from disk if needed.
     config.machine = Some(MachineInfo {
         host: TEST_HOST.into(),
@@ -771,9 +887,11 @@ async fn instances_get_requires_bearer_and_does_not_evict() {
 
     // Live client still there: a prompt is accepted.
     use futures::SinkExt;
-    ws.send(Message::Text(send_prompt_envelope("cmd-still-alive").into()))
-        .await
-        .unwrap();
+    ws.send(Message::Text(
+        send_prompt_envelope("cmd-still-alive").into(),
+    ))
+    .await
+    .unwrap();
     expect_output(&mut server, "Command").await;
 }
 
@@ -791,7 +909,8 @@ async fn instances_get_lists_fresh_entries_and_sets_no_store() {
             https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
         assert_eq!(status, 200);
         assert!(
-            head.to_ascii_lowercase().contains("cache-control: no-store"),
+            head.to_ascii_lowercase()
+                .contains("cache-control: no-store"),
             "head={head}"
         );
         let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
@@ -821,12 +940,21 @@ async fn instances_get_omits_and_deletes_stale_entry() {
 
     let config = with_registry(test_config(&tls), dir.path(), INSTANCE);
     let server = spawn(config).await.unwrap();
-    let (status, _, body) =
-        https_get(&tls, server.local_addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+    let (status, _, body) = https_get(
+        &tls,
+        server.local_addr,
+        TEST_HOST,
+        Some(TOKEN),
+        INSTANCES_PATH,
+    )
+    .await;
     assert_eq!(status, 200);
     let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
     assert!(
-        parsed.instances.iter().all(|i| i.instance_id != "stale-one"),
+        parsed
+            .instances
+            .iter()
+            .all(|i| i.instance_id != "stale-one"),
         "{body}"
     );
     assert!(!path.exists(), "stale file must be deleted");
@@ -836,7 +964,9 @@ async fn instances_get_omits_and_deletes_stale_entry() {
 async fn two_servers_share_a_registry_dir() {
     let tls = make_tls();
     let dir = tempfile::tempdir().unwrap();
-    let a = spawn(with_registry(test_config(&tls), dir.path(), "inst-a")).await.unwrap();
+    let a = spawn(with_registry(test_config(&tls), dir.path(), "inst-a"))
+        .await
+        .unwrap();
     let mut cfg_b = with_registry(test_config(&tls), dir.path(), "inst-b");
     cfg_b.instance_id = "inst-b".into();
     let b = spawn(cfg_b).await.unwrap();
@@ -846,7 +976,11 @@ async fn two_servers_share_a_registry_dir() {
         let (_, _, body) =
             https_get(&tls, a.local_addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
         let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
-        let ids: Vec<_> = parsed.instances.iter().map(|i| i.instance_id.as_str()).collect();
+        let ids: Vec<_> = parsed
+            .instances
+            .iter()
+            .map(|i| i.instance_id.as_str())
+            .collect();
         if ids.contains(&"inst-a") && ids.contains(&"inst-b") {
             break;
         }
@@ -925,7 +1059,10 @@ async fn directory_port_ws_is_404_and_leader_handover_works() {
     let a = spawn(cfg_a).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !a.directory_leader.load(std::sync::atomic::Ordering::Relaxed) {
+    while !a
+        .directory_leader
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         if tokio::time::Instant::now() > deadline {
             panic!("A never became directory leader");
         }
@@ -939,7 +1076,8 @@ async fn directory_port_ws_is_404_and_leader_handover_works() {
     let b = spawn(cfg_b).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        !b.directory_leader.load(std::sync::atomic::Ordering::Relaxed),
+        !b.directory_leader
+            .load(std::sync::atomic::Ordering::Relaxed),
         "B must not be leader while A holds the port"
     );
 
@@ -948,7 +1086,10 @@ async fn directory_port_ws_is_404_and_leader_handover_works() {
 
     a.handle.try_send(HubInput::Shutdown).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !b.directory_leader.load(std::sync::atomic::Ordering::Relaxed) {
+    while !b
+        .directory_leader
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         if tokio::time::Instant::now() > deadline {
             panic!("B did not become leader after A shutdown");
         }
@@ -963,8 +1104,7 @@ async fn instances_get_flood_returns_429() {
     let addr = server.local_addr;
     let mut saw_429 = false;
     for _ in 0..40 {
-        let (status, _, _) =
-            https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+        let (status, _, _) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
         if status == 429 {
             saw_429 = true;
             break;
