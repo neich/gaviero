@@ -188,14 +188,14 @@ fn build_capture_map(
 
 fn read_scope_property(query: &Query, pattern_index: usize) -> Option<IndentScope> {
     for prop in query.property_settings(pattern_index) {
-        if &*prop.key == "scope" {
-            if let Some(ref val) = prop.value {
-                return match &**val {
-                    "all" => Some(IndentScope::All),
-                    "tail" => Some(IndentScope::Tail),
-                    _ => None,
-                };
-            }
+        if &*prop.key == "scope"
+            && let Some(ref val) = prop.value
+        {
+            return match &**val {
+                "all" => Some(IndentScope::All),
+                "tail" => Some(IndentScope::Tail),
+                _ => None,
+            };
         }
     }
     None

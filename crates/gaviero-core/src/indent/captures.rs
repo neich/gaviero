@@ -93,6 +93,12 @@ pub struct LineAccumulator {
     lines: HashMap<usize, Vec<IndentCapture>>,
 }
 
+impl Default for LineAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineAccumulator {
     pub fn new() -> Self {
         Self {

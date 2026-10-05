@@ -27,10 +27,9 @@ pub fn evaluate_single_predicate(
             // The captured node's kind must NOT equal the string.
             if let (Some(PredicateArg::Capture(idx)), Some(PredicateArg::String(kind))) =
                 (args.first(), args.get(1))
+                && let Some(Some(node)) = capture_nodes.get(*idx as usize)
             {
-                if let Some(Some(node)) = capture_nodes.get(*idx as usize) {
-                    return node.kind != *kind;
-                }
+                return node.kind != *kind;
             }
             true // if we can't evaluate, pass through
         }
@@ -38,43 +37,41 @@ pub fn evaluate_single_predicate(
             // #same-line? @a @b — both captures must start on the same line.
             if let (Some(PredicateArg::Capture(a)), Some(PredicateArg::Capture(b))) =
                 (args.first(), args.get(1))
-            {
-                if let (Some(Some(node_a)), Some(Some(node_b))) = (
+                && let (Some(Some(node_a)), Some(Some(node_b))) = (
                     capture_nodes.get(*a as usize),
                     capture_nodes.get(*b as usize),
-                ) {
-                    return node_a.start_line == node_b.start_line;
-                }
+                )
+            {
+                return node_a.start_line == node_b.start_line;
             }
             true
         }
         "not-same-line?" => {
             if let (Some(PredicateArg::Capture(a)), Some(PredicateArg::Capture(b))) =
                 (args.first(), args.get(1))
-            {
-                if let (Some(Some(node_a)), Some(Some(node_b))) = (
+                && let (Some(Some(node_a)), Some(Some(node_b))) = (
                     capture_nodes.get(*a as usize),
                     capture_nodes.get(*b as usize),
-                ) {
-                    return node_a.start_line != node_b.start_line;
-                }
+                )
+            {
+                return node_a.start_line != node_b.start_line;
             }
             true
         }
         "one-line?" => {
             // #one-line? @a — the captured node must span exactly one line.
-            if let Some(PredicateArg::Capture(idx)) = args.first() {
-                if let Some(Some(node)) = capture_nodes.get(*idx as usize) {
-                    return node.start_line == node.end_line;
-                }
+            if let Some(PredicateArg::Capture(idx)) = args.first()
+                && let Some(Some(node)) = capture_nodes.get(*idx as usize)
+            {
+                return node.start_line == node.end_line;
             }
             true
         }
         "not-one-line?" => {
-            if let Some(PredicateArg::Capture(idx)) = args.first() {
-                if let Some(Some(node)) = capture_nodes.get(*idx as usize) {
-                    return node.start_line != node.end_line;
-                }
+            if let Some(PredicateArg::Capture(idx)) = args.first()
+                && let Some(Some(node)) = capture_nodes.get(*idx as usize)
+            {
+                return node.start_line != node.end_line;
             }
             true
         }
