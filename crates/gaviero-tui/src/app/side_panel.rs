@@ -3100,7 +3100,9 @@ pub(crate) fn cancel_agent_conv(app: &mut App, conv_id: &str) {
                 let conv = &mut app.chat_state.conversations[idx];
                 conv.is_streaming = false;
                 conv.streaming_started_at = None;
-                conv.background_agents.clear();
+                // Kept, not cleared: the turn's final message lists them
+                // with how each one ended.
+                conv.stop_background_agents("cancelled", "cancelled by user");
                 conv.bump_revision();
             }
         } else {

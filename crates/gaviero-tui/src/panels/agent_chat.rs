@@ -754,14 +754,108 @@ impl Conversation {
     pub fn has_running_background_agents(&self) -> bool {
         self.background_agents.iter().any(|a| !a.finished)
     }
+
+    /// End every still-running background task with `status` (the host
+    /// stopped the turn, e.g. on cancel) so the summary says so.
+    pub fn stop_background_agents(&mut self, status: &str, reason: &str) {
+        let now = std::time::Instant::now();
+        for agent in self.background_agents.iter_mut().filter(|a| !a.finished) {
+            agent.finished = true;
+            agent.status = status.to_string();
+            agent.summary = reason.to_string();
+            agent.finished_at = Some(now);
+        }
+    }
+
+    /// Clear the turn's background tasks, leaving a System message that
+    /// lists each one and how it ended — the live list disappears with the
+    /// turn, so this is the record of what ran in the background.
+    fn close_background_agents(&mut self) {
+        if self.background_agents.is_empty() {
+            return;
+        }
+        self.stop_background_agents("stopped", "still running when the turn ended");
+        let lines: Vec<String> = self
+            .background_agents
+            .drain(..)
+            .map(|a| a.display_line())
+            .collect();
+        let header = if lines.len() == 1 {
+            "Background task this turn:".to_string()
+        } else {
+            format!("Background tasks this turn ({}):", lines.len())
+        };
+        self.push_message(
+            ChatRole::System,
+            format!("{header}\n{}", lines.join("\n")),
+            Vec::new(),
+        );
+    }
 }
 
-/// One Claude Code background Task/Agent attached to a conversation.
+/// One background task (provider subagent or background shell command)
+/// attached to a conversation's running turn.
 #[derive(Debug, Clone)]
 pub struct BackgroundAgent {
     pub id: String,
     pub description: String,
     pub finished: bool,
+    /// How it ended (`completed`, `failed`, `killed`, `stopped`,
+    /// `cancelled`, `detached`, …); empty while running.
+    pub status: String,
+    /// The provider's summary or the reason it was stopped.
+    pub summary: String,
+    pub started_at: std::time::Instant,
+    pub finished_at: Option<std::time::Instant>,
+}
+
+impl BackgroundAgent {
+    fn elapsed(&self) -> std::time::Duration {
+        self.finished_at
+            .unwrap_or_else(std::time::Instant::now)
+            .duration_since(self.started_at)
+    }
+
+    /// `• search papers (12s)` while running, `✓ search papers — completed
+    /// (42s)` / `✗ … — killed: parent process exited (3s)` once ended.
+    pub fn display_line(&self) -> String {
+        let elapsed = format_elapsed(self.elapsed());
+        if !self.finished {
+            return format!("• {} ({elapsed})", self.description);
+        }
+        let mark = if self.status == "completed" {
+            "✓"
+        } else {
+            "✗"
+        };
+        let status = if self.status.is_empty() {
+            "finished"
+        } else {
+            self.status.as_str()
+        };
+        let reason = self.summary.lines().next().unwrap_or("").trim();
+        if reason.is_empty() || self.status == "completed" {
+            format!("{mark} {} — {status} ({elapsed})", self.description)
+        } else {
+            let mut reason: String = reason.chars().take(120).collect();
+            if self.summary.chars().count() > 120 {
+                reason.push('…');
+            }
+            format!(
+                "{mark} {} — {status}: {reason} ({elapsed})",
+                self.description
+            )
+        }
+    }
+}
+
+fn format_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{}s", secs / 60, secs % 60)
+    }
 }
 
 /// Context-window pressure shown in the status bar and `/context`.
@@ -3739,12 +3833,23 @@ impl AgentChatState {
         let conv = &mut self.conversations[idx];
         if let Some(existing) = conv.background_agents.iter_mut().find(|a| a.id == task_id) {
             existing.description = description.to_string();
+            if existing.finished {
+                // Woken again (e.g. its own background work): a new run.
+                existing.started_at = std::time::Instant::now();
+            }
             existing.finished = false;
+            existing.status.clear();
+            existing.summary.clear();
+            existing.finished_at = None;
         } else {
             conv.background_agents.push(BackgroundAgent {
                 id: task_id.to_string(),
                 description: description.to_string(),
                 finished: false,
+                status: String::new(),
+                summary: String::new(),
+                started_at: std::time::Instant::now(),
+                finished_at: None,
             });
         }
         conv.streaming_status = background_status_label(&conv.background_agents);
@@ -3758,15 +3863,22 @@ impl AgentChatState {
         &mut self,
         conv_id: &str,
         task_id: &str,
-        _status: &str,
-        _summary: &str,
+        status: &str,
+        summary: &str,
     ) {
         let Some(idx) = self.find_conv_idx(conv_id) else {
             return;
         };
         let conv = &mut self.conversations[idx];
-        if let Some(agent) = conv.background_agents.iter_mut().find(|a| a.id == task_id) {
+        if let Some(agent) = conv
+            .background_agents
+            .iter_mut()
+            .find(|a| a.id == task_id && !a.finished)
+        {
             agent.finished = true;
+            agent.status = status.to_string();
+            agent.summary = summary.to_string();
+            agent.finished_at = Some(std::time::Instant::now());
         }
         conv.streaming_status = background_status_label(&conv.background_agents);
         conv.bump_revision();
@@ -3854,7 +3966,7 @@ impl AgentChatState {
             self.conversations[idx].is_streaming = false;
             self.conversations[idx].streaming_status.clear();
             self.conversations[idx].streaming_started_at = None;
-            self.conversations[idx].background_agents.clear();
+            self.conversations[idx].close_background_agents();
             if idx == self.active_conv {
                 self.scroll_to_bottom();
             }
@@ -3870,7 +3982,7 @@ impl AgentChatState {
             self.conversations[idx].is_streaming = false;
             self.conversations[idx].streaming_status.clear();
             self.conversations[idx].streaming_started_at = None;
-            self.conversations[idx].background_agents.clear();
+            self.conversations[idx].close_background_agents();
             if idx == self.active_conv {
                 self.scroll_to_bottom();
             }
@@ -3884,7 +3996,7 @@ impl AgentChatState {
         self.conversations[idx].is_streaming = false;
         self.conversations[idx].streaming_status.clear();
         self.conversations[idx].streaming_started_at = None;
-        self.conversations[idx].background_agents.clear();
+        self.conversations[idx].close_background_agents();
         if idx == self.active_conv {
             self.scroll_to_bottom();
         }
@@ -4494,11 +4606,6 @@ impl AgentChatState {
             // Advance every ~6 ticks (~200ms at 33ms/tick)
             let frame = spinner_frames[(self.tick_count / 6) as usize % spinner_frames.len()];
             let conv = &self.conversations[self.active_conv];
-            let running: Vec<&BackgroundAgent> = conv
-                .background_agents
-                .iter()
-                .filter(|a| !a.finished)
-                .collect();
             let status = &conv.streaming_status;
             let label = if status.is_empty() {
                 "Thinking..."
@@ -4524,11 +4631,15 @@ impl AgentChatState {
                 )],
                 None,
             ));
+            // Every background task of this turn: running ones with their
+            // elapsed time, then the ones already done with how they ended.
             let agent_style = Style::default().fg(theme::TEXT_DIM);
-            for agent in running {
+            let mut agents: Vec<&BackgroundAgent> = conv.background_agents.iter().collect();
+            agents.sort_by_key(|a| a.finished);
+            for agent in agents {
                 lines.push((
                     vec![crate::panels::chat_markdown::StyledSegment::new(
-                        format!("  • {}", agent.description),
+                        format!("  {}", agent.display_line()),
                         agent_style,
                     )],
                     None,
@@ -5462,12 +5573,25 @@ fn format_message_timestamp(timestamp: u64) -> Option<String> {
     Some(local.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
+/// Mirrors core's `bg_status` wording; core follows every task event with
+/// its own status, so this only bridges the gap between the two events.
+/// Shell commands arrive as `$ <command>`.
 fn background_status_label(agents: &[BackgroundAgent]) -> String {
     let running: Vec<&BackgroundAgent> = agents.iter().filter(|a| !a.finished).collect();
-    match running.len() {
-        0 => String::new(),
-        1 => format!("Background agent: {}", running[0].description),
-        n => format!("{n} background agents running"),
+    let commands = running
+        .iter()
+        .filter(|a| a.description.starts_with("$ "))
+        .count();
+    match (running.len(), commands) {
+        (0, _) => String::new(),
+        (1, 1) => format!(
+            "Waiting for background command: {}",
+            &running[0].description[2..]
+        ),
+        (1, _) => format!("Background agent: {}", running[0].description),
+        (n, c) if c == n => format!("Waiting for {n} background commands"),
+        (n, 0) => format!("{n} background agents running"),
+        (n, _) => format!("Waiting for {n} background tasks"),
     }
 }
 
@@ -6708,6 +6832,91 @@ mod tests {
             state.conversations[state.active_conv]
                 .streaming_status
                 .is_empty()
+        );
+    }
+
+    /// The live list goes away with the turn, so the turn's final message
+    /// is followed by a System record of every background task and how it
+    /// ended — including one the provider never reported finished.
+    #[test]
+    fn a_finished_turn_records_how_each_background_task_ended() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.background_task_started_to(&conv_id, "t1", "search papers");
+        state.background_task_started_to(&conv_id, "t2", "$ cargo test");
+        state.background_task_started_to(&conv_id, "t3", "scan patents");
+        state.background_task_finished_to(&conv_id, "t1", "completed", "found 4");
+        state.background_task_finished_to(&conv_id, "t2", "killed", "parent process exited");
+        // A late duplicate must not overwrite the first outcome.
+        state.background_task_finished_to(&conv_id, "t1", "killed", "late");
+
+        state.finalize_message_to(&conv_id, "assistant", "Done.");
+
+        let conv = &state.conversations[state.active_conv];
+        assert!(conv.background_agents.is_empty());
+        let last = conv.messages.last().unwrap();
+        assert_eq!(last.role, ChatRole::System);
+        let lines: Vec<&str> = last.content.lines().collect();
+        assert_eq!(lines[0], "Background tasks this turn (3):");
+        assert!(
+            lines[1].starts_with("✓ search papers — completed ("),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("✗ $ cargo test — killed: parent process exited ("),
+            "{lines:?}"
+        );
+        assert!(
+            lines[3].starts_with("✗ scan patents — stopped: still running when the turn ended ("),
+            "{lines:?}"
+        );
+        assert_eq!(
+            conv.messages[conv.messages.len() - 2].content,
+            "Done.",
+            "the record follows the answer"
+        );
+    }
+
+    #[test]
+    fn a_turn_without_background_tasks_adds_no_record() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.finalize_message_to(&conv_id, "assistant", "Done.");
+        let conv = &state.conversations[state.active_conv];
+        assert!(conv.messages.iter().all(|m| m.role != ChatRole::System));
+    }
+
+    #[test]
+    fn cancelling_marks_running_background_tasks_cancelled() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.background_task_started_to(&conv_id, "t1", "search papers");
+        let idx = state.active_conv;
+        state.conversations[idx].stop_background_agents("cancelled", "cancelled by user");
+        assert!(!state.conversations[idx].has_running_background_agents());
+        state.finalize_message_to(&conv_id, "system", "Cancelled by user.");
+        let record = state.conversations[idx]
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("Background task this turn:"))
+            .expect("record");
+        assert!(
+            record
+                .content
+                .contains("✗ search papers — cancelled: cancelled by user"),
+            "{}",
+            record.content
+        );
+    }
+
+    #[test]
+    fn a_background_command_is_labelled_as_a_command() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.background_task_started_to(&conv_id, "t1", "$ cargo build");
+        assert_eq!(
+            state.conversations[state.active_conv].streaming_status,
+            "Waiting for background command: cargo build"
         );
     }
 
