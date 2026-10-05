@@ -221,6 +221,13 @@ impl HistoryRecorder {
         true
     }
 
+    /// Append a record to a turn that has already ended — the review of its
+    /// file changes, which the user finalizes later (possibly after a
+    /// restart). Sorted last within the turn (`seq = u32::MAX`).
+    pub fn push_after_turn(&self, conv_id: Option<&str>, turn_id: &str, payload: HistoryKind) {
+        self.append_record(conv_id, Some(turn_id), u32::MAX, payload);
+    }
+
     /// A tool call started and only its one-line summary is known. Reserves
     /// the call's seq so its record keeps its place in the turn even though
     /// it is written later: by [`Self::tool_completed`] when the provider
@@ -608,6 +615,7 @@ fn normalize(payload: HistoryKind) -> HistoryKind {
             }
             HistoryKind::TurnEnd(e)
         }
+        other @ (HistoryKind::FilesChanged(_) | HistoryKind::TurnReview(_)) => other,
     }
 }
 

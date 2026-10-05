@@ -9,7 +9,7 @@ Conventions and rules: [CLAUDE.md](CLAUDE.md). Workspace topology: [../../ARCHIT
 ## Topology
 
 ```
-gaviero-core (lib, 27 pub mods)
+gaviero-core (lib, 28 pub mods)
  ├── swarm/ + agent_session/     orchestration + provider transport
  ├── memory/ + mcp/              scoped store + read-only MCP server
  ├── write_gate/ + scope_*       single write path for all agents
@@ -31,17 +31,21 @@ Depends on: tokio, tree-sitter 0.25 (+ grammars), git2, rusqlite + sqlite-vec, o
 
 ## Modules
 
-**27 pub mods** from [`src/lib.rs`](src/lib.rs):
+**28 pub mods** from [`src/lib.rs`](src/lib.rs):
 
 ```
 gaviero-core/src/
-├─ lib.rs                 Re-exports tree-sitter types + 27 pub mods
+├─ lib.rs                 Re-exports tree-sitter types + 28 pub mods
 ├─ types.rs               FileScope, WriteProposal, ModelTier, PrivacyLevel, …
 ├─ workspace.rs           Workspace::single_folder / load, settings cascade
 ├─ session_state.rs       SessionState, TabState, StoredConversation, index
 ├─ tree_sitter.rs         LANGUAGE_REGISTRY (16 langs), enrich_hunks
 ├─ diff_engine.rs         compute_hunks
 ├─ write_gate.rs          WriteGatePipeline, WriteMode, proposal lifecycle
+├─ turn_capture/          Git-free per-turn change capture (TUI chat review)
+│  ├─ mod.rs              TurnCapture begin/end/resolve/gc, pending persistence
+│  ├─ walk.rs / manifest.rs / store.rs   stat walk, baseline, SHA-256 blobs
+│  ├─ changeset.rs / ledger.rs / revert.rs  change set, host writes, file/hunk revert
 ├─ observer.rs            WriteGateObserver, AcpObserver (+ on_tool_call_completed), SwarmObserver
 ├─ history/               Per-turn NDJSON log: record / writer (HistoryRecorder) / reader / tokens
 ├─ scope_enforcer.rs      FileScope checks → path_pattern
@@ -153,7 +157,7 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `deepseek` | StatelessReplay | `ToolAgentSession` |
 | `dsh` | ProcessBound | `AcpClientSession` |
 
-Writes: native edit tools (Claude/Codex/Cursor), ACP `fs/write_text_file` (`dsh:`), or Option-B `<file>` blocks (Ollama / DeepSeek) → same [`WriteGatePipeline`](src/write_gate.rs).
+Writes, TUI chat: every provider writes during the turn (`AgentOptions::host_capture`) and [`turn_capture`](src/turn_capture) records the turn's change set for the mandatory post-turn review. Writes, swarm / CLI: native edit tools (Claude/Codex/Cursor) in the worktree, ACP `fs/write_text_file` (`dsh:`), or `<file>` blocks (Ollama) → [`WriteGatePipeline`](src/write_gate.rs).
 
 ### Memory / MCP / observers
 
@@ -178,7 +182,21 @@ CLEANUP    teardown worktrees / gaviero/* branches / MCP configs
 CONSOLIDATE Consolidator + TierStats → memory
 ```
 
-### Write proposal
+### Turn capture (TUI chat)
+
+```
+TurnCapture::begin   stat walk (.gitignore + files.exclude, no git) → re-hash changed → blobs ≤ 8 MiB
+  session runs       providers write freely (host_capture); host writes → HostWriteLedger
+  session closed     (also on cancel: the select drops the session first)
+TurnCapture::end     stat walk → hash suspects → TurnChangeSet {added|modified|deleted, before/after blobs}
+                     − ledger-attributed host writes; overlap marks vs concurrent turns
+  auto_revert_sensitive → save_pending → history files_changed → TURN REVIEW (conversation blocked)
+TurnCapture::resolve keep | revert_file | revert_hunks (byte-exact, drift-guarded) → archive → gc (last 5)
+```
+
+No `Mutex` is held across the walk, hashing, or any file write.
+
+### Write proposal (swarm / CLI)
 
 ```
 UnifiedStreamEvent::FileBlock (or Cursor snapshot+revert / tool_agent PathsModified)
@@ -243,7 +261,7 @@ First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/
 ## API
 
 ```rust
-// crates/gaviero-core/src/lib.rs — 27 pub mods
+// crates/gaviero-core/src/lib.rs — 28 pub mods
 pub mod acp;
 pub mod agent_session;   // + tool_agent (deepseek:) + agent_client_protocol (dsh:)
 pub mod context_planner;
@@ -265,6 +283,7 @@ pub mod skills;
 pub mod swarm;           // backends incl. Deepseek
 pub mod terminal;
 pub mod tree_sitter;
+pub mod turn_capture;    // host-side, git-free per-turn change capture + revert (TUI chat)
 pub mod types;
 pub mod util;
 pub mod validation_gate;

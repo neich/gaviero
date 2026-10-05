@@ -55,8 +55,9 @@ pub use reader::{
     read_turn, summarize,
 };
 pub use record::{
-    Attribution, CaptureMode, HistoryKind, HistoryRecord, McpCall, MemoryInjection, ProviderUsage,
-    SCHEMA_VERSION, ToolCall, ToolOutput, TurnEnd, TurnStart, truncate_bytes,
+    Attribution, CaptureMode, ChangedFile, FilesChanged, HistoryKind, HistoryRecord, McpCall,
+    MemoryInjection, ProviderUsage, ReviewDecision, SCHEMA_VERSION, ToolCall, ToolOutput, TurnEnd,
+    TurnReview, TurnStart, truncate_bytes,
 };
 pub use tokens::{
     Estimator, compact_count, count_words, estimate_json_text_tokens, estimate_json_tokens,
