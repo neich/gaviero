@@ -391,10 +391,10 @@ impl WriteGatePipeline {
     pub fn accept_node(&mut self, proposal_id: u64, node_name: &str) {
         if let Some(proposal) = self.proposals.get_mut(&proposal_id) {
             for hunk in &mut proposal.structural_hunks {
-                if let Some(ref node) = hunk.enclosing_node {
-                    if node.name.as_deref() == Some(node_name) {
-                        hunk.status = HunkStatus::Accepted;
-                    }
+                if let Some(ref node) = hunk.enclosing_node
+                    && node.name.as_deref() == Some(node_name)
+                {
+                    hunk.status = HunkStatus::Accepted;
                 }
             }
             update_proposal_status(proposal);

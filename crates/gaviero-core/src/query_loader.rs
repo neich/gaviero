@@ -28,14 +28,14 @@ where
     }
 
     // 2. Relative to executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for base in &[exe_dir.join("..").join("queries"), exe_dir.join("queries")] {
-                let path = base.join(lang).join(file);
-                if path.exists() {
-                    return std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading query file: {}", path.display()));
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        for base in &[exe_dir.join("..").join("queries"), exe_dir.join("queries")] {
+            let path = base.join(lang).join(file);
+            if path.exists() {
+                return std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading query file: {}", path.display()));
             }
         }
     }

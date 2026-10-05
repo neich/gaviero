@@ -192,8 +192,7 @@ pub fn kill_tree_on_exit() -> std::io::Result<()> {
         Ok(_) => {}
         Err(1) => return Ok(()), // already armed
         Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "kill-on-exit job object previously failed to arm",
             ));
         }
@@ -355,10 +354,10 @@ fn kill_descendant_processes_windows() {
         queue.extend(direct.iter().copied());
     }
     while let Some(pid) = queue.pop_front() {
-        if descendants.insert(pid) {
-            if let Some(kids) = children.get(&pid) {
-                queue.extend(kids.iter().copied());
-            }
+        if descendants.insert(pid)
+            && let Some(kids) = children.get(&pid)
+        {
+            queue.extend(kids.iter().copied());
         }
     }
 

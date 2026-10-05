@@ -551,10 +551,10 @@ pub fn list_local_branches_with_prefix(repo_dir: &Path, prefix: &str) -> Result<
         .context("iterating local branches")?;
     for b in branches {
         let (branch, _) = b.context("reading branch entry")?;
-        if let Some(name) = branch.name().context("decoding branch name")? {
-            if name.starts_with(prefix) {
-                out.push(name.to_string());
-            }
+        if let Some(name) = branch.name().context("decoding branch name")?
+            && name.starts_with(prefix)
+        {
+            out.push(name.to_string());
         }
     }
     Ok(out)
@@ -957,27 +957,26 @@ impl WorktreeManager {
             .args(["rev-parse", "--git-path", "info/exclude"])
             .current_dir(wt_path)
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !rel.is_empty() {
-                    let exclude_path = if Path::new(&rel).is_absolute() {
-                        PathBuf::from(&rel)
-                    } else {
-                        wt_path.join(&rel)
-                    };
-                    if let Some(parent) = exclude_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+            let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !rel.is_empty() {
+                let exclude_path = if Path::new(&rel).is_absolute() {
+                    PathBuf::from(&rel)
+                } else {
+                    wt_path.join(&rel)
+                };
+                if let Some(parent) = exclude_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+                if !existing.lines().any(|l| l.trim() == ".cargo/") {
+                    let mut new_body = existing;
+                    if !new_body.is_empty() && !new_body.ends_with('\n') {
+                        new_body.push('\n');
                     }
-                    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-                    if !existing.lines().any(|l| l.trim() == ".cargo/") {
-                        let mut new_body = existing;
-                        if !new_body.is_empty() && !new_body.ends_with('\n') {
-                            new_body.push('\n');
-                        }
-                        new_body.push_str(".cargo/\n");
-                        let _ = std::fs::write(&exclude_path, new_body);
-                    }
+                    new_body.push_str(".cargo/\n");
+                    let _ = std::fs::write(&exclude_path, new_body);
                 }
             }
         }

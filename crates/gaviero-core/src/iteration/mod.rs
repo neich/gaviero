@@ -220,7 +220,7 @@ impl IterationEngine {
             let file_count = manifest.modified_files.len();
 
             // Track best by file count
-            if best.as_ref().map_or(true, |(_, c)| file_count > *c) {
+            if best.as_ref().is_none_or(|(_, c)| file_count > *c) {
                 best = Some((manifest.clone(), file_count));
             }
 
@@ -381,7 +381,7 @@ impl IterationEngine {
             let succeeded = manifest.status == AgentStatus::Completed;
             let file_count = manifest.modified_files.len();
 
-            if best.as_ref().map_or(true, |(_, c)| file_count > *c) {
+            if best.as_ref().is_none_or(|(_, c)| file_count > *c) {
                 best = Some((manifest.clone(), file_count));
             }
 
