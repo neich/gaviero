@@ -1267,7 +1267,7 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
         Action::PageDown | Action::InsertChar('J') => panel.scroll_section(10),
         Action::Tab | Action::CycleTabForward => panel.set_section(panel.section.next()),
         Action::CycleTabBack => panel.set_section(panel.section.prev()),
-        Action::InsertChar(c @ '1'..='5') => {
+        Action::InsertChar(c @ '1'..='6') => {
             if let Some(section) = HistorySection::from_digit(c) {
                 panel.set_section(section);
             }
@@ -1284,6 +1284,13 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
             app.history_panel.toggle_scope();
         }
         Action::InsertChar('r') => refresh_history_panel(app),
+        Action::InsertChar('u') if panel.section == HistorySection::Files => {
+            let Some(turn_id) = panel.selected_turn().and_then(|t| t.turn_id.clone()) else {
+                return;
+            };
+            let msg = super::turn_review::undo_reviewed_turn(app, &turn_id);
+            app.status_message = Some((msg, std::time::Instant::now()));
+        }
         Action::InsertChar('c') => {
             let Some(ndjson) = panel.focused_records_ndjson() else {
                 app.status_message = Some((
@@ -1804,6 +1811,16 @@ pub(super) fn send_chat_message(app: &mut App) {
         return;
     }
     let conv_id = app.chat_state.active_conversation_id().to_string();
+    // Mandatory turn review: the previous turn's file changes must be kept or
+    // reverted first. The typed prompt stays in the input box.
+    if super::turn_review::conv_has_pending_review(app, &conv_id) {
+        super::turn_review::open_for_conv(app, Some(&conv_id));
+        app.status_message = Some((
+            "Review the previous turn's file changes first (f to finalize)".to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
     let prompt = app.chat_state.take_input();
     // Desktop-only inputs: draft attachments and the Alt+Y one-shot. The
     // remote path never consumes these (Plan A §2.4).
@@ -1834,6 +1851,9 @@ pub(crate) fn dispatch_prompt_core(
         || app.chat_state.conversations[conv_idx].has_running_background_agents()
     {
         return Err("conversation is already streaming".to_string());
+    }
+    if super::turn_review::conv_has_pending_review(app, &conv_id) {
+        return Err("the previous turn's file changes are awaiting review".to_string());
     }
     // Remote dispatch cannot grant codex MCP trust — that consent dialog is
     // desktop-only. The desktop wrapper intercepts before reaching here.
@@ -2332,6 +2352,23 @@ pub(crate) fn dispatch_prompt_core(
         Some(bootstrap_tier_override.as_str()),
     );
 
+    // Turn capture covers every folder the agent can write to: the primary
+    // root plus the `--add-dir` siblings, each pruned by its `files.exclude`.
+    let turn_capture = app.turn_capture.clone();
+    let capture_scope = {
+        let mut roots = vec![root.clone()];
+        roots.extend(additional_roots.iter().cloned());
+        let mut excludes: Vec<String> = Vec::new();
+        for r in &roots {
+            for p in parse_exclude_patterns(&app.workspace, Some(r)) {
+                if !excludes.contains(&p) {
+                    excludes.push(p);
+                }
+            }
+        }
+        gaviero_core::turn_capture::CaptureScope { roots, excludes }
+    };
+
     let conv_id_clone = conv_id.clone();
     let conv_id_outer = conv_id.clone();
     let turn_id_clone = turn_id.clone();
@@ -2737,6 +2774,41 @@ pub(crate) fn dispatch_prompt_core(
         };
         let turn = gaviero_core::agent_session::build_turn(selections, transport_ctx);
 
+        // Turn capture: snapshot the tree right before the agent starts, so
+        // every change it makes — edit tools, Bash, formatters — is reviewed
+        // after the turn. If the baseline cannot be taken, fall back to the
+        // providers' own Write Gate path (Deferred) rather than run unreviewed.
+        let capture_handle = {
+            let tc = turn_capture.clone();
+            let scope = capture_scope.clone();
+            let tid = turn_id_clone.clone();
+            let cid = conv_id_clone.clone();
+            match tokio::task::spawn_blocking(move || tc.begin(&tid, Some(&cid), scope)).await {
+                Ok(Ok(handle)) => Some(handle),
+                Ok(Err(e)) => {
+                    tracing::warn!("turn capture unavailable, using the Write Gate: {e:#}");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("turn capture task failed, using the Write Gate: {e}");
+                    None
+                }
+            }
+        };
+        let mut options = options;
+        options.host_capture = capture_handle.is_some();
+        if options.host_capture {
+            // Gate-routed writes (Ollama file blocks, ACP fs) land immediately
+            // and are reviewed with the rest of the turn.
+            wg.lock()
+                .await
+                .set_conv_mode(conv_id_clone.clone(), WriteMode::AutoAccept);
+        }
+        let between_turns = capture_handle
+            .as_ref()
+            .map(|h| h.between_turns.clone())
+            .unwrap_or_default();
+
         let observer = TuiAcpObserver {
             tx: tx.clone(),
             conv_id: conv_id_clone.clone(),
@@ -2762,12 +2834,11 @@ pub(crate) fn dispatch_prompt_core(
                 mcp_server: mcp_tool_server,
             },
         );
-        // Outer select! is the safety net for transports that don't yet
-        // observe the token internally (e.g. codex/ollama sessions). When
-        // the token fires, dropping the session triggers `kill_on_drop` on
-        // their child processes. Claude observes the token directly inside
-        // `run_claude_turn` and finishes its revert path before returning,
-        // so this branch never wins for Claude.
+        // Cancel drops the in-flight `send_turn` future (the select is
+        // `biased` and shares the session's token, so this arm wins for every
+        // provider); dropping the session kills its child (`kill_on_drop`).
+        // No provider-side cleanup runs on that path — which is why the turn's
+        // changes are captured below, by the host, whichever arm finished.
         let mut cancelled = false;
         let mut send_error: Option<String> = None;
         let send_result = tokio::select! {
@@ -2796,6 +2867,66 @@ pub(crate) fn dispatch_prompt_core(
                 });
             }
             session.close().await;
+        }
+
+        // The session is closed or dropped (its child is gone), so the tree
+        // holds everything this turn wrote. Diff it against the baseline.
+        if let Some(handle) = capture_handle {
+            let outcome = if cancelled {
+                gaviero_core::turn_capture::TurnOutcome::Cancelled
+            } else if send_error.is_some() {
+                gaviero_core::turn_capture::TurnOutcome::Failed
+            } else {
+                gaviero_core::turn_capture::TurnOutcome::Completed
+            };
+            let tc = turn_capture.clone();
+            let ended = tokio::task::spawn_blocking(move || {
+                let mut end = tc.end(handle, outcome)?;
+                tc.auto_revert_sensitive(&mut end.set);
+                if !end.set.is_empty() {
+                    tc.save_pending(&gaviero_core::turn_capture::PendingReview::new(
+                        end.set.clone(),
+                    ))?;
+                }
+                anyhow::Ok(end)
+            })
+            .await;
+            match ended {
+                Ok(Ok(end)) => {
+                    history.push(
+                        &turn_id_clone,
+                        gaviero_core::history::HistoryKind::FilesChanged(files_changed_record(
+                            &end.set,
+                            between_turns,
+                        )),
+                    );
+                    for w in &end.set.warnings {
+                        let _ = tx.send(Event::MessageComplete {
+                            conv_id: conv_id.clone(),
+                            role: "system".to_string(),
+                            content: format!("⚠ {w}"),
+                        });
+                    }
+                    if !end.set.is_empty() {
+                        let _ = tx.send(Event::TurnReviewPending {
+                            review: gaviero_core::turn_capture::PendingReview::new(end.set),
+                            overlapped: end.overlapped_reviews,
+                        });
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("turn capture end failed: {e:#}");
+                    let _ = tx.send(Event::MessageComplete {
+                        conv_id: conv_id.clone(),
+                        role: "system".to_string(),
+                        content: format!(
+                            "⚠ Could not compute this turn's file changes ({e:#}); \
+                             edits stay on disk unreviewed."
+                        ),
+                    });
+                }
+                Err(e) => tracing::error!("turn capture end task failed: {e}"),
+            }
         }
 
         let proposals = {
@@ -2844,6 +2975,42 @@ pub(crate) fn dispatch_prompt_core(
         },
     );
     Ok(turn_id)
+}
+
+/// History form of a turn's change set (`files_changed` record).
+fn files_changed_record(
+    set: &gaviero_core::turn_capture::TurnChangeSet,
+    between_turns: Vec<String>,
+) -> gaviero_core::history::FilesChanged {
+    use gaviero_core::turn_capture::{ChangeKind, TurnOutcome};
+    gaviero_core::history::FilesChanged {
+        outcome: match set.outcome {
+            TurnOutcome::Completed => "completed",
+            TurnOutcome::Cancelled => "cancelled",
+            TurnOutcome::Failed => "failed",
+        }
+        .to_string(),
+        files: set
+            .files
+            .iter()
+            .map(|c| gaviero_core::history::ChangedFile {
+                path: c.rel.clone(),
+                change: match c.kind {
+                    ChangeKind::Added => "added",
+                    ChangeKind::Modified => "modified",
+                    ChangeKind::Deleted => "deleted",
+                }
+                .to_string(),
+                before_sha256: c.before_hash().map(str::to_string),
+                after_sha256: c.after_hash().map(str::to_string),
+                revertible: c.revertible,
+                overlap_with: c.overlap_with.clone(),
+            })
+            .collect(),
+        auto_reverted: set.auto_reverted.clone(),
+        between_turns,
+        warnings: set.warnings.clone(),
+    }
 }
 
 pub(super) fn chat_paste_from_clipboard(app: &mut App) {

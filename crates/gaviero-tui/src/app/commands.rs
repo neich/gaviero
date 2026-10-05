@@ -80,8 +80,13 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
     overrides.codex_trust = Some(codex_trust);
     let synth =
         gaviero_core::mcp::resolve_mcp_config_synth(&app.workspace, &root, endpoint, &overrides);
-    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-        tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed");
+    match gaviero_core::mcp::synthesize_for_worktree(&synth) {
+        Ok(written) => {
+            for path in &written {
+                super::turn_review::note_host_write(app, path);
+            }
+        }
+        Err(e) => tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed"),
     }
 }
 

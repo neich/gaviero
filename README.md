@@ -2,7 +2,7 @@
 
 ## Overview
 
-Gaviero is a terminal editor for collaborating with AI agents on code — file tree, syntax highlighting, git integration, embedded terminal, and an agent chat panel where every proposed change passes through an interactive Write Gate before touching disk. A headless CLI (`gaviero-cli`) runs the same engine in CI; the `.gaviero` DSL composes multi-agent workflows declaratively.
+Gaviero is a terminal editor for collaborating with AI agents on code — file tree, syntax highlighting, git integration, embedded terminal, and an agent chat panel where agents edit freely while they work and every change a turn made — edit tools, shell commands, formatters — is reviewed afterwards: keep it, or go back to the pre-prompt version per file or hunk, before the conversation continues. The capture needs no git. A headless CLI (`gaviero-cli`) runs the same engine in CI; the `.gaviero` DSL composes multi-agent workflows declaratively.
 
 ## Installation
 
@@ -38,7 +38,7 @@ gaviero --workspace ~/src            # multi-folder workspace built from ~/src
 
 **First run.** Opening a folder with no Gaviero configuration starts a short setup wizard before the editor. It asks for an agent profile — *full capabilities* (shell plus the edit tools, auto-approved, allow/deny-listed) or *restricted* (identical minus `Bash`, which is never offered to the agent) — and whether to write the Claude, Codex and Cursor MCP configs. With `--workspace` it also asks which sub-folders join the workspace (git repositories pre-selected) and writes `<dirname>.gaviero-workspace`. Esc on the first screen skips setup and opens the folder with built-in defaults; existing files are never overwritten.
 
-The editor works standalone without AI features. Keybindings, panels, chat commands, and the Write Gate diff review are documented in [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md).
+The editor works standalone without AI features. Keybindings, panels, chat commands, and the turn review are documented in [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md).
 
 ### Headless CLI
 

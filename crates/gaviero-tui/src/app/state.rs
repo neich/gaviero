@@ -32,6 +32,8 @@ pub enum LeftPanelMode {
     Search,
     Review,
     Changes,
+    /// Mandatory post-turn review of files a chat turn changed on disk.
+    TurnReview,
 }
 
 /// Re-exported so `app::*` keeps importing the preview layout from one place;

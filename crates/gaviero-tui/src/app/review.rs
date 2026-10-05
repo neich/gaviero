@@ -299,6 +299,7 @@ pub(super) fn finalize_current_review(app: &mut App) {
 
     match apply_proposal_to_disk(&path, expected_old, &content, is_deletion) {
         ApplyOutcome::Written => {
+            super::turn_review::note_host_write(app, &path);
             for buf in &mut app.buffers {
                 if buf.path.as_deref() == Some(path.as_path()) {
                     let _ = buf.reload();
@@ -392,6 +393,7 @@ pub(crate) fn finalize_gate_proposal(app: &mut App, mut proposal: WriteProposal)
 
     match apply_proposal_to_disk(&path, expected_old, &content, is_deletion) {
         ApplyOutcome::Written => {
+            super::turn_review::note_host_write(app, &path);
             for buf in &mut app.buffers {
                 if buf.path.as_deref() == Some(path.as_path()) {
                     let _ = buf.reload();
@@ -823,6 +825,7 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                 apply_proposal_to_disk(&path, expected_old.as_deref(), &content, is_deletion);
             match outcome {
                 ApplyOutcome::Written => {
+                    super::turn_review::note_host_write(app, &path);
                     for buf in &mut app.buffers {
                         if buf.path.as_deref() == Some(path.as_path()) {
                             let _ = buf.reload();
@@ -1003,6 +1006,7 @@ pub(super) fn finalize_batch_review(app: &mut App) {
     }
 
     for path in &written {
+        super::turn_review::note_host_write(app, path);
         for buf in &mut app.buffers {
             if buf.path.as_deref() == Some(path.as_path()) {
                 let _ = buf.reload();

@@ -39,7 +39,7 @@ const COLOR_OK: Color = Color::Rgb(152, 195, 121);
 /// sitting beside it.
 const TWO_COLUMN_MIN_WIDTH: u16 = 90;
 
-/// The five detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`5` jump.
+/// The six detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`6` jump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistorySection {
     Prompt,
@@ -47,15 +47,18 @@ pub enum HistorySection {
     Mcp,
     Memory,
     Totals,
+    /// Files the turn changed on disk and how its review resolved.
+    Files,
 }
 
 impl HistorySection {
-    pub const ALL: [HistorySection; 5] = [
+    pub const ALL: [HistorySection; 6] = [
         HistorySection::Prompt,
         HistorySection::Tools,
         HistorySection::Mcp,
         HistorySection::Memory,
         HistorySection::Totals,
+        HistorySection::Files,
     ];
 
     pub fn index(self) -> usize {
@@ -70,7 +73,7 @@ impl HistorySection {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
-    /// `'1'`..`'5'` → section.
+    /// `'1'`..`'6'` → section.
     pub fn from_digit(c: char) -> Option<Self> {
         let n = c.to_digit(10)? as usize;
         (1..=Self::ALL.len()).contains(&n).then(|| Self::ALL[n - 1])
@@ -83,6 +86,7 @@ impl HistorySection {
             Self::Mcp => "MCP",
             Self::Memory => "MEMORY",
             Self::Totals => "TOTALS",
+            Self::Files => "FILES",
         }
     }
 }
@@ -285,7 +289,7 @@ impl HistoryPanelState {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
         let title = if focused {
-            "HISTORY (Tab/1-5: section · / filter · a scope · r reload · c copy · Enter expand)"
+            "HISTORY (Tab/1-6: section · / filter · a scope · r reload · c copy · Enter expand)"
         } else {
             "HISTORY"
         };
@@ -460,6 +464,8 @@ fn record_in_section(record: &HistoryRecord, section: HistorySection) -> bool {
             | (HistorySection::Mcp, HistoryKind::McpCall(_))
             | (HistorySection::Memory, HistoryKind::MemoryInjection(_))
             | (HistorySection::Totals, HistoryKind::TurnEnd(_))
+            | (HistorySection::Files, HistoryKind::FilesChanged(_))
+            | (HistorySection::Files, HistoryKind::TurnReview(_))
     )
 }
 
@@ -657,6 +663,20 @@ pub fn detail_header_lines(turn: &TurnRecords, focused: HistorySection) -> Vec<L
                     None => format!("{boot} · no exact usage"),
                 }
             }
+            HistorySection::Files => {
+                let reviewed = turn
+                    .records
+                    .iter()
+                    .any(|e| matches!(e.record.payload, HistoryKind::TurnReview(_)));
+                match s.files_changed {
+                    0 => "no file changes".to_string(),
+                    n => format!(
+                        "{n} file{} changed · {}",
+                        if n == 1 { "" } else { "s" },
+                        if reviewed { "reviewed" } else { "review pending" }
+                    ),
+                }
+            }
         };
         let is_focused = section == focused;
         let style = if is_focused {
@@ -767,8 +787,75 @@ pub fn section_lines(turn: &TurnRecords, section: HistorySection) -> Vec<Line<'s
             }
         }
         HistorySection::Totals => totals_lines(turn, &provider, &mut lines, &heading, &muted),
+        HistorySection::Files => files_lines(turn, &mut lines, &heading, &muted),
     }
     lines
+}
+
+/// FILES: what the turn changed on disk and the review decision per file.
+fn files_lines(
+    turn: &TurnRecords,
+    lines: &mut Vec<Line<'static>>,
+    heading: &dyn Fn(String) -> Line<'static>,
+    muted: &dyn Fn(String) -> Line<'static>,
+) {
+    let changed = turn.records.iter().find_map(|e| match &e.record.payload {
+        HistoryKind::FilesChanged(f) => Some(f),
+        _ => None,
+    });
+    let review = turn.records.iter().find_map(|e| match &e.record.payload {
+        HistoryKind::TurnReview(r) => Some(r),
+        _ => None,
+    });
+    let Some(changed) = changed else {
+        lines.push(muted(
+            "No file changes recorded for this turn (or turn capture was off).".into(),
+        ));
+        return;
+    };
+    lines.push(heading(format!(
+        "{} file(s) changed · turn {}",
+        changed.files.len(),
+        changed.outcome
+    )));
+    for f in &changed.files {
+        let decision = review
+            .and_then(|r| r.decisions.iter().find(|d| d.path == f.path))
+            .map(|d| match &d.detail {
+                Some(detail) => format!("{} ({detail})", d.result),
+                None => d.result.clone(),
+            })
+            .unwrap_or_else(|| "pending".to_string());
+        let mut flags = String::new();
+        if !f.overlap_with.is_empty() {
+            flags.push_str(&format!("  overlap: {}", f.overlap_with.join(", ")));
+        }
+        if !f.revertible {
+            flags.push_str("  not revertible");
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {:<8} {}  → {decision}{flags}", f.change, f.path),
+            Style::default().fg(COLOR_TEXT),
+        )));
+    }
+    for p in &changed.auto_reverted {
+        lines.push(Line::from(Span::styled(
+            format!("  sensitive  {p}  → auto-reverted"),
+            Style::default().fg(COLOR_WARN),
+        )));
+    }
+    if !changed.between_turns.is_empty() {
+        lines.push(muted(format!(
+            "Changed outside any turn before this one: {}",
+            changed.between_turns.join(", ")
+        )));
+    }
+    for w in &changed.warnings {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {w}"),
+            Style::default().fg(COLOR_WARN),
+        )));
+    }
 }
 
 fn find_start(turn: &TurnRecords) -> Option<&TurnStart> {
@@ -1280,10 +1367,12 @@ mod tests {
 
     #[test]
     fn sections_cycle_and_jump() {
-        assert_eq!(HistorySection::Totals.next(), HistorySection::Prompt);
-        assert_eq!(HistorySection::Prompt.prev(), HistorySection::Totals);
+        assert_eq!(HistorySection::Totals.next(), HistorySection::Files);
+        assert_eq!(HistorySection::Files.next(), HistorySection::Prompt);
+        assert_eq!(HistorySection::Prompt.prev(), HistorySection::Files);
         assert_eq!(HistorySection::from_digit('3'), Some(HistorySection::Mcp));
-        assert_eq!(HistorySection::from_digit('6'), None);
+        assert_eq!(HistorySection::from_digit('6'), Some(HistorySection::Files));
+        assert_eq!(HistorySection::from_digit('7'), None);
         let mut state = HistoryPanelState::new();
         state.section_scroll = 9;
         state.set_section(HistorySection::Tools);

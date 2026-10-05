@@ -441,6 +441,7 @@ pub fn build_snapshot(app: &App) -> renv::Snapshot {
         },
         open_permissions,
         open_proposals,
+        open_turn_reviews: super::turn_review::open_reviews_dto(app),
         // Explicit allow-list DTO (§4.5): exactly these fields, never raw
         // workspace settings. Additions are minor-version bumps and must be
         // added to the field-level test.
@@ -515,6 +516,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::FileProposalDeferred { .. }
         | Event::PermissionRequest { .. }
         | Event::AcpTaskCompleted { .. }
+        | Event::TurnReviewPending { .. }
         | Event::AgentTurnFinished { .. } => None,
         // Internal / desktop-only events: not mirrored.
         Event::Key(_)

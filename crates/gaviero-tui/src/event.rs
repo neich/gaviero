@@ -172,6 +172,14 @@ pub enum Event {
         paths: Vec<std::path::PathBuf>,
     },
 
+    /// A chat turn changed files on disk (host-side turn capture). Its
+    /// review is mandatory before the conversation's next prompt.
+    /// `overlapped` lists other pending reviews that gained an overlap mark.
+    TurnReviewPending {
+        review: gaviero_core::turn_capture::PendingReview,
+        overlapped: Vec<String>,
+    },
+
     /// A4: writer task enqueued a write. Panel counts events for the
     /// "activity" pulse indicator but does not re-query yet.
     MemoryWriteEnqueued {

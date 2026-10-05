@@ -566,7 +566,12 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             LeftPanelMode::FileTree => LeftPanelMode::Search,
                             LeftPanelMode::Search => LeftPanelMode::Review,
                             LeftPanelMode::Review => LeftPanelMode::Changes,
-                            LeftPanelMode::Changes => LeftPanelMode::FileTree,
+                            LeftPanelMode::Changes if !app.pending_turn_reviews.is_empty() => {
+                                LeftPanelMode::TurnReview
+                            }
+                            LeftPanelMode::Changes | LeftPanelMode::TurnReview => {
+                                LeftPanelMode::FileTree
+                            }
                         };
                         return;
                     }
@@ -658,6 +663,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                                     cs.diff_scroll = 0;
                                 }
                             }
+                        }
+                        LeftPanelMode::TurnReview => {
+                            super::turn_review::click_row(app, relative_row);
                         }
                     }
                     return;
@@ -1168,6 +1176,19 @@ fn scroll_left_panel(app: &mut App, up: bool) {
                 }
             }
         }
+        LeftPanelMode::TurnReview => {
+            let view = &mut app.turn_review_view;
+            if up {
+                view.scroll_offset = view.scroll_offset.saturating_sub(delta);
+            } else {
+                let files = app
+                    .pending_turn_reviews
+                    .get(view.active)
+                    .map(|r| r.set.files.len())
+                    .unwrap_or(0);
+                view.scroll_offset = (view.scroll_offset + delta).min(files.saturating_sub(1));
+            }
+        }
     }
 }
 
@@ -1191,6 +1212,13 @@ fn scroll_editor_content(app: &mut App, up: bool) {
                 cs.diff_scroll + delta
             };
         }
+    } else if app.left_panel == LeftPanelMode::TurnReview && !app.pending_turn_reviews.is_empty() {
+        let view = &mut app.turn_review_view;
+        view.diff_scroll = if up {
+            view.diff_scroll.saturating_sub(delta)
+        } else {
+            view.diff_scroll + delta
+        };
     } else if let Some(ref mut review) = app.diff_review {
         review.scroll_top = if up {
             review.scroll_top.saturating_sub(delta)
@@ -1548,6 +1576,7 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                             as usize;
                     }
                 }
+                LeftPanelMode::TurnReview => {}
                 LeftPanelMode::Changes => {
                     if let Some(ref mut cs) = app.changes_state {
                         let total = cs.entries.len();
@@ -2179,6 +2208,7 @@ pub(super) fn save_current_buffer(app: &mut App) {
         buf.refresh_conflict_metadata(buf.git_unmerged);
     }
     if let Some(path) = saved {
+        super::turn_review::note_host_write(app, &path);
         stage_file_if_conflict_resolved(app, &path);
         app.status_message = Some((
             format!("Saved {}", path.display()),
