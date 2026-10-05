@@ -36,11 +36,25 @@
 //! [`TurnCompletion::waiting_on_shells`]. A shell counts from its
 //! `task_started`, which also covers a foreground command the CLI moved to
 //! the background.
+//!
+//! **Trust the CLI, not the tool input.** Claude Code 2.1.289 backgrounds an
+//! `Agent` call by default: the model omits `run_in_background`, and only
+//! `task_started` says `is_backgrounded: true` (`task_type: local_agent`).
+//! Keying on the input flag let the first `result` end the turn and killed
+//! the agents. So a parent-level tool becomes background on the CLI's
+//! `is_backgrounded`; an explicit input flag only counts it early (and is
+//! the fallback for CLIs that omit `is_backgrounded`). On top of that,
+//! `background_tasks_changed` carries the CLI's own list of running
+//! background tasks, and any task on it holds the turn even if the
+//! per-tool classification missed it — so the next change in how Claude
+//! labels its tools delays the turn instead of killing the agents.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use super::protocol::{StreamEvent, is_background_subagent_tool, is_subagent_tool_name};
+use super::protocol::{
+    BackgroundTaskInfo, StreamEvent, is_background_subagent_tool, is_subagent_tool_name,
+};
 
 /// How long to wait, once every background agent has finished and the
 /// parent is idle, for Claude to start the turn that reads their results.
@@ -62,16 +76,25 @@ pub(crate) enum TurnProgress {
 pub(crate) struct TurnCompletion {
     /// Hold the turn for background shell commands too.
     track_shells: bool,
-    /// `tool_use` ids of parent-level non-subagent calls (`Bash`, …) that
-    /// may yet become background tasks. Only filled with `track_shells`.
-    parent_tools: HashSet<String>,
+    /// Parent-level `tool_use` ids that may yet become background tasks,
+    /// mapped to whether the tool is a subagent (`Agent`/`Task`).
+    parent_tools: HashMap<String, bool>,
     /// `tool_use` ids of parent-level background launches: Agent/Task, plus
     /// shell commands Claude reported as tasks when `track_shells` is set.
     bg_agents: HashSet<String>,
-    /// The subset still running. Agents count from their launch; shells
-    /// from `task_started`, which also covers a foreground command the CLI
-    /// moved to the background, and never a launch it refused.
+    /// The subset still running. Agents count from their launch (explicit
+    /// flag) or their `task_started`; shells from `task_started`, which
+    /// also covers a foreground command the CLI moved to the background,
+    /// and never a launch it refused.
     running: HashSet<String>,
+    /// `task_id`s of tasks started by a tracked launch.
+    bg_task_ids: HashSet<String>,
+    /// The CLI's latest `background_tasks_changed` list (shells dropped
+    /// unless `track_shells`).
+    cli_running: Vec<BackgroundTaskInfo>,
+    /// Every `task_id` the CLI ever listed, so the `task_notification` of
+    /// a task only the list knew about still owes its wake-up.
+    cli_seen: HashSet<String>,
     /// Parent turns started (`system/init`).
     turns: u32,
     /// Parent turns reported (`result`).
@@ -112,22 +135,73 @@ impl TurnCompletion {
                     if is_background_subagent_tool(&tu.name, &tu.input) {
                         self.bg_agents.insert(tu.id.clone());
                         self.running.insert(tu.id.clone());
-                    } else if self.track_shells && !is_subagent_tool_name(&tu.name) {
-                        self.parent_tools.insert(tu.id.clone());
+                    } else {
+                        self.parent_tools
+                            .insert(tu.id.clone(), is_subagent_tool_name(&tu.name));
                     }
                 }
             }
+            // A subagent's own tasks wake that subagent, not the parent.
+            StreamEvent::TaskStarted {
+                owned_by_subagent: true,
+                ..
+            } => {}
+            // The CLI says the task ends with its tool call.
+            StreamEvent::TaskStarted {
+                tool_use_id,
+                is_backgrounded: Some(false),
+                ..
+            } => {
+                if self.bg_agents.remove(tool_use_id) {
+                    self.running.remove(tool_use_id);
+                }
+            }
             // A finished agent can be woken again by its own background work.
-            StreamEvent::TaskStarted { tool_use_id, .. } => {
-                if self.parent_tools.remove(tool_use_id) {
-                    self.bg_agents.insert(tool_use_id.clone());
+            StreamEvent::TaskStarted {
+                task_id,
+                tool_use_id,
+                is_backgrounded,
+                ..
+            } => {
+                if let Some(&is_agent) = self.parent_tools.get(tool_use_id) {
+                    // Without `is_backgrounded` (older CLIs) an agent needed
+                    // the explicit input flag; a shell counts on its start.
+                    let background = if is_agent {
+                        *is_backgrounded == Some(true)
+                    } else {
+                        self.track_shells
+                    };
+                    if background {
+                        self.parent_tools.remove(tool_use_id);
+                        self.bg_agents.insert(tool_use_id.clone());
+                    }
                 }
                 if self.bg_agents.contains(tool_use_id) {
                     self.running.insert(tool_use_id.clone());
+                    if !task_id.is_empty() {
+                        self.bg_task_ids.insert(task_id.clone());
+                    }
                 }
             }
-            StreamEvent::TaskNotification { tool_use_id, .. } => {
-                if self.running.remove(tool_use_id) {
+            StreamEvent::BackgroundTasksChanged { tasks } => {
+                self.cli_running = tasks
+                    .iter()
+                    .filter(|t| self.track_shells || t.task_type != "local_bash")
+                    .cloned()
+                    .collect();
+                self.cli_seen
+                    .extend(self.cli_running.iter().map(|t| t.task_id.clone()));
+            }
+            StreamEvent::TaskNotification {
+                task_id,
+                tool_use_id,
+                ..
+            } => {
+                // Either a tracked launch, or one only the CLI's list knew
+                // about: both owe the parent a wake-up.
+                let untracked =
+                    !self.bg_task_ids.contains(task_id) && self.cli_seen.remove(task_id);
+                if self.running.remove(tool_use_id) || untracked {
                     self.owed_wakes += 1;
                 }
             }
@@ -143,13 +217,31 @@ impl TurnCompletion {
             }
             StreamEvent::ResultEvent { .. } => {
                 self.results += 1;
-                if self.parent_idle() && self.running.is_empty() && self.owed_wakes == 0 {
-                    return TurnProgress::Complete;
+                if self.parent_idle() && self.running.is_empty() {
+                    let missed = self.unclassified_cli_tasks();
+                    if !missed.is_empty() {
+                        // Holding still works, but the classification above
+                        // has drifted from the CLI again: say so in the log.
+                        tracing::warn!(
+                            tasks = ?missed,
+                            "Claude still runs background tasks gaviero did not classify; holding the turn"
+                        );
+                    } else if self.owed_wakes == 0 {
+                        return TurnProgress::Complete;
+                    }
                 }
             }
             _ => {}
         }
         TurnProgress::Continue
+    }
+
+    /// Tasks on the CLI's running list that no tracked launch accounts for.
+    pub(crate) fn unclassified_cli_tasks(&self) -> Vec<&BackgroundTaskInfo> {
+        self.cli_running
+            .iter()
+            .filter(|t| !self.bg_task_ids.contains(&t.task_id))
+            .collect()
     }
 
     /// True for the immediate `tool_result` of a background launch.
@@ -160,7 +252,11 @@ impl TurnCompletion {
     /// Every agent is done and the parent is idle, but a wake-up is still
     /// owed: callers wait up to [`BG_WAKE_GRACE`] for it.
     pub(crate) fn awaiting_wake(&self) -> bool {
-        self.turns > 0 && self.parent_idle() && self.running.is_empty() && self.owed_wakes > 0
+        self.turns > 0
+            && self.parent_idle()
+            && self.running.is_empty()
+            && self.unclassified_cli_tasks().is_empty()
+            && self.owed_wakes > 0
     }
 
     fn parent_idle(&self) -> bool {
@@ -449,6 +545,93 @@ mod tests {
         assert_eq!(
             completes_at(&[INIT, &lx, refused, RESULT]),
             (Some(3), false)
+        );
+    }
+
+    /// Recorded from Claude Code 2.1.289 (stream-json stdin, fields
+    /// trimmed): the model omits `run_in_background`, the CLI backgrounds
+    /// the agent anyway, and the parent's first `result` lands 20 s before
+    /// the agent finishes. Ending the turn there killed the agents.
+    #[test]
+    fn a_default_background_agent_holds_the_turn() {
+        let lines: &[&str] = &[
+            INIT,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"probe-a","subagent_type":"general-purpose","prompt":"go"}}]}}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"ta","task_type":"local_agent","description":"probe-a"}]}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"ta","tool_use_id":"tu_a","description":"probe-a","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent"}"#,
+            &ack("tu_a"),
+            r#"{"type":"assistant","parent_tool_use_id":"tu_a","message":{"content":[{"type":"tool_use","id":"tu_sl","name":"Bash","input":{"command":"sleep 20"}}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"DONE-LAUNCHING"}"#, // 6
+            r#"{"type":"system","subtype":"task_started","task_id":"tsl","owned_by_subagent":true,"tool_use_id":"tu_sl","description":"Sleep","is_backgrounded":false,"task_type":"local_bash"}"#,
+            &notify("tsl", "tu_sl"),
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+            &notify("ta", "tu_a"),
+            INIT,
+            RESULT, // 12
+        ];
+        assert_eq!(completes_at(&lines[..7]), (None, false));
+        assert_eq!(completes_at(&lines[..11]), (None, true));
+        assert_eq!(completes_at(lines), (Some(12), false));
+        assert_eq!(completes_at_with_shells(lines), (Some(12), false));
+
+        let mut c = TurnCompletion::default();
+        for line in &lines[..4] {
+            c.observe(&parse_stream_line(line).unwrap());
+        }
+        assert!(c.is_launch_ack("tu_a"), "the ack is not the agent's result");
+    }
+
+    /// `is_backgrounded: false` is the CLI saying the call is foreground,
+    /// even when the input asked for the background.
+    #[test]
+    fn a_foreground_agent_does_not_hold_the_turn() {
+        let fg = r#"{"type":"system","subtype":"task_started","task_id":"ta","tool_use_id":"tu_a","description":"a","is_backgrounded":false,"task_type":"local_agent"}"#;
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"a","prompt":"go"}}]}}"#;
+        assert_eq!(completes_at(&[INIT, plain, fg, RESULT]), (Some(3), false));
+        assert_eq!(
+            completes_at(&[INIT, &launch("tu_a"), fg, RESULT]),
+            (Some(3), false)
+        );
+    }
+
+    /// Older CLIs omit `is_backgrounded`: an agent then needs the explicit
+    /// input flag, as before.
+    #[test]
+    fn without_is_backgrounded_an_unflagged_agent_does_not_hold_the_turn() {
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"a","prompt":"go"}}]}}"#;
+        let legacy = r#"{"type":"system","subtype":"task_started","task_id":"ta","tool_use_id":"tu_a","description":"a"}"#;
+        assert_eq!(
+            completes_at(&[INIT, plain, legacy, RESULT]),
+            (Some(3), false)
+        );
+    }
+
+    /// Safety net: a task the per-tool classification knows nothing about
+    /// (here a hypothetical new tool) still holds the turn while the CLI
+    /// lists it, and its notification owes the parent a wake-up.
+    #[test]
+    fn a_task_only_the_cli_list_knows_holds_the_turn() {
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_m","name":"Monitor","input":{}}]}}"#;
+        let listed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"tm","task_type":"local_monitor","description":"watch"}]}"#;
+        let cleared = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        let notified = notify("tm", "tu_m");
+        let lines: &[&str] = &[
+            INIT, tool, listed, RESULT, // 3: still listed
+            cleared, &notified, INIT, RESULT, // 7
+        ];
+        assert_eq!(completes_at(&lines[..4]), (None, false));
+        assert_eq!(completes_at(&lines[..6]), (None, true));
+        assert_eq!(completes_at(lines), (Some(7), false));
+    }
+
+    /// Positional-prompt sessions: the CLI stops background shells at the
+    /// first `result`, so a listed shell must not hold the turn there.
+    #[test]
+    fn a_listed_shell_does_not_hold_a_positional_turn() {
+        let listed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bsh","task_type":"local_bash","description":"sleep"}]}"#;
+        assert_eq!(
+            completes_at(&[INIT, BASH_LAUNCH, listed, BASH_STARTED, BASH_ACK, WAITING]),
+            (Some(5), false)
         );
     }
 

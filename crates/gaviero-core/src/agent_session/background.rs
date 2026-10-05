@@ -135,9 +135,20 @@ pub(crate) fn finish_all_pending_killed(
     pending: &mut Vec<PendingBg>,
     observer: &dyn AcpObserver,
 ) -> usize {
+    finish_all_pending(pending, "killed", "parent process exited", observer)
+}
+
+/// End every still-tracked task with `status` and `reason`, so the UI says
+/// how each one ended instead of dropping it. Returns how many there were.
+pub(crate) fn finish_all_pending(
+    pending: &mut Vec<PendingBg>,
+    status: &str,
+    reason: &str,
+    observer: &dyn AcpObserver,
+) -> usize {
     let n = pending.len();
     for p in pending.drain(..) {
-        observer.on_background_task_finished(&p.host_id, "killed", "parent process exited");
+        observer.on_background_task_finished(&p.host_id, status, reason);
     }
     n
 }

@@ -53,9 +53,7 @@ use crate::swarm::backend::{
 };
 use crate::write_gate::WriteGatePipeline;
 
-use super::background::{
-    PendingBg, finish_all_pending_killed, finish_pending_bg, register_pending_bg,
-};
+use super::background::{PendingBg, finish_all_pending, finish_pending_bg, register_pending_bg};
 use super::registry::SessionConstruction;
 use super::tool_surface::{AgentToolSurface, CommandDecision};
 use super::{AgentSession, Turn};
@@ -496,6 +494,7 @@ impl CodexAppServerSession {
         let active_turn: SharedActiveTurn = Arc::new(Mutex::new(None));
         let active_turn_bg = active_turn.clone();
         let review = self.review.clone();
+        let parent_thread = thread_id.clone();
 
         let reader_task = tokio::spawn(async move {
             let mut terminal_error: Option<String> = None;
@@ -503,8 +502,14 @@ impl CodexAppServerSession {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let Err(e) =
-                    route_app_server_line(&line, &stdin_bg, &active_turn_bg, &review).await
+                if let Err(e) = route_app_server_line(
+                    &line,
+                    &parent_thread,
+                    &stdin_bg,
+                    &active_turn_bg,
+                    &review,
+                )
+                .await
                 {
                     terminal_error = Some(format!("{e:#}"));
                     break;
@@ -752,8 +757,24 @@ async fn read_thread_id(lines: &mut Lines<BufReader<ChildStdout>>) -> Result<Str
     anyhow::bail!("codex app-server: stdout closed before thread/started")
 }
 
+/// True for a notification that belongs to another thread than the one this
+/// session drives — a sub-agent's (Codex 0.153.4 runs each spawned agent on
+/// its own thread over the same connection). Server requests (approvals)
+/// carry an `id` and are never foreign: a sub-agent's approval still needs
+/// an answer.
+fn is_child_thread_notification(value: &serde_json::Value, parent_thread: &str) -> bool {
+    if value.get("id").is_some() || parent_thread.is_empty() || parent_thread == "unknown" {
+        return false;
+    }
+    value
+        .pointer("/params/threadId")
+        .and_then(|thread| thread.as_str())
+        .is_some_and(|thread| thread != parent_thread)
+}
+
 async fn route_app_server_line(
     line: &str,
+    parent_thread: &str,
     stdin: &WeakStdin,
     active_turn: &SharedActiveTurn,
     review: &ReviewContext,
@@ -769,6 +790,21 @@ async fn route_app_server_line(
         .and_then(|method| method.as_str())
         .unwrap_or_default();
 
+    // A sub-agent's own turn must neither end the parent's turn (its
+    // `turn/completed`) nor stream into the parent's answer (its deltas,
+    // token usage). Only the file-change bookkeeping its approvals rely on
+    // runs; the parent hears about the agent through `subAgentActivity`.
+    if is_child_thread_notification(&value, parent_thread) {
+        match method {
+            "item/started" if item_type(&value) == Some("fileChange") => {
+                capture_file_change_start(&value, active_turn, review).await;
+            }
+            "item/completed" => refresh_file_change_baseline(&value, active_turn).await,
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match method {
         "item/started"
             if value
@@ -780,19 +816,11 @@ async fn route_app_server_line(
             let (events, _) = parse_rpc_event(line);
             send_to_active(active_turn, events).await;
         }
-        "item/started"
-            if value
-                .pointer("/params/item/type")
-                .and_then(|kind| kind.as_str())
-                .is_some_and(is_codex_subagent_item) =>
-        {
-            track_codex_subagent_start(&value, active_turn, review).await;
-            let (events, _) = parse_rpc_event(line);
-            send_to_active(active_turn, events).await;
+        "item/started" | "item/completed" if item_type(&value) == Some(CODEX_SUBAGENT_ACTIVITY) => {
+            track_codex_subagent_activity(&value, active_turn, review).await;
         }
         "item/completed" => {
             refresh_file_change_baseline(&value, active_turn).await;
-            track_codex_subagent_finish(&value, active_turn, review).await;
             let (events, _) = parse_rpc_event(line);
             send_to_active(active_turn, events).await;
         }
@@ -828,7 +856,14 @@ async fn route_app_server_line(
             let active = { active_turn.lock().await.take() };
             let (events, _) = parse_rpc_event(line);
             if let Some(mut active) = active {
-                let _ = finish_all_pending_killed(&mut active.pending_bg, review.observer.as_ref());
+                // Sub-agents live in the app-server, not in the turn: one the
+                // turn did not wait for is left running, not killed.
+                let _ = finish_all_pending(
+                    &mut active.pending_bg,
+                    "detached",
+                    "Codex ended the turn before this sub-agent finished",
+                    review.observer.as_ref(),
+                );
                 if let Err(e) = finalize_native_edits(review, active.snapshot).await {
                     let _ = active
                         .tx
@@ -849,17 +884,62 @@ async fn route_app_server_line(
     Ok(())
 }
 
-/// Codex app-server item types that represent a spawned collaborator /
-/// subagent rather than a host tool. Names collected from the protocol's
-/// `item.type` field; unknown variants are ignored.
-fn is_codex_subagent_item(kind: &str) -> bool {
-    matches!(
-        kind,
-        "collab" | "agent" | "subAgent" | "subagent" | "task" | "spawnedAgent" | "agentTurn"
-    )
+/// One step of a sub-agent's life, reported on the parent thread
+/// (`kind`: `started` / `interacted` / `interrupted` / `completed`, keyed by
+/// `agentThreadId`). Verified against the codex 0.153.4 app-server schema
+/// (`codex app-server generate-json-schema`) and a recorded spawn.
+const CODEX_SUBAGENT_ACTIVITY: &str = "subAgentActivity";
+/// The parent's own multi-agent tool calls (`spawnAgent`, `wait`,
+/// `closeAgent`, …). Shown as tool calls; the agents themselves are tracked
+/// from [`CODEX_SUBAGENT_ACTIVITY`].
+const CODEX_COLLAB_TOOL_CALL: &str = "collabAgentToolCall";
+
+fn item_type(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/params/item/type")
+        .and_then(|kind| kind.as_str())
 }
 
-async fn track_codex_subagent_start(
+/// `spawnAgent: reply with PONG…`, `wait`, …
+fn codex_collab_label(item: &serde_json::Value) -> String {
+    let tool = item.get("tool").and_then(|t| t.as_str()).unwrap_or("agent");
+    match item
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(prompt) => {
+            let mut label: String = prompt.chars().take(60).collect();
+            if prompt.chars().count() > 60 {
+                label.push('…');
+            }
+            format!("{tool}: {label}")
+        }
+        None => tool.to_string(),
+    }
+}
+
+/// `/root/pong` → `pong`: the agent's name under the root agent.
+fn codex_subagent_label(item: &serde_json::Value) -> String {
+    let path = item
+        .get("agentPath")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim_start_matches("/root/")
+        .trim_matches('/');
+    if path.is_empty() {
+        "sub-agent".to_string()
+    } else {
+        format!("sub-agent {path}")
+    }
+}
+
+/// Register or finish a sub-agent from its `subAgentActivity` item. Codex
+/// sends each step as both `item/started` and `item/completed`, and the
+/// `completed` step arrives as an `item/started` too, so the step is read
+/// from `kind`, never from the notification method.
+async fn track_codex_subagent_activity(
     value: &serde_json::Value,
     active_turn: &SharedActiveTurn,
     review: &ReviewContext,
@@ -868,54 +948,37 @@ async fn track_codex_subagent_start(
         .pointer("/params/item")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let id = item
-        .get("id")
+    let agent = item
+        .get("agentThreadId")
+        .or_else(|| item.get("id"))
         .and_then(|id| id.as_str())
         .unwrap_or("")
         .to_string();
-    if id.is_empty() {
+    if agent.is_empty() {
         return;
     }
-    let desc = crate::acp::protocol::subagent_description(&item);
+    let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
     let mut active = active_turn.lock().await;
     let Some(active) = active.as_mut() else {
         return;
     };
-    register_pending_bg(
-        &mut active.pending_bg,
-        &id,
-        &id,
-        &desc,
-        review.observer.as_ref(),
-    );
-}
-
-async fn track_codex_subagent_finish(
-    value: &serde_json::Value,
-    active_turn: &SharedActiveTurn,
-    review: &ReviewContext,
-) {
-    let item = value
-        .pointer("/params/item")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let kind = item.get("type").and_then(|k| k.as_str()).unwrap_or("");
-    if !is_codex_subagent_item(kind) {
-        return;
+    let observer = review.observer.as_ref();
+    match kind {
+        "started" | "interacted" => register_pending_bg(
+            &mut active.pending_bg,
+            &agent,
+            &agent,
+            &codex_subagent_label(&item),
+            observer,
+        ),
+        "completed" | "interrupted" => {
+            finish_pending_bg(&mut active.pending_bg, &agent, &agent, kind, "", observer)
+        }
+        other => tracing::debug!(
+            kind = other,
+            "codex app-server: unknown subAgentActivity kind"
+        ),
     }
-    let id = item.get("id").and_then(|id| id.as_str()).unwrap_or("");
-    let mut active = active_turn.lock().await;
-    let Some(active) = active.as_mut() else {
-        return;
-    };
-    finish_pending_bg(
-        &mut active.pending_bg,
-        id,
-        id,
-        "completed",
-        "",
-        review.observer.as_ref(),
-    );
 }
 
 fn approval_command_line(value: &serde_json::Value) -> Option<String> {
@@ -1901,11 +1964,11 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                     }],
                     false,
                 ),
-                Some(kind) if is_codex_subagent_item(kind) => (
+                Some(CODEX_COLLAB_TOOL_CALL) => (
                     vec![UnifiedStreamEvent::ToolCallStart {
                         id,
                         name: "Task".to_string(),
-                        args: item.clone(),
+                        args: serde_json::json!({ "description": codex_collab_label(item) }),
                     }],
                     false,
                 ),
@@ -1947,7 +2010,7 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                         .to_string();
                     (vec![UnifiedStreamEvent::ToolCallEnd { id }], false)
                 }
-                Some(kind) if is_codex_subagent_item(kind) => {
+                Some(CODEX_COLLAB_TOOL_CALL) => {
                     let id = item
                         .get("id")
                         .and_then(|id| id.as_str())
@@ -2546,23 +2609,160 @@ url = "https://example/mcp/"
         );
     }
 
+    /// Recorded from codex 0.153.4 (fields trimmed).
     #[test]
-    fn parse_subagent_item_lifecycle() {
+    fn parse_collab_tool_call_lifecycle() {
         let (events, _) = parse(
-            r#"{"method":"item/started","params":{"item":{"type":"task","id":"ag1","description":"scan docs"}}}"#,
+            r#"{"method":"item/started","params":{"threadId":"P","item":{"type":"collabAgentToolCall","id":"call_w","tool":"spawnAgent","status":"inProgress","senderThreadId":"P","receiverThreadIds":[],"prompt":"Reply with the word PONG.","agentsStates":{}}}}"#,
         );
         assert!(matches!(
             &events[0],
-            UnifiedStreamEvent::ToolCallStart { id, name, .. }
-                if id == "ag1" && name == "Task"
+            UnifiedStreamEvent::ToolCallStart { id, name, args }
+                if id == "call_w" && name == "Task"
+                    && args["description"] == "spawnAgent: Reply with the word PONG."
         ));
         let (events, _) = parse(
-            r#"{"method":"item/completed","params":{"item":{"type":"task","id":"ag1","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"P","item":{"type":"collabAgentToolCall","id":"call_w","tool":"wait","status":"completed","senderThreadId":"P","receiverThreadIds":[],"agentsStates":{}}}}"#,
         );
         assert_eq!(
             events,
-            vec![UnifiedStreamEvent::ToolCallEnd { id: "ag1".into() }]
+            vec![UnifiedStreamEvent::ToolCallEnd {
+                id: "call_w".into()
+            }]
         );
+        // The agent itself is tracked as a background task, not a tool call.
+        let (events, _) = parse(
+            r#"{"method":"item/started","params":{"threadId":"P","item":{"type":"subAgentActivity","id":"call_s","kind":"started","agentThreadId":"C","agentPath":"/root/pong"}}}"#,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[derive(Default)]
+    struct BgLog {
+        started: Vec<(String, String)>,
+        finished: Vec<(String, String)>,
+    }
+
+    struct BgRecorder(std::sync::Mutex<BgLog>);
+
+    impl AcpObserver for BgRecorder {
+        fn on_stream_chunk(&self, _text: &str) {}
+        fn on_tool_call_started(&self, _tool_name: &str) {}
+        fn on_streaming_status(&self, _status: &str) {}
+        fn on_message_complete(&self, _role: &str, _content: &str) {}
+        fn on_proposal_deferred(&self, _: &Path, _: Option<&str>, _: &str) {}
+        fn on_background_task_started(&self, task_id: &str, description: &str) {
+            let mut log = self.0.lock().unwrap();
+            log.started.push((task_id.into(), description.into()));
+        }
+        fn on_background_task_finished(&self, task_id: &str, status: &str, _summary: &str) {
+            let mut log = self.0.lock().unwrap();
+            log.finished.push((task_id.into(), status.into()));
+        }
+    }
+
+    /// Recorded from codex 0.153.4 with `multi_agent` on (fields trimmed):
+    /// the sub-agent runs on its own thread `C` over the same connection.
+    /// Its `turn/completed` used to end the parent's turn and its deltas
+    /// streamed into the parent's answer; the agent was never listed.
+    #[tokio::test]
+    async fn a_sub_agent_thread_neither_ends_nor_streams_into_the_parent_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(BgRecorder(std::sync::Mutex::new(BgLog::default())));
+        let mut review = review_context(dir.path(), test_write_gate());
+        review.observer = recorder.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let active_turn: SharedActiveTurn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        let stdin: WeakStdin = Weak::new();
+
+        let lines = [
+            r#"{"method":"item/started","params":{"threadId":"P","turnId":"tp","item":{"type":"subAgentActivity","id":"call_s","kind":"started","agentThreadId":"C","agentPath":"/root/pong"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"P","turnId":"tp","item":{"type":"subAgentActivity","id":"call_s","kind":"started","agentThreadId":"C","agentPath":"/root/pong"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"C","turn":{"id":"tc","items":[],"status":"inProgress"}}}"#,
+            r#"{"method":"item/started","params":{"threadId":"P","turnId":"tp","item":{"type":"collabAgentToolCall","id":"call_w","tool":"wait","status":"inProgress","senderThreadId":"P","receiverThreadIds":[],"agentsStates":{}}}}"#,
+            r#"{"method":"item/agentMessage/delta","params":{"threadId":"C","turnId":"tc","itemId":"m1","delta":"PONG"}}"#,
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"C","turnId":"tc","tokenUsage":{"total":{"totalTokens":14607}}}}"#,
+            r#"{"method":"item/started","params":{"threadId":"P","turnId":"tp","item":{"type":"subAgentActivity","id":"subagent-completed-tc","kind":"completed","agentThreadId":"C","agentPath":"/root/pong"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"C","turn":{"id":"tc","items":[],"status":"completed"}}}"#,
+        ];
+        for line in lines {
+            route_app_server_line(line, "P", &stdin, &active_turn, &review)
+                .await
+                .unwrap();
+        }
+        assert!(
+            active_turn.lock().await.is_some(),
+            "the sub-agent's turn/completed must not end the parent's turn"
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.unwrap());
+        }
+        assert_eq!(
+            events,
+            vec![UnifiedStreamEvent::ToolCallStart {
+                id: "call_w".into(),
+                name: "Task".into(),
+                args: serde_json::json!({ "description": "wait" }),
+            }],
+            "no sub-agent text or Done may reach the parent stream"
+        );
+        {
+            let log = recorder.0.lock().unwrap();
+            assert_eq!(log.started, vec![("C".into(), "sub-agent pong".into())]);
+            assert_eq!(log.finished, vec![("C".into(), "completed".into())]);
+        }
+
+        let parent_done = r#"{"method":"turn/completed","params":{"threadId":"P","turn":{"id":"tp","items":[],"status":"completed"}}}"#;
+        route_app_server_line(parent_done, "P", &stdin, &active_turn, &review)
+            .await
+            .unwrap();
+        assert!(active_turn.lock().await.is_none());
+        let mut tail = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            tail.push(event.unwrap());
+        }
+        assert_eq!(
+            tail.last(),
+            Some(&UnifiedStreamEvent::Done(StopReason::EndTurn))
+        );
+    }
+
+    /// A sub-agent still running when the parent's turn ends lives on in
+    /// the app-server: it is reported as detached, not killed.
+    #[tokio::test]
+    async fn an_unawaited_sub_agent_is_reported_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(BgRecorder(std::sync::Mutex::new(BgLog::default())));
+        let mut review = review_context(dir.path(), test_write_gate());
+        review.observer = recorder.clone();
+        let (tx, _rx) = mpsc::channel(64);
+        let active_turn: SharedActiveTurn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        let stdin: WeakStdin = Weak::new();
+        for line in [
+            r#"{"method":"item/started","params":{"threadId":"P","item":{"type":"subAgentActivity","id":"call_s","kind":"started","agentThreadId":"C","agentPath":"/root/scan"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"P","turn":{"id":"tp","items":[],"status":"completed"}}}"#,
+        ] {
+            route_app_server_line(line, "P", &stdin, &active_turn, &review)
+                .await
+                .unwrap();
+        }
+        let log = recorder.0.lock().unwrap();
+        assert_eq!(log.finished, vec![("C".into(), "detached".into())]);
+    }
+
+    #[test]
+    fn approvals_from_a_sub_agent_thread_are_not_foreign() {
+        let request = serde_json::json!({
+            "method": "item/commandExecution/requestApproval",
+            "id": 9,
+            "params": { "threadId": "C", "itemId": "x" }
+        });
+        assert!(!is_child_thread_notification(&request, "P"));
+        let note = serde_json::json!({ "method": "turn/completed", "params": { "threadId": "C" } });
+        assert!(is_child_thread_notification(&note, "P"));
+        assert!(!is_child_thread_notification(&note, "C"));
+        assert!(!is_child_thread_notification(&note, "unknown"));
     }
 
     #[test]
