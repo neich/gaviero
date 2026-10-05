@@ -85,19 +85,19 @@ impl TerminalManager {
         }
 
         // Restore active tab (switch to the first tab if the saved one isn't found)
-        if !self.tab_order().is_empty() {
-            if let Some(active_id_str) = &state.active_tab {
-                // Try to find a tab that matches — but since IDs are regenerated,
-                // we just activate by position
-                let active_idx = state
-                    .tabs
-                    .iter()
-                    .position(|t| t.id == *active_id_str)
-                    .unwrap_or(0);
-                if active_idx < self.tab_order().len() {
-                    let id = self.tab_order()[active_idx];
-                    self.switch_tab(id);
-                }
+        if !self.tab_order().is_empty()
+            && let Some(active_id_str) = &state.active_tab
+        {
+            // Try to find a tab that matches — but since IDs are regenerated,
+            // we just activate by position
+            let active_idx = state
+                .tabs
+                .iter()
+                .position(|t| t.id == *active_id_str)
+                .unwrap_or(0);
+            if active_idx < self.tab_order().len() {
+                let id = self.tab_order()[active_idx];
+                self.switch_tab(id);
             }
         }
     }
