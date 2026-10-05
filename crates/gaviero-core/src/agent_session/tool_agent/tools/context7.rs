@@ -138,7 +138,9 @@ impl Tool for Context7ResolveTool {
             .await
         {
             Ok(r) => r,
-            Err(e) => return ToolOutcome::error(format!("resolve_library_id: request failed: {e}")),
+            Err(e) => {
+                return ToolOutcome::error(format!("resolve_library_id: request failed: {e}"));
+            }
         };
         let status = resp.status();
         let body = match resp.text().await {
@@ -253,7 +255,10 @@ fn format_search_results(body: &str) -> Result<String, String> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| "search response had no 'results' array".to_string())?;
     if results.is_empty() {
-        return Ok("No context7 libraries matched that query. Try a shorter or more common name.".to_string());
+        return Ok(
+            "No context7 libraries matched that query. Try a shorter or more common name."
+                .to_string(),
+        );
     }
     let mut out = String::new();
     for (i, r) in results.iter().take(MAX_RESOLVE_HITS).enumerate() {

@@ -133,7 +133,9 @@ impl Tool for AskQuestionTool {
         let decision = match rx.await {
             Ok(decision) => decision,
             // A dropped sender is a deny (`observer.rs` documents this).
-            Err(_) => return ToolOutcome::error("the question was cancelled before it was answered"),
+            Err(_) => {
+                return ToolOutcome::error("the question was cancelled before it was answered");
+            }
         };
 
         match decision {
@@ -150,9 +152,9 @@ impl Tool for AskQuestionTool {
                     ),
                 }
             }
-            crate::observer::PermissionDecision::Deny { message } => {
-                ToolOutcome::error(message.unwrap_or_else(|| "the user declined to answer".to_string()))
-            }
+            crate::observer::PermissionDecision::Deny { message } => ToolOutcome::error(
+                message.unwrap_or_else(|| "the user declined to answer".to_string()),
+            ),
         }
     }
 }
@@ -175,7 +177,9 @@ fn first_question(args: &Value) -> Option<&str> {
 /// before the prompt means the model gets a message it can act on instead.
 fn validate_questions(args: &Value) -> Result<(), String> {
     let Some(questions) = args.get("questions").and_then(Value::as_array) else {
-        return Err("missing required argument 'questions' (expected a non-empty array)".to_string());
+        return Err(
+            "missing required argument 'questions' (expected a non-empty array)".to_string(),
+        );
     };
     if questions.is_empty() {
         return Err("'questions' must contain at least one question".to_string());
@@ -192,7 +196,9 @@ fn validate_questions(args: &Value) -> Result<(), String> {
             .and_then(Value::as_str)
             .is_none_or(|s| s.trim().is_empty())
         {
-            return Err(format!("question {n} is missing a non-empty 'question' string"));
+            return Err(format!(
+                "question {n} is missing a non-empty 'question' string"
+            ));
         }
         let Some(options) = q.get("options").and_then(Value::as_array) else {
             return Err(format!(
@@ -305,10 +311,7 @@ mod tests {
                                 .and_then(|o| o.get("label"))
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
-                            answers.insert(
-                                text.to_string(),
-                                Value::String(label.to_string()),
-                            );
+                            answers.insert(text.to_string(), Value::String(label.to_string()));
                         }
                     }
                     obj.insert("answers".into(), Value::Object(answers));
@@ -385,7 +388,10 @@ mod tests {
         assert!(out.content.contains("Which targets?"), "{}", out.content);
         assert!(out.content.contains("api"), "{}", out.content);
         // The host saw this tool name and the exact input, unmodified.
-        assert_eq!(observer.seen_tool.lock().unwrap().as_slice(), [ASK_USER_QUESTION_TOOL]);
+        assert_eq!(
+            observer.seen_tool.lock().unwrap().as_slice(),
+            [ASK_USER_QUESTION_TOOL]
+        );
         assert_eq!(
             observer.seen_input.lock().unwrap()[0],
             two_questions(),
@@ -409,7 +415,10 @@ mod tests {
         // `updated_input`. Reporting success here would tell the model a
         // question had been answered when none was asked.
         let out = AskQuestionTool
-            .run(two_questions(), &ctx_with(Some(Arc::new(DefaultAllowObserver))))
+            .run(
+                two_questions(),
+                &ctx_with(Some(Arc::new(DefaultAllowObserver))),
+            )
             .await;
         assert!(out.is_error);
         assert!(out.content.contains("no answers"), "{}", out.content);
@@ -484,7 +493,8 @@ mod tests {
     #[test]
     fn validate_enforces_the_declared_ceilings() {
         let opt = |i: usize| json!({ "label": format!("o{i}") });
-        let q = |n: usize| json!({ "question": "Q?", "options": (0..n).map(opt).collect::<Vec<_>>() });
+        let q =
+            |n: usize| json!({ "question": "Q?", "options": (0..n).map(opt).collect::<Vec<_>>() });
         let many = json!({ "questions": (0..MAX_QUESTIONS + 1).map(|_| q(2)).collect::<Vec<_>>() });
         assert!(validate_questions(&many).is_err());
         let wide = json!({ "questions": [q(MAX_OPTIONS + 1)] });

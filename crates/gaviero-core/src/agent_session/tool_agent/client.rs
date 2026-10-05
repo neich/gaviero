@@ -218,7 +218,9 @@ fn parse_tool_arguments(name: &str, raw: &str) -> std::result::Result<Value, Str
     {
         return Ok(value);
     }
-    Err(format!("tool '{name}' has malformed arguments JSON: {strict_err}"))
+    Err(format!(
+        "tool '{name}' has malformed arguments JSON: {strict_err}"
+    ))
 }
 
 /// Escape raw control characters that sit *inside* JSON string literals.

@@ -406,11 +406,11 @@ mod tests {
             "in-process provider was given no memory tools: added {added:?}"
         );
         assert!(
-            reg.names().iter().any(|n| *n == "memory_search"),
+            reg.names().contains(&"memory_search"),
             "memory_search was returned as added but is not dispatchable"
         );
         assert!(
-            reg.names().iter().any(|n| *n == "Read"),
+            reg.names().contains(&"Read"),
             "dropping the allow-list must not cost the fs surface"
         );
     }

@@ -162,10 +162,8 @@ impl ToolAgentSession {
         // * an explicit `"availableTools": []` yields an empty registry — it
         //   previously fell through to `full_chat()`, handing the most
         //   permissive tool set to the most restrictive setting.
-        let surface = super::tool_surface::AgentToolSurface::from_agent_options(
-            &options,
-            &workspace_root,
-        );
+        let surface =
+            super::tool_surface::AgentToolSurface::from_agent_options(&options, &workspace_root);
         let mut tools = ToolRegistry::from_names(surface.available());
         // Gaviero's MCP retrieval tools, adapted to the in-process loop. Appended
         // after the fs/exec tools so those keep a stable position in the `tools`
@@ -347,10 +345,8 @@ impl AgentSession for ToolAgentSession {
         // here is not used to revert or report anything.
         let had_edits = !self.host_capture && !snapshot.lock().await.is_empty();
         if outcome.error.is_some() || self.cancel_token.is_cancelled() {
-            if had_edits {
-                if let Err(e) = snapshot.lock().await.revert_all().await {
-                    tracing::warn!("tool-agent revert on error/cancel failed: {e:#}");
-                }
+            if had_edits && let Err(e) = snapshot.lock().await.revert_all().await {
+                tracing::warn!("tool-agent revert on error/cancel failed: {e:#}");
             }
         } else if had_edits {
             // Only the paths matter: the host syncs its open buffers to disk and
@@ -400,7 +396,7 @@ fn resolve_loop_limits(workspace_root: &Path) -> agent_loop::LoopLimits {
 }
 
 /// Resolve DeepSeek API config from workspace settings + env/secrets.
-pub(crate) fn resolve_api_config(workspace_root: &PathBuf) -> Result<ApiClientConfig> {
+pub(crate) fn resolve_api_config(workspace_root: &std::path::Path) -> Result<ApiClientConfig> {
     let settings_path = workspace_root.join(".gaviero").join("settings.json");
     let (base_url, pricing) = std::fs::read_to_string(&settings_path)
         .ok()
