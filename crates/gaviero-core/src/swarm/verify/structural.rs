@@ -172,7 +172,7 @@ fn collect_error_nodes(
 ) -> Vec<ErrorWithSeverity> {
     let mut errors = Vec::new();
     let mut cursor = tree.walk();
-    walk_for_errors(&mut cursor, source, lines, &tree, &mut errors);
+    walk_for_errors(&mut cursor, source, lines, tree, &mut errors);
     errors
 }
 
@@ -274,10 +274,10 @@ fn walk_for_names(cursor: &mut tree_sitter::TreeCursor, source: &[u8], names: &m
 
     if DEF_KINDS.contains(&kind) {
         // Try to get the name
-        if let Some(name_node) = node.child_by_field_name("name") {
-            if let Ok(name) = name_node.utf8_text(source) {
-                names.push(name.to_string());
-            }
+        if let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source)
+        {
+            names.push(name.to_string());
         }
     }
 

@@ -907,7 +907,7 @@ pub async fn execute(
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
                     // Store result to memory
-                    let effective_write_ns = effective_write_namespace(&unit, config);
+                    let effective_write_ns = effective_write_namespace(unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -930,8 +930,8 @@ pub async fn execute(
                 }
 
                 // Runtime fan-out: materialize + run SpawnManifest workers
-                if !failed {
-                    if let Err(e) = run_fanout_wave_if_needed(
+                if !failed
+                    && let Err(e) = run_fanout_wave_if_needed(
                         unit_id,
                         plan,
                         config,
@@ -955,9 +955,8 @@ pub async fn execute(
                         &make_observer,
                     )
                     .await
-                    {
-                        tracing::warn!("fan-out after '{unit_id}' failed: {e:#}");
-                    }
+                {
+                    tracing::warn!("fan-out after '{unit_id}' failed: {e:#}");
                 }
             }
         } else {
@@ -1120,7 +1119,7 @@ pub async fn execute(
                             );
                             // Store result to memory
                             if let Some(unit) = unit_map.get(manifest.work_unit_id.as_str()) {
-                                let effective_write_ns = effective_write_namespace(&unit, config);
+                                let effective_write_ns = effective_write_namespace(unit, config);
                                 store_agent_result(
                                     &memory,
                                     &memory_writer,
@@ -1291,7 +1290,7 @@ pub async fn execute(
             // Walk depends_on transitively from each body agent, collecting
             // dep ids that are NOT themselves loop body agents.
             let mut visited: std::collections::HashSet<String> = Default::default();
-            let mut queue: Vec<String> = loop_config.agent_ids.iter().cloned().collect();
+            let mut queue: Vec<String> = loop_config.agent_ids.to_vec();
             while let Some(id) = queue.pop() {
                 if let Some(unit) = unit_map.get(id.as_str()) {
                     for d in &unit.depends_on {
@@ -1424,7 +1423,7 @@ pub async fn execute(
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
                     drop(b);
-                    let effective_write_ns = effective_write_namespace(&unit, config);
+                    let effective_write_ns = effective_write_namespace(unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -1435,12 +1434,11 @@ pub async fn execute(
                         config,
                     )
                     .await;
-                    if let Some(ref branch_name) = manifest.branch {
-                        if let Some(ref mgr) = worktree_mgr {
-                            if let Some(tip) = mgr.branch_tip(branch_name) {
-                                chain_anchor = Some(tip);
-                            }
-                        }
+                    if let Some(ref branch_name) = manifest.branch
+                        && let Some(ref mgr) = worktree_mgr
+                        && let Some(tip) = mgr.branch_tip(branch_name)
+                    {
+                        chain_anchor = Some(tip);
                     }
                 }
                 exec_state.record_result(agent_id, manifest.clone());
@@ -1675,7 +1673,7 @@ pub async fn execute(
 
             // Substitute {{ITER}} / {{PREV_ITER}} for this loop pass.
             // iteration is 1-indexed here (1..max_iterations); iter_abs = iter_start + iteration.
-            let iter_abs = loop_config.iter_start + iteration as u32;
+            let iter_abs = loop_config.iter_start + iteration;
             let run_loop_parallel = effective_max_parallel > 1 && loop_config.agent_ids.len() > 1;
 
             if run_loop_parallel {
@@ -1714,14 +1712,10 @@ pub async fn execute(
                         } else {
                             mgr.provision(&unit.id)?
                         };
-                        if !context_files.is_empty() {
-                            if let Err(e) = mgr.inject_context_files(&unit.id, &context_files) {
-                                tracing::warn!(
-                                    "Failed to inject context files for {}: {}",
-                                    unit.id,
-                                    e
-                                );
-                            }
+                        if !context_files.is_empty()
+                            && let Err(e) = mgr.inject_context_files(&unit.id, &context_files)
+                        {
+                            tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
                         }
                         handle.path.clone()
                     } else {
@@ -1956,7 +1950,7 @@ pub async fn execute(
                             &manifest.work_unit_id,
                             &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                         );
-                        let effective_write_ns = effective_write_namespace(&unit, config);
+                        let effective_write_ns = effective_write_namespace(unit, config);
                         store_agent_result(
                             &memory,
                             &memory_writer,
@@ -1968,14 +1962,12 @@ pub async fn execute(
                         )
                         .await;
 
-                        if stacked {
-                            if let Some(ref branch_name) = manifest.branch {
-                                if let Some(ref mgr) = worktree_mgr {
-                                    if let Some(tip) = mgr.branch_tip(branch_name) {
-                                        chain_anchor = Some(tip);
-                                    }
-                                }
-                            }
+                        if stacked
+                            && let Some(ref branch_name) = manifest.branch
+                            && let Some(ref mgr) = worktree_mgr
+                            && let Some(tip) = mgr.branch_tip(branch_name)
+                        {
+                            chain_anchor = Some(tip);
                         }
                     }
                     exec_state.record_result(agent_id, manifest.clone());
@@ -2144,7 +2136,7 @@ pub async fn execute(
                         &manifest.work_unit_id,
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
-                    let effective_write_ns = effective_write_namespace(&unit, config);
+                    let effective_write_ns = effective_write_namespace(unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -2180,62 +2172,62 @@ pub async fn execute(
         // deliverable, NOT something to merge back. Skip them here.
         let is_stacked_iter_branch = |branch: &str| -> bool {
             // Match `gaviero/<anything>-iter<digits>` shape.
-            if let Some(rest) = branch.strip_prefix("gaviero/") {
-                if let Some(idx) = rest.rfind("-iter") {
-                    let suffix = &rest[idx + "-iter".len()..];
-                    return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
-                }
+            if let Some(rest) = branch.strip_prefix("gaviero/")
+                && let Some(idx) = rest.rfind("-iter")
+            {
+                let suffix = &rest[idx + "-iter".len()..];
+                return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
             }
             false
         };
         for manifest in &all_manifests {
-            if let Some(ref branch) = manifest.branch {
-                if matches!(manifest.status, AgentStatus::Completed) {
-                    if is_stacked_iter_branch(branch) {
-                        tracing::debug!("skipping merge of stacked iteration branch '{}'", branch);
-                        continue;
-                    }
-                    let mut result = merge::merge_branch(&config.workspace_root, branch)?;
-                    if !result.success && !result.conflicts.is_empty() {
-                        let files: Vec<String> = result
-                            .conflicts
-                            .iter()
-                            .map(|c| c.file.to_string_lossy().to_string())
-                            .collect();
-                        observer.on_merge_conflict(branch, &files);
+            if let Some(ref branch) = manifest.branch
+                && matches!(manifest.status, AgentStatus::Completed)
+            {
+                if is_stacked_iter_branch(branch) {
+                    tracing::debug!("skipping merge of stacked iteration branch '{}'", branch);
+                    continue;
+                }
+                let mut result = merge::merge_branch(&config.workspace_root, branch)?;
+                if !result.success && !result.conflicts.is_empty() {
+                    let files: Vec<String> = result
+                        .conflicts
+                        .iter()
+                        .map(|c| c.file.to_string_lossy().to_string())
+                        .collect();
+                    observer.on_merge_conflict(branch, &files);
 
-                        // Auto-resolve conflicts via Claude
-                        observer.on_phase_changed("resolving conflicts");
-                        let resolved = merge::auto_resolve_conflicts(
-                            &config.workspace_root,
-                            branch,
-                            &result.conflicts,
-                            &config.model,
-                            config.ollama_base_url.as_deref(),
-                        )
-                        .await;
+                    // Auto-resolve conflicts via Claude
+                    observer.on_phase_changed("resolving conflicts");
+                    let resolved = merge::auto_resolve_conflicts(
+                        &config.workspace_root,
+                        branch,
+                        &result.conflicts,
+                        &config.model,
+                        config.ollama_base_url.as_deref(),
+                    )
+                    .await;
 
-                        match resolved {
-                            Ok(resolved_conflicts) => {
-                                let all_ok = resolved_conflicts.iter().all(|c| c.resolved);
-                                result.conflicts = resolved_conflicts;
-                                result.success = all_ok;
-                                if !all_ok {
-                                    tracing::warn!(
-                                        "some conflicts could not be auto-resolved for {}",
-                                        branch
-                                    );
-                                    merge::abort_merge(&config.workspace_root)?;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("auto-resolve failed for {}: {}", branch, e);
+                    match resolved {
+                        Ok(resolved_conflicts) => {
+                            let all_ok = resolved_conflicts.iter().all(|c| c.resolved);
+                            result.conflicts = resolved_conflicts;
+                            result.success = all_ok;
+                            if !all_ok {
+                                tracing::warn!(
+                                    "some conflicts could not be auto-resolved for {}",
+                                    branch
+                                );
                                 merge::abort_merge(&config.workspace_root)?;
                             }
                         }
+                        Err(e) => {
+                            tracing::error!("auto-resolve failed for {}: {}", branch, e);
+                            merge::abort_merge(&config.workspace_root)?;
+                        }
                     }
-                    all_merges.push(result);
                 }
+                all_merges.push(result);
             }
         }
     }
@@ -2460,15 +2452,14 @@ impl WorkspaceAnalysis {
                                     } else {
                                         3
                                     };
-                                    if let Ok(impact) = store.impact_radius(&owned, depth) {
-                                        if !impact.affected_files.is_empty() {
+                                    if let Ok(impact) = store.impact_radius(&owned, depth)
+                                        && !impact.affected_files.is_empty() {
                                             sections.push(
                                                 crate::repo_map::store::GraphStore::format_impact_for_prompt(
                                                     &impact,
                                                 ),
                                             );
                                         }
-                                    }
                                 }
 
                                 if !wu.context_callers_of.is_empty() {
@@ -2504,15 +2495,13 @@ impl WorkspaceAnalysis {
                                         .collect();
                                     if let Ok(impact) =
                                         store.impact_radius(&refs, wu.context_depth as usize)
-                                    {
-                                        if !impact.affected_tests.is_empty() {
+                                        && !impact.affected_tests.is_empty() {
                                             sections.push(format!(
                                                 "[Tests for {:?}]:\n{}",
                                                 wu.context_tests_for,
                                                 impact.affected_tests.join(", ")
                                             ));
                                         }
-                                    }
                                 }
 
                                 if !sections.is_empty() {
@@ -2562,7 +2551,7 @@ fn effective_write_namespace<'a>(unit: &'a WorkUnit, config: &'a SwarmConfig) ->
     unit.write_namespace
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
+        .unwrap_or({
             if config.write_namespace.is_empty() {
                 "swarm"
             } else {
@@ -3211,7 +3200,7 @@ fn build_iter_evidence(
                 // Cap summary at 400 chars to keep the prompt bounded.
                 if trimmed.len() > 400 {
                     out.push_str(&trimmed[..400]);
-                    out.push_str("…");
+                    out.push('…');
                 } else {
                     out.push_str(trimmed);
                 }
@@ -3316,6 +3305,7 @@ async fn run_readonly_agent(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_inner(
     unit: &WorkUnit,
     worktree_mgr: Option<&mut WorktreeManager>,
@@ -3345,10 +3335,10 @@ async fn run_agent_inner(
             mgr.provision(&unit.id)?
         };
         let path = handle.path.clone();
-        if !context_files.is_empty() {
-            if let Err(e) = mgr.inject_context_files(&unit.id, context_files) {
-                tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
-            }
+        if !context_files.is_empty()
+            && let Err(e) = mgr.inject_context_files(&unit.id, context_files)
+        {
+            tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
         }
         (path, branch_override.as_ref().map(|ov| ov.branch.clone()))
     } else {
@@ -3885,6 +3875,7 @@ fn force_stage_owned_ignored(
 /// Writes one aggregate entry for the agent's run, plus one sentinel entry per
 /// `staleness_source` path recording the current file hash. On the next run,
 /// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
+#[allow(clippy::too_many_arguments)]
 async fn run_fanout_wave_if_needed(
     completed_unit_id: &str,
     plan: &CompiledPlan,
@@ -3996,7 +3987,7 @@ async fn run_fanout_wave_if_needed(
         exec_state.set_status(&unit.id, NodeStatus::Running);
         observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, &unit.description);
 
-        let effective_read_ns = effective_read_namespaces(unit, config, &memory);
+        let effective_read_ns = effective_read_namespaces(unit, config, memory);
         let agent_ctx = AgentRunContext::for_run(
             config,
             context_files,
@@ -4020,7 +4011,7 @@ async fn run_fanout_wave_if_needed(
         .await?;
 
         if matches!(manifest.status, AgentStatus::Completed) {
-            let effective_write_ns = effective_write_namespace(&unit, config);
+            let effective_write_ns = effective_write_namespace(unit, config);
             store_agent_result(
                 memory,
                 memory_writer,
@@ -4342,10 +4333,10 @@ pub fn revert_swarm(
 
     // Delete agent branches first so they don't linger after the reset
     for manifest in &result.manifests {
-        if let Some(ref branch) = manifest.branch {
-            if let Err(e) = crate::git::delete_branch(workspace_root, branch) {
-                tracing::warn!("Could not delete branch {}: {}", branch, e);
-            }
+        if let Some(ref branch) = manifest.branch
+            && let Err(e) = crate::git::delete_branch(workspace_root, branch)
+        {
+            tracing::warn!("Could not delete branch {}: {}", branch, e);
         }
     }
 
@@ -5090,10 +5081,6 @@ mod tests {
             output: None,
             cost_usd: 0.0,
         }
-    }
-
-    fn judge_until() -> super::super::plan::LoopUntilCondition {
-        super::super::plan::LoopUntilCondition::Agent("convergence-judge".into())
     }
 
     /// Positional shorthand so the gate tests read as a table of cases.
@@ -6267,7 +6254,7 @@ async fn evaluate_agent_condition(
                     current_iter_abs,
                     "partial",
                     manifest.summary.as_deref().unwrap_or(""),
-                    &ctx.loop_agent_ids,
+                    ctx.loop_agent_ids,
                 );
             }
             LoopConditionOutcome::Partial
@@ -6553,19 +6540,18 @@ fn parse_judge_verdict(text: &str) -> Option<JudgeVerdict> {
     }
 
     // 1. ```json ... ``` fenced block (most reliable).
-    if let Some(fenced) = extract_fenced_json(trimmed) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(fenced.trim()) {
-            if let Some(verdict) = parse_judge_verdict_json(&value) {
-                return Some(verdict);
-            }
-        }
+    if let Some(fenced) = extract_fenced_json(trimmed)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(fenced.trim())
+        && let Some(verdict) = parse_judge_verdict_json(&value)
+    {
+        return Some(verdict);
     }
 
     // 2. Whole text is raw JSON.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(verdict) = parse_judge_verdict_json(&value) {
-            return Some(verdict);
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(verdict) = parse_judge_verdict_json(&value)
+    {
+        return Some(verdict);
     }
 
     // 3. Line scan, last-to-first: VERDICT-style line wins over incidental tokens.
@@ -6633,10 +6619,10 @@ fn parse_judge_verdict_json(value: &serde_json::Value) -> Option<JudgeVerdict> {
     }
 
     for key in ["verdict", "decision", "result", "status"] {
-        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
-            if let Some(verdict) = parse_judge_token(text) {
-                return Some(verdict);
-            }
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str())
+            && let Some(verdict) = parse_judge_token(text)
+        {
+            return Some(verdict);
         }
     }
 

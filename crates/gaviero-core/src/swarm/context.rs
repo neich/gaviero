@@ -159,20 +159,20 @@ fn extract_referenced_files(prompt: &str, workspace_root: &Path) -> Vec<(String,
     for word in prompt.split_whitespace() {
         if let Some(path_str) = word.strip_prefix('@') {
             let full_path = workspace_root.join(path_str);
-            if full_path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    // Truncate large files
-                    let truncated = if content.len() > 8000 {
-                        format!(
-                            "{}...\n[truncated, {} chars total]",
-                            &content[..8000],
-                            content.len()
-                        )
-                    } else {
-                        content
-                    };
-                    files.push((path_str.to_string(), truncated));
-                }
+            if full_path.is_file()
+                && let Ok(content) = std::fs::read_to_string(&full_path)
+            {
+                // Truncate large files
+                let truncated = if content.len() > 8000 {
+                    format!(
+                        "{}...\n[truncated, {} chars total]",
+                        &content[..8000],
+                        content.len()
+                    )
+                } else {
+                    content
+                };
+                files.push((path_str.to_string(), truncated));
             }
         }
     }

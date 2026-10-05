@@ -237,9 +237,11 @@ mod tests {
 
     #[test]
     fn test_success_rate() {
-        let mut stats = TierStats::default();
-        stats.cheap_total = 10;
-        stats.cheap_succeeded = 8;
+        let stats = TierStats {
+            cheap_total: 10,
+            cheap_succeeded: 8,
+            ..Default::default()
+        };
 
         assert_eq!(stats.success_rate(ModelTier::Cheap), Some(0.8));
         assert_eq!(stats.success_rate(ModelTier::Expensive), None);

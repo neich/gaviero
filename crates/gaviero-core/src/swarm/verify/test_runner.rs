@@ -178,25 +178,22 @@ pub fn auto_detect_test_command(project_root: &Path) -> Option<String> {
     }
 
     // package.json with "test" script → npm test
-    if let Ok(content) = std::fs::read_to_string(project_root.join("package.json")) {
-        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-            if pkg.get("scripts").and_then(|s| s.get("test")).is_some() {
-                return Some("npm test".into());
-            }
-        }
+    if let Ok(content) = std::fs::read_to_string(project_root.join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+        && pkg.get("scripts").and_then(|s| s.get("test")).is_some()
+    {
+        return Some("npm test".into());
     }
 
     // pytest markers
     for name in &["pytest.ini", "setup.cfg", "pyproject.toml"] {
-        if project_root.join(name).exists() {
-            if let Ok(content) = std::fs::read_to_string(project_root.join(name)) {
-                if content.contains("[tool.pytest")
-                    || content.contains("[pytest]")
-                    || *name == "pytest.ini"
-                {
-                    return Some("pytest".into());
-                }
-            }
+        if project_root.join(name).exists()
+            && let Ok(content) = std::fs::read_to_string(project_root.join(name))
+            && (content.contains("[tool.pytest")
+                || content.contains("[pytest]")
+                || *name == "pytest.ini")
+        {
+            return Some("pytest".into());
         }
     }
 
@@ -207,10 +204,10 @@ pub fn auto_detect_test_command(project_root: &Path) -> Option<String> {
     }
 
     // Makefile with test target
-    if let Ok(content) = std::fs::read_to_string(project_root.join("Makefile")) {
-        if content.contains("\ntest:") || content.starts_with("test:") {
-            return Some("make test".into());
-        }
+    if let Ok(content) = std::fs::read_to_string(project_root.join("Makefile"))
+        && (content.contains("\ntest:") || content.starts_with("test:"))
+    {
+        return Some("make test".into());
     }
 
     None
@@ -394,18 +391,18 @@ fn parse_rust_test_output(output: &str) -> Option<ParsedTestResults> {
     // Collect failure names
     let mut failures = Vec::new();
     for line in output.lines() {
-        if line.starts_with("test ") && line.contains(" ... FAILED") {
-            if let Some(name) = line
+        if line.starts_with("test ")
+            && line.contains(" ... FAILED")
+            && let Some(name) = line
                 .strip_prefix("test ")
                 .and_then(|s| s.split(" ... ").next())
-            {
-                failures.push(TestFailure {
-                    test_name: name.to_string(),
-                    message: String::new(),
-                    file: None,
-                    line: None,
-                });
-            }
+        {
+            failures.push(TestFailure {
+                test_name: name.to_string(),
+                message: String::new(),
+                file: None,
+                line: None,
+            });
         }
     }
 

@@ -285,7 +285,7 @@ fn repair_truncated_json(json: &str) -> String {
 
         // Trim back: remove from the last comma or colon to try a smaller valid subset
         let trimmed = result.trim_end();
-        if let Some(pos) = trimmed.rfind(|c: char| c == ',' || c == ':') {
+        if let Some(pos) = trimmed.rfind([',', ':']) {
             result = trimmed[..pos].to_string();
         } else {
             break;
@@ -346,9 +346,8 @@ fn close_json(json: &str) -> String {
     }
 
     // Remove trailing comma after closing string
-    let trimmed = result.trim_end();
-    if trimmed.ends_with(',') {
-        result = trimmed[..trimmed.len() - 1].to_string();
+    if let Some(stripped) = result.trim_end().strip_suffix(',') {
+        result = stripped.to_string();
     }
 
     // Close in reverse order
@@ -405,7 +404,7 @@ mod tests {
         let input = r#"{"units": [{"id": "a"}, {"id": "b""#;
         let repaired = repair_truncated_json(input);
         let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
-        assert!(v.get("units").unwrap().as_array().unwrap().len() >= 1);
+        assert!(!v.get("units").unwrap().as_array().unwrap().is_empty());
     }
 
     #[test]
