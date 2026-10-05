@@ -168,7 +168,6 @@ pub enum Event {
     /// Reconciliation is read-only, so nothing is carried to revert to --
     /// undoing a turn is the harness's job, not a per-file editor action.
     ToolAgentEditsPending {
-        conv_id: String,
         paths: Vec<std::path::PathBuf>,
     },
 
@@ -182,14 +181,10 @@ pub enum Event {
 
     /// A4: writer task enqueued a write. Panel counts events for the
     /// "activity" pulse indicator but does not re-query yet.
-    MemoryWriteEnqueued {
-        kind: String,
-    },
+    MemoryWriteEnqueued,
     /// A4: writer task committed a write. Triggers a debounced panel
     /// refresh of the "Recently Written" section.
-    MemoryWriteCommitted {
-        kind: String,
-    },
+    MemoryWriteCommitted,
     /// A4: writer task failed. Logs to status bar and panel.
     MemoryWriteFailed {
         kind: String,
@@ -199,7 +194,6 @@ pub enum Event {
     /// re-queries the row for the "Injected Now" section.
     MemoryManifestPersisted {
         turn_id: String,
-        session_id: String,
     },
     /// A5: read-only MCP tool activity from the in-process server.
     McpToolCall {
@@ -465,10 +459,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
     // tens of ms mid-paste under load; giving up early splits one gesture
     // into multiple Event::Paste chunks (see paste_text cursor note).
     let mut saw_start = false;
-    loop {
-        let Ok(next) = event::read() else {
-            break;
-        };
+    while let Ok(next) = event::read() {
         if let Some(ch) = paste_or_escape_char(&next) {
             text.push(ch);
             keys.push(next);

@@ -673,7 +673,11 @@ pub fn detail_header_lines(turn: &TurnRecords, focused: HistorySection) -> Vec<L
                     n => format!(
                         "{n} file{} changed · {}",
                         if n == 1 { "" } else { "s" },
-                        if reviewed { "reviewed" } else { "review pending" }
+                        if reviewed {
+                            "reviewed"
+                        } else {
+                            "review pending"
+                        }
                     ),
                 }
             }

@@ -237,7 +237,7 @@ pub fn format_chat_markdown_mapped(
             let level = trimmed.chars().take_while(|c| *c == '#').count().min(6);
             if trimmed
                 .get(level..level + 1)
-                .map_or(true, |c| c == " " || c.is_empty())
+                .is_none_or(|c| c == " " || c.is_empty())
             {
                 let marker = match level {
                     1 => "█ ",
@@ -258,10 +258,10 @@ pub fn format_chat_markdown_mapped(
         }
 
         // Block quotes
-        if trimmed.starts_with('>') {
+        if let Some(quoted) = trimmed.strip_prefix('>') {
             push_inline_wrapped(
                 &mut output,
-                trimmed[1..].trim_start(),
+                quoted.trim_start(),
                 "│ ",
                 "│ ",
                 width,

@@ -214,6 +214,7 @@ impl<'a> EditorView<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_code_line(
         &self,
         line_idx: usize,

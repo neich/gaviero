@@ -206,7 +206,7 @@ pub fn set_bracketed_paste(w: &mut impl Write, enable: bool) -> std::io::Result<
             DISABLE_BRACKETED_PASTE
         };
         w.write_all(seq.as_bytes())?;
-        return w.flush();
+        w.flush()
     }
     #[cfg(not(windows))]
     {
