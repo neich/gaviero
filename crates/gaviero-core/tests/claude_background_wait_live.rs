@@ -1,7 +1,8 @@
 //! Live check against the installed `claude` CLI: a chat turn whose agent
-//! starts a background shell command and waits for it must stay open (the
-//! TUI keeps its prompt locked) until Claude reads the command's output and
-//! answers, in both permission modes.
+//! starts a background shell command or subagent and waits for it must stay
+//! open (the TUI keeps its prompt locked) until Claude reads the result and
+//! answers, in both permission modes. Re-run after every Claude Code
+//! upgrade: the stream shape these turns depend on is undocumented.
 //!
 //! `cargo test -p gaviero-core --test claude_background_wait_live -- --ignored`
 
@@ -71,7 +72,13 @@ impl WriteGateObserver for NoWrites {
     fn on_proposal_finalized(&self, _: &str) {}
 }
 
-async fn run(auto_approve: bool) {
+/// Run one chat turn against the live CLI; returns the log, the turn's
+/// wall time, and how long the CLI took to exit after the final message.
+async fn run_turn(
+    auto_approve: bool,
+    tools: &[&str],
+    user_message: &str,
+) -> (Log, Duration, Duration) {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
     let log = Arc::new(Mutex::new(Log::default()));
     let model = "claude:haiku";
@@ -91,8 +98,8 @@ async fn run(auto_approve: bool) {
         conv_id: None,
         options: AgentOptions {
             auto_approve,
-            available_tools: Some(vec!["Bash".into()]),
-            approved_tools: Some(vec!["Bash".into()]),
+            available_tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+            approved_tools: Some(tools.iter().map(|t| t.to_string()).collect()),
             suppress_hooks: true,
             ..AgentOptions::default()
         },
@@ -101,11 +108,7 @@ async fn run(auto_approve: bool) {
         mcp_server: None,
     });
     let turn = Turn {
-        user_message: "Run this shell command with the Bash tool using run_in_background=true: \
-                       sleep 20 && echo PROBE_DONE . Then end your turn and wait for it to \
-                       finish (do not poll, do not sleep). When it finishes, reply with \
-                       exactly: FINAL <its output>."
-            .into(),
+        user_message: user_message.into(),
         memory_selections: vec![],
         graph_selections: vec![],
         file_refs: vec![],
@@ -123,14 +126,31 @@ async fn run(auto_approve: bool) {
         .expect("send_turn");
     let returned = Instant::now();
 
-    let log = log.lock().unwrap();
-    let transcript = format!(
+    let log = std::mem::take(&mut *log.lock().unwrap());
+    let finalize = returned - log.completed_at.expect("completed");
+    (log, started.elapsed(), finalize)
+}
+
+fn transcript(log: &Log) -> String {
+    format!(
         "messages: {:?}\nstarted: {:?}\nfinished: {:?}\nstatuses: {:?}",
         log.messages, log.started, log.finished, log.statuses
-    );
+    )
+}
+
+async fn run(auto_approve: bool) {
+    let (log, elapsed, finalize) = run_turn(
+        auto_approve,
+        &["Bash"],
+        "Run this shell command with the Bash tool using run_in_background=true: \
+         sleep 20 && echo PROBE_DONE . Then end your turn and wait for it to \
+         finish (do not poll, do not sleep). When it finishes, reply with \
+         exactly: FINAL <its output>.",
+    )
+    .await;
+    let transcript = transcript(&log);
     // Closing stdin lets the CLI exit; without it the host waits out
     // PROCESS_WAIT_TIMEOUT (10 s) and kills it.
-    let finalize = returned - log.completed_at.expect("completed");
     assert!(
         finalize < Duration::from_secs(8),
         "CLI took {finalize:?} to exit after the turn\n{transcript}"
@@ -154,8 +174,47 @@ async fn run(auto_approve: bool) {
     );
     assert!(content.contains("FINAL PROBE_DONE"), "{transcript}");
     assert!(
-        started.elapsed() >= Duration::from_secs(20),
+        elapsed >= Duration::from_secs(20),
         "turn ended before the command could finish\n{transcript}"
+    );
+}
+
+/// The model launches a subagent *without* `run_in_background`; Claude
+/// Code 2.1.289 backgrounds it by default and the parent answers before it
+/// finishes. The turn must stay open until the agent's result is read.
+async fn run_agent(auto_approve: bool) {
+    let (log, _, _) = run_turn(
+        auto_approve,
+        &["Agent", "Bash"],
+        "Use the Agent tool exactly once (subagent_type general-purpose, \
+         description probe-a) with this prompt: Run the Bash command `sleep 20` \
+         then reply with the single word PONG. Do not pass run_in_background. \
+         Do not wait for it yourself. When it has finished, reply with \
+         exactly: FINAL <its reply>.",
+    )
+    .await;
+    let transcript = transcript(&log);
+    assert!(
+        log.started.iter().any(|d| d.contains("probe-a")),
+        "{transcript}"
+    );
+    assert!(
+        log.finished.iter().any(|(s, _)| s == "completed"),
+        "{transcript}"
+    );
+    // Ending at the parent's first `result` leaves only the launch turn's
+    // text; `FINAL` comes from the wake-up turn that read the agent. The
+    // agent's own reply is not asserted: inside an agent sandbox its Bash
+    // can fail (MSYS exit 66) and it answers with the error instead of PONG.
+    assert_eq!(log.messages.len(), 1, "{transcript}");
+    let (role, content) = &log.messages[0];
+    assert_eq!(role, "assistant", "{transcript}");
+    assert!(content.contains("FINAL "), "{transcript}");
+    assert!(
+        log.statuses
+            .iter()
+            .any(|s| s.starts_with("Background agent: probe-a")),
+        "{transcript}"
     );
 }
 
@@ -169,4 +228,16 @@ async fn interactive_turn_waits_for_a_background_command() {
 #[ignore = "spawns the claude CLI and calls the API"]
 async fn auto_approve_turn_waits_for_a_background_command() {
     run(true).await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the claude CLI and calls the API"]
+async fn interactive_turn_waits_for_a_default_background_agent() {
+    run_agent(false).await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the claude CLI and calls the API"]
+async fn auto_approve_turn_waits_for_a_default_background_agent() {
+    run_agent(true).await;
 }

@@ -431,6 +431,7 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
         }
         StreamEvent::TaskStarted { .. }
         | StreamEvent::TaskNotification { .. }
+        | StreamEvent::BackgroundTasksChanged { .. }
         | StreamEvent::UserToolResults { .. } => {
             // Background-agent lifecycle: consumed by `TurnCompletion` in
             // `drive_session` to decide which `result` ends the unit.

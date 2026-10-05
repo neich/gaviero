@@ -55,10 +55,13 @@ pub fn is_subagent_tool_name(name: &str) -> bool {
     matches!(name, "Task" | "Agent")
 }
 
-/// True when this tool call is a Task/Agent launched in the background —
+/// True when this tool call *explicitly* asks for a background Task/Agent —
 /// the parent turn can emit `result` before the subagent finishes.
 ///
 /// Accepts both Claude's `run_in_background` and Cursor's `runInBackground`.
+/// Only a hint: an absent flag does not mean foreground (Claude Code 2.1.289
+/// backgrounds subagents by default). Claude's `task_started.is_backgrounded`
+/// is the authority — see [`crate::acp::turn`].
 pub fn is_background_subagent_tool(name: &str, input: &Value) -> bool {
     is_subagent_tool_name(name) && subagent_runs_in_background(input)
 }
@@ -84,6 +87,15 @@ pub fn subagent_description(input: &Value) -> String {
         }
     }
     "subagent".to_string()
+}
+
+/// One entry of a `background_tasks_changed` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskInfo {
+    pub task_id: String,
+    /// `local_agent`, `local_bash`, …
+    pub task_type: String,
+    pub description: String,
 }
 
 /// Token usage for one chat turn, normalised to a single-iteration view.
@@ -160,9 +172,22 @@ pub enum StreamEvent {
         tool_use_id: String,
         description: String,
         /// Claude's `task_type` (`local_bash` for a background shell
-        /// command; empty when the CLI omitted it).
+        /// command, `local_agent` for a subagent; empty when the CLI
+        /// omitted it).
         task_type: String,
+        /// The CLI's own verdict on whether the task outlives its tool call
+        /// (`is_backgrounded`). `None` on CLIs that omit it. Authoritative
+        /// over the tool input: Claude Code 2.1.289 backgrounds an `Agent`
+        /// call that carries no `run_in_background` at all.
+        is_backgrounded: Option<bool>,
+        /// The task belongs to a subagent's tool call, not the parent's
+        /// (`owned_by_subagent`).
+        owned_by_subagent: bool,
     },
+
+    /// The CLI's full list of running background tasks
+    /// (`type: system`, `subtype: background_tasks_changed`).
+    BackgroundTasksChanged { tasks: Vec<BackgroundTaskInfo> },
 
     /// Background / subagent task reached a terminal state
     /// (`type: system`, `subtype: task_notification`).
@@ -303,7 +328,28 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                         }
                     },
                     task_type: opt_str(&v, "task_type").to_string(),
+                    is_backgrounded: v.get("is_backgrounded").and_then(Value::as_bool),
+                    owned_by_subagent: v
+                        .get("owned_by_subagent")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 })
+            } else if subtype == "background_tasks_changed" {
+                let tasks = v
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(|tasks| {
+                        tasks
+                            .iter()
+                            .map(|t| BackgroundTaskInfo {
+                                task_id: opt_str(t, "task_id").to_string(),
+                                task_type: opt_str(t, "task_type").to_string(),
+                                description: opt_str(t, "description").to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(StreamEvent::BackgroundTasksChanged { tasks })
             } else if subtype == "task_notification" {
                 Ok(StreamEvent::TaskNotification {
                     task_id: opt_str(&v, "task_id").to_string(),
@@ -970,14 +1016,70 @@ mod tests {
                 tool_use_id,
                 description,
                 task_type,
+                is_backgrounded,
+                owned_by_subagent,
             } => {
                 assert_eq!(task_id, "task_abc");
                 assert_eq!(tool_use_id, "toolu_abc");
                 assert_eq!(description, "Running background analysis");
                 assert_eq!(task_type, "background");
+                assert_eq!(is_backgrounded, None);
+                assert!(!owned_by_subagent);
             }
             _ => panic!("Expected TaskStarted, got {:?}", event),
         }
+    }
+
+    /// Recorded from Claude Code 2.1.289 (fields trimmed).
+    #[test]
+    fn test_parse_task_started_background_flags() {
+        let agent = r#"{"type":"system","subtype":"task_started","task_id":"a3b4","tool_use_id":"toolu_a","description":"probe-a","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent"}"#;
+        let nested = r#"{"type":"system","subtype":"task_started","task_id":"bqu2","owned_by_subagent":true,"tool_use_id":"toolu_b","description":"Sleep","is_backgrounded":false,"task_type":"local_bash"}"#;
+        match parse_stream_line(agent).unwrap() {
+            StreamEvent::TaskStarted {
+                is_backgrounded,
+                owned_by_subagent,
+                task_type,
+                ..
+            } => {
+                assert_eq!(is_backgrounded, Some(true));
+                assert!(!owned_by_subagent);
+                assert_eq!(task_type, "local_agent");
+            }
+            other => panic!("Expected TaskStarted, got {other:?}"),
+        }
+        match parse_stream_line(nested).unwrap() {
+            StreamEvent::TaskStarted {
+                is_backgrounded,
+                owned_by_subagent,
+                ..
+            } => {
+                assert_eq!(is_backgrounded, Some(false));
+                assert!(owned_by_subagent);
+            }
+            other => panic!("Expected TaskStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_background_tasks_changed() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a3b4","task_type":"local_agent","description":"probe-a"}]}"#;
+        match parse_stream_line(line).unwrap() {
+            StreamEvent::BackgroundTasksChanged { tasks } => assert_eq!(
+                tasks,
+                vec![BackgroundTaskInfo {
+                    task_id: "a3b4".into(),
+                    task_type: "local_agent".into(),
+                    description: "probe-a".into(),
+                }]
+            ),
+            other => panic!("Expected BackgroundTasksChanged, got {other:?}"),
+        }
+        let empty = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        assert!(matches!(
+            parse_stream_line(empty).unwrap(),
+            StreamEvent::BackgroundTasksChanged { tasks } if tasks.is_empty()
+        ));
     }
 
     #[test]

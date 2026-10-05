@@ -45,8 +45,8 @@ use crate::swarm::backend::shared;
 use crate::write_gate::WriteGatePipeline;
 
 use super::background::{
-    PendingBg, background_command_label, bg_status, finish_all_pending_killed, finish_pending_bg,
-    register_pending_bg, shell_command_summary,
+    PendingBg, background_command_label, bg_status, finish_all_pending, finish_all_pending_killed,
+    finish_pending_bg, register_pending_bg, shell_command_summary,
 };
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
@@ -432,8 +432,18 @@ impl ClaudeSession {
                     tracing::warn!(
                         "Claude did not resume after its background tasks finished; ending turn"
                     );
-                    finish_all_pending_killed(&mut pending_bg, self.observer.as_ref());
+                    finish_all_pending(
+                        &mut pending_bg,
+                        "stopped",
+                        "Claude did not resume to read it",
+                        self.observer.as_ref(),
+                    );
                     self.observer.on_message_complete("assistant", &full_text);
+                    self.observer.on_message_complete(
+                        "system",
+                        "Claude did not resume after its background tasks finished, \
+                         so this answer may not include their results.",
+                    );
                     break;
                 }
                 Err(_elapsed) => {
@@ -441,6 +451,7 @@ impl ClaudeSession {
                     let elapsed_secs = idle_count * STREAM_IDLE_TIMEOUT.as_secs() as u32;
                     if session.try_wait_exited() {
                         tracing::warn!("Claude subprocess exited during idle wait");
+                        finish_all_pending_killed(&mut pending_bg, self.observer.as_ref());
                         let stderr = session.stderr_output().await;
                         let msg = if stderr.is_empty() {
                             "Claude process exited unexpectedly during tool execution.\n\
@@ -589,11 +600,19 @@ impl ClaudeSession {
                                         }
                                     }
                                 }
+                                // A task that ends with its own tool call
+                                // (a subagent's foreground command) is not
+                                // a background task.
+                                StreamEvent::TaskStarted {
+                                    is_backgrounded: Some(false),
+                                    ..
+                                } => {}
                                 StreamEvent::TaskStarted {
                                     task_id,
                                     tool_use_id,
                                     description,
                                     task_type,
+                                    ..
                                 } => {
                                     let description = if task_type == "local_bash" {
                                         background_command_label(
@@ -677,6 +696,12 @@ impl ClaudeSession {
                                         self.observer.on_turn_token_usage(u);
                                     }
                                     if is_error {
+                                        finish_all_pending(
+                                            &mut pending_bg,
+                                            "killed",
+                                            "Claude ended the turn with an error",
+                                            self.observer.as_ref(),
+                                        );
                                         let msg = if is_auth_error(&result_text) {
                                             format!(
                                                 "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
@@ -694,8 +719,10 @@ impl ClaudeSession {
                                     if progress == TurnProgress::Complete {
                                         // Leftover tasks (a subagent's own
                                         // background work) die with the session.
-                                        finish_all_pending_killed(
+                                        finish_all_pending(
                                             &mut pending_bg,
+                                            "stopped",
+                                            "still running when Claude finished the turn",
                                             self.observer.as_ref(),
                                         );
                                         self.observer.on_message_complete("assistant", &full_text);
@@ -707,6 +734,25 @@ impl ClaudeSession {
                                     // Stay on the stream: Claude resumes the
                                     // parent when they finish, and dropping now
                                     // would kill_on_drop those children.
+                                    //
+                                    // A task held only by the CLI's own list
+                                    // (the per-tool classification missed it)
+                                    // is listed too, so the user sees what the
+                                    // turn is waiting for.
+                                    for task in completion.unclassified_cli_tasks() {
+                                        let description = if task.task_type == "local_bash" {
+                                            background_command_label(&task.description)
+                                        } else {
+                                            task.description.clone()
+                                        };
+                                        register_pending_bg(
+                                            &mut pending_bg,
+                                            &task.task_id,
+                                            "",
+                                            &description,
+                                            self.observer.as_ref(),
+                                        );
+                                    }
                                     self.observer.on_streaming_status(&bg_status(&pending_bg));
                                 }
                                 StreamEvent::PermissionRequest {
@@ -771,6 +817,8 @@ impl ClaudeSession {
                                         self.observer.on_claude_session_started(&session_id);
                                     }
                                 }
+                                // Consumed by `completion`.
+                                StreamEvent::BackgroundTasksChanged { .. } => {}
                                 StreamEvent::Unknown(_) => {}
                             }
                         }
@@ -835,6 +883,12 @@ impl ClaudeSession {
                             break;
                         }
                         Err(e) => {
+                            finish_all_pending(
+                                &mut pending_bg,
+                                "killed",
+                                "the Claude stream failed",
+                                self.observer.as_ref(),
+                            );
                             self.observer
                                 .on_message_complete("system", &format!("Stream error: {}", e));
                             break;
@@ -856,6 +910,12 @@ impl ClaudeSession {
             // (and surfaced as proposals — never auto-applied).
             tracing::info!("Claude session cancelled by host — killing subprocess");
             session.kill();
+            finish_all_pending(
+                &mut pending_bg,
+                "cancelled",
+                "cancelled by user",
+                self.observer.as_ref(),
+            );
             self.observer
                 .on_streaming_status("Cancelling — reverting in-flight edits...");
             // Reap the subprocess so we don't leave a zombie. SIGKILL on the
