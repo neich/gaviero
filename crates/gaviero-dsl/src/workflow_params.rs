@@ -124,10 +124,10 @@ pub fn expand_workflow_params_in_script(
     // Pass 1 — materialize client params (immutable workflow borrow).
     for item in &script.items {
         let Item::Workflow(wf) = item else { continue };
-        if let Some(name) = workflow_name {
-            if wf.name != name {
-                continue;
-            }
+        if let Some(name) = workflow_name
+            && wf.name != name
+        {
+            continue;
         }
 
         let usage = param_usage_for_workflow(wf, &agent_by_name);
@@ -139,11 +139,8 @@ pub fn expand_workflow_params_in_script(
 
         let mut resolved_kinds: HashMap<String, ParamKind> = HashMap::new();
         for (pname, decl) in &params_by_name {
-            match resolve_param_kind(pname, decl, &usage, &mut errors) {
-                Some(kind) => {
-                    resolved_kinds.insert(pname.clone(), kind);
-                }
-                None => {}
+            if let Some(kind) = resolve_param_kind(pname, decl, &usage, &mut errors) {
+                resolved_kinds.insert(pname.clone(), kind);
             }
         }
 
@@ -207,10 +204,10 @@ pub fn expand_workflow_params_in_script(
     // Pass 2 — roster expansion (mutate workflow steps).
     for item in script.items.iter_mut() {
         let Item::Workflow(wf) = item else { continue };
-        if let Some(name) = workflow_name {
-            if wf.name != name {
-                continue;
-            }
+        if let Some(name) = workflow_name
+            && wf.name != name
+        {
+            continue;
         }
 
         let empty_kinds = HashMap::new();
@@ -232,7 +229,7 @@ pub fn expand_workflow_params_in_script(
                     let roster = match resolve_roster(
                         &lb.reviewers,
                         &params_by_name,
-                        &resolved_kinds,
+                        resolved_kinds,
                         override_params,
                     ) {
                         Ok(r) => r,
@@ -413,10 +410,10 @@ fn record_client_param_usage(
     let Some(agent) = agent_by_name.get(agent_name) else {
         return;
     };
-    if let Some((client_name, _)) = &agent.client {
-        if param_names.contains(client_name) {
-            usage.entry(client_name.clone()).or_default().client = true;
-        }
+    if let Some((client_name, _)) = &agent.client
+        && param_names.contains(client_name)
+    {
+        usage.entry(client_name.clone()).or_default().client = true;
     }
 }
 
@@ -590,7 +587,7 @@ fn synth_client_from_spec(name: &str, spec: &ClientParamSpec) -> ClientDecl {
         model: spec.model.clone(),
         effort: spec.effort.clone(),
         extra: spec.extra.clone(),
-        privacy: spec.privacy.clone().or(Some((PrivacyLit::Public, span))),
+        privacy: spec.privacy.or(Some((PrivacyLit::Public, span))),
         is_default: false,
         span,
         file_id: 0,

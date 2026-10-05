@@ -99,7 +99,7 @@ pub fn compile_with_vars(
         override_tiers,
         override_params,
     )
-    .map_err(|e| miette::Report::new(e))
+    .map_err(miette::Report::new)
 }
 
 /// Compile a `.gaviero` script from disk, resolving any `include "..."`
