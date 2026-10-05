@@ -104,18 +104,18 @@ pub(super) fn run_search_from_input(app: &mut App) {
 }
 
 pub(super) fn open_selected_search_result(app: &mut App) {
-    if let Some(result) = app.search_panel.selected_result().cloned() {
-        if result.abs_path.exists() {
-            app.open_file(&result.abs_path);
-            app.focus = Focus::Editor;
-            if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                let target_line = result.line_number.saturating_sub(1);
-                let max_line = buf.line_count().saturating_sub(1);
-                buf.cursor.line = target_line.min(max_line);
-                buf.cursor.col = 0;
-                buf.cursor.anchor = None;
-                buf.scroll.top_line = target_line.saturating_sub(10);
-            }
+    if let Some(result) = app.search_panel.selected_result().cloned()
+        && result.abs_path.exists()
+    {
+        app.open_file(&result.abs_path);
+        app.focus = Focus::Editor;
+        if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+            let target_line = result.line_number.saturating_sub(1);
+            let max_line = buf.line_count().saturating_sub(1);
+            buf.cursor.line = target_line.min(max_line);
+            buf.cursor.col = 0;
+            buf.cursor.anchor = None;
+            buf.scroll.top_line = target_line.saturating_sub(10);
         }
     }
 }
@@ -182,18 +182,18 @@ pub(super) fn start_tree_dialog(app: &mut App, kind: TreeDialogKind) {
 
     let mut dialog = TreeDialog::new(kind.clone(), target_dir);
 
-    if matches!(kind, TreeDialogKind::Rename) {
-        if let Some(entry) = app.file_tree.entries.get(app.file_tree.scroll.selected) {
-            dialog.original_path = Some(entry.path.clone());
-            dialog.input = entry.name.clone();
-            dialog.cursor = dialog.input.len();
-        }
+    if matches!(kind, TreeDialogKind::Rename)
+        && let Some(entry) = app.file_tree.entries.get(app.file_tree.scroll.selected)
+    {
+        dialog.original_path = Some(entry.path.clone());
+        dialog.input = entry.name.clone();
+        dialog.cursor = dialog.input.len();
     }
 
-    if matches!(kind, TreeDialogKind::Delete) {
-        if let Some(entry) = app.file_tree.entries.get(app.file_tree.scroll.selected) {
-            dialog.original_path = Some(entry.path.clone());
-        }
+    if matches!(kind, TreeDialogKind::Delete)
+        && let Some(entry) = app.file_tree.entries.get(app.file_tree.scroll.selected)
+    {
+        dialog.original_path = Some(entry.path.clone());
     }
 
     app.tree_dialog = Some(dialog);
@@ -563,11 +563,11 @@ pub(super) fn handle_bulk_move_key(app: &mut App, key: &crossterm::event::KeyEve
             app.file_tree.move_down();
         }
         KeyCode::Enter => {
-            if let Some(path) = app.file_tree.selected_path() {
-                if path.is_dir() {
-                    let dest_dir = path.to_path_buf();
-                    app.bulk_op_state = Some(BulkOpState::ConfirmMove { paths, dest_dir });
-                }
+            if let Some(path) = app.file_tree.selected_path()
+                && path.is_dir()
+            {
+                let dest_dir = path.to_path_buf();
+                app.bulk_op_state = Some(BulkOpState::ConfirmMove { paths, dest_dir });
             }
         }
         _ => {}
@@ -608,7 +608,7 @@ pub(super) fn execute_bulk_delete(app: &mut App, paths: &[std::path::PathBuf]) {
 pub(super) fn execute_bulk_move(
     app: &mut App,
     paths: &[std::path::PathBuf],
-    dest_dir: &std::path::PathBuf,
+    dest_dir: &std::path::Path,
 ) {
     let mut moved_count = 0;
     for src in paths {

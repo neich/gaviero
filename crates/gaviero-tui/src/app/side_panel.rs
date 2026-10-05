@@ -88,6 +88,19 @@ pub(super) fn handle_chat_cursor_down(app: &mut App) {
     }
 }
 
+/// Bulk soft-delete `/forget*` variants. `/forget-history` is dispatched by an
+/// earlier arm, so it is excluded here.
+fn is_bulk_forget_command(t: &str) -> bool {
+    t.starts_with("/forget-scope")
+        || t.starts_with("/forget-type")
+        || t.starts_with("/forget-source")
+        || (t.starts_with("/forget") && !t.starts_with("/forget-history"))
+}
+
+fn is_mcp_command(t: &str) -> bool {
+    t == "/mcp" || t.starts_with("/mcp ")
+}
+
 pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     // Only clear the output text selection on non-selection keypresses.
     // SelectUp/SelectDown extend it; Copy reads it.
@@ -221,27 +234,21 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     match action {
         Action::Rename => {
             app.chat_state.start_rename();
-            return;
         }
         Action::Tab if ac_active => {
             app.chat_state.accept_autocomplete();
-            return;
         }
         Action::Enter if ac_active => {
             app.chat_state.accept_autocomplete();
-            return;
         }
         Action::CursorUp if ac_active => {
             app.chat_state.autocomplete_up();
-            return;
         }
         Action::CursorDown if ac_active => {
             app.chat_state.autocomplete_down();
-            return;
         }
         Action::Quit if ac_active => {
             app.chat_state.autocomplete.reset();
-            return;
         }
         Action::Enter => {
             if !app.chat_state.text_input.text.is_empty() && !app.chat_state.active_conv_busy() {
@@ -309,16 +316,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     .starts_with("/forget-history")
                 {
                     app.handle_forget_history_command();
-                } else if {
-                    // Dispatch /forget* — `/forget-history` is captured
-                    // by the prior arm so this one only sees the bulk
-                    // soft-delete variants.
-                    let t = app.chat_state.text_input.text.trim();
-                    t.starts_with("/forget-scope")
-                        || t.starts_with("/forget-type")
-                        || t.starts_with("/forget-source")
-                        || (t.starts_with("/forget") && !t.starts_with("/forget-history"))
-                } {
+                } else if is_bulk_forget_command(app.chat_state.text_input.text.trim()) {
                     app.handle_forget_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/skills") {
                     handle_skills_command(app);
@@ -334,10 +332,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.chat_state.text_input.text.clear();
                     app.chat_state.text_input.cursor = 0;
                     super::commands::handle_ntfy_command(app, &line);
-                } else if {
-                    let t = app.chat_state.text_input.text.trim();
-                    t == "/mcp" || t.starts_with("/mcp ")
-                } {
+                } else if is_mcp_command(app.chat_state.text_input.text.trim()) {
                     let line = app.chat_state.text_input.text.trim().to_string();
                     super::commands::handle_mcp_command(app, &line);
                 } else if !app.chat_state.process_slash_command() {
@@ -443,8 +438,13 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 app.chat_state.clear_text_selection();
             } else if app.chat_state.text_input.has_selection() {
                 // Copy selected text from the input widget
-                if let Some(text) = app.chat_state.text_input.selected_text() {
-                    app.set_clipboard(&text.to_string());
+                if let Some(text) = app
+                    .chat_state
+                    .text_input
+                    .selected_text()
+                    .map(|t| t.to_string())
+                {
+                    app.set_clipboard(&text);
                 }
                 app.chat_state.text_input.sel_anchor = None;
             } else {
@@ -459,12 +459,10 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 }
             }
         }
-        Action::SelectDown => {
-            if !app.chat_state.active_conv_busy() {
-                let panel_w = chat_panel_content_width(app);
-                if !app.chat_state.select_down_in_input(panel_w) {
-                    app.chat_state.select_down_in_output();
-                }
+        Action::SelectDown if !app.chat_state.active_conv_busy() => {
+            let panel_w = chat_panel_content_width(app);
+            if !app.chat_state.select_down_in_input(panel_w) {
+                app.chat_state.select_down_in_output();
             }
         }
         _ => {}
@@ -479,13 +477,13 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
             Action::CursorUp | Action::InsertChar('k') => app.git_panel.branch_picker_up(),
             Action::CursorDown | Action::InsertChar('j') => app.git_panel.branch_picker_down(),
             Action::Enter => {
-                if let Some(name) = app.git_panel.selected_branch_name() {
-                    if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                        if let Err(e) = entry.repo.checkout(&name) {
-                            app.git_panel.error_message = Some(format!("{}", e));
-                        }
-                        app.git_panel.refresh(&entry.repo);
+                if let Some(name) = app.git_panel.selected_branch_name()
+                    && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+                {
+                    if let Err(e) = entry.repo.checkout(&name) {
+                        app.git_panel.error_message = Some(format!("{}", e));
                     }
+                    app.git_panel.refresh(&entry.repo);
                 }
                 app.git_panel.close_branch_picker();
             }
@@ -502,34 +500,34 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         Action::CursorDown | Action::InsertChar('j') => app.git_panel.move_down(),
         Action::Tab => app.git_panel.cycle_region(),
         Action::InsertChar('s') if app.git_panel.region != GitRegion::CommitInput => {
-            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                    if let Err(e) = entry.repo.stage_file(&path) {
-                        app.git_panel.error_message = Some(format!("{}", e));
-                    }
-                    app.git_panel.refresh(&entry.repo);
+            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string())
+                && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+            {
+                if let Err(e) = entry.repo.stage_file(&path) {
+                    app.git_panel.error_message = Some(format!("{}", e));
                 }
+                app.git_panel.refresh(&entry.repo);
             }
         }
         Action::InsertChar('u') if app.git_panel.region != GitRegion::CommitInput => {
-            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                    if let Err(e) = entry.repo.unstage_file(&path) {
-                        app.git_panel.error_message = Some(format!("{}", e));
-                    }
-                    app.git_panel.refresh(&entry.repo);
+            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string())
+                && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+            {
+                if let Err(e) = entry.repo.unstage_file(&path) {
+                    app.git_panel.error_message = Some(format!("{}", e));
                 }
+                app.git_panel.refresh(&entry.repo);
             }
         }
         Action::InsertChar('d') if app.git_panel.region != GitRegion::CommitInput => {
-            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                    if let Err(e) = entry.repo.discard_changes(&path) {
-                        app.git_panel.error_message = Some(format!("{}", e));
-                    }
-                    app.git_panel.refresh(&entry.repo);
-                    app.refresh_file_tree();
+            if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string())
+                && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+            {
+                if let Err(e) = entry.repo.discard_changes(&path) {
+                    app.git_panel.error_message = Some(format!("{}", e));
                 }
+                app.git_panel.refresh(&entry.repo);
+                app.refresh_file_tree();
             }
         }
         Action::InsertChar('c') if app.git_panel.region != GitRegion::CommitInput => {
@@ -551,16 +549,16 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
             }
         }
         Action::InsertChar('a') if app.git_panel.region != GitRegion::CommitInput => {
-            if !app.git_panel.commit_input.is_empty() {
-                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                    match entry.repo.amend(&app.git_panel.commit_input.text) {
-                        Ok(_) => {
-                            app.git_panel.commit_input.clear();
-                            app.git_panel.refresh(&entry.repo);
-                        }
-                        Err(e) => {
-                            app.git_panel.error_message = Some(format!("{}", e));
-                        }
+            if !app.git_panel.commit_input.is_empty()
+                && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+            {
+                match entry.repo.amend(&app.git_panel.commit_input.text) {
+                    Ok(_) => {
+                        app.git_panel.commit_input.clear();
+                        app.git_panel.refresh(&entry.repo);
+                    }
+                    Err(e) => {
+                        app.git_panel.error_message = Some(format!("{}", e));
                     }
                 }
             }
@@ -596,17 +594,17 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
             app.git_panel.commit_input.select_word_right();
         }
         Action::Enter if app.git_panel.region == GitRegion::CommitInput => {
-            if !app.git_panel.commit_input.is_empty() {
-                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-                    match entry.repo.commit(&app.git_panel.commit_input.text) {
-                        Ok(_) => {
-                            app.git_panel.commit_input.clear();
-                            app.git_panel.refresh(&entry.repo);
-                            app.refresh_file_tree();
-                        }
-                        Err(e) => {
-                            app.git_panel.error_message = Some(format!("{}", e));
-                        }
+            if !app.git_panel.commit_input.is_empty()
+                && let Some(entry) = app.git_repos.get(app.git_panel.active_repo)
+            {
+                match entry.repo.commit(&app.git_panel.commit_input.text) {
+                    Ok(_) => {
+                        app.git_panel.commit_input.clear();
+                        app.git_panel.refresh(&entry.repo);
+                        app.refresh_file_tree();
+                    }
+                    Err(e) => {
+                        app.git_panel.error_message = Some(format!("{}", e));
                     }
                 }
             }
@@ -680,11 +678,11 @@ pub(super) fn open_selected_git_file(app: &mut App) {
 /// * `i` / `Esc` enter / leave inspect overlay (Injected Now).
 /// * `h` / `Esc` enter / leave history overlay.
 /// * `d`/`p`/`s`/`e` → delete / pin / scope-change / edit on Recently
-///    Written (edit-text UX is kept minimal here: pop an inline text
-///    input via `insert_char` in a follow-up change).
+///   Written (edit-text UX is kept minimal here: pop an inline text
+///   input via `insert_char` in a follow-up change).
 /// * `y`/`n` confirm / reject a pending delete.
 /// * `/` activates search; printable chars type into the query; `Esc`
-///    clears search.
+///   clears search.
 pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
     use crate::panels::memory_panel::{
         PanelEditTarget, PanelPromptMode, PanelSection, ScopeChoice,
@@ -732,9 +730,8 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
 
     // Inspect / history overlays consume Esc / arrow keys.
     if app.memory_panel.inspecting {
-        match action {
-            Action::Quit => app.memory_panel.inspecting = false,
-            _ => {}
+        if action == Action::Quit {
+            app.memory_panel.inspecting = false
         }
         return;
     }
@@ -1096,7 +1093,7 @@ fn commit_panel_prompt(app: &mut App) {
                 .get(app.active_buffer)
                 .and_then(|b| b.path.as_deref());
             let focused_folder = active_path.and_then(|path| app.workspace.folder_for_path(path));
-            let repo_id = hash_path(focused_folder.unwrap_or(&workspace_root));
+            let repo_id = hash_path(focused_folder.unwrap_or(workspace_root));
             let new_scope = match selected {
                 ScopeChoice::Global => WriteScope::Global,
                 ScopeChoice::Workspace => WriteScope::Workspace,
@@ -1108,7 +1105,7 @@ fn commit_panel_prompt(app: &mut App) {
                                 gaviero_core::memory::module_path_for_file(folder, path)
                             })
                         })
-                        .unwrap_or_else(|| "".to_string());
+                        .unwrap_or_default();
                     if module_path.is_empty() {
                         WriteScope::Repo { repo_id }
                     } else {
@@ -1195,19 +1192,16 @@ pub(super) fn refresh_memory_panel(app: &mut App) {
     let tx = app.event_tx.clone();
     tokio::spawn(async move {
         // Most recent manifest (across all sessions).
-        if let Ok(rows) = mem.workspace().recent_manifests(1).await {
-            if let Some(row) = rows.into_iter().next() {
-                let _ = tx.send(crate::event::Event::MemoryManifestPersisted {
-                    turn_id: row.turn_id,
-                    session_id: row.session_id,
-                });
-            }
+        if let Ok(rows) = mem.workspace().recent_manifests(1).await
+            && let Some(row) = rows.into_iter().next()
+        {
+            let _ = tx.send(crate::event::Event::MemoryManifestPersisted {
+                turn_id: row.turn_id,
+            });
         }
         // Recently-written seed — piggy-back through MemoryWriteCommitted
         // so the controller runs the same refresh path.
-        let _ = tx.send(crate::event::Event::MemoryWriteCommitted {
-            kind: "PanelBootstrap".to_string(),
-        });
+        let _ = tx.send(crate::event::Event::MemoryWriteCommitted);
     });
 }
 
@@ -1324,13 +1318,13 @@ pub(super) fn handle_history_panel_escape(app: &mut App) -> bool {
 fn schedule_memory_panel_search(app: &mut App) {
     use crate::panels::memory_panel::SEARCH_DEBOUNCE;
     let now = std::time::Instant::now();
-    if let Some(prev) = app.memory_panel.search_last_run {
-        if now.duration_since(prev) < SEARCH_DEBOUNCE {
-            // Too soon — let the timer-driven re-invocation catch up.
-            // The actual run happens below anyway; keeping a simple
-            // eager path since typing cadence for humans is typically
-            // < 1 event per 150ms.
-        }
+    if let Some(prev) = app.memory_panel.search_last_run
+        && now.duration_since(prev) < SEARCH_DEBOUNCE
+    {
+        // Too soon — let the timer-driven re-invocation catch up.
+        // The actual run happens below anyway; keeping a simple
+        // eager path since typing cadence for humans is typically
+        // < 1 event per 150ms.
     }
     app.memory_panel.search_last_run = Some(now);
 
@@ -1574,7 +1568,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
             .get(app.active_buffer)
             .and_then(|b| b.path.as_deref())
             .and_then(|p| app.workspace.folder_for_path(p))
-            .map(|p| gaviero_core::memory::scope::hash_path(p));
+            .map(gaviero_core::memory::scope::hash_path);
         app.chat_state
             .update_skill_autocomplete_matches(&app.skill_catalog, active_repo_id.as_deref());
         return;
@@ -2106,12 +2100,12 @@ pub(crate) fn dispatch_prompt_core(
         // which must invalidate the handle so haiku doesn't silently
         // resume a session Claude opened under sonnet. V9 §11 M4
         // acceptance: "Model change invalidates stored handle".
-        if let Some(ref mut ledger) = conv.session_ledger {
-            if ledger.invalidate_if_fingerprint_changed(&current_fp) {
-                // Also drop the legacy `claude_session_id` mirror so the
-                // next turn passes no `--resume` flag.
-                conv.claude_session_id = None;
-            }
+        if let Some(ref mut ledger) = conv.session_ledger
+            && ledger.invalidate_if_fingerprint_changed(&current_fp)
+        {
+            // Also drop the legacy `claude_session_id` mirror so the
+            // next turn passes no `--resume` flag.
+            conv.claude_session_id = None;
         }
     }
     // Read the (possibly invalidated) legacy handle AFTER the lazy-init
@@ -2325,12 +2319,11 @@ pub(crate) fn dispatch_prompt_core(
 
     // Seed paths for graph ranking: explicit @file refs + active buffer (if any), made relative to workspace root.
     let mut graph_seeds: Vec<String> = refs.clone();
-    if let Some(buf) = app.buffers.get(app.active_buffer) {
-        if let Some(p) = buf.path.as_deref() {
-            if let Ok(rel) = p.strip_prefix(&graph_root) {
-                graph_seeds.push(rel.to_string_lossy().to_string());
-            }
-        }
+    if let Some(buf) = app.buffers.get(app.active_buffer)
+        && let Some(p) = buf.path.as_deref()
+        && let Ok(rel) = p.strip_prefix(&graph_root)
+    {
+        graph_seeds.push(rel.to_string_lossy().to_string());
     }
     graph_seeds.sort();
     graph_seeds.dedup();
@@ -2630,61 +2623,61 @@ pub(crate) fn dispatch_prompt_core(
         // contributes only TUI-specific bits: emitting the
         // `ChatMemoryInjected` event for the panel and supplying
         // workspace-resolved configs.
-        let (chat_injection, memory_tok) = if bootstrap_memory && memory.is_some() {
-            let mem = memory.as_ref().expect("checked above");
-            let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
-                memory_reranker.as_deref();
-            let outcome = gaviero_core::context_planner::perform_injection_with_module(
-                gaviero_core::context_planner::ChatMemoryRequest {
-                    stores: mem,
-                    writer: memory_writer.as_ref(),
-                    workspace_root: &root,
-                    folder_root: focused_folder.as_deref(),
-                    user_prompt: &prompt,
-                    turn_id: &turn_id_clone,
-                    session_id: &conv_id_clone,
-                    injection_config: &chat_injection_config,
-                    retrieval_config: &retrieval_cfg,
-                    reranker: reranker_ref,
-                    rerank_config: memory_rerank_cfg.as_ref(),
-                    manifests_enabled,
-                    capture_candidate_pool,
-                    embedder_name: &embedder_name,
-                    reranker_name: reranker_name.as_deref(),
-                },
-                pending_module_path.as_deref(),
-            )
-            .await;
-            let _ = tx.send(Event::ChatMemoryInjected {
-                conv_id: conv_id_clone.clone(),
-                items_injected: outcome.summary.items_injected,
-                pool_size: outcome.summary.pool_size,
-                tokens_used: outcome.summary.tokens_used,
-                token_budget: outcome.summary.token_budget,
-            });
-            // The memory call and its response: the rendered block that goes
-            // into the prompt, plus the manifest the writer task persists.
-            history.push(
-                &turn_id_clone,
-                gaviero_core::history::HistoryKind::MemoryInjection(
-                    gaviero_core::history::memory_injection_record(
-                        outcome.summary.items_injected,
-                        outcome.summary.pool_size,
-                        outcome.summary.tokens_used,
-                        outcome.summary.token_budget,
-                        outcome
-                            .injection
-                            .as_ref()
-                            .map(|inj| inj.block.clone())
-                            .filter(|block| !block.is_empty()),
-                        outcome.manifest_payload,
+        let (chat_injection, memory_tok) =
+            if let Some(mem) = memory.as_ref().filter(|_| bootstrap_memory) {
+                let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
+                    memory_reranker.as_deref();
+                let outcome = gaviero_core::context_planner::perform_injection_with_module(
+                    gaviero_core::context_planner::ChatMemoryRequest {
+                        stores: mem,
+                        writer: memory_writer.as_ref(),
+                        workspace_root: &root,
+                        folder_root: focused_folder.as_deref(),
+                        user_prompt: &prompt,
+                        turn_id: &turn_id_clone,
+                        session_id: &conv_id_clone,
+                        injection_config: &chat_injection_config,
+                        retrieval_config: &retrieval_cfg,
+                        reranker: reranker_ref,
+                        rerank_config: memory_rerank_cfg.as_ref(),
+                        manifests_enabled,
+                        capture_candidate_pool,
+                        embedder_name: &embedder_name,
+                        reranker_name: reranker_name.as_deref(),
+                    },
+                    pending_module_path.as_deref(),
+                )
+                .await;
+                let _ = tx.send(Event::ChatMemoryInjected {
+                    conv_id: conv_id_clone.clone(),
+                    items_injected: outcome.summary.items_injected,
+                    pool_size: outcome.summary.pool_size,
+                    tokens_used: outcome.summary.tokens_used,
+                    token_budget: outcome.summary.token_budget,
+                });
+                // The memory call and its response: the rendered block that goes
+                // into the prompt, plus the manifest the writer task persists.
+                history.push(
+                    &turn_id_clone,
+                    gaviero_core::history::HistoryKind::MemoryInjection(
+                        gaviero_core::history::memory_injection_record(
+                            outcome.summary.items_injected,
+                            outcome.summary.pool_size,
+                            outcome.summary.tokens_used,
+                            outcome.summary.token_budget,
+                            outcome
+                                .injection
+                                .as_ref()
+                                .map(|inj| inj.block.clone())
+                                .filter(|block| !block.is_empty()),
+                            outcome.manifest_payload,
+                        ),
                     ),
-                ),
-            );
-            (outcome.injection, outcome.summary.tokens_used)
-        } else {
-            (None, 0)
-        };
+                );
+                (outcome.injection, outcome.summary.tokens_used)
+            } else {
+                (None, 0)
+            };
 
         // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
         // dispatch through `AgentSession`. The registry hands back a
@@ -3037,10 +3030,10 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
 pub(super) fn try_attach_clipboard_image(app: &mut App) -> bool {
     // One gesture can hit both empty bracketed-paste and the Windows Ctrl+V
     // fallback; ignore a second attach within the debounce window.
-    if let Some(at) = app.last_clipboard_image_attach {
-        if at.elapsed() < std::time::Duration::from_millis(300) {
-            return true;
-        }
+    if let Some(at) = app.last_clipboard_image_attach
+        && at.elapsed() < std::time::Duration::from_millis(300)
+    {
+        return true;
     }
     let cb = match app.clipboard.as_mut() {
         Some(cb) => cb,

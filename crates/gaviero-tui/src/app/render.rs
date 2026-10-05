@@ -957,7 +957,7 @@ pub(super) fn render_panel_header_styled(
         height: area.height - 1,
     };
 
-    let (bg, fg) = color_override.unwrap_or_else(|| {
+    let (bg, fg) = color_override.unwrap_or({
         if focused {
             (theme::FOCUSED_SELECTION_BG, theme::PANEL_HEADER_FOCUSED_FG)
         } else {
@@ -1009,7 +1009,7 @@ pub(super) fn render_terminal(app: &mut App, frame: &mut Frame, area: Rect) {
     let needs_spawn = app
         .terminal_manager
         .active_instance()
-        .map_or(true, |i| !i.spawned);
+        .is_none_or(|i| !i.spawned);
     if needs_spawn {
         app.spawn_active_terminal();
     }
@@ -1405,15 +1405,13 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             bg_style
         };
-        let mut cx = x + 1;
-        for ch in line.chars() {
+        for (cx, ch) in (x + 1..).zip(line.chars()) {
             if cx >= x + dialog_w - 1 {
                 break;
             }
             if cx < frame.area().right() {
                 frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
             }
-            cx += 1;
         }
     }
 }
@@ -1534,15 +1532,13 @@ pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect
         } else {
             bg_style
         };
-        let mut cx = x + 1;
-        for ch in line.chars() {
+        for (cx, ch) in (x + 1..).zip(line.chars()) {
             if cx >= x + dialog_w - 1 {
                 break;
             }
             if cx < frame.area().right() {
                 frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
             }
-            cx += 1;
         }
     }
 }
@@ -1758,15 +1754,13 @@ fn draw_modal_box(
         } else {
             bg_style
         };
-        let mut cx = x + 1;
-        for ch in line.chars() {
+        for (cx, ch) in (x + 1..).zip(line.chars()) {
             if cx >= x + dialog_w - 1 {
                 break;
             }
             if cx < frame.area().right() {
                 frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
             }
-            cx += 1;
         }
     }
 }

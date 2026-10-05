@@ -533,7 +533,6 @@ pub struct Availability {
     pub key_pem: Vec<u8>,
     pub cert: pairing::CertInfo,
     pub cert_source: CertSource,
-    pub cert_path: PathBuf,
     pub tailnet_addrs: Vec<IpAddr>,
 }
 
@@ -574,13 +573,13 @@ pub fn check_availability(config: &RemoteConfig) -> Result<Availability, RemoteU
         key_pem,
         cert,
         cert_source,
-        cert_path,
         tailnet_addrs,
     })
 }
 
 /// Bind list (§3.2): loopback plus detected tailnet addresses. Never a
 /// wildcard; anything else requires `remote.allowPublicBind`.
+#[cfg(test)]
 pub fn bind_addrs(config: &RemoteConfig, tailnet: &[IpAddr]) -> Vec<SocketAddr> {
     bind_addrs_on(config, tailnet, config.port)
 }
@@ -602,6 +601,7 @@ fn bind_addrs_on(config: &RemoteConfig, tailnet: &[IpAddr], port: u16) -> Vec<So
 
 /// The pairing URL — always the MagicDNS hostname, never an IP or
 /// `localhost`, because the certificate is issued to that name (§3.1).
+#[cfg(test)]
 pub fn pairing_url(config: &RemoteConfig) -> String {
     pairing_url_on(config, config.port)
 }
@@ -657,12 +657,9 @@ pub struct RemoteStarted {
     pub host: String,
     pub host_source: HostSource,
     pub cert_source: CertSource,
-    pub cert_path: PathBuf,
     pub cert_not_after: String,
-    pub cert_near_expiry: bool,
     /// `tailscale cert` ran during this bootstrap.
     pub cert_provisioned: bool,
-    pub tailnet_addrs: Vec<IpAddr>,
     pub token_scope: TokenScope,
     pub token_fingerprint: String,
     /// The machine directory port this instance participates in, if enabled.
@@ -816,11 +813,8 @@ pub async fn start(
             host: config.magic_dns_host.clone(),
             host_source: config.host_source,
             cert_source: availability.cert_source,
-            cert_path: availability.cert_path.clone(),
             cert_not_after: availability.cert.not_after.clone(),
-            cert_near_expiry: availability.cert.is_near_expiry(),
             cert_provisioned: false,
-            tailnet_addrs: availability.tailnet_addrs.clone(),
             token_scope: token.scope,
             token_fingerprint: pairing::token_fingerprint(&token.token),
             directory_port: config.directory_enabled.then_some(config.directory_port),
@@ -1682,7 +1676,6 @@ mod tests {
                 key_pem,
                 cert,
                 cert_source: CertSource::Machine,
-                cert_path: machine.path().join("remote/tls/cert.pem"),
                 tailnet_addrs: Vec::new(),
             }
         };

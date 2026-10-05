@@ -532,8 +532,8 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::ChatMemoryInjected { .. }
         | Event::TurnBootstrapMeasured { .. }
         | Event::ToolAgentEditsPending { .. }
-        | Event::MemoryWriteEnqueued { .. }
-        | Event::MemoryWriteCommitted { .. }
+        | Event::MemoryWriteEnqueued
+        | Event::MemoryWriteCommitted
         | Event::MemoryWriteFailed { .. }
         | Event::MemoryManifestPersisted { .. }
         | Event::McpToolCall { .. }

@@ -43,7 +43,10 @@ pub(crate) struct TurnReviewView {
 pub(crate) enum Preview {
     Hunks(Vec<DiffHunk>),
     /// Whole-file only: a note plus the lines worth showing (deleted content).
-    Whole { note: String, removed: Vec<String> },
+    Whole {
+        note: String,
+        removed: Vec<String>,
+    },
 }
 
 // ── Entry points ─────────────────────────────────────────────────────
@@ -55,7 +58,11 @@ pub(super) fn conv_has_pending_review(app: &App, conv_id: &str) -> bool {
 }
 
 /// A turn ended with changes: register its review and show it.
-pub(super) fn on_turn_review_pending(app: &mut App, review: PendingReview, overlapped: Vec<String>) {
+pub(super) fn on_turn_review_pending(
+    app: &mut App,
+    review: PendingReview,
+    overlapped: Vec<String>,
+) {
     let turn_id = review.set.turn_id.clone();
     let conv_id = review.set.conv_id.clone();
     let n = review.set.files.len();
@@ -150,10 +157,7 @@ pub(super) fn restore_on_startup(app: &mut App) {
         ));
         show(app, 0);
     }
-    let capture = app.turn_capture.clone();
-    std::thread::spawn(move || {
-        capture.gc();
-    });
+    app.turn_capture.gc_later();
 }
 
 /// Record a write the user made through the editor (save, new file) so a
@@ -223,28 +227,24 @@ fn decided<'a>(review: &'a PendingReview, change: &FileChange) -> Option<&'a Fil
     review.decisions.get(&change.key())
 }
 
+/// Record a decision in memory only. Every action ends in
+/// [`advance_or_finish`] (or an explicit [`persist`]), which saves once — a
+/// bulk `A` / `R` over hundreds of files must not save per file.
 fn record_decision(app: &mut App, key: String, decision: FileDecision) {
     let view_active = app.turn_review_view.active;
-    let Some(review) = app.pending_turn_reviews.get_mut(view_active) else {
-        return;
-    };
-    review.decisions.insert(key, decision);
-    persist(app);
+    if let Some(review) = app.pending_turn_reviews.get_mut(view_active) {
+        review.decisions.insert(key, decision);
+    }
 }
 
-/// Save decisions so a crash keeps them (off the event loop), and mirror
-/// them to the phone.
+/// Save decisions so a crash keeps them (off the event loop, ordered with
+/// the archive), and mirror them to the phone.
 fn persist(app: &mut App) {
     let Some(review) = active_review(app).cloned() else {
         return;
     };
     push_review_frame(app, &review.set.turn_id, false);
-    let capture = app.turn_capture.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = capture.save_pending(&review) {
-            tracing::warn!("saving turn review decisions failed: {e:#}");
-        }
-    });
+    app.turn_capture.save_pending_later(review);
 }
 
 // ── Actions ──────────────────────────────────────────────────────────
@@ -333,25 +333,39 @@ fn status(app: &mut App, msg: impl Into<String>) {
 
 /// Go back to the pre-prompt version of file `idx` of the active review, now.
 fn reject_file(app: &mut App, idx: usize, force: bool) -> Result<(), RejectError> {
-    let Some(change) = active_review(app).and_then(|r| r.set.files.get(idx)).cloned() else {
+    let path = revert_one(app, idx, force)?;
+    sync_editor(app, std::iter::once(path.as_path()));
+    Ok(())
+}
+
+/// Revert file `idx` and record the decision. Returns the reverted path; the
+/// caller syncs the editor (once, for a bulk reject).
+fn revert_one(app: &mut App, idx: usize, force: bool) -> Result<std::path::PathBuf, RejectError> {
+    let Some(change) = active_review(app)
+        .and_then(|r| r.set.files.get(idx))
+        .cloned()
+    else {
         return Err(RejectError::Refused("no such file".into()));
     };
     match revert_file(&app.turn_capture, &change, force) {
         Ok(RevertOutcome::Reverted | RevertOutcome::AlreadyAtBefore) => {
             record_decision(app, change.key(), FileDecision::Revert);
-            super::agent_writes::reconcile_agent_writes(
-                app,
-                std::iter::once(change.path.as_path()),
-                super::agent_writes::WriteOrigin::AgentTurn {
-                    source: "turn review",
-                },
-            );
-            Ok(())
+            Ok(change.path)
         }
         Ok(RevertOutcome::Drifted) => Err(RejectError::Drifted),
         Ok(RevertOutcome::NotRevertible(why)) => Err(RejectError::Refused(why)),
         Err(e) => Err(RejectError::Refused(format!("{e:#}"))),
     }
+}
+
+fn sync_editor<'a>(app: &mut App, paths: impl IntoIterator<Item = &'a std::path::Path>) {
+    super::agent_writes::reconcile_agent_writes(
+        app,
+        paths,
+        super::agent_writes::WriteOrigin::AgentTurn {
+            source: "turn review",
+        },
+    );
 }
 
 fn accept_file(app: &mut App, idx: usize) {
@@ -440,19 +454,23 @@ fn decide_rest(app: &mut App, reject: bool, interactive: bool) -> Result<(), Str
 
     let force = interactive && app.turn_review_view.confirm_force.as_deref() == Some("R");
     app.turn_review_view.confirm_force = None;
+    let mut reverted = Vec::new();
     let mut drifted = Vec::new();
     let mut refused = Vec::new();
     for idx in undecided {
         let rel = active_review(app)
             .map(|r| r.set.files[idx].rel.clone())
             .unwrap_or_default();
-        match reject_file(app, idx, force) {
-            Ok(()) => {}
+        match revert_one(app, idx, force) {
+            Ok(path) => reverted.push(path),
             Err(RejectError::Drifted) => drifted.push(rel),
             Err(RejectError::Refused(why)) => refused.push(format!("{rel} ({why})")),
         }
     }
+    sync_editor(app, reverted.iter().map(std::path::PathBuf::as_path));
     if !drifted.is_empty() {
+        // The other rejects are already on disk; keep their decisions.
+        persist(app);
         let names = drifted.join(", ");
         if !interactive {
             return Err(format!(
@@ -469,8 +487,12 @@ fn decide_rest(app: &mut App, reject: bool, interactive: bool) -> Result<(), Str
         );
         return Ok(());
     }
-    let refused_msg = (!refused.is_empty())
-        .then(|| format!("Cannot reject {} — accept them to finish", refused.join(", ")));
+    let refused_msg = (!refused.is_empty()).then(|| {
+        format!(
+            "Cannot reject {} — accept them to finish",
+            refused.join(", ")
+        )
+    });
     if let Some(msg) = &refused_msg {
         status(app, msg.clone());
     }
@@ -481,8 +503,8 @@ fn decide_rest(app: &mut App, reject: bool, interactive: bool) -> Result<(), Str
     }
 }
 
-/// Move the selection to the next undecided file, or end the review when
-/// every file has a decision.
+/// Move the selection to the next undecided file (saving the decisions so
+/// far), or end the review when every file has a decision.
 fn advance_or_finish(app: &mut App) {
     let Some(review) = active_review(app) else {
         return;
@@ -496,6 +518,7 @@ fn advance_or_finish(app: &mut App) {
         Some(i) => {
             app.turn_review_view.selected = i;
             ensure_preview(app);
+            persist(app);
         }
         None => finish(app),
     }
@@ -521,17 +544,17 @@ fn finish(app: &mut App) {
         })
         .collect();
     let reviewed = ReviewedTurn {
-        set: review.set.clone(),
+        set: review.set,
         resolved,
     };
-    if let Err(e) = app.turn_capture.archive(&reviewed) {
-        tracing::warn!("archiving turn review {} failed: {e:#}", review.set.turn_id);
-    }
     app.pending_turn_reviews.remove(active);
     app.turn_review_view = TurnReviewView::default();
 
     record_history(app, &reviewed);
     let resolved = report(app, &reviewed);
+    // Writing the archive and collecting unreferenced blobs walks the whole
+    // store: never on the event loop.
+    app.turn_capture.archive_later(reviewed);
     app.remote
         .push_frame(gaviero_remote::envelope::ServerFrame::TurnReviewResolved(
             resolved,
@@ -574,10 +597,7 @@ fn record_history(app: &App, reviewed: &ReviewedTurn) {
     );
 }
 
-fn report(
-    app: &mut App,
-    reviewed: &ReviewedTurn,
-) -> gaviero_remote::envelope::TurnReviewResolved {
+fn report(app: &mut App, reviewed: &ReviewedTurn) -> gaviero_remote::envelope::TurnReviewResolved {
     let mut kept = 0;
     let mut reverted = 0;
     let mut failed: Vec<String> = Vec::new();
@@ -603,7 +623,11 @@ fn report(
     }
     let mut msg = format!("Turn review finalized — {kept} kept, {reverted} reverted");
     if !failed.is_empty() {
-        msg.push_str(&format!(", {} failed:\n{}", failed.len(), failed.join("\n")));
+        msg.push_str(&format!(
+            ", {} failed:\n{}",
+            failed.len(),
+            failed.join("\n")
+        ));
     }
     if let Some(conv_id) = reviewed.set.conv_id.as_deref()
         && let Some(idx) = app.chat_state.find_conv_idx(conv_id)
@@ -632,9 +656,15 @@ fn report(
 pub(super) fn undo_reviewed_turn(app: &mut App, turn_id: &str) -> String {
     use gaviero_core::turn_capture::{RETAINED_TURNS, RevertOutcome, revert_file};
 
-    if app.pending_turn_reviews.iter().any(|r| r.set.turn_id == turn_id) {
+    if app
+        .pending_turn_reviews
+        .iter()
+        .any(|r| r.set.turn_id == turn_id)
+    {
         return "This turn's review is still pending — decide there (TURN REVIEW panel)".into();
     }
+    // The archive of a just-finished review may still be queued.
+    app.turn_capture.flush();
     let Some(reviewed) = app
         .turn_capture
         .recent_reviewed()
@@ -788,7 +818,11 @@ pub(crate) fn apply_remote_action(
             if let Some(label) = already_decided(app, idx) {
                 // Absolute actions: repeating the same decision is a no-op.
                 let same = (action == "keep_file") == (label == "accepted");
-                return if same { Ok(()) } else { Err(format!("already {label}")) };
+                return if same {
+                    Ok(())
+                } else {
+                    Err(format!("already {label}"))
+                };
             }
         }
         _ => {}
@@ -853,7 +887,10 @@ pub(super) fn render_turn_review_list(app: &mut App, frame: &mut Frame, area: Re
         .unwrap_or_else(|| "conversation".to_string());
     let outcome = match review.set.outcome {
         TurnOutcome::Completed => ("", theme::TEXT_DIM),
-        TurnOutcome::Cancelled => ("  CANCELLED — consider R (revert whole turn)", theme::WARNING),
+        TurnOutcome::Cancelled => (
+            "  CANCELLED — consider R (revert whole turn)",
+            theme::WARNING,
+        ),
         TurnOutcome::Failed => ("  FAILED — consider R (revert whole turn)", theme::ERROR),
     };
     header.push(Line::from(vec![
@@ -1002,7 +1039,10 @@ pub(super) fn render_turn_review_diff(app: &mut App, frame: &mut Frame, area: Re
                 .fg(theme::FOCUS_BORDER)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("— {decision_label}"), Style::default().fg(theme::TEXT_FG)),
+        Span::styled(
+            format!("— {decision_label}"),
+            Style::default().fg(theme::TEXT_FG),
+        ),
     ]));
     if !change.overlap_with.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1084,7 +1124,12 @@ pub(super) fn render_turn_review_diff(app: &mut App, frame: &mut Frame, area: Re
 pub(super) fn status_hint(app: &App) -> String {
     let (n, left) = active_review(app)
         .map(|r| {
-            let left = r.set.files.iter().filter(|c| decided(r, c).is_none()).count();
+            let left = r
+                .set
+                .files
+                .iter()
+                .filter(|c| decided(r, c).is_none())
+                .count();
             (r.set.files.len(), left)
         })
         .unwrap_or((0, 0));
@@ -1096,7 +1141,9 @@ pub(super) fn status_hint(app: &App) -> String {
 
 /// Select a row by mouse.
 pub(super) fn click_row(app: &mut App, relative_row: usize) {
-    let header = 2 + active_review(app).map(|r| r.set.warnings.len()).unwrap_or(0);
+    let header = 2 + active_review(app)
+        .map(|r| r.set.warnings.len())
+        .unwrap_or(0);
     let Some(row) = relative_row.checked_sub(header) else {
         return;
     };
@@ -1214,7 +1261,35 @@ mod tests {
         f.key('A');
         assert!(!conv_has_pending_review(&f.app, &conv));
         assert_eq!(f.read("a.txt").as_deref(), Some("after\n"), "accepted");
+        f.app.turn_capture.flush();
         assert!(f.app.turn_capture.load_pending().is_empty());
+    }
+
+    #[test]
+    fn accepting_a_large_turn_archives_it_and_never_leaves_it_pending() {
+        let mut f = Fixture::new();
+        let names: Vec<String> = (0..150).map(|i| format!("f{i:03}.txt")).collect();
+        for name in &names {
+            f.write(name, "before\n");
+        }
+        f.turn("t1", |f| {
+            for name in &names {
+                f.write(name, "after\n");
+            }
+        });
+        // One single decision first (queues a save), then the rest at once.
+        f.select("f000.txt");
+        f.key('a');
+        f.key('A');
+        assert!(!conv_has_pending_review(&f.app, &f.conv()));
+
+        f.app.turn_capture.flush();
+        assert!(
+            f.app.turn_capture.load_pending().is_empty(),
+            "a queued save must not land after the archive"
+        );
+        let archived = f.app.turn_capture.recent_reviewed();
+        assert_eq!(archived[0].resolved.len(), names.len());
     }
 
     #[test]
@@ -1261,7 +1336,11 @@ mod tests {
         // Reject one file: it goes back now, the review stays open on the rest.
         f.select("a.txt");
         f.key('r');
-        assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"), "applied immediately");
+        assert_eq!(
+            f.read("a.txt").as_deref(),
+            Some("a0\n"),
+            "applied immediately"
+        );
         assert!(conv_has_pending_review(&f.app, &f.conv()));
         // Accept the whole turn: the remaining files stay, the review ends.
         f.key('A');
@@ -1306,6 +1385,7 @@ mod tests {
         assert!(!conv_has_pending_review(&f.app, &f.conv()));
         assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
         assert_eq!(f.read("b.txt").as_deref(), Some("b0\n"));
+        f.app.turn_capture.flush();
         let archived = f.app.turn_capture.recent_reviewed();
         assert_eq!(archived[0].resolved.len(), 2);
     }
@@ -1347,7 +1427,11 @@ mod tests {
         f.turn("t1", |f| f.write("a.txt", "v2\n"));
         f.write("a.txt", "v3 user\n");
         f.key('r');
-        assert_eq!(f.read("a.txt").as_deref(), Some("v3 user\n"), "first r only warns");
+        assert_eq!(
+            f.read("a.txt").as_deref(),
+            Some("v3 user\n"),
+            "first r only warns"
+        );
         assert!(conv_has_pending_review(&f.app, &f.conv()));
         f.key('j'); // any other key cancels
         f.key('r');
@@ -1367,7 +1451,11 @@ mod tests {
 
         let first = undo_reviewed_turn(&mut f.app, "t1");
         assert!(first.contains("Press u again"), "{first}");
-        assert_eq!(f.read("a.txt").as_deref(), Some("v2\n"), "first press only arms");
+        assert_eq!(
+            f.read("a.txt").as_deref(),
+            Some("v2\n"),
+            "first press only arms"
+        );
         let second = undo_reviewed_turn(&mut f.app, "t1");
         assert!(second.contains("1 file(s) restored"), "{second}");
         assert_eq!(f.read("a.txt").as_deref(), Some("v1\n"));
@@ -1401,14 +1489,22 @@ mod tests {
         );
 
         // Rejecting the only file decides the turn: the review ends.
-        super::super::remote::apply_turn_review_action(&mut f.app, &act(K::RevertFile, Some("a.txt")))
-            .unwrap();
+        super::super::remote::apply_turn_review_action(
+            &mut f.app,
+            &act(K::RevertFile, Some("a.txt")),
+        )
+        .unwrap();
         assert_eq!(f.read("a.txt").as_deref(), Some("v1\n"));
         assert!(!conv_has_pending_review(&f.app, &conv));
-        assert!(super::super::projection::build_snapshot(&f.app).open_turn_reviews.is_empty());
+        assert!(
+            super::super::projection::build_snapshot(&f.app)
+                .open_turn_reviews
+                .is_empty()
+        );
 
-        let err = super::super::remote::apply_turn_review_action(&mut f.app, &act(K::KeepAll, None))
-            .unwrap_err();
+        let err =
+            super::super::remote::apply_turn_review_action(&mut f.app, &act(K::KeepAll, None))
+                .unwrap_err();
         assert_eq!(err.code, ErrorCode::UnknownTurnReview);
     }
 
@@ -1443,8 +1539,7 @@ mod tests {
         });
         f.select("a.txt");
         f.key('r');
-        // `persist` writes off-thread; give it a moment.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        f.app.turn_capture.flush();
 
         let reopened = Fixture::open(f.root());
         assert_eq!(reopened.pending_turn_reviews.len(), 1);
@@ -1456,7 +1551,11 @@ mod tests {
             Some(&FileDecision::Revert),
             "decisions persist with the review"
         );
-        assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"), "the reject already applied");
+        assert_eq!(
+            f.read("a.txt").as_deref(),
+            Some("a1\n"),
+            "the reject already applied"
+        );
         assert_eq!(reopened.left_panel, LeftPanelMode::TurnReview);
     }
 }

@@ -52,7 +52,7 @@ pub const REMOTE_CONFIRM_REQUIRED: &[&str] = &["/autoapprove", "/yolo", "/reset"
 /// First whitespace-delimited token of a slash line. Preserves the desktop
 /// parser's token boundary — `/runaway` does not match `/run`.
 pub fn slash_command_token(line: &str) -> &str {
-    line.trim_start().split_whitespace().next().unwrap_or("")
+    line.split_whitespace().next().unwrap_or("")
 }
 
 /// A rejected command: maps directly onto `command_error`.
@@ -300,8 +300,9 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             }
             ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
-            ClientFrame::TurnReviewAction(a) => apply_turn_review_action(app, &a)
-                .map(|()| (CommandStatus::Completed, None)),
+            ClientFrame::TurnReviewAction(a) => {
+                apply_turn_review_action(app, &a).map(|()| (CommandStatus::Completed, None))
+            }
             ClientFrame::RequestMessages(r) => {
                 // 1.1 `latest_page`: an absent cursor means the newest page.
                 crate::app::projection::build_message_page(app, &r.conv_id, r.before_seq, r.limit)
@@ -595,13 +596,8 @@ pub fn apply_turn_review_action(
         K::RevertAll => "revert_all",
         K::Finalize => "finalize",
     };
-    crate::app::turn_review::apply_remote_action(
-        app,
-        &action.turn_id,
-        kind,
-        action.path.as_deref(),
-    )
-    .map_err(|reason| CommandFailure::new(ErrorCode::InvalidPayload, reason))
+    crate::app::turn_review::apply_remote_action(app, &action.turn_id, kind, action.path.as_deref())
+        .map_err(|reason| CommandFailure::new(ErrorCode::InvalidPayload, reason))
 }
 
 // ── Slash commands (§5.1) ───────────────────────────────────────────

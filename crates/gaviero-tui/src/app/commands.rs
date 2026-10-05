@@ -76,8 +76,10 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
         "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
         _ => gaviero_core::mcp::TrustConsent::Unknown,
     };
-    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-    overrides.codex_trust = Some(codex_trust);
+    let overrides = gaviero_core::mcp::McpConfigOverrides {
+        codex_trust: Some(codex_trust),
+        ..Default::default()
+    };
     let synth =
         gaviero_core::mcp::resolve_mcp_config_synth(&app.workspace, &root, endpoint, &overrides);
     match gaviero_core::mcp::synthesize_for_worktree(&synth) {
@@ -86,7 +88,9 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
                 super::turn_review::note_host_write(app, path);
             }
         }
-        Err(e) => tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed"),
+        Err(e) => {
+            tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed")
+        }
     }
 }
 
@@ -126,7 +130,7 @@ fn resolve_remember_scope(
         .get(app.active_buffer)
         .and_then(|b| b.path.as_deref());
     let focused_folder = active_path.and_then(|path| app.workspace.folder_for_path(path));
-    let repo_id = hash_path(focused_folder.unwrap_or(&workspace_root));
+    let repo_id = hash_path(focused_folder.unwrap_or(workspace_root));
 
     match variant {
         "here" => {
@@ -163,7 +167,7 @@ fn resolve_remember_scope(
             // Default variant — read from settings.
             let default = app
                 .workspace
-                .resolve_setting(S::MEMORY_REMEMBER_DEFAULT_SCOPE, Some(&workspace_root))
+                .resolve_setting(S::MEMORY_REMEMBER_DEFAULT_SCOPE, Some(workspace_root))
                 .as_str()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "repo".to_string());
@@ -542,17 +546,17 @@ fn extract_reason_flag(args: &str) -> (Option<String>, String) {
     };
     let before = s[..idx].trim();
     let after = s[idx + "--reason".len()..].trim_start();
-    if let Some(rest_q) = after.strip_prefix('"') {
-        if let Some(end) = rest_q.find('"') {
-            let reason = &rest_q[..end];
-            let tail = rest_q[end + 1..].trim();
-            let body = if tail.is_empty() {
-                before.to_string()
-            } else {
-                format!("{before} {tail}")
-            };
-            return (Some(reason.to_string()), body);
-        }
+    if let Some(rest_q) = after.strip_prefix('"')
+        && let Some(end) = rest_q.find('"')
+    {
+        let reason = &rest_q[..end];
+        let tail = rest_q[end + 1..].trim();
+        let body = if tail.is_empty() {
+            before.to_string()
+        } else {
+            format!("{before} {tail}")
+        };
+        return (Some(reason.to_string()), body);
     }
     let mut iter = after.split_whitespace();
     let first = iter.next().unwrap_or("").to_string();

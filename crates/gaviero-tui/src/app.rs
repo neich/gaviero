@@ -540,10 +540,10 @@ impl App {
         // Hot-event projection (Plan A §2.1 path 1, invariant 12): chunks
         // and status events carry complete wire data and are forwarded
         // before the reducer consumes the event.
-        if self.remote.handle.is_some() {
-            if let Some(frame) = projection::project_hot_event(self, &event) {
-                self.remote.push_frame(frame);
-            }
+        if self.remote.handle.is_some()
+            && let Some(frame) = projection::project_hot_event(self, &event)
+        {
+            self.remote.push_frame(frame);
         }
         controller::handle_event(self, event);
         // Post-reducer projection + delivery (§2.1 path 2, invariant 11):
@@ -668,18 +668,18 @@ impl App {
         );
 
         let mut hints = gaviero_core::context_planner::BootstrapEstimateHints::default();
-        if let Ok(guard) = self.topology_cache.try_read() {
-            if let Some(body) = guard.get(&graph_root) {
-                hints.topology_chars = Some(body.len());
-            }
+        if let Ok(guard) = self.topology_cache.try_read()
+            && let Some(body) = guard.get(&graph_root)
+        {
+            hints.topology_chars = Some(body.len());
         }
-        if let Ok(guard) = self.repo_map.try_read() {
-            if let Some(map) = guard.get(&graph_root) {
-                let budget = self.chat_state.agent_settings.graph_budget_tokens;
-                if budget > 0 {
-                    let plan = map.rank_for_agent(&[], budget);
-                    hints.outline_tokens = Some(plan.token_estimate);
-                }
+        if let Ok(guard) = self.repo_map.try_read()
+            && let Some(map) = guard.get(&graph_root)
+        {
+            let budget = self.chat_state.agent_settings.graph_budget_tokens;
+            if budget > 0 {
+                let plan = map.rank_for_agent(&[], budget);
+                hints.outline_tokens = Some(plan.token_estimate);
             }
         }
         let conv = self.chat_state.active_conversation();
@@ -998,7 +998,7 @@ impl App {
         left_panel::execute_bulk_delete(self, paths);
     }
 
-    fn execute_bulk_move(&mut self, paths: &[std::path::PathBuf], dest_dir: &std::path::PathBuf) {
+    fn execute_bulk_move(&mut self, paths: &[std::path::PathBuf], dest_dir: &std::path::Path) {
         left_panel::execute_bulk_move(self, paths, dest_dir);
     }
 
