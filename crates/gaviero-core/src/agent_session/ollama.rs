@@ -25,11 +25,12 @@ use std::pin::Pin;
 use anyhow::Result;
 use futures::Stream;
 
-use crate::context_planner::compaction::{CompactionPolicy, compact_replay, should_compact};
-use crate::context_planner::{ContinuityHandle, ContinuityMode, ReplayPayload};
+use crate::context_planner::compaction::CompactionPolicy;
+use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::swarm::backend::UnifiedStreamEvent;
 
 use super::registry::SessionConstruction;
+use super::replay_compaction::compact_turn_replay;
 use super::{AgentSession, LegacyAgentSession, Turn};
 
 // ── OllamaSession ─────────────────────────────────────────────────────────────
@@ -95,22 +96,7 @@ impl AgentSession for OllamaSession {
         // Check and apply compaction to the replay history carried in the Turn.
         // The session does NOT write back to the caller's SessionLedger; it only
         // bounds what Ollama sees at the transport layer.
-        if let Some(ref payload) = turn.replay_history
-            && should_compact(&self.policy, &payload.entries, self.max_context_tokens)
-        {
-            let (compacted_entries, record) = compact_replay(&self.policy, payload.entries.clone());
-            tracing::info!(
-                target: "turn_metrics",
-                turns_compacted = record.turns_compacted,
-                kept_entries = compacted_entries.len(),
-                max_context_tokens = ?self.max_context_tokens,
-                "ollama_replay_compacted"
-            );
-            turn.replay_history = Some(ReplayPayload {
-                entries: compacted_entries,
-            })
-            .filter(|p| !p.entries.is_empty());
-        }
+        compact_turn_replay(&mut turn, &self.policy, self.max_context_tokens, "ollama");
 
         self.inner.send_turn(turn).await
     }

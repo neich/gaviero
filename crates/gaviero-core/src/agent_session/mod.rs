@@ -115,6 +115,7 @@ pub mod cursor;
 pub mod ollama;
 pub mod reconcile;
 pub mod registry;
+pub(crate) mod replay_compaction;
 pub mod tool_agent;
 pub(crate) mod tool_surface;
 

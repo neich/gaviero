@@ -8,10 +8,11 @@
 use serde_json::{Value, json};
 
 use crate::context_planner::ReplayPayload;
-use crate::context_planner::compaction::{CompactionPolicy, compact_replay, should_compact};
+use crate::context_planner::compaction::CompactionPolicy;
 use crate::context_planner::ledger::Role;
 
 use crate::agent_session::Turn;
+use crate::agent_session::replay_compaction::compact_turn_replay;
 
 /// Apply replay compaction to `turn` when any policy threshold is exceeded.
 pub(crate) fn apply_replay_compaction(
@@ -19,25 +20,7 @@ pub(crate) fn apply_replay_compaction(
     policy: &CompactionPolicy,
     max_context_tokens: Option<usize>,
 ) {
-    let Some(ref payload) = turn.replay_history else {
-        return;
-    };
-    if !should_compact(policy, &payload.entries, max_context_tokens) {
-        return;
-    }
-    let (compacted_entries, record) = compact_replay(policy, payload.entries.clone());
-    tracing::info!(
-        target: "turn_metrics",
-        provider = "deepseek",
-        turns_compacted = record.turns_compacted,
-        kept_entries = compacted_entries.len(),
-        max_context_tokens = ?max_context_tokens,
-        "tool_agent_replay_compacted"
-    );
-    turn.replay_history = Some(ReplayPayload {
-        entries: compacted_entries,
-    })
-    .filter(|p| !p.entries.is_empty());
+    compact_turn_replay(turn, policy, max_context_tokens, "deepseek");
 }
 
 /// Assemble the initial message array for one API turn.

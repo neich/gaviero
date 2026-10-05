@@ -663,6 +663,15 @@ pub fn apply_remote_slash(
         app.chat_state.add_user_message_at(idx, line);
         let listing = super::commands::mcp_command_reply(app, line);
         app.chat_state.add_system_message_at(idx, &listing);
+    } else if command == "/compact"
+        && let crate::panels::agent_chat::CompactAction::Native(prompt) = app
+            .chat_state
+            .compact_action_at(idx, line.trim()["/compact".len()..].trim())
+    {
+        // Same as the desktop: the provider compacts its own session, sent
+        // as a prompt with the prompt path's checks (busy, pending review).
+        apply_remote_prompt(app, conv_id, &prompt, usize::MAX)?;
+        return Ok(());
     } else {
         app.chat_state
             .apply_slash_line(idx, line, SlashOrigin::Remote);

@@ -187,6 +187,22 @@ pub trait AcpObserver: Send + Sync {
     /// (`completed` / `failed` / `stopped`) or the parent process exited
     /// while it was still running (`killed`).
     fn on_background_task_finished(&self, _task_id: &str, _status: &str, _summary: &str) {}
+
+    /// The provider reported the session model's real context window in
+    /// tokens (Claude: `result.modelUsage.<model>.contextWindow`). Hosts use
+    /// it instead of a static per-provider guess for the context indicator.
+    fn on_context_window(&self, _tokens: u64) {}
+
+    /// The provider compacted the session's context — on `/compact`
+    /// (`trigger` = `manual`) or by itself near the limit (`auto`). Token
+    /// counts are the provider's own, when it reports them.
+    fn on_context_compacted(
+        &self,
+        _trigger: &str,
+        _pre_tokens: Option<u64>,
+        _post_tokens: Option<u64>,
+    ) {
+    }
 }
 
 /// Raw payload of a finished tool call, handed to

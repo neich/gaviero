@@ -55,8 +55,10 @@ use crate::write_gate::WriteGatePipeline;
 
 use super::background::{PendingBg, finish_all_pending, finish_pending_bg, register_pending_bg};
 use super::registry::SessionConstruction;
+use super::replay_compaction::compact_turn_replay;
 use super::tool_surface::{AgentToolSurface, CommandDecision};
 use super::{AgentSession, Turn};
+use crate::context_planner::compaction::CompactionPolicy;
 
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -352,6 +354,8 @@ pub struct CodexAppServerSession {
     workspace_root: PathBuf,
     additional_roots: Vec<PathBuf>,
     continuity_mode: ContinuityMode,
+    /// `ProviderProfile::max_context_tokens`, for the replay bound.
+    max_context_tokens: Option<usize>,
     inner: Option<AppServerInner>,
     handle: Option<ContinuityHandle>,
     review: ReviewContext,
@@ -383,6 +387,7 @@ impl CodexAppServerSession {
             .unwrap_or(&args.model)
             .to_string();
         let continuity_mode = args.profile.continuity_mode;
+        let max_context_tokens = args.profile.max_context_tokens;
 
         #[allow(deprecated)]
         let handle = if continuity_mode == ContinuityMode::ProcessBound {
@@ -427,6 +432,7 @@ impl CodexAppServerSession {
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
             continuity_mode,
+            max_context_tokens,
             inner: None,
             handle,
             review,
@@ -564,6 +570,15 @@ impl AgentSession for CodexAppServerSession {
             return Ok(error_then_done(msg));
         }
 
+        // Chat replays the transcript into every Codex turn; bound it like
+        // the other replaying sessions.
+        let mut turn = turn;
+        compact_turn_replay(
+            &mut turn,
+            &CompactionPolicy::default(),
+            self.max_context_tokens,
+            "codex",
+        );
         let rendered_message = render_turn_prompt(turn);
         let inner = self.inner.as_mut().expect("ensure_running set inner");
         let thread_id = inner.thread_id.clone();

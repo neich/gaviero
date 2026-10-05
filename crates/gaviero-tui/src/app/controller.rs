@@ -842,7 +842,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::TurnTokenUsage { conv_id, usage } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
-                app.chat_state.conversations[idx].last_token_usage = Some(usage);
+                // An all-zero report says nothing about the context (Claude's
+                // `/compact` turn reports zeros right after the compaction
+                // set the real size), so keep the last real one.
+                if usage != gaviero_core::acp::protocol::TokenUsage::default() {
+                    app.chat_state.conversations[idx].last_token_usage = Some(usage);
+                }
             } else {
                 tracing::debug!(
                     target: "turn_metrics",
@@ -850,6 +855,18 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     "TurnTokenUsage for unknown conv_id — dropped"
                 );
             }
+        }
+        Event::ContextWindow { conv_id, tokens } => {
+            app.chat_state.record_context_window(&conv_id, tokens);
+        }
+        Event::ContextCompacted {
+            conv_id,
+            trigger,
+            pre_tokens,
+            post_tokens,
+        } => {
+            app.chat_state
+                .context_compacted_to(&conv_id, &trigger, pre_tokens, post_tokens);
         }
         Event::TurnCostUpdate { conv_id, cost_usd } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {

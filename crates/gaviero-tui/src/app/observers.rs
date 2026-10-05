@@ -108,6 +108,27 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
+    fn on_context_window(&self, tokens: u64) {
+        let _ = self.tx.send(Event::ContextWindow {
+            conv_id: self.conv_id.clone(),
+            tokens,
+        });
+    }
+
+    fn on_context_compacted(
+        &self,
+        trigger: &str,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+    ) {
+        let _ = self.tx.send(Event::ContextCompacted {
+            conv_id: self.conv_id.clone(),
+            trigger: trigger.to_string(),
+            pre_tokens,
+            post_tokens,
+        });
+    }
+
     fn on_permission_request(
         &self,
         tool_name: &str,
