@@ -213,10 +213,7 @@ impl Provider {
     /// the provider is excluded.
     pub const fn mcp_capabilities(self) -> McpCapabilities {
         match self {
-            Provider::Claude
-            | Provider::Codex
-            | Provider::CodexAppServer
-            | Provider::Cursor => {
+            Provider::Claude | Provider::Codex | Provider::CodexAppServer | Provider::Cursor => {
                 McpCapabilities::permissive_over(McpTransport::ConfigFileStdio)
             }
             Provider::Dsh => McpCapabilities::permissive_over(McpTransport::HttpOnly),
@@ -1322,11 +1319,7 @@ mod tests {
     /// exists to prevent.
     #[test]
     fn has_multi_choice_agrees_with_the_kind_it_is_derived_from() {
-        for kind in [
-            PromptKind::None,
-            PromptKind::YesNo,
-            PromptKind::MultiChoice,
-        ] {
+        for kind in [PromptKind::None, PromptKind::YesNo, PromptKind::MultiChoice] {
             assert_eq!(kind.has_multi_choice(), kind == PromptKind::MultiChoice);
         }
     }
@@ -1346,14 +1339,9 @@ mod tests {
             "deepseek:x",
             "ollama:x",
         ] {
-            let profile = build_provider_profile(
-                &ModelSpec::parse(spec),
-                &RuntimeConfig::default(),
-            );
-            if let Some(msg) = profile
-                .tool_enforcement
-                .ui_disclosure(&profile.provider)
-            {
+            let profile =
+                build_provider_profile(&ModelSpec::parse(spec), &RuntimeConfig::default());
+            if let Some(msg) = profile.tool_enforcement.ui_disclosure(&profile.provider) {
                 assert!(
                     msg.contains(&profile.provider),
                     "disclosure must name the provider: {msg}"

@@ -218,7 +218,7 @@ impl<'a> ContextPlanner<'a> {
                 Vec::with_capacity(input.extra_folder_paths.len() + 1);
             roots.push(self.workspace_root);
             for p in input.extra_folder_paths {
-                if !roots.iter().any(|r| *r == *p) {
+                if !roots.contains(p) {
                     roots.push(*p);
                 }
             }
