@@ -188,10 +188,10 @@ impl AcpSessionFactory {
         let mut sessions = self.persistent_sessions.lock().await;
 
         // Check if existing session is alive
-        if let Some(session) = sessions.get(key) {
-            if session.is_alive() {
-                return Ok(());
-            }
+        if let Some(session) = sessions.get(key)
+            && session.is_alive()
+        {
+            return Ok(());
         }
 
         // Spawn new persistent session (no --print)
@@ -236,7 +236,7 @@ impl AcpSessionFactory {
     /// Kill all persistent sessions. Called on workspace close or TUI quit.
     pub async fn kill_all(&self) {
         let mut sessions = self.persistent_sessions.lock().await;
-        for (_, session) in sessions.iter_mut() {
+        for session in sessions.values_mut() {
             session.kill();
         }
         sessions.clear();
