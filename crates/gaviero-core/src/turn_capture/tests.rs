@@ -87,7 +87,12 @@ fn revert_restores_every_kind_byte_exact() {
         std::fs::remove_file(w.root.join("del.txt")).unwrap();
     });
     for c in &set.files {
-        assert_eq!(revert_file(&w.cap, c, false).unwrap(), RevertOutcome::Reverted, "{}", c.rel);
+        assert_eq!(
+            revert_file(&w.cap, c, false).unwrap(),
+            RevertOutcome::Reverted,
+            "{}",
+            c.rel
+        );
     }
     assert_eq!(w.read("mod.txt").as_deref(), Some("no trailing newline"));
     assert_eq!(w.read("del.txt").as_deref(), Some("doomed\n"));
@@ -102,9 +107,15 @@ fn revert_refuses_a_drifted_file_unless_forced() {
     w.write("a.txt", "v3 user edit\n");
     let c = &set.files[0];
     assert!(has_drifted(c));
-    assert_eq!(revert_file(&w.cap, c, false).unwrap(), RevertOutcome::Drifted);
+    assert_eq!(
+        revert_file(&w.cap, c, false).unwrap(),
+        RevertOutcome::Drifted
+    );
     assert_eq!(w.read("a.txt").as_deref(), Some("v3 user edit\n"));
-    assert_eq!(revert_file(&w.cap, c, true).unwrap(), RevertOutcome::Reverted);
+    assert_eq!(
+        revert_file(&w.cap, c, true).unwrap(),
+        RevertOutcome::Reverted
+    );
     assert_eq!(w.read("a.txt").as_deref(), Some("v1\n"));
 }
 
@@ -114,15 +125,23 @@ fn hunk_revert_keeps_the_other_hunks() {
     let before: String = (0..20).map(|i| format!("line {i}\n")).collect();
     w.write("f.txt", &before);
     let set = w.turn("t1", |w| {
-        let after = before.replace("line 1\n", "LINE 1\n").replace("line 18\n", "LINE 18\n");
+        let after = before
+            .replace("line 1\n", "LINE 1\n")
+            .replace("line 18\n", "LINE 18\n");
         w.write("f.txt", &after);
     });
     let c = &set.files[0];
     let hunks = file_hunks(&w.cap, c).unwrap();
     assert_eq!(hunks.len(), 2);
-    assert_eq!(revert_hunks(&w.cap, c, &[1], false).unwrap(), RevertOutcome::Reverted);
+    assert_eq!(
+        revert_hunks(&w.cap, c, &[1], false).unwrap(),
+        RevertOutcome::Reverted
+    );
     let now = w.read("f.txt").unwrap();
-    assert!(now.contains("LINE 1\n") && now.contains("line 18\n"), "{now}");
+    assert!(
+        now.contains("LINE 1\n") && now.contains("line 18\n"),
+        "{now}"
+    );
 }
 
 #[test]
@@ -164,7 +183,10 @@ fn host_writes_are_not_attributed_to_the_agent() {
             .record(&w.root.join("editor.txt"), Some(b"saved by user\n"));
         w.write("agent.txt", "v2\n");
     });
-    assert_eq!(kinds(&set), vec![("agent.txt".into(), ChangeKind::Modified)]);
+    assert_eq!(
+        kinds(&set),
+        vec![("agent.txt".into(), ChangeKind::Modified)]
+    );
 }
 
 #[test]
@@ -192,7 +214,9 @@ fn overlapping_turns_mark_each_other() {
     w.write("shared.txt", "from a\n");
     w.write("a_only.txt", "from a\n");
     let a_end = w.cap.end(a, TurnOutcome::Completed).unwrap();
-    w.cap.save_pending(&PendingReview::new(a_end.set.clone())).unwrap();
+    w.cap
+        .save_pending(&PendingReview::new(a_end.set.clone()))
+        .unwrap();
     w.write("shared.txt", "from b\n");
     let b_end = w.cap.end(b, TurnOutcome::Completed).unwrap();
 
@@ -220,6 +244,24 @@ fn a_turn_that_ended_before_another_began_is_not_an_overlap() {
 }
 
 #[test]
+fn background_saves_never_land_after_the_archive() {
+    let w = ws();
+    w.write("f.txt", "v1\n");
+    let set = w.turn("t1", |w| w.write("f.txt", "v2\n"));
+    let review = PendingReview::new(set);
+    for _ in 0..20 {
+        w.cap.save_pending_later(review.clone());
+    }
+    w.cap.archive_later(ReviewedTurn {
+        set: review.set.clone(),
+        resolved: Default::default(),
+    });
+    w.cap.flush();
+    assert!(w.cap.load_pending().is_empty());
+    assert_eq!(w.cap.recent_reviewed().len(), 1);
+}
+
+#[test]
 fn resolve_applies_decisions_and_archives() {
     let w = ws();
     w.write("keep.txt", "k1\n");
@@ -230,11 +272,22 @@ fn resolve_applies_decisions_and_archives() {
     });
     let mut review = PendingReview::new(set);
     w.cap.save_pending(&review).unwrap();
-    let back_key = review.set.files.iter().find(|c| c.rel == "back.txt").unwrap().key();
-    review.decisions.insert(back_key.clone(), FileDecision::Revert);
+    let back_key = review
+        .set
+        .files
+        .iter()
+        .find(|c| c.rel == "back.txt")
+        .unwrap()
+        .key();
+    review
+        .decisions
+        .insert(back_key.clone(), FileDecision::Revert);
 
     let done = w.cap.resolve(&review, &HashSet::new());
-    assert_eq!(done.resolved.get(&back_key), Some(&ResolvedDecision::Reverted));
+    assert_eq!(
+        done.resolved.get(&back_key),
+        Some(&ResolvedDecision::Reverted)
+    );
     assert_eq!(w.read("keep.txt").as_deref(), Some("k2\n"));
     assert_eq!(w.read("back.txt").as_deref(), Some("b1\n"));
     assert!(w.cap.load_pending().is_empty());

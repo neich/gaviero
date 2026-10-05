@@ -33,7 +33,7 @@ pub mod walk;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use anyhow::{Context, Result};
 
@@ -73,7 +73,11 @@ pub struct TurnCapture {
     store: BlobStore,
     ledger: HostWriteLedger,
     state: Mutex<State>,
+    /// Single background thread for review persistence, started on first use.
+    io: OnceLock<mpsc::Sender<IoJob>>,
 }
+
+type IoJob = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 struct State {
@@ -138,6 +142,7 @@ impl TurnCapture {
             dir,
             ledger: HostWriteLedger::default(),
             state: Mutex::new(State::default()),
+            io: OnceLock::new(),
         })
     }
 
@@ -158,7 +163,12 @@ impl TurnCapture {
 
     /// Refresh the baseline and open a turn. Blocking (walks + hashes): call
     /// from `spawn_blocking`.
-    pub fn begin(&self, turn_id: &str, conv_id: Option<&str>, scope: CaptureScope) -> Result<TurnHandle> {
+    pub fn begin(
+        &self,
+        turn_id: &str,
+        conv_id: Option<&str>,
+        scope: CaptureScope,
+    ) -> Result<TurnHandle> {
         let started_ns = now_ns();
         let (cached, others_active) = {
             let st = self.lock();
@@ -283,7 +293,8 @@ impl TurnCapture {
 
         files.retain(|c| !self.ledger.attributes(&c.path, c.after_hash(), started_ns));
         for c in &mut files {
-            c.binary = self.is_binary_side(c.before.as_ref()) || self.is_binary_side(c.after.as_ref());
+            c.binary =
+                self.is_binary_side(c.before.as_ref()) || self.is_binary_side(c.after.as_ref());
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -364,8 +375,10 @@ impl TurnCapture {
             }
             match revert_file(self, &c, true) {
                 Ok(RevertOutcome::Reverted | RevertOutcome::AlreadyAtBefore) => {
-                    set.warnings
-                        .push(format!("{}: sensitive path changed by the agent — reverted", c.rel));
+                    set.warnings.push(format!(
+                        "{}: sensitive path changed by the agent — reverted",
+                        c.rel
+                    ));
                     set.auto_reverted.push(c.rel.clone());
                 }
                 Ok(other) => {
@@ -515,7 +528,9 @@ impl TurnCapture {
     }
 
     fn load_pending_one(&self, turn_id: &str) -> Option<PendingReview> {
-        let path = self.pending_dir().join(format!("{}.json", file_stem(turn_id)));
+        let path = self
+            .pending_dir()
+            .join(format!("{}.json", file_stem(turn_id)));
         std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -529,7 +544,9 @@ impl TurnCapture {
     }
 
     pub fn remove_pending(&self, turn_id: &str) {
-        let path = self.pending_dir().join(format!("{}.json", file_stem(turn_id)));
+        let path = self
+            .pending_dir()
+            .join(format!("{}.json", file_stem(turn_id)));
         let _ = std::fs::remove_file(path);
     }
 
@@ -542,6 +559,76 @@ impl TurnCapture {
         self.remove_pending(&reviewed.set.turn_id);
         self.gc();
         Ok(())
+    }
+
+    // ── Background persistence ───────────────────────────────────
+
+    /// Run `job` on this capture's single I/O thread. Jobs run in submission
+    /// order, so an archive can never be overtaken by an earlier save of the
+    /// same review (which would resurrect it as pending).
+    fn enqueue(&self, job: IoJob) {
+        let tx = self.io.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<IoJob>();
+            let spawned = std::thread::Builder::new()
+                .name("turn-capture-io".into())
+                .spawn(move || {
+                    for job in rx {
+                        job();
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("turn capture I/O thread failed to start: {e}");
+            }
+            tx
+        });
+        // The thread is gone (or never started): run on the caller instead.
+        if let Err(mpsc::SendError(job)) = tx.send(job) {
+            job();
+        }
+    }
+
+    /// [`Self::save_pending`] off the caller's thread, in order with the other
+    /// background writes.
+    pub fn save_pending_later(self: &Arc<Self>, review: PendingReview) {
+        let this = Arc::clone(self);
+        self.enqueue(Box::new(move || {
+            if let Err(e) = this.save_pending(&review) {
+                tracing::warn!("saving turn review {} failed: {e:#}", review.set.turn_id);
+            }
+        }));
+    }
+
+    /// [`Self::archive`] (including its blob GC) off the caller's thread.
+    pub fn archive_later(self: &Arc<Self>, reviewed: ReviewedTurn) {
+        let this = Arc::clone(self);
+        self.enqueue(Box::new(move || {
+            if let Err(e) = this.archive(&reviewed) {
+                tracing::warn!(
+                    "archiving turn review {} failed: {e:#}",
+                    reviewed.set.turn_id
+                );
+            }
+        }));
+    }
+
+    /// [`Self::gc`] off the caller's thread.
+    pub fn gc_later(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        self.enqueue(Box::new(move || {
+            this.gc();
+        }));
+    }
+
+    /// Block until every background write queued so far has landed.
+    pub fn flush(&self) {
+        if self.io.get().is_none() {
+            return;
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        self.enqueue(Box::new(move || {
+            let _ = done_tx.send(());
+        }));
+        let _ = done_rx.recv();
     }
 
     /// Reviewed turns still within retention, newest first.
@@ -575,7 +662,10 @@ impl TurnCapture {
             resolved,
         };
         if let Err(e) = self.archive(&reviewed) {
-            tracing::warn!("turn capture: archiving {} failed: {e:#}", review.set.turn_id);
+            tracing::warn!(
+                "turn capture: archiving {} failed: {e:#}",
+                review.set.turn_id
+            );
         }
         reviewed
     }
@@ -642,7 +732,12 @@ fn pin_set(keep: &mut HashSet<String>, set: &TurnChangeSet) {
     }
 }
 
-fn change(path: &Path, kind: ChangeKind, before: Option<&Entry>, after: Option<&Entry>) -> FileChange {
+fn change(
+    path: &Path,
+    kind: ChangeKind,
+    before: Option<&Entry>,
+    after: Option<&Entry>,
+) -> FileChange {
     let side = |e: &Entry| BlobRef {
         sha256: e.sha256.clone(),
         size: e.size,
@@ -650,7 +745,9 @@ fn change(path: &Path, kind: ChangeKind, before: Option<&Entry>, after: Option<&
     };
     let any = before.or(after).expect("a change has at least one side");
     let before_ref = before.map(side);
-    let revertible = before_ref.as_ref().is_none_or(|b| b.stored && b.sha256.is_some());
+    let revertible = before_ref
+        .as_ref()
+        .is_none_or(|b| b.stored && b.sha256.is_some());
     FileChange {
         path: path.to_path_buf(),
         root: any.root.clone(),
@@ -668,12 +765,21 @@ fn change(path: &Path, kind: ChangeKind, before: Option<&Entry>, after: Option<&
 fn file_stem(turn_id: &str) -> String {
     turn_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
 fn read_json_dir<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<T> {
-    read_json_dir_with_paths(dir).into_iter().map(|(_, v)| v).collect()
+    read_json_dir_with_paths(dir)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
 }
 
 fn read_json_dir_with_paths<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<(PathBuf, T)> {
