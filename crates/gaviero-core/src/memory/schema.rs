@@ -779,23 +779,23 @@ fn migrate_v12(conn: &Connection) -> Result<()> {
 /// Schema fields:
 /// - `id`                — auto pk
 /// - `memory_id`         — original `memories.id` (no FK; the source
-///                         row is gone after hard-delete)
+///   row is gone after hard-delete)
 /// - `memory_content_hash` — for join-back / dedup-on-restore
 /// - `memory_kind`       — record | history | summary (history only
-///                         appears via C2.4's `user_redaction` path)
+///   appears via C2.4's `user_redaction` path)
 /// - `memory_source`     — write-origin from `memories.source`
 /// - `memory_trust`      — trust_score at the time of deletion
 /// - `deleted_at`        — ISO-8601 UTC
 /// - `deleted_by`        — one of the documented operations:
-///                         `user_command` (slash command bulk),
-///                         `panel` (TUI per-row d),
-///                         `sleeptime_merge` (B5 near-dup loser),
-///                         `sleeptime_prune` (B5 retention prune),
-///                         `user_redaction` (C2.4 /forget-history)
+///   `user_command` (slash command bulk),
+///   `panel` (TUI per-row d),
+///   `sleeptime_merge` (B5 near-dup loser),
+///   `sleeptime_prune` (B5 retention prune),
+///   `user_redaction` (C2.4 /forget-history)
 /// - `reason`            — optional human note (`/forget --reason`)
 /// - `original_row_json` — full row dump; for sleeptime merges this
-///                         additionally carries `merged_into` so the
-///                         restore path knows the surviving id.
+///   additionally carries `merged_into` so the
+///   restore path knows the surviving id.
 fn migrate_v13(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS deletions (
@@ -957,7 +957,14 @@ mod tests {
     fn setup_conn() -> Connection {
         // Register BEFORE opening the connection (auto_extension applies to new opens)
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         }

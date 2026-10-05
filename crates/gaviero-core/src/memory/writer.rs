@@ -734,6 +734,7 @@ impl WriterHandle {
     }
 
     /// Fire-and-forget turn-complete notification (Phase 4 will handle extraction).
+    #[allow(clippy::too_many_arguments)]
     pub fn turn_complete(
         &self,
         session_id: impl Into<String>,
@@ -1285,7 +1286,7 @@ async fn process_message(
             let store = stores.workspace().clone();
             let res = store.redact_history_row(memory_id, &reason).await;
             send_ack_typed(ack, &res);
-            res.map(|audit_id| WriteResult::Inserted(audit_id))
+            res.map(WriteResult::Inserted)
         }
         WriterMessage::Flush { ack } => {
             // The receive loop intercepts `Flush` as a drain barrier before
@@ -1311,9 +1312,7 @@ async fn process_message(
                 .await;
             send_ack_typed(ack, &res);
             res.map(|report| {
-                if dry_run {
-                    WriteResult::Skipped
-                } else if report.deleted == 0 {
+                if dry_run || report.deleted == 0 {
                     WriteResult::Skipped
                 } else {
                     WriteResult::Inserted(report.deleted as i64)
@@ -1551,6 +1550,7 @@ async fn process_agent_flag(
 /// task, which the chat path enqueues into and returns from immediately.
 /// Per-stage latency is logged via `tracing` with a correlation id built
 /// from `turn_id` for post-hoc perf work.
+#[allow(clippy::too_many_arguments)]
 async fn process_turn_complete(
     stores: &Arc<MemoryStores>,
     llm: Option<&Arc<dyn ConsolidationLlm>>,

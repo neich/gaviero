@@ -46,8 +46,8 @@ impl MemoryStore {
     ///
     /// 1. Embed the query **once** (before the SQLite lock).
     /// 2. Acquire the SQLite mutex once and walk every admissible scope
-    ///    level under that single lock. The per-scope hybrid (vec + FTS
-    ///    + RRF) reads run sequentially — sqlite-vec ships only a
+    ///    level under that single lock. The per-scope hybrid (vec, FTS,
+    ///    RRF) reads run sequentially — sqlite-vec ships only a
     ///    single connection in this store, so genuine I/O parallelism
     ///    would need a connection pool (a Tier C refactor). The win
     ///    over the pre-B3 cascade is the cascade's serial early-exit,

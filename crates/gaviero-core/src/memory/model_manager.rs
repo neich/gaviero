@@ -72,6 +72,12 @@ pub struct ModelManager {
     cache_dir: PathBuf,
 }
 
+impl Default for ModelManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelManager {
     pub fn new() -> Self {
         let cache_dir = dirs::cache_dir()

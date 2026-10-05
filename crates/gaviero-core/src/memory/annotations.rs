@@ -309,7 +309,7 @@ fn is_inside_fence(response: &str, position: usize) -> bool {
             None => break,
         }
     }
-    fences % 2 != 0
+    !fences.is_multiple_of(2)
 }
 
 #[cfg(test)]

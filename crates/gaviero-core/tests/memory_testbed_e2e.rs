@@ -106,10 +106,6 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     // t4 is identical to t1.
     let user_t4 = user_t1.clone();
 
-    let history_after_t1: String;
-    let history_after_t2: String;
-    let history_after_t3: String;
-
     let injection_cfg = ChatInjectionConfig {
         enabled: true,
         scopes: ScopeMix {
@@ -154,7 +150,7 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         outcome_t1.session_id.as_deref().unwrap_or("?"),
     );
     r.kv("elapsed_ms", outcome_t1.elapsed.as_millis());
-    history_after_t1 = append_to_history("", &user_t1, &outcome_t1.assistant_text);
+    let history_after_t1: String = append_to_history("", &user_t1, &outcome_t1.assistant_text);
 
     let resume_id_t1 = outcome_t1.session_id.clone();
 
@@ -179,7 +175,8 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         outcome_t2.session_id.as_deref().unwrap_or("?"),
     );
     r.kv("elapsed_ms", outcome_t2.elapsed.as_millis());
-    history_after_t2 = append_to_history(&history_after_t1, &user_t2, &outcome_t2.assistant_text);
+    let history_after_t2: String =
+        append_to_history(&history_after_t1, &user_t2, &outcome_t2.assistant_text);
 
     // ── t3 ── continuation, history = t1+t2 transcripts
     r.section("turn t3 (continuation)");
@@ -202,7 +199,8 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         outcome_t3.session_id.as_deref().unwrap_or("?"),
     );
     r.kv("elapsed_ms", outcome_t3.elapsed.as_millis());
-    history_after_t3 = append_to_history(&history_after_t2, &user_t3, &outcome_t3.assistant_text);
+    let history_after_t3: String =
+        append_to_history(&history_after_t2, &user_t3, &outcome_t3.assistant_text);
     let _ = history_after_t3; // retained for diagnostic symmetry
 
     // ── /reset ── transport-layer model: drop resume_session_id +
@@ -454,15 +452,15 @@ async fn drive_turn(
     // and the injection's <project_memory> block passes through verbatim.
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("<user_message>\n{}\n</user_message>", user_msg));
-    if let Some(inj) = outcome.injection.as_ref() {
-        if !inj.block.is_empty() {
-            parts.push(inj.block.clone());
-        }
+    if let Some(inj) = outcome.injection.as_ref()
+        && !inj.block.is_empty()
+    {
+        parts.push(inj.block.clone());
     }
-    if let Some(history) = simulated_history.as_ref() {
-        if !history.trim().is_empty() {
-            parts.push(format!("<prev_conv>\n{}\n</prev_conv>", history.trim_end()));
-        }
+    if let Some(history) = simulated_history.as_ref()
+        && !history.trim().is_empty()
+    {
+        parts.push(format!("<prev_conv>\n{}\n</prev_conv>", history.trim_end()));
     }
     let enriched_prompt = parts.join("\n\n");
 
@@ -705,10 +703,10 @@ async fn e2e_parallel_sessions_isolated() -> Result<()> {
             };
             if let Some(arr) = payload.get("selected_ids").and_then(|v| v.as_array()) {
                 for x in arr {
-                    if let Some(id) = x.as_i64() {
-                        if !local_ids.contains(&id) {
-                            foreign.push(id);
-                        }
+                    if let Some(id) = x.as_i64()
+                        && !local_ids.contains(&id)
+                    {
+                        foreign.push(id);
                     }
                 }
             }

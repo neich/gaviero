@@ -332,7 +332,7 @@ impl MemoryStore {
     }
 
     /// Commit a batch of re-embedded rows: updates `memories.embedding`
-    /// + `memories.model_id`, and replaces both vec virtual-table rows.
+    /// and `memories.model_id`, and replaces both vec virtual-table rows.
     /// Brief lock held only for the batch's writes.
     pub async fn reembed_apply_batch(
         &self,

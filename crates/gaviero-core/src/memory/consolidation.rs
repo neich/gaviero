@@ -41,18 +41,13 @@ const FLUSH_BUDGET: Duration = Duration::from_secs(30);
 const MIN_ACK_BUDGET: Duration = Duration::from_secs(1);
 
 /// Policy for consolidation during store operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsolidationPolicy {
     /// Automatic dedup and merge flagging on store.
+    #[default]
     Auto,
     /// No consolidation — always insert.
     None,
-}
-
-impl Default for ConsolidationPolicy {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Result of a consolidation run.
@@ -406,10 +401,10 @@ impl Consolidator {
             .workspace()
             .search(namespace, content, 1)
             .await?;
-        if let Some(top) = results.first() {
-            if top.score > 2.5 {
-                return Ok(Some(top.entry.id));
-            }
+        if let Some(top) = results.first()
+            && top.score > 2.5
+        {
+            return Ok(Some(top.entry.id));
         }
         Ok(None)
     }
