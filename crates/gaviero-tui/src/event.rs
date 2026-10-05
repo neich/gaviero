@@ -67,6 +67,19 @@ pub enum Event {
         role: String,
         content: String,
     },
+    /// The provider reported its session model's real context window.
+    ContextWindow {
+        conv_id: String,
+        tokens: u64,
+    },
+    /// The provider compacted the session's context (`/compact` or its own
+    /// automatic compaction).
+    ContextCompacted {
+        conv_id: String,
+        trigger: String,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+    },
 
     /// A file proposal was deferred (batch review mode) — show compact summary in chat.
     FileProposalDeferred {

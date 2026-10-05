@@ -69,7 +69,8 @@ Pending reviews survive a restart. The phone (remote) has the same four decision
 | `/mcp` / `/mcp probe` | MCP reach record + endpoint; probe pointer (CLI) |
 | `/attach <path>` / `/detach` | Add/remove file context |
 | `/lite` | Minimal-context turn (topology only) |
-| `/compact` / `/clear` | Trim or clear conversation history |
+| `/compact [text\|N]` | Claude: the CLI compacts its own session (optional extra guidance). Other providers: keep the last N messages of the transcript gaviero replays |
+| `/clear` | Clear agent context (alias of `/reset`) |
 
 Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash inventory: [CLAUDE.md](CLAUDE.md).
 

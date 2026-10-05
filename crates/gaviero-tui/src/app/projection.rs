@@ -509,6 +509,8 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         // controller owns; the pump's revision sweep and the controller's
         // explicit frame pushes cover them.
         Event::ProposalCreated(_)
+        | Event::ContextWindow { .. }
+        | Event::ContextCompacted { .. }
         | Event::ProposalUpdated(_)
         | Event::BatchProposalSynced { .. }
         | Event::ProposalFinalized(_)

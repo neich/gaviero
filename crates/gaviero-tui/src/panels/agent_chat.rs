@@ -989,6 +989,10 @@ pub struct AgentChatState {
     /// When true, the next prompt will be sent with `--dangerously-skip-permissions`.
     /// Toggled with Alt+Y. Resets to false after the message is sent.
     pub auto_approve_next: bool,
+    /// Context windows the providers reported, keyed by model spec
+    /// (`claude:opus` → 1,000,000). Every chat on that model uses it, ahead
+    /// of the static per-provider table.
+    reported_context_windows: std::collections::HashMap<String, usize>,
 }
 
 impl AgentChatState {
@@ -1058,6 +1062,7 @@ impl AgentChatState {
             chat_output_kb_cursor: None,
             user_scrolled_during_stream: false,
             auto_approve_next: false,
+            reported_context_windows: std::collections::HashMap::new(),
         }
     }
 
@@ -1701,12 +1706,56 @@ impl AgentChatState {
             return false;
         }
 
+        // `/compact` on a provider that compacts natively becomes that
+        // provider's own command, sent as the turn's prompt.
+        let idx = self.active_conv;
+        if let Some(arg) = compact_command_arg(&input)
+            && let CompactAction::Native(prompt) = self.compact_action_at(idx, arg)
+        {
+            self.text_input.text = prompt;
+            self.text_input.cursor = self.text_input.char_count();
+            return false;
+        }
+
         // Clear the draft up-front (every handled arm used to do this at
         // its end); `/rename`'s bare form re-fills it via `start_rename`.
         self.text_input.text.clear();
         self.text_input.cursor = 0;
-        let idx = self.active_conv;
         self.apply_slash_line(idx, &input, SlashOrigin::Desktop)
+    }
+
+    /// What `/compact [arg]` does for the conversation at `idx`. Claude
+    /// compacts its own server-side session when sent `/compact` (verified
+    /// on Claude Code 2.1.289 over gaviero's stream-json transport); every
+    /// provider gaviero replays the transcript to is compacted by trimming
+    /// that transcript.
+    pub fn compact_action_at(&self, idx: usize, arg: &str) -> CompactAction {
+        let Some(conv) = self.conversations.get(idx) else {
+            return CompactAction::TrimReplay;
+        };
+        let model = self.effective_model_at(idx);
+        let provider = model.split_once(':').map(|(p, _)| p).unwrap_or("claude");
+        let live_session = conv
+            .session_ledger
+            .as_ref()
+            .is_some_and(|l| !l.is_first_turn());
+        match provider {
+            "claude" if conv.claude_session_id.is_some() => {
+                // A bare number is the transcript-trim count; text is extra
+                // guidance for the summary.
+                let extra = if arg.is_empty() || arg.parse::<usize>().is_ok() {
+                    String::new()
+                } else {
+                    format!(" {arg}")
+                };
+                CompactAction::Native(format!("/compact {COMPACT_INSTRUCTIONS}{extra}"))
+            }
+            "cursor" if live_session => CompactAction::Unsupported(
+                "Cursor keeps this conversation on its side and summarizes it itself; \
+                 /compact cannot shrink it yet. /reset starts a fresh Cursor session.",
+            ),
+            _ => CompactAction::TrimReplay,
+        }
     }
 
     /// Shared slash reducer (Plan A §2.2): one implementation of each
@@ -1813,6 +1862,22 @@ impl AgentChatState {
                 true
             }
             "/compact" => {
+                match self.compact_action_at(idx, arg) {
+                    CompactAction::TrimReplay => {}
+                    CompactAction::Native(_) => {
+                        // Desktop and remote both send the native prompt as a
+                        // turn before reaching this reducer.
+                        self.add_system_message_at(
+                            idx,
+                            "Send /compact from the prompt to compact this conversation.",
+                        );
+                        return true;
+                    }
+                    CompactAction::Unsupported(why) => {
+                        self.add_system_message_at(idx, why);
+                        return true;
+                    }
+                }
                 let keep = if arg.is_empty() {
                     theme::DEFAULT_COMPACT_KEEP
                 } else {
@@ -2243,7 +2308,7 @@ impl AgentChatState {
                      /context mode <mode>     — Set bootstrap mode for this conversation (auto|minimal|manual|none)\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
-                     /compact [N]             — Keep last N messages (default 6), discard older\n\n\
+                     /compact [text|N]        — Claude: compact the session natively (optional extra guidance). Other providers: keep the last N messages of the replayed transcript (default 6)\n\n\
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
                      /attach                  — List current attachments\n\
@@ -2443,20 +2508,82 @@ impl AgentChatState {
         self.context_limit_tokens_for(self.effective_model())
     }
 
-    /// Context window size for an explicit model spec.
+    /// Context window size for an explicit model spec: the window the
+    /// provider reported for it, else the static profile.
     pub fn context_limit_tokens_for(&self, model: &str) -> usize {
+        if let Some(&reported) = self.reported_context_windows.get(model) {
+            return reported;
+        }
         // Trailing `[1m]` (e.g. `claude:sonnet[1m]`, `claude:claude-opus-4-7[1m]`)
         // selects the 1M-token extended context variant — see Claude Code
         // model-config docs. Strip the suffix before matching the base alias.
         if model.ends_with("[1m]") {
             return 1_000_000;
         }
-        let provider = model.split_once(':').map(|(p, _)| p).unwrap_or("claude");
-        match provider {
-            "ollama" | "local" => 8_192,
-            "claude" | "codex" | "cursor" => 200_000,
-            _ => 200_000,
+        // Same table the planner and replay bound use (`ProviderProfile`),
+        // so the bar and the sessions agree (dsh / DeepSeek: 128k).
+        gaviero_core::context_planner::build_provider_profile(
+            &gaviero_core::context_planner::ModelSpec::parse(model),
+            &gaviero_core::context_planner::RuntimeConfig::default(),
+        )
+        .max_context_tokens
+        .unwrap_or(200_000)
+    }
+
+    /// Remember the window the provider reported for `conv_id`'s model
+    /// (Claude: 1,000,000 for Opus 5.5, where the static guess said 200k).
+    pub fn record_context_window(&mut self, conv_id: &str, tokens: u64) {
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
+        if tokens == 0 {
+            return;
         }
+        let model = self.effective_model_at(idx).to_string();
+        let tokens = usize::try_from(tokens).unwrap_or(usize::MAX);
+        if self.reported_context_windows.insert(model, tokens) != Some(tokens) {
+            self.conversations[idx].bump_revision();
+        }
+    }
+
+    /// The provider compacted `conv_id`'s context: say so in the chat — an
+    /// automatic compaction is otherwise invisible — and move the context
+    /// bar to the compacted size.
+    pub fn context_compacted_to(
+        &mut self,
+        conv_id: &str,
+        trigger: &str,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+    ) {
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
+        let how = if trigger == "auto" {
+            "automatically, near its context limit"
+        } else {
+            "on request"
+        };
+        let sizes = match (pre_tokens, post_tokens) {
+            (Some(pre), Some(post)) => format!(
+                ": {} → {} tokens",
+                gaviero_core::history::grouped_count(pre),
+                gaviero_core::history::grouped_count(post)
+            ),
+            _ => String::new(),
+        };
+        if let Some(post) = post_tokens {
+            self.conversations[idx].last_token_usage =
+                Some(gaviero_core::acp::protocol::TokenUsage {
+                    input_tokens: post,
+                    ..Default::default()
+                });
+        }
+        self.add_system_message_at(
+            idx,
+            &format!("The agent compacted this conversation {how}{sizes}."),
+        );
+        self.conversations[idx].bump_revision();
     }
 
     pub fn add_system_message(&mut self, content: &str) {
@@ -5573,6 +5700,32 @@ fn format_message_timestamp(timestamp: u64) -> Option<String> {
     Some(local.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
+/// What `/compact` does for one conversation ([`AgentChatState::compact_action_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactAction {
+    /// Send this as the turn's prompt: the provider compacts its own session.
+    Native(String),
+    /// Trim the visible transcript gaviero replays to the provider.
+    TrimReplay,
+    /// Neither applies; the reason is shown to the user.
+    Unsupported(&'static str),
+}
+
+/// Guidance sent with a native `/compact`. Summaries lose the artifact
+/// trail first — paths and errors (Factory's compression evaluation, see
+/// `research/cross-agent-session-compaction-2026-10-05.md`).
+const COMPACT_INSTRUCTIONS: &str = "Keep verbatim: file paths, commands, error messages, \
+     decisions and their reasons, the user's constraints, and open questions and next steps.";
+
+/// `Some(arg)` when `input` is a `/compact` command.
+fn compact_command_arg(input: &str) -> Option<&str> {
+    let rest = input.trim().strip_prefix("/compact")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None; // e.g. `/compactfoo`
+    }
+    Some(rest.trim())
+}
+
 /// Mirrors core's `bg_status` wording; core follows every task event with
 /// its own status, so this only bridges the gap between the two events.
 /// Shell commands arrive as `$ <command>`.
@@ -6906,6 +7059,151 @@ mod tests {
                 .contains("✗ search papers — cancelled: cancelled by user"),
             "{}",
             record.content
+        );
+    }
+
+    fn conv_on(state: &mut AgentChatState, model: &str) -> usize {
+        let idx = state.active_conv;
+        state.conversations[idx].model_override = Some(model.to_string());
+        idx
+    }
+
+    #[test]
+    fn compact_on_a_live_claude_session_is_sent_to_claude() {
+        let mut state = AgentChatState::new();
+        let idx = conv_on(&mut state, "claude:opus");
+        state.conversations[idx].claude_session_id = Some("sess-1".into());
+
+        let CompactAction::Native(prompt) = state.compact_action_at(idx, "") else {
+            panic!("expected a native compaction");
+        };
+        assert!(
+            prompt.starts_with("/compact Keep verbatim: file paths"),
+            "{prompt}"
+        );
+        assert!(matches!(
+            state.compact_action_at(idx, "focus on the parser"),
+            CompactAction::Native(p) if p.ends_with(" focus on the parser")
+        ));
+        // A bare number is the transcript-trim count, not guidance.
+        assert_eq!(
+            state.compact_action_at(idx, "4"),
+            CompactAction::Native(format!("/compact {COMPACT_INSTRUCTIONS}"))
+        );
+
+        // The desktop path turns the typed command into the turn's prompt.
+        state.text_input.text = "/compact".into();
+        assert!(!state.process_slash_command(), "not handled locally");
+        assert_eq!(state.text_input.text, prompt);
+    }
+
+    #[test]
+    fn compact_trims_the_replay_for_providers_gaviero_replays_to() {
+        let mut state = AgentChatState::new();
+        for model in [
+            "codex:gpt-5.6-sol",
+            "dsh:deepseek-v4-pro",
+            "ollama:qwen2.5-coder:7b",
+        ] {
+            let idx = conv_on(&mut state, model);
+            assert_eq!(
+                state.compact_action_at(idx, ""),
+                CompactAction::TrimReplay,
+                "{model}"
+            );
+        }
+        // Claude before its first turn has no session yet: its transcript is
+        // still inlined by gaviero, so trimming it is what helps.
+        let idx = conv_on(&mut state, "claude:opus");
+        assert_eq!(state.compact_action_at(idx, ""), CompactAction::TrimReplay);
+    }
+
+    #[test]
+    fn compact_on_a_live_cursor_session_explains_instead_of_trimming() {
+        use gaviero_core::context_planner::{
+            ModelSpec, PlannerFingerprint, RuntimeConfig, SessionLedger, build_provider_profile,
+        };
+        let mut state = AgentChatState::new();
+        let idx = conv_on(&mut state, "cursor:composer-2.5");
+        let profile = build_provider_profile(
+            &ModelSpec::parse("cursor:composer-2.5"),
+            &RuntimeConfig::default(),
+        );
+        let mut ledger = SessionLedger::new(&profile, PlannerFingerprint::from_profile(&profile));
+        ledger.record_turn_dispatched();
+        state.conversations[idx].session_ledger = Some(ledger);
+        assert!(matches!(
+            state.compact_action_at(idx, ""),
+            CompactAction::Unsupported(why) if why.contains("Cursor")
+        ));
+    }
+
+    #[test]
+    fn compact_command_arg_only_matches_the_command() {
+        assert_eq!(compact_command_arg("/compact"), Some(""));
+        assert_eq!(
+            compact_command_arg("  /compact  keep paths "),
+            Some("keep paths")
+        );
+        assert_eq!(compact_command_arg("/compactor"), None);
+        assert_eq!(compact_command_arg("/context"), None);
+    }
+
+    /// Claude Code reports each model's real window; Opus 5.5 is 1M, which
+    /// the static table guessed as 200k (a chat at 360k read as "100%").
+    #[test]
+    fn a_reported_context_window_beats_the_static_table() {
+        let mut state = AgentChatState::new();
+        let idx = conv_on(&mut state, "claude:opus");
+        assert_eq!(state.context_limit_tokens_for("claude:opus"), 200_000);
+        let conv_id = state.conversations[idx].id.clone();
+        state.record_context_window(&conv_id, 1_000_000);
+        assert_eq!(state.context_limit_tokens_for("claude:opus"), 1_000_000);
+        assert_eq!(state.context_limit_tokens(), 1_000_000);
+        // Other models keep their own value.
+        assert_eq!(state.context_limit_tokens_for("claude:haiku"), 200_000);
+        // The static fallback is the planner's profile table.
+        assert_eq!(
+            state.context_limit_tokens_for("dsh:deepseek-v4-pro"),
+            128_000
+        );
+        assert_eq!(
+            state.context_limit_tokens_for("deepseek:deepseek-v4-pro"),
+            128_000
+        );
+        assert_eq!(
+            state.context_limit_tokens_for("ollama:qwen2.5-coder:7b"),
+            8_192
+        );
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-5.6-sol"), 200_000);
+        assert_eq!(
+            state.context_limit_tokens_for("claude:sonnet[1m]"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn a_compaction_is_announced_and_resets_the_context_bar() {
+        let mut state = AgentChatState::new();
+        let idx = conv_on(&mut state, "claude:opus");
+        let conv_id = state.conversations[idx].id.clone();
+        state.context_compacted_to(&conv_id, "auto", Some(812_400), Some(31_002));
+        let conv = &state.conversations[idx];
+        let last = conv.messages.last().unwrap();
+        assert_eq!(last.role, ChatRole::System);
+        assert_eq!(
+            last.content,
+            "The agent compacted this conversation automatically, near its context limit: \
+             812,400 → 31,002 tokens."
+        );
+        assert_eq!(
+            conv.last_token_usage.as_ref().map(|u| u.prefix_tokens()),
+            Some(31_002)
+        );
+        state.context_compacted_to(&conv_id, "manual", None, None);
+        assert_eq!(
+            state.conversations[idx].messages.last().unwrap().content,
+            "The agent compacted this conversation on request."
         );
     }
 
