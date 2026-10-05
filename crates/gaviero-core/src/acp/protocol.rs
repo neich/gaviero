@@ -189,6 +189,18 @@ pub enum StreamEvent {
     /// (`type: system`, `subtype: background_tasks_changed`).
     BackgroundTasksChanged { tasks: Vec<BackgroundTaskInfo> },
 
+    /// Claude compacted the session's context (`type: system`,
+    /// `subtype: compact_boundary`), either because `/compact` was sent or
+    /// on its own near the window limit. Recorded from Claude Code 2.1.289:
+    /// `compact_metadata {trigger, pre_tokens, post_tokens,
+    /// cumulative_dropped_tokens, duration_ms}`.
+    CompactBoundary {
+        /// `manual` or `auto`.
+        trigger: String,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+    },
+
     /// Background / subagent task reached a terminal state
     /// (`type: system`, `subtype: task_notification`).
     TaskNotification {
@@ -213,6 +225,11 @@ pub enum StreamEvent {
         /// absent or unparseable. Present means Claude told us exactly how
         /// many tokens the session was conditioned on this turn.
         usage: Option<TokenUsage>,
+        /// `(model id, context window)` from `modelUsage.*.contextWindow`,
+        /// one per model the turn used (subagents may add a second). The CLI
+        /// knows the real window (1,000,000 for `claude-opus-5-5` on Claude
+        /// Code 2.1.289); empty when absent.
+        context_windows: Vec<(String, u64)>,
     },
 
     /// Permission request — Claude wants to execute a tool and needs user approval.
@@ -350,6 +367,13 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                     })
                     .unwrap_or_default();
                 Ok(StreamEvent::BackgroundTasksChanged { tasks })
+            } else if subtype == "compact_boundary" {
+                let meta = v.get("compact_metadata").unwrap_or(&Value::Null);
+                Ok(StreamEvent::CompactBoundary {
+                    trigger: opt_str(meta, "trigger").to_string(),
+                    pre_tokens: meta.get("pre_tokens").and_then(Value::as_u64),
+                    post_tokens: meta.get("post_tokens").and_then(Value::as_u64),
+                })
             } else if subtype == "task_notification" {
                 Ok(StreamEvent::TaskNotification {
                     task_id: opt_str(&v, "task_id").to_string(),
@@ -519,6 +543,19 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 .get("usage")
                 .and_then(|u| u.as_object())
                 .map(parse_usage_object);
+            let context_windows = v
+                .get("modelUsage")
+                .and_then(Value::as_object)
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|(model, u)| {
+                            let window = u.get("contextWindow").and_then(Value::as_u64)?;
+                            Some((model.clone(), window))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             Ok(StreamEvent::ResultEvent {
                 is_error,
@@ -526,6 +563,7 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 duration_ms,
                 cost_usd,
                 usage,
+                context_windows,
             })
         }
 
@@ -1082,6 +1120,62 @@ mod tests {
         ));
     }
 
+    /// Recorded from Claude Code 2.1.289 after `/compact` on a resumed
+    /// session (stream-json stdin).
+    #[test]
+    fn test_parse_compact_boundary() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":33668,"post_tokens":2509,"cumulative_dropped_tokens":31159,"duration_ms":29568}}"#;
+        match parse_stream_line(line).unwrap() {
+            StreamEvent::CompactBoundary {
+                trigger,
+                pre_tokens,
+                post_tokens,
+            } => {
+                assert_eq!(trigger, "manual");
+                assert_eq!(pre_tokens, Some(33668));
+                assert_eq!(post_tokens, Some(2509));
+            }
+            other => panic!("Expected CompactBoundary, got {other:?}"),
+        }
+    }
+
+    /// `modelUsage` from Claude Code 2.1.289: the CLI reports each model's
+    /// real context window (1M for Opus 5.5, 200k for Haiku 4.5).
+    #[test]
+    fn test_parse_result_context_windows() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK","modelUsage":{"claude-opus-5-5":{"inputTokens":3,"contextWindow":1000000,"maxOutputTokens":64000},"claude-haiku-4-5-20251001":{"inputTokens":9,"contextWindow":200000}}}"#;
+        match parse_stream_line(line).unwrap() {
+            StreamEvent::ResultEvent {
+                mut context_windows,
+                ..
+            } => {
+                context_windows.sort();
+                assert_eq!(
+                    context_windows,
+                    vec![
+                        ("claude-haiku-4-5-20251001".to_string(), 200_000),
+                        ("claude-opus-5-5".to_string(), 1_000_000),
+                    ]
+                );
+            }
+            other => panic!("Expected ResultEvent, got {other:?}"),
+        }
+        let bare = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#;
+        assert!(matches!(
+            parse_stream_line(bare).unwrap(),
+            StreamEvent::ResultEvent { context_windows, .. } if context_windows.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_parse_background_tasks_changed_empty() {
+        let empty = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        assert!(matches!(
+            parse_stream_line(empty).unwrap(),
+            StreamEvent::BackgroundTasksChanged { tasks } if tasks.is_empty()
+        ));
+    }
+
     #[test]
     fn test_parse_task_notification() {
         let line = r#"{"type":"system","subtype":"task_notification","task_id":"task_abc","tool_use_id":"toolu_abc","status":"completed","summary":"done","output_file":""}"#;
@@ -1182,6 +1276,7 @@ mod tests {
                 duration_ms,
                 cost_usd,
                 usage,
+                ..
             } => {
                 assert!(!is_error);
                 assert_eq!(result_text, "Done!");

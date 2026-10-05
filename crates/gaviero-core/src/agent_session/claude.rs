@@ -350,8 +350,16 @@ impl ClaudeSession {
         // `AcpSession::spawn` takes the enriched prompt directly; we pass the
         // same value that `send_prompt_via_claude` produced via
         // `shared::build_enriched_prompt`.
-        let final_prompt =
-            shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
+        let final_prompt = match slash_command_passthrough(&turn.user_message) {
+            // Claude runs a slash command (`/compact`, `/init`, a custom
+            // command) only when it is the whole stdin message — wrapped in
+            // `<user_message>` with context blocks it is read as prose.
+            // Verified on Claude Code 2.1.289.
+            Some(command) => command.to_string(),
+            None => {
+                shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs)
+            }
+        };
 
         // Widen `--add-dir` with each unique parent so Claude's Read tool
         // can reach attachments that live outside the workspace (e.g.
@@ -406,6 +414,9 @@ impl ClaudeSession {
         let mut completion = TurnCompletion::waiting_on_shells();
         // `tool_use` id → command line, to label background command tasks.
         let mut shell_commands: HashMap<String, String> = HashMap::new();
+        // The model `system/init` announced, to pick its context window out
+        // of `result.modelUsage`.
+        let mut session_model = String::new();
 
         loop {
             let idle_wait = if completion.awaiting_wake() {
@@ -680,8 +691,14 @@ impl ClaudeSession {
                                     is_error,
                                     result_text,
                                     usage,
+                                    context_windows,
                                     ..
                                 } => {
+                                    if let Some(window) =
+                                        session_context_window(&context_windows, &session_model)
+                                    {
+                                        self.observer.on_context_window(window);
+                                    }
                                     if let Some(u) = usage.as_ref() {
                                         tracing::info!(
                                             target: "turn_metrics",
@@ -789,7 +806,10 @@ impl ClaudeSession {
                                     );
                                     idle_count = 0;
                                 }
-                                StreamEvent::SystemInit { session_id, .. } => {
+                                StreamEvent::SystemInit { session_id, model } => {
+                                    if !model.is_empty() {
+                                        session_model = model;
+                                    }
                                     // Claude woke the parent to read finished
                                     // agents; keep its reply apart from the last.
                                     if progress == TurnProgress::WakeTurn && !full_text.is_empty() {
@@ -819,6 +839,25 @@ impl ClaudeSession {
                                 }
                                 // Consumed by `completion`.
                                 StreamEvent::BackgroundTasksChanged { .. } => {}
+                                StreamEvent::CompactBoundary {
+                                    trigger,
+                                    pre_tokens,
+                                    post_tokens,
+                                } => {
+                                    tracing::info!(
+                                        target: "turn_metrics",
+                                        provider = "claude",
+                                        trigger = %trigger,
+                                        pre_tokens = ?pre_tokens,
+                                        post_tokens = ?post_tokens,
+                                        "context_compacted"
+                                    );
+                                    self.observer.on_context_compacted(
+                                        &trigger,
+                                        pre_tokens,
+                                        post_tokens,
+                                    );
+                                }
                                 StreamEvent::Unknown(_) => {}
                             }
                         }
@@ -1148,6 +1187,33 @@ fn collect_attachment_parents(
     out
 }
 
+/// The message itself when it is a Claude slash command (`/compact keep
+/// the paths`, `/init`, `/my-cmd:sub`) — the chat's `//` pass-through and
+/// `/compact` produce these. A message that merely starts with a path
+/// (`/usr/bin is missing`) is not one: the command name allows only
+/// letters, digits, `-`, `_` and `:`.
+fn slash_command_passthrough(user_message: &str) -> Option<&str> {
+    let message = user_message.trim();
+    let rest = message.strip_prefix('/')?;
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    let is_command = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'));
+    is_command.then_some(message)
+}
+
+/// The session model's window among `result.modelUsage` entries. A turn
+/// that ran subagents on another model reports several; prefer the one the
+/// session announced in `system/init`, else the only entry.
+fn session_context_window(windows: &[(String, u64)], session_model: &str) -> Option<u64> {
+    windows
+        .iter()
+        .find(|(model, _)| !session_model.is_empty() && model == session_model)
+        .or_else(|| (windows.len() == 1).then(|| &windows[0]))
+        .map(|(_, window)| *window)
+}
+
 // ── AgentSession impl ─────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -1186,8 +1252,49 @@ impl AgentSession for ClaudeSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_attachment_parents, embed_attachment_refs};
+    use super::{
+        collect_attachment_parents, embed_attachment_refs, session_context_window,
+        slash_command_passthrough,
+    };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn slash_commands_pass_through_bare() {
+        assert_eq!(
+            slash_command_passthrough("  /compact Keep the paths.\n"),
+            Some("/compact Keep the paths.")
+        );
+        assert_eq!(slash_command_passthrough("/init"), Some("/init"));
+        assert_eq!(
+            slash_command_passthrough("/frontend:review src"),
+            Some("/frontend:review src")
+        );
+        assert_eq!(slash_command_passthrough("/usr/bin is missing"), None);
+        assert_eq!(slash_command_passthrough("/ leading space"), None);
+        assert_eq!(slash_command_passthrough("/1st"), None);
+        assert_eq!(slash_command_passthrough("please /compact"), None);
+        assert_eq!(slash_command_passthrough(""), None);
+    }
+
+    #[test]
+    fn the_session_models_window_wins_over_a_subagents() {
+        let windows = vec![
+            ("claude-haiku-4-5-20251001".to_string(), 200_000),
+            ("claude-opus-5-5".to_string(), 1_000_000),
+        ];
+        assert_eq!(
+            session_context_window(&windows, "claude-opus-5-5"),
+            Some(1_000_000)
+        );
+        // Several models and no match: no guess.
+        assert_eq!(session_context_window(&windows, "other"), None);
+        assert_eq!(
+            session_context_window(&windows[..1], ""),
+            Some(200_000),
+            "a single entry is the session model"
+        );
+        assert_eq!(session_context_window(&[], "claude-opus-5-5"), None);
+    }
 
     #[test]
     fn embed_attachment_refs_returns_original_when_no_attachments() {

@@ -405,6 +405,7 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
             duration_ms,
             cost_usd,
             usage,
+            ..
         } => {
             if *is_error {
                 out.push(UnifiedStreamEvent::Error(result_text.clone()));
@@ -432,6 +433,7 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
         StreamEvent::TaskStarted { .. }
         | StreamEvent::TaskNotification { .. }
         | StreamEvent::BackgroundTasksChanged { .. }
+        | StreamEvent::CompactBoundary { .. }
         | StreamEvent::UserToolResults { .. } => {
             // Background-agent lifecycle: consumed by `TurnCompletion` in
             // `drive_session` to decide which `result` ends the unit.
@@ -490,6 +492,7 @@ mod tests {
             duration_ms: Some(1500),
             cost_usd: Some(0.02),
             usage: None,
+            context_windows: vec![],
         });
         assert_eq!(events.len(), 2);
         assert!(
@@ -514,6 +517,7 @@ mod tests {
                 cache_read_input_tokens: 5_000,
                 output_tokens: 42,
             }),
+            context_windows: vec![],
         });
         match &events[0] {
             UnifiedStreamEvent::Usage(u) => {
@@ -532,6 +536,7 @@ mod tests {
             duration_ms: None,
             cost_usd: None,
             usage: None,
+            context_windows: vec![],
         });
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], UnifiedStreamEvent::Error("rate limit".into()));
