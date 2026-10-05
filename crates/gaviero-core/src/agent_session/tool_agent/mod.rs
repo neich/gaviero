@@ -129,6 +129,10 @@ pub struct ToolAgentSession {
     #[allow(dead_code)] // Option-B writes are direct-to-disk; gate kept for parity
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     cancel_token: CancellationToken,
+    /// `AgentOptions::host_capture`: the host records and reviews the turn's
+    /// changes, so writes need no turn snapshot and nothing is reverted here
+    /// on error or cancel (the review shows those turns too).
+    host_capture: bool,
 }
 
 impl ToolAgentSession {
@@ -236,6 +240,7 @@ impl ToolAgentSession {
         // applied the host's policy, and a second resolution is how the two
         // views drift apart.
         let policy = surface.policy().clone();
+        let host_capture = options.host_capture;
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
@@ -255,6 +260,7 @@ impl ToolAgentSession {
             policy,
             write_gate,
             cancel_token,
+            host_capture,
         }
     }
 
@@ -336,7 +342,10 @@ impl AgentSession for ToolAgentSession {
                 .on_turn_cost_usd(outcome.total_cost_usd);
         }
 
-        let had_edits = !snapshot.lock().await.is_empty();
+        // Host capture: the host diffs the tree after the turn and reviews
+        // every change (cancelled and failed turns included), so the snapshot
+        // here is not used to revert or report anything.
+        let had_edits = !self.host_capture && !snapshot.lock().await.is_empty();
         if outcome.error.is_some() || self.cancel_token.is_cancelled() {
             if had_edits {
                 if let Err(e) = snapshot.lock().await.revert_all().await {

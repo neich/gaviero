@@ -92,6 +92,8 @@ pub struct CursorSession {
     bash_approved: bool,
     /// MCP tools advertised for the retrieval stanza.
     exposed_tools: Option<Vec<String>>,
+    /// `AgentOptions::host_capture` — see `ClaudeSession::host_capture`.
+    host_capture: bool,
     /// One-shot Cursor reach warning (plan P0.4: warn-only, no argv switch).
     reach_warned: AtomicBool,
 }
@@ -135,6 +137,7 @@ impl CursorSession {
             cancel_token: args.cancel_token,
             bash_approved,
             exposed_tools: args.options.exposed_tools.clone(),
+            host_capture: args.options.host_capture,
             reach_warned: AtomicBool::new(false),
         }
     }
@@ -719,7 +722,9 @@ impl CursorSession {
                     } else {
                         self.workspace_root.join(&rel_or_abs)
                     };
-                    if !snapshots.contains_key(&abs_path) {
+                    // Host capture records the turn's changes itself; an
+                    // empty map also skips the post-stream revert/propose.
+                    if !self.host_capture && !snapshots.contains_key(&abs_path) {
                         let snapshot = match tokio::fs::read_to_string(&abs_path).await {
                             Ok(s) => Some(s),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

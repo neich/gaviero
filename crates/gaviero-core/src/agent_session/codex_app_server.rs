@@ -306,6 +306,10 @@ struct ReviewContext {
     agent_id: String,
     conv_id: Option<String>,
     tool_surface: AgentToolSurface,
+    /// `AgentOptions::host_capture`: approved edits stay on disk and the host
+    /// reviews the turn's changes; the snapshot only serves the approval
+    /// drift check, never a revert → re-propose.
+    host_capture: bool,
 }
 
 impl ReviewContext {
@@ -411,6 +415,7 @@ impl CodexAppServerSession {
             agent_id: args.agent_id,
             conv_id: args.conv_id,
             tool_surface,
+            host_capture: args.options.host_capture,
         };
 
         Self {
@@ -1685,6 +1690,9 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 }
 
 async fn finalize_native_edits(review: &ReviewContext, snapshot: TurnSnapshot) -> Result<()> {
+    if review.host_capture {
+        return Ok(());
+    }
     let mut errors = Vec::new();
     let mut completed = Vec::new();
 
@@ -2058,6 +2066,7 @@ mod tests {
             agent_id: "codex-test".to_string(),
             conv_id: None,
             tool_surface: AgentToolSurface::unrestricted_unattended(),
+            host_capture: false,
         }
     }
 
@@ -2626,6 +2635,25 @@ url = "https://example/mcp/"
         let dir = tempfile::tempdir().unwrap();
         let review = review_context(dir.path(), test_write_gate());
         assert!(resolve_allowed_path("../outside.txt", &review).is_err());
+    }
+
+    #[tokio::test]
+    async fn host_capture_leaves_native_edits_on_disk_without_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed.txt");
+        tokio::fs::write(&changed, "before\n").await.unwrap();
+        let gate = test_write_gate();
+        let mut review = review_context(dir.path(), gate.clone());
+        review.host_capture = true;
+
+        let mut snapshot = TurnSnapshot::default();
+        snapshot.capture_before_write(&changed).await.unwrap();
+        tokio::fs::write(&changed, "after\n").await.unwrap();
+        finalize_native_edits(&review, snapshot).await.unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(&changed).await.unwrap(), "after\n");
+        assert!(gate.lock().await.pending_proposals().is_empty());
+        assert!(gate.lock().await.active_proposal_ids().is_empty());
     }
 
     #[tokio::test]

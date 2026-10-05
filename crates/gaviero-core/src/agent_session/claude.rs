@@ -157,6 +157,10 @@ pub struct ClaudeSession {
     available_tools: Option<Vec<String>>,
     approved_tools: Option<Vec<String>>,
     exposed_tools: Option<Vec<String>>,
+    /// `AgentOptions::host_capture`: the host records this turn's changes
+    /// itself, so tool edits land without the snapshot → revert → propose
+    /// round trip below.
+    host_capture: bool,
     profile: ProviderProfile,
     /// Resume handle, initialized from `options.resume_session_id` at
     /// construction. M6: set once and used as input to `AcpSession::spawn`
@@ -201,6 +205,7 @@ impl ClaudeSession {
         let available_tools = args.options.available_tools.clone();
         let approved_tools = args.options.approved_tools.clone();
         let exposed_tools = args.options.exposed_tools.clone();
+        let host_capture = args.options.host_capture;
 
         Self {
             write_gate: args.write_gate,
@@ -216,6 +221,7 @@ impl ClaudeSession {
             available_tools,
             approved_tools,
             exposed_tools,
+            host_capture,
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
@@ -323,6 +329,7 @@ impl ClaudeSession {
                 // Keeps a background command alive past the parent's first
                 // `result` in auto-approve mode too — see `acp::turn`.
                 stdin_prompt: true,
+                host_capture: self.host_capture,
                 ..AgentOptions::default()
             }
         };
@@ -528,7 +535,9 @@ impl ClaudeSession {
                                             );
                                         }
                                     }
-                                    for tu in &tool_uses {
+                                    // Host capture: the turn's changes are
+                                    // recorded by the host, whatever wrote them.
+                                    for tu in tool_uses.iter().filter(|_| !self.host_capture) {
                                         if matches!(
                                             tu.name.as_str(),
                                             "Write" | "Edit" | "MultiEdit"
