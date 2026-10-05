@@ -31,6 +31,8 @@ pub enum ClientFrame {
     RequestTerminals(RequestTerminals),
     TerminalInput(TerminalInput),
     RequestFileCompletions(RequestFileCompletions),
+    /// 1.2 (`turn_review`).
+    TurnReviewAction(TurnReviewAction),
 }
 
 impl ClientFrame {
@@ -52,7 +54,20 @@ impl ClientFrame {
         "request_terminals",
         "terminal_input",
         "request_file_completions",
+        "turn_review_action",
     ];
+}
+
+/// Decide a pending turn review from the phone. Actions are absolute (never
+/// toggles), so a retried command is harmless. Per-hunk decisions are
+/// desktop-only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnReviewAction {
+    pub turn_id: String,
+    pub action: TurnReviewActionKind,
+    /// Required for `keep_file` / `revert_file`: a `TurnReviewFile.path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -180,6 +195,12 @@ pub enum ServerFrame {
     CostUpdate(CostUpdate),
     CommandResult(CommandResult),
     CommandError(CommandError),
+    /// 1.2 (`turn_review`): a review opened (upsert by `turn_id`).
+    TurnReviewPending(TurnReviewEvent),
+    /// 1.2: decisions or overlap marks changed (upsert by `turn_id`).
+    TurnReviewUpdated(TurnReviewEvent),
+    /// 1.2: the review was finalized; the conversation is unblocked.
+    TurnReviewResolved(TurnReviewResolved),
 }
 
 impl ServerFrame {
@@ -205,6 +226,9 @@ impl ServerFrame {
         "cost_update",
         "command_result",
         "command_error",
+        "turn_review_pending",
+        "turn_review_updated",
+        "turn_review_resolved",
     ];
 }
 
@@ -217,6 +241,27 @@ pub struct Snapshot {
     pub open_permissions: Vec<PermissionRequest>,
     pub open_proposals: Vec<ProposalSummary>,
     pub settings: RemoteSettings,
+    /// 1.2 (`turn_review`): reviews awaiting a decision, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_turn_reviews: Vec<TurnReview>,
+}
+
+/// Payload of `turn_review_pending` / `turn_review_updated`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnReviewEvent {
+    pub review: TurnReview,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnReviewResolved {
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_id: Option<String>,
+    pub kept: u32,
+    pub reverted: u32,
+    /// `path: reason` for decisions that could not be applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

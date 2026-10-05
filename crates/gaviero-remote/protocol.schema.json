@@ -76,7 +76,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -115,6 +115,27 @@
           "conv_id",
           "conv_revision",
           "title"
+        ],
+        "type": "object"
+      },
+      "RequestFileCompletions": {
+        "properties": {
+          "limit": {
+            "description": "Clamped server-side to 1–50; absent ⇒ 10.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "Text typed after `@`, without the `@`. Limited to 1024 bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
         ],
         "type": "object"
       },
@@ -163,40 +184,12 @@
           "terminal_id": {
             "format": "uint64",
             "minimum": 0,
-            "type": ["integer", "null"]
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
-        "type": "object"
-      },
-      "TerminalInput": {
-        "properties": {
-          "terminal_id": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "text": {
-            "description": "UTF-8 input, including terminal control keys. Limited to 4096 bytes.",
-            "type": "string"
-          }
-        },
-        "required": ["terminal_id", "text"],
-        "type": "object"
-      },
-      "RequestFileCompletions": {
-        "properties": {
-          "limit": {
-            "description": "Clamped server-side to 1–50; absent ⇒ 10.",
-            "format": "uint32",
-            "minimum": 0,
-            "type": ["integer", "null"]
-          },
-          "query": {
-            "description": "Text typed after `@`, without the `@`. Limited to 1024 bytes.",
-            "type": "string"
-          }
-        },
-        "required": ["query"],
         "type": "object"
       },
       "ResetConversation": {
@@ -303,6 +296,57 @@
           "conv_id"
         ],
         "type": "object"
+      },
+      "TerminalInput": {
+        "properties": {
+          "terminal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "description": "UTF-8 input, including terminal control keys. Limited to 4096 bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "text"
+        ],
+        "type": "object"
+      },
+      "TurnReviewAction": {
+        "description": "Decide a pending turn review from the phone. Actions are absolute (never\ntoggles), so a retried command is harmless. Per-hunk decisions are\ndesktop-only.",
+        "properties": {
+          "action": {
+            "$ref": "#/$defs/TurnReviewActionKind"
+          },
+          "path": {
+            "description": "Required for `keep_file` / `revert_file`: a `TurnReviewFile.path`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "TurnReviewActionKind": {
+        "enum": [
+          "keep_file",
+          "revert_file",
+          "keep_all",
+          "revert_all",
+          "finalize"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -517,26 +561,67 @@
       },
       {
         "properties": {
-          "payload": { "$ref": "#/$defs/RequestTerminals" },
-          "type": { "const": "request_terminals", "type": "string" }
+          "payload": {
+            "$ref": "#/$defs/RequestTerminals"
+          },
+          "type": {
+            "const": "request_terminals",
+            "type": "string"
+          }
         },
-        "required": ["type", "payload"],
+        "required": [
+          "type",
+          "payload"
+        ],
         "type": "object"
       },
       {
         "properties": {
-          "payload": { "$ref": "#/$defs/TerminalInput" },
-          "type": { "const": "terminal_input", "type": "string" }
+          "payload": {
+            "$ref": "#/$defs/TerminalInput"
+          },
+          "type": {
+            "const": "terminal_input",
+            "type": "string"
+          }
         },
-        "required": ["type", "payload"],
+        "required": [
+          "type",
+          "payload"
+        ],
         "type": "object"
       },
       {
         "properties": {
-          "payload": { "$ref": "#/$defs/RequestFileCompletions" },
-          "type": { "const": "request_file_completions", "type": "string" }
+          "payload": {
+            "$ref": "#/$defs/RequestFileCompletions"
+          },
+          "type": {
+            "const": "request_file_completions",
+            "type": "string"
+          }
         },
-        "required": ["type", "payload"],
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "1.2 (`turn_review`).",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TurnReviewAction"
+          },
+          "type": {
+            "const": "turn_review_action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
         "type": "object"
       }
     ],
@@ -608,7 +693,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -678,7 +763,7 @@
   "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 1
+    "minor": 2
   },
   "server_envelope": {
     "$defs": {
@@ -1019,7 +1104,9 @@
           "too_large",
           "rate_limited",
           "duplicate_command",
-          "internal_error"
+          "internal_error",
+          "turn_review_pending",
+          "unknown_turn_review"
         ],
         "type": "string"
       },
@@ -1583,7 +1670,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -1653,6 +1740,13 @@
           "open_proposals": {
             "items": {
               "$ref": "#/$defs/ProposalSummary"
+            },
+            "type": "array"
+          },
+          "open_turn_reviews": {
+            "description": "1.2 (`turn_review`): reviews awaiting a decision, oldest first.",
+            "items": {
+              "$ref": "#/$defs/TurnReview"
             },
             "type": "array"
           },
@@ -1838,6 +1932,166 @@
           "conv_id",
           "turn_id",
           "tool_name"
+        ],
+        "type": "object"
+      },
+      "TurnFileChange": {
+        "enum": [
+          "added",
+          "modified",
+          "deleted"
+        ],
+        "type": "string"
+      },
+      "TurnFileDecision": {
+        "oneOf": [
+          {
+            "const": "pending",
+            "description": "Not decided yet.",
+            "type": "string"
+          },
+          {
+            "const": "keep",
+            "description": "Accepted: the agent's version stays.",
+            "type": "string"
+          },
+          {
+            "const": "revert",
+            "description": "Rejected: back to the pre-prompt version (already applied on disk).",
+            "type": "string"
+          },
+          {
+            "const": "revert_hunks",
+            "description": "Some hunks reverted. The desktop no longer produces it (its review\nis whole-file only); kept so 1.2 clients that know it still decode.",
+            "type": "string"
+          }
+        ]
+      },
+      "TurnOutcome": {
+        "enum": [
+          "completed",
+          "cancelled",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "TurnReview": {
+        "description": "A turn whose file changes await the mandatory review.",
+        "properties": {
+          "conv_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "items": {
+              "$ref": "#/$defs/TurnReviewFile"
+            },
+            "type": "array"
+          },
+          "outcome": {
+            "$ref": "#/$defs/TurnOutcome"
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "turn_id",
+          "outcome",
+          "files"
+        ],
+        "type": "object"
+      },
+      "TurnReviewEvent": {
+        "description": "Payload of `turn_review_pending` / `turn_review_updated`.",
+        "properties": {
+          "review": {
+            "$ref": "#/$defs/TurnReview"
+          }
+        },
+        "required": [
+          "review"
+        ],
+        "type": "object"
+      },
+      "TurnReviewFile": {
+        "description": "One file a turn changed on disk.",
+        "properties": {
+          "binary": {
+            "type": "boolean"
+          },
+          "change": {
+            "$ref": "#/$defs/TurnFileChange"
+          },
+          "decision": {
+            "$ref": "#/$defs/TurnFileDecision"
+          },
+          "overlap_with": {
+            "description": "Turn ids whose window overlapped this turn and changed the same path.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "description": "Workspace-folder-relative, `/`-separated.",
+            "type": "string"
+          },
+          "revertible": {
+            "description": "False when the pre-turn content was not stored: keep is the only option.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "change",
+          "decision",
+          "revertible",
+          "binary"
+        ],
+        "type": "object"
+      },
+      "TurnReviewResolved": {
+        "properties": {
+          "conv_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed": {
+            "description": "`path: reason` for decisions that could not be applied.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kept": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reverted": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "kept",
+          "reverted"
         ],
         "type": "object"
       },
@@ -2171,6 +2425,57 @@
           },
           "type": {
             "const": "command_error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "1.2 (`turn_review`): a review opened (upsert by `turn_id`).",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TurnReviewEvent"
+          },
+          "type": {
+            "const": "turn_review_pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "1.2: decisions or overlap marks changed (upsert by `turn_id`).",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TurnReviewEvent"
+          },
+          "type": {
+            "const": "turn_review_updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "1.2: the review was finalized; the conversation is unblocked.",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TurnReviewResolved"
+          },
+          "type": {
+            "const": "turn_review_resolved",
             "type": "string"
           }
         },

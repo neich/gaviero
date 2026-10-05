@@ -518,6 +518,8 @@ fn frame_conv_id(frame: &ServerFrame) -> Option<&str> {
         F::ProposalCreated(x) | F::ProposalUpdated(x) | F::ProposalDetail(x) => {
             x.proposal.conv_id.as_deref()
         }
+        F::TurnReviewPending(x) | F::TurnReviewUpdated(x) => x.review.conv_id.as_deref(),
+        F::TurnReviewResolved(x) => x.conv_id.as_deref(),
         F::Hello(_)
         | F::Snapshot(_)
         | F::ProposalFinalized(_)

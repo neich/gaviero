@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.1 (1.0 frozen; 1.1 additive)
+# Gaviero Remote Protocol — v1.2 (1.0 frozen; 1.1 and 1.2 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 1 }
+PROTOCOL_VERSION  = { major: 1, minor: 2 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1)
@@ -34,6 +34,29 @@ Feature-detect through `hello.capabilities`, never through `minor`.
 Compatibility: a 1.0 client talking to a 1.1 server ignores the new fields and works unchanged. A
 1.1 client talking to a 1.0 server must send `before_seq` (any value ≥ the newest `seq`, e.g.
 `9007199254740991`) and treat the instance as directory-less.
+
+## 1.2 additions — turn review
+
+Feature-detect through the `turn_review` capability. In TUI chat every file a turn changed on disk
+is captured by the desktop; when a turn changed anything its review is **mandatory**: the
+conversation refuses `send_prompt` (`command_error { turn_review_pending }`) until the review is
+finalized, from either side.
+
+| Where | Addition |
+|---|---|
+| server frame `turn_review_pending` | `{ review: TurnReview }` — a review opened (upsert by `turn_id`) |
+| server frame `turn_review_updated` | `{ review: TurnReview }` — decisions or overlap marks changed (upsert) |
+| server frame `turn_review_resolved` | `{ turn_id, conv_id?, kept, reverted, failed? }` — finalized; drop it, the conversation is unblocked |
+| `snapshot.open_turn_reviews` | optional `[TurnReview]`, omitted when empty; a snapshot replaces the client's set |
+| client frame `turn_review_action` | `{ turn_id, action, path? }` — the four decisions, each applied immediately: `keep_file` (accept) / `revert_file` (reject: back to the pre-prompt version) for one file, `keep_all` / `revert_all` for every file still `pending`. The review ends (`turn_review_resolved`) once no file is `pending`. `finalize` is accepted as `keep_all`. `path` (a `TurnReviewFile.path`) required for the per-file actions. |
+| `command_error.code` | `turn_review_pending`, `unknown_turn_review` (already finalized — usually by the desktop; refresh, do not retry) |
+
+Rejecting a file that changed *after* the turn needs a confirmation that is desktop-only: from the
+phone, `revert_file` / `revert_all` on such a file fails with `invalid_payload` and leaves it
+`pending`.
+
+Compatibility: a 1.1 client ignores the new frames and the snapshot field; its `send_prompt` on a
+blocked conversation fails with a code it maps to `unrecognized`.
 
 - **major** bumps on incompatible envelope or semantic changes. The server rejects a
   different major.
@@ -103,6 +126,7 @@ invalid_payload      unknown_type          unknown_conversation  unknown_request
 unknown_proposal     invalid_hunk          stale_request         stale_proposal
 stale_conversation   conversation_streaming  slash_not_allowed   confirm_required
 too_large            rate_limited          duplicate_command     internal_error
+turn_review_pending  unknown_turn_review                                         (1.2)
 ```
 
 ## Per-entity freshness — first-writer-wins
@@ -150,6 +174,7 @@ holds the current token.
 | `request_terminals` | `{ terminal_id? }` — requires `shell_sessions`; lists tabs and reads the selected screen |
 | `terminal_input` | `{ terminal_id, text }` — requires `shell_sessions`; writes UTF-8 input and control keys to the named PTY |
 | `request_file_completions` | `{ query, limit? }` — requires `file_completions`; workspace paths for an `@` reference |
+| `turn_review_action` | `{ turn_id, action, path? }` — requires `turn_review` (1.2); see §1.2 additions |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -159,7 +184,7 @@ close 4006.
 | type | payload |
 |---|---|
 | `hello` | `{ protocol_version, instance_id, tui_version, workspace: { id, display_name }, capabilities, confirm_required, allowed_slash_commands, limits, machine? }` — `machine` since 1.1 |
-| `snapshot` | `{ revision, conversations: [ConversationSummary], active_id, active_conversation: ConversationState, open_permissions: [PermissionRequest], open_proposals: [ProposalSummary], settings: RemoteSettings }` |
+| `snapshot` | `{ revision, conversations: [ConversationSummary], active_id, active_conversation: ConversationState, open_permissions: [PermissionRequest], open_proposals: [ProposalSummary], settings: RemoteSettings, open_turn_reviews? }` — `open_turn_reviews` since 1.2 |
 | `conversation_state_changed` | `{ conversation: ConversationSummary, active_id }` — upsert by `conv_id` |
 | `conversation_removed` | `{ conv_id, active_id }` |
 | `message_page` | `{ conv_id, messages: [Message], oldest_seq, has_older_messages }` |
@@ -178,10 +203,12 @@ close 4006.
 | `cost_update` | `{ conv_id, turn_id, usd }` |
 | `command_result` | `{ command_id, status, result? }` — `status ∈ accepted \| completed` |
 | `command_error` | `{ command_id, code, message }` |
+| `turn_review_pending` / `turn_review_updated` | `{ review: TurnReview }` — 1.2 |
+| `turn_review_resolved` | `{ turn_id, conv_id?, kept, reverted, failed? }` — 1.2 |
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
-minor versions can advertise features. 1.1 advertises `latest_page` and `instances`. Clients
-ignore unknown entries.
+minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
+`turn_review`. Clients ignore unknown entries.
 
 ## DTOs
 
@@ -235,6 +262,16 @@ ProposalSummary      { proposal_id, proposal_revision, conv_id?, source, path, s
                        removed_lines, hunks: [HunkSummary] }
 HunkSummary          { index, hunk_type, description, status }
   Never carries hunk text.
+
+TurnReview           { turn_id, conv_id?, outcome, files: [TurnReviewFile], warnings? }  (1.2)
+  outcome ∈ completed | cancelled | failed
+TurnReviewFile       { path, change, decision, revertible, binary, overlap_with? }       (1.2)
+  change ∈ added | modified | deleted
+  decision ∈ pending | keep | revert | revert_hunks — pending = not decided yet; keep =
+  accepted; revert = rejected (already back to the pre-prompt version on disk);
+  revert_hunks is not produced by current desktops.
+  path is workspace-folder-relative. revertible: false ⇒ keep is the only option.
+  overlap_with lists turn ids whose window overlapped and changed the same path.
 
 RemoteSettings       { default_model?, default_effort? }
   Explicit allow-list; never raw workspace settings. Additions are minor bumps.

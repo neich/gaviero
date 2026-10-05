@@ -36,7 +36,7 @@ fn fixtures(side: &str) -> Vec<(String, String)> {
 #[test]
 fn client_fixtures_round_trip() {
     let fixtures = fixtures("client");
-    assert_eq!(fixtures.len(), 16, "one fixture per client frame type");
+    assert_eq!(fixtures.len(), 17, "one fixture per client frame type");
     for (name, text) in fixtures {
         let parsed: Value = serde_json::from_str(&text).unwrap();
         let env: ClientEnvelope = serde_json::from_str(&text)
@@ -51,7 +51,7 @@ fn client_fixtures_round_trip() {
 #[test]
 fn server_fixtures_round_trip() {
     let fixtures = fixtures("server");
-    assert_eq!(fixtures.len(), 20, "one fixture per server frame type");
+    assert_eq!(fixtures.len(), 23, "one fixture per server frame type");
     for (name, text) in fixtures {
         let parsed: Value = serde_json::from_str(&text).unwrap();
         let env: ServerEnvelope = serde_json::from_str(&text)
