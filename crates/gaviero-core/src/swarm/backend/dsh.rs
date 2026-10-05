@@ -17,10 +17,7 @@ use crate::context_planner::{PlannerMetadata, PlannerSelections};
 use crate::observer::AcpObserver;
 use crate::write_gate::{WriteGatePipeline, WriteMode};
 
-use super::{
-    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset,
-    UnifiedStreamEvent,
-};
+use super::{AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, UnifiedStreamEvent};
 
 pub struct DshBackend {
     display_name: String,
@@ -77,10 +74,7 @@ impl AgentBackend for DshBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
-        let write_gate = request
-            .write_gate
-            .map(|h| h.0)
-            .unwrap_or_else(|| {
+        let write_gate = request.write_gate.map(|h| h.0).unwrap_or_else(|| {
             Arc::new(Mutex::new(WriteGatePipeline::new(
                 WriteMode::RejectAll,
                 Box::new(NoopWrite),
@@ -113,8 +107,9 @@ impl AgentBackend for DshBackend {
             cancel_token: CancellationToken::new(),
             mcp_server: None,
         };
-        let mut session =
-            AcpClientSession::new_with_scope(args, request.file_scope.clone()).with_extra(extra).with_system_prompt(request.system_prompt);
+        let mut session = AcpClientSession::new_with_scope(args, request.file_scope.clone())
+            .with_extra(extra)
+            .with_system_prompt(request.system_prompt);
         let turn = build_turn(
             PlannerSelections {
                 memory_selections: vec![],
@@ -142,10 +137,11 @@ impl AgentBackend for DshBackend {
     }
 
     async fn health_check(&self) -> Result<()> {
-        let spec = crate::agent_session::agent_client_protocol::dsh::DshLaunchSpec::from_workspace_root(
-            Path::new("."),
-            &[],
-        );
+        let spec =
+            crate::agent_session::agent_client_protocol::dsh::DshLaunchSpec::from_workspace_root(
+                Path::new("."),
+                &[],
+            );
         if spec.command_resolvable() {
             Ok(())
         } else {

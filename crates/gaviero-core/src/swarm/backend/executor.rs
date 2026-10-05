@@ -107,10 +107,8 @@ pub async fn complete_to_text(
         }
     }
 
-    if in_thinking {
-        if let Some(obs) = observer {
-            obs.on_stream_chunk("\n</think>\n");
-        }
+    if in_thinking && let Some(obs) = observer {
+        obs.on_stream_chunk("\n</think>\n");
     }
 
     // M0 instrumentation: emit per-turn Read tool count.

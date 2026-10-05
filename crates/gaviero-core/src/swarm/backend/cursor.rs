@@ -121,7 +121,8 @@ impl AgentBackend for CursorBackend {
         }
         let system_prompt = request.system_prompt.clone().unwrap_or_else(|| {
             default_editor_system_prompt(
-                &self.capabilities()
+                &self
+                    .capabilities()
                     .with_exposed_tools(request.exposed_tools.as_deref()),
             )
         });

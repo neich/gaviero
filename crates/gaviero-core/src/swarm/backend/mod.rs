@@ -159,7 +159,9 @@ impl Capabilities {
     /// Overlay `mcp.gavieroServer.exposedTools` onto this capability set.
     pub fn with_exposed_tools(mut self, tools: Option<&[String]>) -> Self {
         if let Some(t) = tools
-            && (self.retrieval.graph_and_memory || self.retrieval.symbols || !self.retrieval.exposed.is_empty())
+            && (self.retrieval.graph_and_memory
+                || self.retrieval.symbols
+                || !self.retrieval.exposed.is_empty())
         {
             self.retrieval = RetrievalToolset::from_exposed(t);
         }
@@ -168,7 +170,7 @@ impl Capabilities {
 }
 
 /// Runtime capability flags for a backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capabilities {
     pub tool_use: bool,
     pub streaming: bool,
@@ -180,21 +182,6 @@ pub struct Capabilities {
     pub supports_file_blocks: bool,
     /// Which read-only retrieval tools are live (drives the pull stanza).
     pub retrieval: RetrievalToolset,
-}
-
-impl Default for Capabilities {
-    fn default() -> Self {
-        Self {
-            tool_use: false,
-            streaming: false,
-            vision: false,
-            extended_thinking: false,
-            max_context_tokens: 0,
-            supports_system_prompt: false,
-            supports_file_blocks: false,
-            retrieval: RetrievalToolset::default(),
-        }
-    }
 }
 
 // ── Completion Request ──────────────────────────────────────────────────────
@@ -396,7 +383,7 @@ mod tests {
             suppress_hooks: true,
             file_scope: FileScope::default(),
             tool_policy: None,
-        exposed_tools: None,
+            exposed_tools: None,
             write_gate: None,
         };
 
@@ -443,7 +430,7 @@ mod tests {
             suppress_hooks: true,
             file_scope: FileScope::default(),
             tool_policy: None,
-        exposed_tools: None,
+            exposed_tools: None,
             write_gate: None,
         };
 
