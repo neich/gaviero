@@ -22,6 +22,7 @@ where
     let mut turn_count = 0;
     let mut session_params = Value::Null;
     let mut model_params = Value::Null;
+    let mut reasoning_params = Value::Null;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
@@ -53,12 +54,7 @@ where
                             },
                             "agentInfo": { "name": "fake-acp-agent", "version": "0.0.0" },
                             "authMethods": [],
-                            "configOptions": [{
-                                "id": "thinking",
-                                "name": "thinking",
-                                "description": "thinking on/off",
-                                "type": "boolean"
-                            }]
+                            "configOptions": config_options_for(scenario)
                         }
                     }),
                 )
@@ -84,31 +80,7 @@ where
                     )
                     .await?;
                 } else {
-                    let config_options = if scenario == "model_catalog" {
-                        json!([{
-                            "id": "model",
-                            "name": "Model",
-                            "category": "model",
-                            "type": "select",
-                            "currentValue": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
-                            "options": [{
-                                "group": "deepseek-official",
-                                "name": "DeepSeek",
-                                "options": [
-                                    {
-                                        "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
-                                        "name": "DeepSeek-V4-Flash"
-                                    },
-                                    {
-                                        "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
-                                        "name": "DeepSeek-V4-Pro"
-                                    }
-                                ]
-                            }]
-                        }])
-                    } else {
-                        json!([{ "id": "thinking", "type": "boolean" }])
-                    };
+                    let config_options = config_options_for(scenario);
                     write_json(
                         &mut writer,
                         &json!({
@@ -124,19 +96,57 @@ where
                 }
             }
             "session/set_config_option" | "session/set_model" => {
-                if method == "session/set_model" || msg["params"]["configId"] == "model" {
+                let config_id = msg["params"]["configId"].as_str().unwrap_or("");
+                let is_model = method == "session/set_model" || config_id == "model";
+                if is_model {
                     model_params = msg["params"].clone();
+                    write_json(
+                        &mut writer,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                    )
+                    .await?;
+                } else if config_id == "reasoning_effort"
+                    && !advertised_reasoning_values(scenario)
+                        .iter()
+                        .any(|value| Some(value.as_str()) == msg["params"]["value"].as_str())
+                {
+                    // Live dsh rejects a select value it did not advertise with
+                    // `unknown reasoning effort for provider/model: …`; mirror
+                    // that so a mis-mapped gaviero effort fails the test rather
+                    // than passing silently.
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": format!(
+                                    "unknown reasoning effort for provider/model: {}",
+                                    msg["params"]["value"]
+                                )
+                            }
+                        }),
+                    )
+                    .await?;
+                } else {
+                    reasoning_params = msg["params"].clone();
+                    write_json(
+                        &mut writer,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                    )
+                    .await?;
                 }
-                write_json(
-                    &mut writer,
-                    &json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-                )
-                .await?;
             }
             "session/prompt" => {
                 turn_count += 1;
-                if scenario == "inspect" || scenario == "model_catalog" {
-                    emit_update(&mut writer, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": json!({ "turn": turn_count, "new": session_params, "model": model_params, "prompt": msg["params"]["prompt"] }).to_string() } })).await?;
+                if scenario == "inspect"
+                    || scenario == "model_catalog"
+                    || scenario == "thinking_only"
+                    || scenario == "reasoning_default_off"
+                    || scenario == "thinking_disabled"
+                {
+                    emit_update(&mut writer, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": json!({ "turn": turn_count, "new": session_params, "model": model_params, "reasoning": reasoning_params, "prompt": msg["params"]["prompt"] }).to_string() } })).await?;
                 }
                 handle_prompt(&mut writer, id, scenario, &mut next_agent_id).await?;
                 if scenario == "die_mid" {
@@ -160,6 +170,98 @@ where
         }
     }
     Ok(())
+}
+
+/// Config options this scenario advertises, mirroring live dsh: a
+/// `reasoning_effort` select (`category: "thought_level"`) whose values are the
+/// DeepSeek adapter's `off | low | high | max`, the legacy `thinking` boolean
+/// for the fallback path, or the opaque model catalog.
+fn config_options_for(scenario: &str) -> Value {
+    match scenario {
+        "model_catalog" => json!([{
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+            "options": [{
+                "group": "deepseek-official",
+                "name": "DeepSeek",
+                "options": [
+                    {
+                        "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                        "name": "DeepSeek-V4-Flash"
+                    },
+                    {
+                        "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                        "name": "DeepSeek-V4-Pro"
+                    }
+                ]
+            }]
+        }]),
+        // Legacy shape: a bare boolean with no select values.
+        "thinking_only" => json!([{ "id": "thinking", "type": "boolean" }]),
+        // A deployment whose profile selected DeepSeek's `off`: every level is
+        // still offered, but inheriting the default would run without thinking.
+        "reasoning_default_off" => json!([{
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "off",
+            "options": [
+                { "value": "off", "name": "Off" },
+                { "value": "low", "name": "Low" },
+                { "value": "high", "name": "High" },
+                { "value": "max", "name": "Max" }
+            ]
+        }]),
+        // `thinking: disabled` in the dsh deployment: only `off` is advertised,
+        // so no ACP value can turn thinking back on.
+        "thinking_disabled" => json!([{
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "off",
+            "options": [
+                { "value": "off", "name": "Off" }
+            ]
+        }]),
+        _ => json!([{
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [
+                { "value": "off", "name": "Off" },
+                { "value": "low", "name": "Low" },
+                { "value": "high", "name": "High" },
+                { "value": "max", "name": "Max" }
+            ]
+        }]),
+    }
+}
+
+/// The `reasoning_effort` select values `scenario` advertises, for validating
+/// `session/set_config_option` the way live dsh does.
+fn advertised_reasoning_values(scenario: &str) -> Vec<String> {
+    config_options_for(scenario)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|option| option.get("id").and_then(Value::as_str) == Some("reasoning_effort"))
+        .filter_map(|option| option.get("options"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(

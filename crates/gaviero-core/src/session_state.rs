@@ -257,6 +257,9 @@ pub struct StoredMessage {
     /// Unix timestamp (seconds since epoch).
     #[serde(default)]
     pub timestamp: u64,
+    /// The user marked this message's exchange to carry over on `/handoff`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
 }
 
 /// A full conversation stored on disk.
@@ -293,6 +296,18 @@ pub struct StoredConversation {
     /// records written before T1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_token_usage: Option<StoredTokenUsage>,
+    /// The exchanges `/handoff` carried into a fresh provider session,
+    /// rendered once at handoff time. Sent while the planner would re-inline
+    /// the transcript (first turn of a native session; every turn of a
+    /// replayed one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_context: Option<String>,
+    /// Index into `messages` of the first message host replay may re-inline
+    /// (`/reset` and `/handoff` move it past the old transcript). Message
+    /// `seq`s are renumbered on load, so the boundary is stored as an index.
+    /// `None` = replay from the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_from_index: Option<usize>,
 }
 
 /// Serializable mirror of [`crate::acp::protocol::TokenUsage`] for on-disk
@@ -579,6 +594,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
     }
 
+    /// `/handoff` state: the kept flags, the carried block and the replay
+    /// boundary survive a round trip, and records written before them load.
+    #[test]
+    fn handoff_state_round_trips_and_older_records_load() {
+        let old = r#"{"id":"c","title":"t","messages":[{"role":"user","content":"hi"}],"created":1,"updated":2}"#;
+        let parsed: StoredConversation = serde_json::from_str(old).unwrap();
+        assert!(!parsed.messages[0].kept);
+        assert_eq!(parsed.carried_context, None);
+        assert_eq!(parsed.replay_from_index, None);
+
+        let mut stored = parsed;
+        stored.messages[0].kept = true;
+        stored.carried_context = Some("<carried_context>x</carried_context>".into());
+        stored.replay_from_index = Some(1);
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredConversation = serde_json::from_str(&json).unwrap();
+        assert!(back.messages[0].kept);
+        assert_eq!(
+            back.carried_context.as_deref(),
+            Some("<carried_context>x</carried_context>")
+        );
+        assert_eq!(back.replay_from_index, Some(1));
+    }
+
     #[test]
     fn save_conversation_leaves_a_readable_file_after_repeated_saves() {
         // Guards the truncation failure mode: the second save must never be
@@ -594,6 +633,7 @@ mod tests {
                 content: "a".repeat(4096),
                 tool_calls: Vec::new(),
                 timestamp: 0,
+                kept: false,
             }],
             created: 1,
             updated: 2,
@@ -602,6 +642,8 @@ mod tests {
             session_ledger: None,
             continuity_handle: None,
             last_token_usage: None,
+            carried_context: None,
+            replay_from_index: None,
         };
         save_conversation(key, &conv).unwrap();
 
@@ -678,6 +720,7 @@ mod tests {
                 content: "answer".into(),
                 tool_calls: Vec::new(),
                 timestamp: 1_757_000_042,
+                kept: false,
             }],
             created: 1000,
             updated: 2000,
@@ -686,6 +729,8 @@ mod tests {
             session_ledger: None,
             continuity_handle: None,
             last_token_usage: None,
+            carried_context: None,
+            replay_from_index: None,
         };
 
         let json = serde_json::to_string(&stored).unwrap();
@@ -724,6 +769,8 @@ mod tests {
             session_ledger: Some(persisted.clone()),
             continuity_handle: Some(ContinuityHandle::ClaudeSessionId("abc".into())),
             last_token_usage: None,
+            carried_context: None,
+            replay_from_index: None,
         };
 
         let json = serde_json::to_string(&stored).unwrap();
@@ -758,8 +805,14 @@ mod tests {
                 cache_read_input_tokens: 42_000,
                 output_tokens: 200,
             }),
+            carried_context: None,
+            replay_from_index: None,
         };
         let json = serde_json::to_string(&stored).unwrap();
+        assert!(
+            !json.contains("carried_context") && !json.contains("replay_from_index"),
+            "unset handoff fields stay out of the file: {json}"
+        );
         let back: StoredConversation = serde_json::from_str(&json).unwrap();
         let u = back.last_token_usage.expect("usage present");
         assert_eq!(u.input_tokens, 1500);

@@ -210,6 +210,19 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         match action {
             Action::CursorUp => app.chat_state.browse_up(),
             Action::CursorDown => app.chat_state.browse_down(),
+            // Mark the exchange under the cursor to carry over on /handoff.
+            Action::InsertChar(' ') => {
+                let idx = app.chat_state.active_conv;
+                let msg = app.chat_state.browsed_msg;
+                if let Some(kept) = app.chat_state.conversations[idx].toggle_keep_exchange(msg) {
+                    let note = if kept {
+                        "Exchange kept — /handoff carries it here, /handoff to <tab|new> elsewhere"
+                    } else {
+                        "Exchange no longer kept"
+                    };
+                    app.status_message = Some((note.to_string(), std::time::Instant::now()));
+                }
+            }
             Action::Copy => {
                 if let Some(text) = app.chat_state.browsed_message_content() {
                     app.set_clipboard(&text);
@@ -2137,6 +2150,20 @@ pub(crate) fn dispatch_prompt_core(
         .as_ref()
         .map(|l| l.is_first_turn())
         .unwrap_or(true);
+
+    // `/handoff`: the kept exchanges ride along exactly when the transcript
+    // would be re-inlined — the first turn of a native session (Claude,
+    // Cursor keep it from then on), every turn of a replayed one (codex,
+    // dsh, deepseek, ollama rebuild context each turn). After the user's
+    // prompt, which stays first. Not on a slash command: Claude runs one
+    // only when it is the whole message.
+    let task_text = crate::panels::agent_chat::with_carried_context(
+        task_text,
+        app.chat_state.conversations[conv_idx]
+            .carried_context
+            .as_deref(),
+        is_first_turn,
+    );
 
     // Conversation history is only inlined on the first turn AND when the
     // conversation's `transcript_inline_mode` allows it. On resumed turns

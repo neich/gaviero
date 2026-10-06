@@ -23,6 +23,49 @@ use super::{
     UnifiedStreamEvent,
 };
 
+/// DeepSeek's thinking-mode effort when gaviero names no level.
+///
+/// The API's own default (see <https://api-docs.deepseek.com/guides/thinking_mode>),
+/// pinned explicitly so every request carries a level instead of inheriting
+/// whatever the model or account default happens to be.
+pub const DEFAULT_DEEPSEEK_REASONING_EFFORT: &str = "high";
+
+/// Map gaviero's provider-neutral `effort` onto DeepSeek's `reasoning_effort`
+/// vocabulary.
+///
+/// DeepSeek's chat API accepts `low | high | max`, and maps a *requested* effort
+/// with the table from <https://api-docs.deepseek.com/guides/thinking_mode>
+/// (minimal→low, low→low, medium→high, high→high, xhigh→high, max→max,
+/// ultra→max). The dsh DeepSeek adapter advertises the same thinking levels as
+/// its ACP `reasoning_effort` select (`low | high | max`, plus `off`), so both
+/// DeepSeek paths share this one mapping.
+///
+/// `None` means "gaviero names no level" — `off`/`auto`/unknown are deliberately
+/// **not** forwarded as DeepSeek's `off`, which would disable thinking. Callers
+/// substitute [`DEFAULT_DEEPSEEK_REASONING_EFFORT`].
+pub fn reasoning_effort_for_deepseek(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "low" => Some("low"),
+        "medium" | "high" | "xhigh" => Some("high"),
+        "max" | "ultra" => Some("max"),
+        _ => None,
+    }
+}
+
+/// The `reasoning_effort` to send on the DeepSeek chat API.
+///
+/// Thinking mode is always on for gaviero, so the mapping never yields `off`:
+/// an explicit level maps onto `low|high|max`, and anything else
+/// (`off`/`auto`/unset/unknown) resolves to `high`. Sending a level that the
+/// model cannot do would be a hard API error, which is why unknown values fall
+/// back rather than being forwarded verbatim.
+pub fn deepseek_reasoning_effort(effort: Option<&str>) -> &'static str {
+    match effort.and_then(reasoning_effort_for_deepseek) {
+        Some(level) => level,
+        None => DEFAULT_DEEPSEEK_REASONING_EFFORT,
+    }
+}
+
 /// Swarm backend that delegates to the in-process tool-agent harness.
 pub struct DeepseekBackend {
     model: String,
@@ -137,6 +180,7 @@ impl AgentBackend for DeepseekBackend {
             allowed_tools: request.allowed_tools,
             auto_approve: request.auto_approve,
             tool_policy: request.tool_policy,
+            effort: request.effort,
         };
 
         tokio::spawn(async move {
@@ -205,5 +249,52 @@ mod tests {
         let caps = DeepseekBackend::capabilities_for_swarm();
         assert!(caps.tool_use);
         assert!(!caps.supports_file_blocks);
+    }
+
+    /// The exact table from the DeepSeek thinking-mode guide, shared by the
+    /// dsh ACP path and the in-process chat client.
+    #[test]
+    fn effort_vocabulary_maps_onto_deepseek_levels() {
+        for (requested, expected) in [
+            ("minimal", Some("low")),
+            ("low", Some("low")),
+            ("medium", Some("high")),
+            ("high", Some("high")),
+            ("xhigh", Some("high")),
+            ("max", Some("max")),
+            ("ultra", Some("max")),
+        ] {
+            assert_eq!(
+                reasoning_effort_for_deepseek(requested),
+                expected,
+                "requested {requested}"
+            );
+        }
+        // Case/whitespace tolerant, like the other providers' effort maps.
+        assert_eq!(reasoning_effort_for_deepseek(" ULTRA "), Some("max"));
+        assert_eq!(reasoning_effort_for_deepseek("Medium"), Some("high"));
+    }
+
+    #[test]
+    fn off_and_auto_never_map_to_thinking_off() {
+        // Thinking mode is always on, so `off`/`auto`/unknown must not become
+        // DeepSeek's `off` reasoning value.
+        for requested in ["off", "auto", "", "   ", "OFF", "AUTO", "unknown"] {
+            assert_eq!(reasoning_effort_for_deepseek(requested), None, "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn unset_effort_resolves_to_the_thinking_default() {
+        assert_eq!(deepseek_reasoning_effort(Some("max")), "max");
+        assert_eq!(deepseek_reasoning_effort(Some("minimal")), "low");
+        for unset in [None, Some("off"), Some("auto"), Some(""), Some("turbo")] {
+            assert_eq!(
+                deepseek_reasoning_effort(unset),
+                DEFAULT_DEEPSEEK_REASONING_EFFORT,
+                "{unset:?} must keep thinking on at the default level"
+            );
+        }
+        assert_eq!(DEFAULT_DEEPSEEK_REASONING_EFFORT, "high");
     }
 }

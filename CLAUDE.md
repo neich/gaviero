@@ -4,11 +4,17 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024 workspace.
 
 ## Build & Test
 
+### Build
 ```bash
 cargo build                    # all crates
-cargo test                     # all tests (network/model tests are #[ignore])
-cargo clippy --workspace       # lint
 ```
+### Test
+```bash
+cargo test
+```
+
+
+Do not run rustfmt
 
 Binaries: `gaviero` (TUI), `gaviero-cli` (headless), `gaviero-mcp-shim` (subprocess→MCP bridge).
 

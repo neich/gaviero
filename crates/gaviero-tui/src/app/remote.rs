@@ -32,6 +32,8 @@ pub const REMOTE_ALLOWED_SLASH: &[&str] = &[
     "/no-inject",
     "/reset",
     "/clear",
+    "/keep",
+    "/handoff",
     "/rename",
     "/namespace",
     "/ns",
@@ -47,7 +49,8 @@ pub const REMOTE_ALLOWED_SLASH: &[&str] = &[
 ];
 
 /// Destructive or approval-bypassing commands require `confirmed: true`.
-pub const REMOTE_CONFIRM_REQUIRED: &[&str] = &["/autoapprove", "/yolo", "/reset", "/clear"];
+pub const REMOTE_CONFIRM_REQUIRED: &[&str] =
+    &["/autoapprove", "/yolo", "/reset", "/clear", "/handoff"];
 
 /// First whitespace-delimited token of a slash line. Preserves the desktop
 /// parser's token boundary — `/runaway` does not match `/run`.

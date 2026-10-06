@@ -61,6 +61,16 @@ impl ApiClient for DeepseekClient {
         if let Some(mt) = request.max_tokens {
             body["max_tokens"] = json!(mt);
         }
+        if let Some(effort) = &request.reasoning_effort {
+            // Thinking mode is on for every gaviero turn. The level and the
+            // toggle are sent together so neither a model default nor an
+            // account default can turn the chain of thought off — see
+            // <https://api-docs.deepseek.com/guides/thinking_mode>: on the
+            // OpenAI-format endpoint the toggle is a top-level `thinking`
+            // object and the level a top-level `reasoning_effort`.
+            body["reasoning_effort"] = json!(effort);
+            body["thinking"] = json!({ "type": "enabled" });
+        }
 
         let resp = post_with_retry(&self.http, &url, cfg.api_key.expose(), &body).await?;
 
@@ -388,7 +398,7 @@ mod tests {
     use super::super::{ApiEvent, ApiRequest, ToolCall};
     use super::*;
     use futures::StreamExt;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg(base: &str) -> ApiClientConfig {
@@ -417,6 +427,7 @@ mod tests {
             messages: vec![json!({ "role": "user", "content": "hi" })],
             tools: vec![],
             max_tokens: None,
+            reasoning_effort: Some("high".into()),
         };
         let mut stream = client.complete(request).await.unwrap();
         let mut events = Vec::new();
@@ -455,6 +466,71 @@ mod tests {
             other => panic!("expected Usage, got {other:?}"),
         }
         assert!(matches!(events[3], ApiEvent::Done(StopReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn sends_reasoning_effort_and_enables_thinking() {
+        // The request body must carry both DeepSeek's OpenAI-format toggle and
+        // the resolved level; a body that omits either fails the matcher and
+        // wiremock answers 404, which surfaces as a `complete` error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "reasoning_effort": "max",
+                "thinking": { "type": "enabled" }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DeepseekClient::new(Ok(cfg(&server.uri())));
+        let request = ApiRequest {
+            model: "deepseek-v4-pro".into(),
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            tools: vec![],
+            max_tokens: None,
+            reasoning_effort: Some("max".into()),
+        };
+        let mut stream = client.complete(request).await.unwrap();
+        while stream.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn omits_thinking_when_no_effort_is_requested() {
+        // `None` means the provider default is left alone; the toggle must not
+        // be asserted for a caller that asked for no reasoning control.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DeepseekClient::new(Ok(cfg(&server.uri())));
+        let request = ApiRequest {
+            model: "deepseek-v4-pro".into(),
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            tools: vec![],
+            max_tokens: None,
+            reasoning_effort: None,
+        };
+        let mut stream = client.complete(request).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("thinking").is_none(), "{body}");
     }
 
     #[tokio::test]
@@ -617,6 +693,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            reasoning_effort: None,
         };
         let result = client.complete(request).await;
         assert!(result.is_err());
@@ -658,6 +735,7 @@ mod tests {
             messages: vec![json!({ "role": "user", "content": "hi" })],
             tools: vec![],
             max_tokens: None,
+            reasoning_effort: Some("low".into()),
         };
         let mut stream = client.complete(request).await.unwrap();
         let mut saw_text = false;
@@ -677,6 +755,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            reasoning_effort: None,
         };
         assert!(client.complete(request).await.is_err());
     }

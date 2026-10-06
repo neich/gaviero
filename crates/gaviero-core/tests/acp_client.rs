@@ -476,6 +476,177 @@ fn turn(msg: &str, auto_approve: bool) -> Turn {
     }
 }
 
+/// The same turn but with an explicit effort, so tests can drive `apply_effort`.
+fn turn_with_effort(msg: &str, effort: &str) -> Turn {
+    Turn {
+        effort: Some(effort.into()),
+        ..turn(msg, true)
+    }
+}
+
+/// gaviero's effort vocabulary maps onto the values `dsh` actually advertises
+/// (`off | low | high | max`) rather than being sent verbatim: live dsh rejects
+/// an unadvertised select value with `unknown reasoning effort`, which is how
+/// `medium`/`xhigh`/`ultra` used to be dropped silently.
+#[tokio::test]
+async fn effort_maps_onto_the_advertised_reasoning_select() {
+    let dir = workspace();
+    let mut args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    args.options.effort = "off".into();
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect"));
+
+    for (requested, expected) in [
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "high"),
+        ("max", "max"),
+        ("ultra", "max"),
+    ] {
+        let report =
+            inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", requested)).await);
+        assert_eq!(
+            report["reasoning"]["configId"], "reasoning_effort",
+            "requested {requested}: {report}"
+        );
+        assert_eq!(
+            report["reasoning"]["value"], expected,
+            "requested {requested}: {report}"
+        );
+    }
+    Box::new(session).close().await;
+}
+
+/// Thinking mode is always on *and* the level is always set explicitly:
+/// `off`/`auto` must never select DeepSeek's `off` reasoning value (which
+/// disables the chain of thought), and must not leave the level to an implicit
+/// provider default either — `set_config_option` is issued on every session.
+#[tokio::test]
+async fn off_effort_is_set_explicitly_and_never_disables_thinking() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect"));
+
+    for requested in ["off", "auto", ""] {
+        let report =
+            inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", requested)).await);
+        assert_eq!(
+            report["reasoning"]["configId"], "reasoning_effort",
+            "{requested:?} must be set on the session, not left implicit: {report}"
+        );
+        let value = report["reasoning"]["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{requested:?} must send a string level: {report}"));
+        assert!(
+            !value.is_empty() && !value.eq_ignore_ascii_case("off"),
+            "{requested:?} must keep thinking on, got {value:?}: {report}"
+        );
+    }
+    Box::new(session).close().await;
+}
+
+/// Agents that only expose the legacy boolean `thinking` option still get
+/// thinking *enabled*, even when gaviero's effort is `off`.
+#[tokio::test]
+async fn legacy_thinking_option_is_always_enabled() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("thinking_only"));
+    let report = inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", "off")).await);
+    assert_eq!(report["reasoning"]["configId"], "thinking", "{report}");
+    assert_eq!(report["reasoning"]["value"], true, "{report}");
+    Box::new(session).close().await;
+}
+
+/// A dsh profile that defaults `reasoningEffort` to DeepSeek's `off` must not
+/// hand gaviero a non-thinking session: gaviero's unset (`off`/`auto`) effort
+/// selects a thinking level instead of inheriting the non-thinking default.
+#[tokio::test]
+async fn off_effort_does_not_inherit_a_non_thinking_default() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("reasoning_default_off"));
+
+    for requested in ["off", "auto"] {
+        let report =
+            inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", requested)).await);
+        assert_eq!(
+            report["reasoning"]["configId"], "reasoning_effort",
+            "{requested}: {report}"
+        );
+        assert_eq!(
+            report["reasoning"]["value"], "high",
+            "{requested} must pick a thinking level, not inherit `off`: {report}"
+        );
+    }
+
+    // An explicit gaviero level still wins over the fallback.
+    let report = inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", "max")).await);
+    assert_eq!(report["reasoning"]["value"], "max", "{report}");
+    Box::new(session).close().await;
+}
+
+/// `thinking: disabled` in the dsh deployment is not overridable over ACP: the
+/// adapter advertises only `off` and rejects anything else. gaviero must send
+/// nothing rather than a value live dsh would reject.
+#[tokio::test]
+async fn disabled_thinking_deployment_is_not_overridden() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("thinking_disabled"));
+
+    for requested in ["off", "medium", "max"] {
+        let report =
+            inspect_prompt(&drain_turn(&mut session, turn_with_effort("hi", requested)).await);
+        assert!(
+            report["reasoning"].is_null(),
+            "{requested} must not send an unadvertised effort: {report}"
+        );
+    }
+    Box::new(session).close().await;
+}
+
 async fn drain(session: &mut AcpClientSession, auto_approve: bool) -> Vec<UnifiedStreamEvent> {
     let mut stream = session
         .send_turn(turn("hello", auto_approve))

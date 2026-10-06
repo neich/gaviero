@@ -88,6 +88,9 @@ pub struct ChatMessage {
     /// deserialize to it via `#[serde(default)]`, and the renderer omits the
     /// stamp entirely rather than claiming 1970.
     pub timestamp: u64,
+    /// The user marked this message's exchange to carry over on `/handoff`
+    /// (browse mode: Space). Kept per message, toggled per exchange.
+    pub kept: bool,
 }
 
 fn chat_render_trace_enabled() -> bool {
@@ -654,6 +657,10 @@ pub struct Conversation {
     pub last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms,
     /// Memory injection size from the last `ChatMemoryInjected` event.
     pub last_memory_injection_tokens: usize,
+    /// What `/handoff` carried into the fresh provider session (the kept
+    /// exchanges, rendered). Sent with the prompt whenever the planner would
+    /// re-inline the transcript; cleared by `/reset`.
+    pub carried_context: Option<String>,
 }
 
 impl Conversation {
@@ -698,6 +705,7 @@ impl Conversation {
             last_bootstrap_tokens: 0,
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
+            carried_context: None,
         }
     }
 
@@ -741,6 +749,7 @@ impl Conversation {
             content,
             tool_calls,
             timestamp,
+            kept: false,
         });
     }
 
@@ -753,6 +762,105 @@ impl Conversation {
 
     pub fn has_running_background_agents(&self) -> bool {
         self.background_agents.iter().any(|a| !a.finished)
+    }
+
+    /// [`Self::replay_from_seq`] as an index into `messages`, for saving:
+    /// restore renumbers `seq` from 1, so the seq itself would not survive.
+    /// `None` when replay starts at the first message.
+    pub fn replay_from_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|m| m.seq >= self.replay_from_seq)
+            .or((self.replay_from_seq > 0).then_some(self.messages.len()))
+            .filter(|&i| i > 0)
+    }
+
+    /// Message indices of the exchange that holds message `i`: from the
+    /// user prompt that opened it up to (not including) the next prompt.
+    /// Messages before the first prompt form their own exchange.
+    fn exchange_range(&self, i: usize) -> std::ops::Range<usize> {
+        let start = self.messages[..=i]
+            .iter()
+            .rposition(|m| m.role == ChatRole::User)
+            .unwrap_or(0);
+        let end = self.messages[i + 1..]
+            .iter()
+            .position(|m| m.role == ChatRole::User)
+            .map_or(self.messages.len(), |p| i + 1 + p);
+        start..end
+    }
+
+    /// Mark or unmark the whole exchange holding message `i` for
+    /// `/handoff`. Only its prompt and answers carry; system notes never
+    /// do. Returns the new state, `None` when `i` is out of range.
+    pub fn toggle_keep_exchange(&mut self, i: usize) -> Option<bool> {
+        if i >= self.messages.len() {
+            return None;
+        }
+        let range = self.exchange_range(i);
+        let carries = |m: &ChatMessage| m.role != ChatRole::System;
+        let keep = !self.messages[range.clone()]
+            .iter()
+            .filter(|m| carries(m))
+            .any(|m| m.kept);
+        for m in self.messages[range].iter_mut().filter(|m| carries(m)) {
+            m.kept = keep;
+        }
+        self.bump_revision();
+        Some(keep)
+    }
+
+    /// The kept exchanges, oldest first: `(prompt, answers)` per exchange.
+    fn kept_exchanges(&self) -> Vec<(Option<&str>, Vec<&str>)> {
+        let mut out: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
+        let mut open = false;
+        for m in &self.messages {
+            match m.role {
+                ChatRole::User => {
+                    open = m.kept;
+                    if open {
+                        out.push((Some(m.content.as_str()), Vec::new()));
+                    }
+                }
+                ChatRole::Assistant if m.kept => {
+                    if !open {
+                        out.push((None, Vec::new()));
+                        open = true;
+                    }
+                    if let Some(last) = out.last_mut() {
+                        last.1.push(m.content.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Render the kept exchanges verbatim — never truncated, unlike host
+    /// replay (2,000 chars per message) — as the block `/handoff` carries.
+    /// `None` when nothing is kept.
+    pub fn render_kept_exchanges(&self) -> Option<(String, usize)> {
+        let exchanges = self.kept_exchanges();
+        if exchanges.is_empty() {
+            return None;
+        }
+        let mut body = String::from(
+            "<carried_context>\nThe user carried these exchanges over from earlier in this \
+             conversation; everything else from it was left out on purpose.\n",
+        );
+        for (n, (prompt, answers)) in exchanges.iter().enumerate() {
+            body.push_str(&format!("\n<exchange n=\"{}\">\n", n + 1));
+            if let Some(prompt) = prompt {
+                body.push_str(&format!("<user>\n{}\n</user>\n", prompt.trim()));
+            }
+            for answer in answers {
+                body.push_str(&format!("<assistant>\n{}\n</assistant>\n", answer.trim()));
+            }
+            body.push_str("</exchange>\n");
+        }
+        body.push_str("</carried_context>");
+        Some((body, exchanges.len()))
     }
 
     /// End every still-running background task with `status` (the host
@@ -1031,6 +1139,7 @@ impl AgentChatState {
             last_bootstrap_tokens: 0,
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
+            carried_context: None,
         };
         Self {
             conversations: vec![conv],
@@ -1907,6 +2016,7 @@ impl AgentChatState {
                         content: summary,
                         tool_calls: Vec::new(),
                         timestamp: gaviero_core::session_state::now_unix(),
+                        kept: false,
                     });
                     conv.messages.extend(kept);
 
@@ -2151,6 +2261,162 @@ impl AgentChatState {
                 self.reset_conversation_at(idx);
                 true
             }
+            "/keep" => {
+                let conv = &mut self.conversations[idx];
+                if arg == "clear" {
+                    for m in conv.messages.iter_mut() {
+                        m.kept = false;
+                    }
+                    conv.bump_revision();
+                    self.add_system_message_at(idx, "Cleared every kept exchange.");
+                    return true;
+                }
+                let listing = match conv.render_kept_exchanges() {
+                    Some((block, n)) => {
+                        let previews: Vec<String> = conv
+                            .kept_exchanges()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (prompt, answers))| {
+                                let text = prompt.or(answers.first().copied()).unwrap_or("");
+                                let line = text.lines().next().unwrap_or("").trim();
+                                let mut preview: String = line.chars().take(80).collect();
+                                if line.chars().count() > 80 {
+                                    preview.push('…');
+                                }
+                                format!("{}. {preview}", i + 1)
+                            })
+                            .collect();
+                        format!(
+                            "Kept {n} exchange{} (~{} tokens):\n{}\n\n/handoff carries them into a \
+                             fresh session here; /handoff to <tab|new> carries them into another \
+                             tab. /keep clear unmarks them all.",
+                            if n == 1 { "" } else { "s" },
+                            words_to_tokens(count_words(&block)),
+                            previews.join("\n")
+                        )
+                    }
+                    None => "Nothing kept yet.".to_string(),
+                };
+                self.add_system_message_at(
+                    idx,
+                    &format!(
+                        "{listing}\nMark exchanges in browse mode: Ctrl+C (with nothing \
+                         selected), ↑/↓ to an exchange, Space to keep or unkeep it."
+                    ),
+                );
+                true
+            }
+            "/handoff" => {
+                let Some((block, n)) = self.conversations[idx].render_kept_exchanges() else {
+                    self.add_system_message_at(
+                        idx,
+                        "Nothing to hand off: mark the exchanges to keep first (browse mode: \
+                         Ctrl+C with nothing selected, ↑/↓, Space). /keep lists them.",
+                    );
+                    return true;
+                };
+                let tokens = words_to_tokens(count_words(&block));
+                // `/handoff`, `/handoff <target>`, and `/handoff to <target>`
+                // are the same command — `to` is an optional keyword, and the
+                // target may itself contain spaces (a title).
+                let spec = match arg.split_once(char::is_whitespace) {
+                    Some((head, rest)) if head.eq_ignore_ascii_case("to") => rest.trim(),
+                    _ if arg.eq_ignore_ascii_case("to") => {
+                        self.add_system_message_at(idx, HANDOFF_USAGE);
+                        return true;
+                    }
+                    _ => arg,
+                };
+                let target = if spec.is_empty() {
+                    HandoffTarget::Tab(idx)
+                } else {
+                    match self.resolve_handoff_target(spec) {
+                        Ok(target) => target,
+                        Err(message) => {
+                            self.add_system_message_at(idx, &message);
+                            return true;
+                        }
+                    }
+                };
+                let target_idx = match target {
+                    HandoffTarget::Tab(target_idx) => target_idx,
+                    HandoffTarget::New => {
+                        self.new_conversation();
+                        self.active_conv
+                    }
+                };
+
+                // In place: this tab drops its session and the next prompt
+                // carries the block. Also the target of an explicit
+                // self-reference (`/handoff to 1` on tab 1).
+                if target_idx == idx {
+                    self.reset_conversation_at(idx);
+                    self.conversations[idx].carried_context = Some(block);
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "── Handoff ── The next prompt starts a fresh session that carries only \
+                             the {n} kept exchange{} (~{tokens} tokens), verbatim. Everything above \
+                             stays visible but is no longer sent.",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    );
+                    return true;
+                }
+
+                // Cross-tab: the target's session is replaced, so it must not
+                // be mid-turn — a streaming reply, a background task, or a
+                // parked permission belongs to the session being dropped.
+                let busy = {
+                    let conv = &self.conversations[target_idx];
+                    conv.is_streaming
+                        || conv.has_running_background_agents()
+                        || conv.pending_permission.is_some()
+                };
+                if busy {
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "Tab {} is mid-turn — finish or cancel it before handing off into it.",
+                            target_idx + 1
+                        ),
+                    );
+                    return true;
+                }
+
+                // A brand-new tab has no session to drop; an existing one
+                // does, so only it takes the reset (and its reset note).
+                if !self.conversations[target_idx].messages.is_empty() {
+                    self.reset_conversation_at(target_idx);
+                }
+                self.conversations[target_idx].carried_context = Some(block);
+                let source_title = self.conversations[idx].title.clone();
+                let target_title = self.conversations[target_idx].title.clone();
+                let plural = if n == 1 { "" } else { "s" };
+                // Target note first: on the desktop the source note is the
+                // one that scrolls into view (the command was typed there).
+                self.add_system_message_at(
+                    target_idx,
+                    &format!(
+                        "── Handoff ← from tab {} ({source_title}) ── The {n} kept exchange{plural} \
+                         (~{tokens} tokens) from that session ride along with your next prompt, \
+                         verbatim. Anything this tab held before is no longer sent.",
+                        idx + 1
+                    ),
+                );
+                self.add_system_message_at(
+                    idx,
+                    &format!(
+                        "── Handoff → tab {} ({target_title}) ── That tab starts a fresh session \
+                         carrying only the {n} kept exchange{plural} (~{tokens} tokens), verbatim; \
+                         the block goes out with its next prompt. This tab is unchanged and the \
+                         kept marks stay.",
+                        target_idx + 1
+                    ),
+                );
+                true
+            }
             "/rename" => {
                 if arg.is_empty() {
                     match origin {
@@ -2308,6 +2574,8 @@ impl AgentChatState {
                      /context mode <mode>     — Set bootstrap mode for this conversation (auto|minimal|manual|none)\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
+                     /keep [clear]            — List (or unmark) the exchanges marked to keep. Mark them in browse mode: Ctrl+C with nothing selected, ↑/↓, Space\n\
+                     /handoff [to <tab|new>]  — Start a fresh session carrying only the kept exchanges, verbatim (detours left out). Default: this tab. `to <n|title>` seeds another tab (this one is left untouched), `to new` opens one\n\
                      /compact [text|N]        — Claude: compact the session natively (optional extra guidance). Other providers: keep the last N messages of the replayed transcript (default 6)\n\n\
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
@@ -2461,10 +2729,25 @@ impl AgentChatState {
         } else {
             count_words(self.text_input.text.trim())
         };
+        // `/handoff`'s carried exchanges go out with the next prompt while
+        // the planner would re-inline the transcript (same gate as dispatch).
+        let conv = &self.conversations[self.active_conv];
+        let carried_words = match conv.carried_context.as_deref() {
+            Some(carried)
+                if conv
+                    .session_ledger
+                    .as_ref()
+                    .is_none_or(|l| l.is_first_turn()) =>
+            {
+                count_words(carried)
+            }
+            _ => 0,
+        };
         words_to_tokens(
             input_words
                 .saturating_add(output_words)
-                .saturating_add(draft_words),
+                .saturating_add(draft_words)
+                .saturating_add(carried_words),
         )
     }
 
@@ -2665,6 +2948,9 @@ impl AgentChatState {
         conv.claude_session_id = None;
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
+        // A plain reset drops whatever an earlier `/handoff` carried;
+        // `/handoff` sets its block again right after resetting.
+        conv.carried_context = None;
         // Host-side replay watermark: visible pre-reset turns stay in the
         // panel but must not re-enter `Turn.replay_history` once
         // `transcript_inline_mode` returns to `Auto`. `deepseek:` keeps
@@ -2795,6 +3081,73 @@ impl AgentChatState {
             self.scroll_pinned_to_bottom = true;
             self.history_index = None;
             self.history_stash.clear();
+        }
+    }
+
+    // ── /handoff targets ────────────────────────────────────────
+
+    /// `1: title, 2: title` — what `/handoff to` accepts, for error messages.
+    fn handoff_tab_list(&self) -> String {
+        self.conversations
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}: {}", i + 1, c.title))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Resolve `/handoff`'s target spec: `new` / `+`, a 1-based tab
+    /// position (the status bar's `Chat n/N`), or a tab title — exact
+    /// match first, then a unique case-insensitive substring. Errors carry
+    /// a user-facing message so the command arm just prints them.
+    fn resolve_handoff_target(&self, spec: &str) -> Result<HandoffTarget, String> {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("new") || spec == "+" {
+            return Ok(HandoffTarget::New);
+        }
+        if let Ok(n) = spec.parse::<usize>() {
+            if n >= 1 && n <= self.conversations.len() {
+                return Ok(HandoffTarget::Tab(n - 1));
+            }
+            return Err(format!(
+                "No tab {n}: this session has {} tab{}. Tabs: {}",
+                self.conversations.len(),
+                if self.conversations.len() == 1 { "" } else { "s" },
+                self.handoff_tab_list()
+            ));
+        }
+        let needle = spec.to_ascii_lowercase();
+        let exact: Vec<usize> = self
+            .conversations
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.title.to_ascii_lowercase() == needle)
+            .map(|(i, _)| i)
+            .collect();
+        let matches: Vec<usize> = if exact.is_empty() {
+            self.conversations
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.title.to_ascii_lowercase().contains(&needle))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            exact
+        };
+        match matches.as_slice() {
+            [only] => Ok(HandoffTarget::Tab(*only)),
+            [] => Err(format!(
+                "No tab matches \"{spec}\". Tabs: {}",
+                self.handoff_tab_list()
+            )),
+            many => Err(format!(
+                "\"{spec}\" matches {} tabs ({}) — use the tab number instead.",
+                many.len(),
+                many.iter()
+                    .map(|&i| format!("{}: {}", i + 1, self.conversations[i].title))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
 
@@ -4171,6 +4524,7 @@ impl AgentChatState {
                         // `0` for records written before timestamps were
                         // persisted; the renderer omits the stamp for those.
                         timestamp: m.timestamp,
+                        kept: m.kept,
                     })
                     .collect();
                 // V9 §11 M4: restore the planner ledger and legacy
@@ -4249,12 +4603,15 @@ impl AgentChatState {
                     // server-side session may be gone, and `--resume` may
                     // refuse the stale id. Default `Auto` preserves that.
                     transcript_inline_mode: TranscriptInlineMode::Auto,
-                    replay_from_seq: 0,
+                    // Restored messages are numbered from 1, so index `i`
+                    // is `seq` `i + 1`.
+                    replay_from_seq: stored.replay_from_index.map_or(0, |i| i as u64 + 1),
                     last_token_usage: pending_usage,
                     last_turn_cost_usd: 0.0,
                     last_bootstrap_tokens: 0,
                     last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
                     last_memory_injection_tokens: 0,
+                    carried_context: stored.carried_context,
                 });
             }
         }
@@ -4393,6 +4750,7 @@ impl AgentChatState {
                         content: m.content.clone(),
                         tool_calls: m.tool_calls.clone(),
                         timestamp: m.timestamp,
+                        kept: m.kept,
                     })
                     .collect(),
                 created: 0,
@@ -4409,6 +4767,11 @@ impl AgentChatState {
                     .as_ref()
                     .and_then(|l| l.continuity_handle.clone()),
                 last_token_usage: conv.last_token_usage.as_ref().map(Into::into),
+                carried_context: conv.carried_context.clone(),
+                // Restore renumbers `seq` from 1, so the boundary travels as
+                // an index; without it a restart re-inlines everything
+                // `/reset` or `/handoff` dropped.
+                replay_from_index: conv.replay_from_index(),
             };
 
             summaries.push(ss::ConversationSummary {
@@ -4681,6 +5044,12 @@ impl AgentChatState {
             // order after a restart, where `seq` alone only tells you the
             // order within one conversation. Omitted for timestamp `0`
             // (pre-timestamp records) rather than rendering the epoch.
+            // `★` marks a message whose exchange `/handoff` will carry.
+            let role_label = if msg.kept {
+                format!("★ {role_label}")
+            } else {
+                role_label.to_string()
+            };
             let prefix = match format_message_timestamp(msg.timestamp) {
                 Some(stamp) => format!("{} [{}]: ", role_label, stamp),
                 None => format!("{}: ", role_label),
@@ -4885,7 +5254,7 @@ impl AgentChatState {
 
         // Browse mode hint
         if self.browse_mode {
-            let hint = " [BROWSE] ↑↓ nav  Ctrl+C copy  Esc exit ";
+            let hint = " [BROWSE] ↑↓ nav  Space keep  Ctrl+C copy  Esc exit ";
             let hint_style = Style::default().fg(theme::TAB_BG).bg(theme::ACCENT);
             let hint_y = area.y;
             let hint_display_w = UnicodeWidthStr::width(hint) as u16;
@@ -5711,11 +6080,44 @@ pub enum CompactAction {
     Unsupported(&'static str),
 }
 
+/// Where `/handoff` sends the kept exchanges ([`AgentChatState::apply_slash_line`]).
+///
+/// `Tab` is an existing conversation; a self-reference folds back to the
+/// in-place handoff in the command arm. `New` creates a tab, switches to
+/// it (like Ctrl+T), then seeds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffTarget {
+    Tab(usize),
+    New,
+}
+
+/// Shown when `/handoff`'s target cannot be resolved, and for a bare `to`.
+const HANDOFF_USAGE: &str = "Usage: /handoff [to <tab|new>] — <tab> is the status bar's \
+     position (`Chat n/N`) or a tab title (exact, else a unique substring). `new` creates \
+     a tab. /keep lists what will be carried.";
+
 /// Guidance sent with a native `/compact`. Summaries lose the artifact
 /// trail first — paths and errors (Factory's compression evaluation, see
 /// `research/cross-agent-session-compaction-2026-10-05.md`).
 const COMPACT_INSTRUCTIONS: &str = "Keep verbatim: file paths, commands, error messages, \
      decisions and their reasons, the user's constraints, and open questions and next steps.";
+
+/// The task text a turn sends: the user's prompt, plus `/handoff`'s carried
+/// exchanges when the planner would re-inline the transcript
+/// (`is_first_turn`). The prompt stays first; a slash command is left alone
+/// because Claude runs one only when it is the whole message.
+pub(crate) fn with_carried_context(
+    task_text: String,
+    carried: Option<&str>,
+    is_first_turn: bool,
+) -> String {
+    match carried {
+        Some(carried) if is_first_turn && !task_text.trim_start().starts_with('/') => {
+            format!("{task_text}\n\n{carried}")
+        }
+        _ => task_text,
+    }
+}
 
 /// `Some(arg)` when `input` is a `/compact` command.
 fn compact_command_arg(input: &str) -> Option<&str> {
@@ -7205,6 +7607,366 @@ mod tests {
             state.conversations[idx].messages.last().unwrap().content,
             "The agent compacted this conversation on request."
         );
+    }
+
+    /// A session with a research exchange, a detour, and a main-thread
+    /// exchange whose answer came in two messages plus a system note.
+    fn session_with_detour(state: &mut AgentChatState) -> usize {
+        let idx = conv_on(state, "claude:opus");
+        let conv = &mut state.conversations[idx];
+        conv.push_message(ChatRole::User, "Research the lexer options".into(), vec![]);
+        conv.push_message(
+            ChatRole::Assistant,
+            "RESEARCH: ".to_string() + &"x".repeat(5_000),
+            vec![],
+        );
+        conv.push_message(
+            ChatRole::User,
+            "Why does cargo fail on Windows?".into(),
+            vec![],
+        );
+        conv.push_message(ChatRole::Assistant, "Detour answer".into(), vec![]);
+        conv.push_message(ChatRole::User, "Implement the chosen lexer".into(), vec![]);
+        conv.push_message(ChatRole::Assistant, "Part one".into(), vec![]);
+        conv.push_message(ChatRole::System, "a system note".into(), vec![]);
+        conv.push_message(ChatRole::Assistant, "Part two".into(), vec![]);
+        idx
+    }
+
+    #[test]
+    fn keeping_marks_the_whole_exchange_and_toggles_back() {
+        let mut state = AgentChatState::new();
+        let idx = session_with_detour(&mut state);
+        let conv = &mut state.conversations[idx];
+        // Marking the second answer message keeps its prompt and both answers.
+        assert_eq!(conv.toggle_keep_exchange(7), Some(true));
+        let kept: Vec<bool> = conv.messages.iter().map(|m| m.kept).collect();
+        assert_eq!(
+            kept,
+            vec![false, false, false, false, true, true, false, true],
+            "system notes never carry"
+        );
+        assert_eq!(conv.toggle_keep_exchange(4), Some(false));
+        assert!(conv.messages.iter().all(|m| !m.kept));
+        assert_eq!(conv.toggle_keep_exchange(99), None);
+    }
+
+    #[test]
+    fn the_carried_block_holds_only_kept_exchanges_verbatim() {
+        let mut state = AgentChatState::new();
+        let idx = session_with_detour(&mut state);
+        let conv = &mut state.conversations[idx];
+        conv.toggle_keep_exchange(1);
+        conv.toggle_keep_exchange(5);
+        let (block, n) = conv.render_kept_exchanges().expect("something kept");
+        assert_eq!(n, 2);
+        assert!(block.starts_with("<carried_context>"));
+        assert!(block.ends_with("</carried_context>"));
+        assert!(
+            block.contains(&"x".repeat(5_000)),
+            "never truncated (host replay cuts at 2,000 chars)"
+        );
+        assert!(!block.contains("Detour answer"));
+        assert!(!block.contains("Why does cargo fail"));
+        assert!(!block.contains("a system note"));
+        let research = block.find("Research the lexer").unwrap();
+        let implement = block.find("Implement the chosen lexer").unwrap();
+        assert!(research < implement, "oldest first");
+        assert!(
+            block.contains(
+                "<assistant>\nPart one\n</assistant>\n<assistant>\nPart two\n</assistant>"
+            )
+        );
+    }
+
+    #[test]
+    fn handoff_resets_the_session_and_carries_the_kept_exchanges() {
+        let mut state = AgentChatState::new();
+        let idx = session_with_detour(&mut state);
+        state.active_conv = idx;
+        state.conversations[idx].claude_session_id = Some("old-session".into());
+
+        // Nothing kept: nothing happens to the session.
+        state.text_input.text = "/handoff".into();
+        assert!(state.process_slash_command());
+        assert_eq!(
+            state.conversations[idx].claude_session_id.as_deref(),
+            Some("old-session")
+        );
+        assert!(state.conversations[idx].carried_context.is_none());
+
+        state.conversations[idx].toggle_keep_exchange(1);
+        state.text_input.text = "/handoff".into();
+        assert!(state.process_slash_command());
+        let conv = &state.conversations[idx];
+        assert!(conv.claude_session_id.is_none(), "fresh provider session");
+        assert!(
+            conv.carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options"))
+        );
+        // Boundary right after the `/handoff` echo: only the reset note and
+        // the handoff note (System, never replayed) follow it.
+        assert_eq!(
+            conv.replay_from_seq,
+            conv.next_message_seq - 2,
+            "the old transcript (detours included) is no longer replayed"
+        );
+        assert!(
+            state
+                .context_messages_at(idx)
+                .iter()
+                .all(|(_, text)| !text.contains("Detour answer")),
+            "host replay no longer carries the detours"
+        );
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff ──"))
+        );
+        assert!(
+            conv.messages[1].kept,
+            "kept marks stay so a later handoff carries them again"
+        );
+
+        // A plain /reset drops the carried block.
+        state.text_input.text = "/reset".into();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[idx].carried_context.is_none());
+    }
+
+    #[test]
+    fn handoff_to_another_tab_seeds_it_and_leaves_the_source_alone() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        // A second tab with a session and a transcript of its own.
+        state.new_conversation();
+        let target = state.active_conv;
+        assert_eq!(target, 1);
+        state.conversations[target].claude_session_id = Some("target-session".into());
+        state.conversations[target].push_message(
+            ChatRole::User,
+            "old target prompt".into(),
+            Vec::new(),
+        );
+
+        state.active_conv = source;
+        state.text_input.text = "/handoff to 2".into();
+        assert!(state.process_slash_command());
+
+        let t = &state.conversations[target];
+        assert!(t.claude_session_id.is_none(), "fresh provider session in the target");
+        assert!(
+            t.carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options")),
+            "the kept block landed in the other tab"
+        );
+        assert!(
+            t.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff ← from tab 1")),
+            "the target is told where the block came from"
+        );
+        assert_eq!(t.transcript_inline_mode, TranscriptInlineMode::Suppress);
+        assert!(
+            state
+                .context_messages_at(target)
+                .iter()
+                .all(|(_, text)| !text.contains("old target prompt")),
+            "the target's old transcript is no longer replayed"
+        );
+
+        let s = &state.conversations[source];
+        assert_eq!(
+            s.claude_session_id.as_deref(),
+            Some("source-session"),
+            "the source session is untouched"
+        );
+        assert!(s.carried_context.is_none(), "the block did not stay in the source");
+        assert!(
+            s.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff → tab 2")),
+            "the source notes where the block went"
+        );
+        assert!(s.messages[1].kept, "kept marks stay so the block can be sent again");
+
+        // ...and by title, not just by position.
+        state.conversations[target].title = "review branch".into();
+        state.conversations[target].carried_context = None;
+        state.text_input.text = "/handoff to review".into();
+        assert!(state.process_slash_command());
+        assert!(
+            state.conversations[target]
+                .carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options")),
+            "a unique title prefix resolves to the tab"
+        );
+    }
+
+    #[test]
+    fn handoff_to_new_creates_and_switches_to_a_fresh_tab() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        state.text_input.text = "/handoff to new".into();
+        assert!(state.process_slash_command());
+
+        assert_eq!(state.conversations.len(), 2, "one new tab");
+        let target = state.active_conv;
+        assert_eq!(target, 1, "Ctrl+T semantics: the new tab is the active one");
+        let t = &state.conversations[target];
+        assert!(t.claude_session_id.is_none());
+        assert!(
+            t.carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options"))
+        );
+        assert!(
+            t.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff ← from tab 1"))
+        );
+        assert!(
+            !t.messages.iter().any(|m| m.content.contains("Context cleared")),
+            "a brand-new tab has no stale session to reset"
+        );
+
+        let s = &state.conversations[source];
+        assert_eq!(s.claude_session_id.as_deref(), Some("source-session"));
+        assert!(s.carried_context.is_none());
+        assert!(s.messages[1].kept);
+    }
+
+    #[test]
+    fn handoff_reports_an_unresolvable_or_ambiguous_target() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        // Out of range: reported, nothing reset.
+        state.text_input.text = "/handoff to 9".into();
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations.len(), 1, "no tab was created");
+        assert!(state.conversations[source].claude_session_id.is_some());
+        assert!(state.conversations[source].carried_context.is_none());
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("No tab 9")
+        );
+
+        // A bare `to` is a usage error, not a silent self-handoff.
+        state.text_input.text = "/handoff to".into();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[source].claude_session_id.is_some());
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .starts_with("Usage: /handoff")
+        );
+
+        // Two tabs sharing a word: the substring form must not guess.
+        state.new_conversation();
+        let second = state.active_conv;
+        state.conversations[source].title = "lexer research".into();
+        state.conversations[second].title = "lexer work".into();
+        state.active_conv = source;
+        state.text_input.text = "/handoff to lexer".into();
+        assert!(state.process_slash_command());
+        let last = &state.conversations[source].messages.last().unwrap().content;
+        assert!(
+            last.contains("matches 2 tabs")
+                && last.contains("lexer research")
+                && last.contains("lexer work"),
+            "{last}"
+        );
+        assert!(state.conversations[second].carried_context.is_none());
+        assert!(state.conversations[source].claude_session_id.is_some());
+    }
+
+    #[test]
+    fn handoff_refuses_a_target_tab_that_is_mid_turn() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+        state.new_conversation();
+        let target = state.active_conv;
+        state.conversations[target].is_streaming = true;
+        state.active_conv = source;
+
+        state.text_input.text = "/handoff to 2".into();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[target].is_streaming, "the target turn keeps running");
+        assert!(state.conversations[target].carried_context.is_none());
+        assert!(state.conversations[target].claude_session_id.is_none());
+        assert_eq!(
+            state.conversations[source].claude_session_id.as_deref(),
+            Some("source-session"),
+            "the source is untouched too"
+        );
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("Tab 2 is mid-turn")
+        );
+    }
+
+    #[test]
+    fn the_replay_boundary_survives_a_restart_as_an_index() {
+        let mut state = AgentChatState::new();
+        let idx = session_with_detour(&mut state);
+        let conv = &mut state.conversations[idx];
+        assert_eq!(conv.replay_from_index(), None, "replay from the start");
+        conv.replay_from_seq = conv.messages[4].seq;
+        assert_eq!(conv.replay_from_index(), Some(4));
+        // Restore numbers messages from 1: index 4 → seq 5 → message 4 again.
+        assert_eq!(4u64 + 1, conv.messages[4].seq);
+        // A reset after the last message: every message is excluded.
+        conv.replay_from_seq = conv.next_message_seq;
+        assert_eq!(conv.replay_from_index(), Some(conv.messages.len()));
+    }
+
+    #[test]
+    fn the_carry_rides_along_only_while_the_transcript_would_be_inlined() {
+        let carried = Some("<carried_context>R</carried_context>");
+        assert_eq!(
+            with_carried_context("next step".into(), carried, true),
+            "next step\n\n<carried_context>R</carried_context>"
+        );
+        // A resumed native session already holds it.
+        assert_eq!(
+            with_carried_context("next step".into(), carried, false),
+            "next step"
+        );
+        // A slash command must reach Claude bare.
+        assert_eq!(
+            with_carried_context("/compact".into(), carried, true),
+            "/compact"
+        );
+        assert_eq!(with_carried_context("next".into(), None, true), "next");
     }
 
     #[test]
