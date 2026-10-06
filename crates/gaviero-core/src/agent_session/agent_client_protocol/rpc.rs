@@ -171,13 +171,24 @@ impl JsonRpcChild {
         let stdin = child.stdin.take().context("ACP stdin unavailable")?;
         let stderr = child.stderr.take();
 
+        // Stderr is the only place a dying `dsh` explains itself (missing
+        // build, bad API key, node crash). The reader must see it before
+        // failing in-flight RPCs, otherwise initialize reports only
+        // "stdout closed".
+        let stderr_log: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let (stderr_done_tx, stderr_done_rx) = oneshot::channel::<()>();
         if let Some(stderr) = stderr {
+            let log = stderr_log.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "dsh_acp", "agent stderr: {line}");
+                    append_stderr_line(&log, &line).await;
                 }
+                let _ = stderr_done_tx.send(());
             });
+        } else {
+            let _ = stderr_done_tx.send(());
         }
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -197,11 +208,22 @@ impl JsonRpcChild {
                 };
                 dispatch_line(value, &pending_reader, &incoming_tx, &notif_tx).await;
             }
+            // Process exit closes both pipes. Wait until stderr has been
+            // drained so the RPC error can quote it. Timeout covers a
+            // child that closed stdout and left stderr open.
+            let _ = tokio::time::timeout(Duration::from_secs(2), stderr_done_rx).await;
+            let stderr_text = stderr_log.lock().await.clone();
+            let message = stdout_closed_message(&stderr_text);
+            if stderr_text.trim().is_empty() {
+                tracing::debug!(target: "dsh_acp", "{message}");
+            } else {
+                tracing::warn!(target: "dsh_acp", "{message}");
+            }
             let mut pending = pending_reader.lock().await;
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(RpcError {
                     code: -1,
-                    message: "ACP agent stdout closed".into(),
+                    message: message.clone(),
                 }));
             }
         });
@@ -231,6 +253,51 @@ impl Drop for JsonRpcChild {
         self.reader.abort();
         let _ = self.child.start_kill();
     }
+}
+
+const STDERR_CAP: usize = 8 * 1024;
+
+async fn append_stderr_line(log: &Mutex<String>, line: &str) {
+    let mut buf = log.lock().await;
+    if buf.len() >= STDERR_CAP {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    let room = STDERR_CAP.saturating_sub(buf.len());
+    if line.len() <= room {
+        buf.push_str(line);
+    } else {
+        let end = floor_char_boundary(line, room);
+        buf.push_str(&line[..end]);
+    }
+}
+
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut end = index.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// User-facing text when the agent closes stdout before answering.
+/// Quotes captured stderr so a crash (missing `lib/bin.js`, auth, node)
+/// is visible in the TUI instead of only a debug log.
+fn stdout_closed_message(stderr_text: &str) -> String {
+    const MAX: usize = 1_500;
+    let trimmed = stderr_text.trim();
+    if trimmed.is_empty() {
+        return "ACP agent stdout closed".to_string();
+    }
+    let body = if trimmed.chars().count() > MAX {
+        let clipped: String = trimmed.chars().take(MAX).collect();
+        format!("{clipped}…")
+    } else {
+        trimmed.to_string()
+    };
+    format!("ACP agent stdout closed\n{body}")
 }
 
 fn id_key(id: &Value) -> String {
@@ -343,5 +410,54 @@ mod tests {
     fn id_key_formats_number_and_string() {
         assert_eq!(id_key(&json!(7)), "7");
         assert_eq!(id_key(&json!("abc")), "abc");
+    }
+
+    #[test]
+    fn stdout_closed_message_quotes_stderr_and_stays_plain_when_empty() {
+        assert_eq!(stdout_closed_message("  \n"), "ACP agent stdout closed");
+        let msg = stdout_closed_message("Error: Cannot find module 'lib/bin.js'\n");
+        assert!(msg.starts_with("ACP agent stdout closed\n"), "{msg}");
+        assert!(msg.contains("Cannot find module"), "{msg}");
+        let long = "x".repeat(2_000);
+        let clipped = stdout_closed_message(&long);
+        assert!(clipped.ends_with('…'), "{clipped}");
+        assert!(clipped.chars().count() < long.chars().count());
+    }
+
+    /// A child that reads one stdin line, writes stderr, and exits must
+    /// surface that stderr on the in-flight RPC. This is the initialize
+    /// failure mode: `dsh` dies before any JSON-RPC response.
+    #[tokio::test]
+    async fn stdout_close_includes_child_stderr() {
+        let cmd = dying_agent_command();
+        let child = JsonRpcChild::spawn(cmd).await.expect("spawn dying agent");
+        let err = child
+            .handle
+            .request("initialize", json!({}))
+            .await
+            .expect_err("child exits without a response");
+        let msg = err.to_string();
+        assert!(msg.contains("ACP agent stdout closed"), "{msg}");
+        assert!(msg.contains("boom-missing-bin"), "{msg}");
+    }
+
+    fn dying_agent_command() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = tokio::process::Command::new("cmd");
+            // Read the initialize line, then die with a distinctive stderr.
+            cmd.args([
+                "/d",
+                "/c",
+                "set /p X=&& echo boom-missing-bin>&2&& exit /b 1",
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args(["-c", "read line; echo boom-missing-bin >&2; exit 1"]);
+            cmd
+        }
     }
 }
