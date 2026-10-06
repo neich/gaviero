@@ -26,6 +26,10 @@ pub struct SwarmTurnRequest {
     pub user_prompt: String,
     pub allowed_tools: Vec<String>,
     pub auto_approve: bool,
+    /// Provider-neutral effort requested by the work unit. Thinking mode is
+    /// always on, so an unset/`off`/`auto` value resolves to DeepSeek's `high`
+    /// rather than disabling reasoning.
+    pub effort: Option<String>,
     /// Shell policy resolved by the host from the *workspace* cascade.
     /// `None` falls back to resolving from `workspace_root`, which inside a
     /// swarm worktree finds no settings file and therefore no denylist.
@@ -64,6 +68,11 @@ pub async fn run_turn(
         ToolRegistry::from_names(&req.allowed_tools)
     };
 
+    // Resolve before the request is decomposed; thinking is always on, so this
+    // is never `off`.
+    let reasoning_effort =
+        crate::swarm::backend::deepseek::deepseek_reasoning_effort(req.effort.as_deref());
+
     let messages = build_messages(&req.system_prompt, None, &req.user_prompt);
     let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
     let policy = req
@@ -85,6 +94,7 @@ pub async fn run_turn(
         &ctx,
         observer,
         &req.model,
+        Some(reasoning_effort),
         messages,
         &super::agent_loop::LoopLimits::default(),
         cancel,

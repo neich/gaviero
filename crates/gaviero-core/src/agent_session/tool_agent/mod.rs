@@ -67,6 +67,11 @@ pub struct ApiRequest {
     pub messages: Vec<serde_json::Value>,
     pub tools: Vec<serde_json::Value>,
     pub max_tokens: Option<u32>,
+    /// Reasoning effort, already mapped onto the provider's vocabulary
+    /// (`low | high | max` for DeepSeek's chat API). Thinking mode is always on
+    /// for gaviero, so the harness resolves a level for every request and never
+    /// sends `off`.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Normalized event from an [`ApiClient`]. Mirrors the subset of
@@ -126,6 +131,9 @@ pub struct ToolAgentSession {
     profile: ProviderProfile,
     compaction: CompactionPolicy,
     policy: ToolPolicy,
+    /// `AgentOptions::effort`, the host-resolved default for this session.
+    /// `Turn::effort` overrides it per turn; thinking mode is never disabled.
+    effort: String,
     #[allow(dead_code)] // Option-B writes are direct-to-disk; gate kept for parity
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     cancel_token: CancellationToken,
@@ -239,6 +247,7 @@ impl ToolAgentSession {
         // views drift apart.
         let policy = surface.policy().clone();
         let host_capture = options.host_capture;
+        let effort = options.effort.clone();
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
@@ -256,6 +265,7 @@ impl ToolAgentSession {
             profile,
             compaction: CompactionPolicy::default(),
             policy,
+            effort,
             write_gate,
             cancel_token,
             host_capture,
@@ -311,6 +321,13 @@ impl AgentSession for ToolAgentSession {
         let system = default_editor_system_prompt(&self.capabilities());
         let prompt = Self::build_prompt(&turn);
         let messages = build_messages(&system, turn.replay_history.as_ref(), &prompt);
+        // Per-turn effort, resolved the same way the ACP path resolves it:
+        // the turn's value wins over the session default. Thinking mode is
+        // always on, so an unset/`off`/`auto` effort becomes DeepSeek's `high`
+        // rather than nothing.
+        let effort = turn.effort.as_deref().unwrap_or(self.effort.as_str());
+        let reasoning_effort =
+            crate::swarm::backend::deepseek::deepseek_reasoning_effort(Some(effort));
         let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
         let ctx = ToolCtx {
             workspace_root: self.workspace_root.clone(),
@@ -328,6 +345,7 @@ impl AgentSession for ToolAgentSession {
             &ctx,
             self.observer.as_ref(),
             &self.model,
+            Some(reasoning_effort),
             messages,
             &self.limits,
             &self.cancel_token,

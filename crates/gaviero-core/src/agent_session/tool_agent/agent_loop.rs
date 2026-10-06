@@ -90,6 +90,7 @@ pub(crate) async fn run_agent_loop(
     ctx: &ToolCtx,
     observer: &dyn AcpObserver,
     model: &str,
+    reasoning_effort: Option<&str>,
     mut messages: Vec<Value>,
     limits: &LoopLimits,
     cancel: &CancellationToken,
@@ -98,6 +99,7 @@ pub(crate) async fn run_agent_loop(
     let mut visible = String::new();
     let mut in_thinking = false;
     let mut total_cost = 0.0_f64;
+    let reasoning_effort = reasoning_effort.map(str::to_string);
 
     for _round in 0..limits.max_rounds {
         if cancel.is_cancelled() {
@@ -113,6 +115,7 @@ pub(crate) async fn run_agent_loop(
             messages: messages.clone(),
             tools: schemas.clone(),
             max_tokens: None,
+            reasoning_effort: reasoning_effort.clone(),
         };
         let mut stream = match client.complete(request).await {
             Ok(s) => s,
@@ -276,7 +279,16 @@ pub(crate) async fn run_agent_loop(
     observer.on_stream_chunk(&marker);
     visible.push_str(&marker);
 
-    if let Some(handoff) = handoff_round(client, observer, model, &messages, cancel).await {
+    if let Some(handoff) = handoff_round(
+        client,
+        observer,
+        model,
+        reasoning_effort.as_deref(),
+        &messages,
+        cancel,
+    )
+    .await
+    {
         visible.push_str(&handoff);
     }
 
@@ -297,6 +309,7 @@ async fn handoff_round(
     client: &dyn ApiClient,
     observer: &dyn AcpObserver,
     model: &str,
+    reasoning_effort: Option<&str>,
     messages: &[Value],
     cancel: &CancellationToken,
 ) -> Option<String> {
@@ -311,6 +324,9 @@ async fn handoff_round(
         // No schemas: the model cannot keep working, only report.
         tools: Vec::new(),
         max_tokens: None,
+        // Thinking stays on for the hand-off too: it is the round that has to
+        // summarise everything the capped turn established.
+        reasoning_effort: reasoning_effort.map(str::to_string),
     };
     let mut stream = match client.complete(request).await {
         Ok(s) => s,
@@ -459,6 +475,7 @@ mod tests {
     struct RecordingClient {
         rounds: Mutex<VecDeque<Vec<ApiEvent>>>,
         seen: Mutex<Vec<Vec<Value>>>,
+        seen_effort: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -468,6 +485,10 @@ mod tests {
             request: ApiRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<ApiEvent>> + Send>>> {
             self.seen.lock().unwrap().push(request.messages);
+            self.seen_effort
+                .lock()
+                .unwrap()
+                .push(request.reasoning_effort.clone());
             let batch = self
                 .rounds
                 .lock()
@@ -493,6 +514,7 @@ mod tests {
                 ],
             ])),
             seen: Mutex::new(Vec::new()),
+            seen_effort: Mutex::new(Vec::new()),
         };
         let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
         let cancel = CancellationToken::new();
@@ -502,6 +524,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "deepseek-v4-pro",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &cancel,
@@ -518,6 +541,45 @@ mod tests {
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
             .expect("assistant tool-call message on second request");
         assert_eq!(assistant["reasoning_content"], "let me think");
+    }
+
+    /// The resolved effort is attached to *every* API call in the turn — the
+    /// tool rounds and the capped hand-off — so thinking mode cannot silently
+    /// drift back to the provider default mid-turn.
+    #[tokio::test]
+    async fn reasoning_effort_reaches_every_request_in_the_turn() {
+        let client = RecordingClient {
+            rounds: Mutex::new(VecDeque::from(vec![
+                vec![tool_call("echo"), ApiEvent::Done(StopReason::ToolUse)],
+                vec![
+                    ApiEvent::Text("done".into()),
+                    ApiEvent::Done(StopReason::EndTurn),
+                ],
+            ])),
+            seen: Mutex::new(Vec::new()),
+            seen_effort: Mutex::new(Vec::new()),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let cancel = CancellationToken::new();
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &NoopObserver,
+            "deepseek-v4-pro",
+            Some("max"),
+            initial_messages(),
+            &LoopLimits::default(),
+            &cancel,
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let seen = client.seen_effort.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one request per round: {seen:?}");
+        assert!(
+            seen.iter().all(|e| e.as_deref() == Some("max")),
+            "every round must carry the resolved effort: {seen:?}"
+        );
     }
 
     fn tool_call(name: &str) -> ApiEvent {
@@ -553,6 +615,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "deepseek-v4-pro",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &cancel,
@@ -582,6 +645,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "m",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &cancel,
@@ -659,6 +723,7 @@ mod tests {
             &ctx(),
             &observer,
             "m",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &CancellationToken::new(),
@@ -703,6 +768,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "m",
+            None,
             initial_messages(),
             &limits,
             &cancel,
@@ -752,6 +818,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "m",
+            None,
             initial_messages(),
             &limits,
             &cancel,
@@ -785,6 +852,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "m",
+            None,
             initial_messages(),
             &limits,
             &cancel,
@@ -865,6 +933,7 @@ mod tests {
             &ctx,
             observer.as_ref(),
             "m",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &cancel,
@@ -888,6 +957,7 @@ mod tests {
             &ctx(),
             &NoopObserver,
             "m",
+            None,
             initial_messages(),
             &LoopLimits::default(),
             &cancel,

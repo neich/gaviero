@@ -94,7 +94,11 @@ struct LiveSession {
     /// folders forced an enclosing parent (live dsh rejects
     /// `additionalDirectories`).
     session_cwd: PathBuf,
-    thinking_settable: bool,
+    /// The advertised reasoning config option (`reasoning_effort` select on live
+    /// dsh, or a legacy `thinking` boolean), kept whole so each turn can be
+    /// resolved against the *values that provider actually accepts*. `None`
+    /// means the agent exposes no reasoning control at all.
+    reasoning: Option<Value>,
     gate_written: HashSet<PathBuf>,
 }
 
@@ -220,9 +224,10 @@ impl AcpClientSession {
                 }),
             )
             .await?;
-        let thinking_settable = config_option_named(&init, "thinking")
-            || config_option_named(&init, "effort")
-            || config_option_named(&init, "reasoning_effort");
+        // The reasoning option is advertised by live dsh on `session/new`, not
+        // `initialize`; keep whichever the handshake offers first, then fill
+        // from the other below.
+        let mut reasoning = reasoning_config_option(&init).cloned();
 
         let primary_cwd = absolute_cwd(&self.workspace_root);
         let session_cwd = enclosing_workspace_cwd(&self.workspace_root, &self.additional_roots)
@@ -294,51 +299,162 @@ impl AcpClientSession {
                 "dsh: could not select {model}; using the session default"
             ));
         }
-        let thinking_settable = thinking_settable
-            || config_option_named(&new, "thinking")
-            || config_option_named(&new, "effort")
-            || config_option_named(&new, "reasoning_effort");
+        if reasoning.is_none() {
+            reasoning = reasoning_config_option(&new).cloned();
+        }
         self.handle = Some(ContinuityHandle::AcpSessionId(session_id.clone()));
         self.inner = Some(LiveSession {
             rpc,
             session_id,
             session_cwd,
-            thinking_settable,
+            reasoning,
             gate_written: HashSet::new(),
         });
         Ok(true)
     }
 
+    /// Push the turn's effort onto the live session's reasoning config option.
+    ///
+    /// Live dsh exposes reasoning as an ACP `reasoning_effort` **select**
+    /// (`category: "thought_level"`) whose legal values are exactly what the
+    /// provider adapter advertises — `off | low | high | max` for
+    /// `@deepseek-ai/dsh`. Sending anything else is rejected with `unknown
+    /// reasoning effort`, so a raw gaviero level such as `medium` or `ultra`
+    /// is resolved against the advertised list via
+    /// [`crate::swarm::backend::deepseek::reasoning_effort_for_deepseek`].
+    ///
+    /// A value is set on **every** session, so the level is the one gaviero
+    /// resolved rather than whatever the provider or profile default happens to
+    /// be:
+    ///
+    /// * an explicit gaviero level maps to its advertised DeepSeek value;
+    /// * `off`/`auto`/unset/unknown re-assert the advertised default when that
+    ///   is already a thinking level (a dsh profile may deliberately pick
+    ///   `max`), and otherwise fall back to `high` — never to DeepSeek's `off`;
+    /// * a legacy boolean `thinking` option is only ever set to `true`;
+    /// * an agent that advertises no thinking level at all (`thinking:
+    ///   disabled`) is reported rather than silently accepted: `off` would be
+    ///   the only legal value, and selecting it would disable thinking.
     async fn apply_effort(
         handle: &JsonRpcHandle,
         session_id: &str,
-        thinking_settable: bool,
+        reasoning: Option<&Value>,
         effort: &str,
     ) {
-        if !thinking_settable {
+        let Some(option) = reasoning else {
             tracing::info!("dsh: effort not settable over ACP");
             return;
-        }
-        let on = !matches!(effort, "off" | "auto" | "");
-        // Official dsh-acp advertises `reasoning_effort`; the in-tree fake
-        // agent advertises `thinking`. Try both.
-        for (config_id, value) in [("reasoning_effort", json!(effort)), ("thinking", json!(on))] {
-            if handle
-                .request(
-                    "session/set_config_option",
-                    json!({
-                        "sessionId": session_id,
-                        "configId": config_id,
-                        "value": value
-                    }),
-                )
-                .await
-                .is_ok()
-            {
-                return;
+        };
+        let config_id = config_option_id(option).unwrap_or("reasoning_effort");
+        let value = if config_id == "thinking" {
+            // Legacy/in-tree agent: a bare boolean. Never disable thinking.
+            json!(true)
+        } else {
+            let mapped =
+                crate::swarm::backend::deepseek::reasoning_effort_for_deepseek(effort);
+            match mapped.and_then(|target| advertised_select_value(option, target)) {
+                Some(value) => json!(value),
+                None => {
+                    if let Some(target) = mapped {
+                        tracing::warn!(
+                            effort,
+                            mapped = target,
+                            "dsh: advertised {config_id} has no `{target}` value"
+                        );
+                    }
+                    // `off`/`auto`/unset — and an unadvertised mapping — must
+                    // not leave thinking disabled. A dsh profile may default
+                    // `reasoningEffort` to DeepSeek's `off`, which turns the
+                    // chain of thought off per request. Keep a thinking-on
+                    // default such as the profile's `max`, but never inherit
+                    // `off`.
+                    match thinking_on_value(option) {
+                        Some(value) => json!(value),
+                        None => {
+                            tracing::warn!(
+                                config_id,
+                                "dsh: agent advertises no thinking level; thinking stays off — \
+                                 enable it in the dsh profile (thinking: enabled, or a \
+                                 reasoningEffort other than off)"
+                            );
+                            return;
+                        }
+                    }
+                }
             }
+        };
+        if let Err(e) = handle
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value
+                }),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, config_id, "dsh: setting effort failed");
         }
     }
+}
+
+/// Resolve `target` against an advertised config option's select values.
+///
+/// A select's `options` entries are the opaque values ACP will accept, so an
+/// advertised list is authoritative: a target that is absent has no valid
+/// representation and resolves to `None`. An option with no list is free-form
+/// and takes the target verbatim.
+fn advertised_select_value(option: &Value, target: &str) -> Option<String> {
+    let values = collect_select_values(option.get("options").unwrap_or(&Value::Null));
+    if values.is_empty() {
+        return Some(target.to_string());
+    }
+    values.into_iter().find(|value| value == target)
+}
+
+/// The advertised reasoning option's currently effective select value.
+///
+/// dsh's `reasoning_effort` select reports the resolved effort here, or the
+/// opaque `""` provider-default choice when the adapter declares no
+/// `defaultEffort`.
+fn current_select_value(option: &Value) -> Option<&str> {
+    option.get("currentValue").and_then(Value::as_str)
+}
+
+/// Whether an advertised reasoning value leaves thinking enabled.
+///
+/// DeepSeek's ids are `off` (thinking disabled per request) and
+/// `low`/`high`/`max` (enabled). dsh's opaque `""` provider-default choice is
+/// treated as on: it is only advertised by adapters that declare no
+/// `defaultEffort`, and every such adapter here is thinking-capable.
+fn thinking_is_on(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("off")
+}
+
+/// A value that turns thinking on, used whenever gaviero's own effort names no
+/// *advertised* level.
+///
+/// Prefers the advertised default when it is already a thinking level, so a
+/// deployment that deliberately selected `max` is re-asserted explicitly rather
+/// than downgraded. Otherwise prefers DeepSeek's `high`, then the highest
+/// advertised thinking level. `None` means the agent offers no thinking level at
+/// all (`thinking: disabled`), where `off` is the only legal value.
+fn thinking_on_value(option: &Value) -> Option<String> {
+    let values = collect_select_values(option.get("options").unwrap_or(&Value::Null));
+    if let Some(current) = current_select_value(option)
+        && !current.is_empty()
+        && thinking_is_on(current)
+        && (values.is_empty() || values.iter().any(|value| value == current))
+    {
+        return Some(current.to_string());
+    }
+    if let Some(high) = values.iter().find(|value| value.as_str() == "high") {
+        return Some(high.clone());
+    }
+    values
+        .into_iter()
+        .find(|value| !value.is_empty() && thinking_is_on(value))
 }
 
 struct SessionNew {
@@ -715,22 +831,28 @@ fn workspace_folders_hint(
     Some(hint)
 }
 
-fn config_option_named(value: &Value, name: &str) -> bool {
-    value
+/// The advertised ACP config option that carries reasoning, in preference
+/// order: live dsh's `reasoning_effort` select, a generic `effort`, then the
+/// legacy `thinking` boolean. Searched on `initialize` and `session/new`
+/// results alike (live dsh only populates `session/new`).
+fn reasoning_config_option(value: &Value) -> Option<&Value> {
+    let options = value
         .get("configOptions")
         .or_else(|| {
             value
                 .get("agentCapabilities")
                 .and_then(|c| c.get("configOptions"))
         })
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .any(|opt| {
-            opt.get("id")
-                .or_else(|| opt.get("name"))
-                .and_then(|v| v.as_str())
-                == Some(name)
+        .and_then(|v| v.as_array())?;
+    ["reasoning_effort", "effort", "thinking"]
+        .iter()
+        .find_map(|name| {
+            options.iter().find(|opt| {
+                opt.get("id")
+                    .or_else(|| opt.get("name"))
+                    .and_then(|v| v.as_str())
+                    == Some(*name)
+            })
         })
 }
 
@@ -1285,8 +1407,8 @@ impl AgentSession for AcpClientSession {
         let live = self.inner.as_mut().expect("ensure_running");
         let handle = live.rpc.handle.clone();
         let session_id = live.session_id.clone();
-        let thinking_settable = live.thinking_settable;
-        Self::apply_effort(&handle, &session_id, thinking_settable, &effort).await;
+        let reasoning = live.reasoning.clone();
+        Self::apply_effort(&handle, &session_id, reasoning.as_ref(), &effort).await;
 
         // Host capture: the host diffs the tree itself after the turn, so the
         // git dirty-set baseline and the out-of-band reconcile are skipped.
@@ -1519,6 +1641,79 @@ mod tests {
         assert!(c.extended_thinking);
         assert!(!c.supports_file_blocks);
         assert_eq!(c.max_context_tokens, 128_000);
+    }
+
+    /// DeepSeek's `off` is the only advertised value that disables thinking;
+    /// dsh's opaque `""` provider-default choice must not read as off.
+    #[test]
+    fn thinking_is_on_treats_only_off_as_disabled() {
+        for value in ["high", "low", "max", "", "HIGH", "provider-default"] {
+            assert!(thinking_is_on(value), "{value:?}");
+        }
+        for value in ["off", "OFF", "Off"] {
+            assert!(!thinking_is_on(value), "{value:?}");
+        }
+    }
+
+    /// The fallback never returns `off`/`""`, so an unset gaviero effort cannot
+    /// land on a non-thinking value — and it re-asserts an already-resolved
+    /// thinking default instead of downgrading it.
+    #[test]
+    fn thinking_on_value_prefers_the_resolved_default_then_high() {
+        let option = json!({
+            "options": [
+                { "value": "off" },
+                { "value": "low" },
+                { "value": "high" },
+                { "value": "max" }
+            ]
+        });
+        assert_eq!(thinking_on_value(&option).as_deref(), Some("high"));
+
+        // A profile that deliberately resolved `max` is kept, not downgraded.
+        let max_default = json!({
+            "currentValue": "max",
+            "options": [
+                { "value": "off" },
+                { "value": "low" },
+                { "value": "high" },
+                { "value": "max" }
+            ]
+        });
+        assert_eq!(thinking_on_value(&max_default).as_deref(), Some("max"));
+
+        // A non-thinking default is ignored rather than re-asserted.
+        let off_default = json!({
+            "currentValue": "off",
+            "options": [
+                { "value": "off" },
+                { "value": "low" },
+                { "value": "high" },
+                { "value": "max" }
+            ]
+        });
+        assert_eq!(thinking_on_value(&off_default).as_deref(), Some("high"));
+
+        // A lower ceiling still yields a thinking level rather than `off`.
+        let low_only = json!({ "options": [{ "value": "off" }, { "value": "low" }] });
+        assert_eq!(thinking_on_value(&low_only).as_deref(), Some("low"));
+
+        // Thinking unconditionally disabled: nothing to select.
+        let disabled = json!({ "options": [{ "value": "off" }] });
+        assert_eq!(thinking_on_value(&disabled), None);
+    }
+
+    #[test]
+    fn current_select_value_reads_the_advertised_default() {
+        assert_eq!(
+            current_select_value(&json!({ "currentValue": "max" })),
+            Some("max")
+        );
+        assert_eq!(
+            current_select_value(&json!({ "currentValue": "" })),
+            Some("")
+        );
+        assert_eq!(current_select_value(&json!({ "type": "select" })), None);
     }
 
     #[test]
