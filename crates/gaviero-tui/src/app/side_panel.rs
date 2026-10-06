@@ -216,7 +216,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 let msg = app.chat_state.browsed_msg;
                 if let Some(kept) = app.chat_state.conversations[idx].toggle_keep_exchange(msg) {
                     let note = if kept {
-                        "Exchange kept — /handoff carries it to a fresh session"
+                        "Exchange kept — /handoff carries it here, /handoff to <tab|new> elsewhere"
                     } else {
                         "Exchange no longer kept"
                     };

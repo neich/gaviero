@@ -71,7 +71,7 @@ Pending reviews survive a restart. The phone (remote) has the same four decision
 | `/lite` | Minimal-context turn (topology only) |
 | `/compact [text\|N]` | Claude: the CLI compacts its own session (optional extra guidance). Other providers: keep the last N messages of the transcript gaviero replays |
 | `/clear` | Clear agent context (alias of `/reset`) |
-| `/keep [clear]` / `/handoff` | Mark exchanges to keep in browse mode (Ctrl+C with nothing selected, ↑/↓, **Space** → `★`), then `/handoff` starts a fresh session carrying only those exchanges, verbatim; detours are left out. `/keep` lists them. |
+| `/keep [clear]` / `/handoff [to <tab\|new>]` | Mark exchanges to keep in browse mode (Ctrl+C with nothing selected, ↑/↓, **Space** → `★`), then `/handoff` starts a fresh session carrying only those exchanges, verbatim; detours are left out. `/handoff to <n\|title>` seeds an existing tab instead (the source is left untouched), `/handoff to new` opens one. `/keep` lists them. |
 
 Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash inventory: [CLAUDE.md](CLAUDE.md).
 

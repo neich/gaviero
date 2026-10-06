@@ -2289,7 +2289,8 @@ impl AgentChatState {
                             .collect();
                         format!(
                             "Kept {n} exchange{} (~{} tokens):\n{}\n\n/handoff carries them into a \
-                             fresh session; /keep clear unmarks them all.",
+                             fresh session here; /handoff to <tab|new> carries them into another \
+                             tab. /keep clear unmarks them all.",
                             if n == 1 { "" } else { "s" },
                             words_to_tokens(count_words(&block)),
                             previews.join("\n")
@@ -2316,15 +2317,102 @@ impl AgentChatState {
                     return true;
                 };
                 let tokens = words_to_tokens(count_words(&block));
-                self.reset_conversation_at(idx);
-                self.conversations[idx].carried_context = Some(block);
+                // `/handoff`, `/handoff <target>`, and `/handoff to <target>`
+                // are the same command — `to` is an optional keyword, and the
+                // target may itself contain spaces (a title).
+                let spec = match arg.split_once(char::is_whitespace) {
+                    Some((head, rest)) if head.eq_ignore_ascii_case("to") => rest.trim(),
+                    _ if arg.eq_ignore_ascii_case("to") => {
+                        self.add_system_message_at(idx, HANDOFF_USAGE);
+                        return true;
+                    }
+                    _ => arg,
+                };
+                let target = if spec.is_empty() {
+                    HandoffTarget::Tab(idx)
+                } else {
+                    match self.resolve_handoff_target(spec) {
+                        Ok(target) => target,
+                        Err(message) => {
+                            self.add_system_message_at(idx, &message);
+                            return true;
+                        }
+                    }
+                };
+                let target_idx = match target {
+                    HandoffTarget::Tab(target_idx) => target_idx,
+                    HandoffTarget::New => {
+                        self.new_conversation();
+                        self.active_conv
+                    }
+                };
+
+                // In place: this tab drops its session and the next prompt
+                // carries the block. Also the target of an explicit
+                // self-reference (`/handoff to 1` on tab 1).
+                if target_idx == idx {
+                    self.reset_conversation_at(idx);
+                    self.conversations[idx].carried_context = Some(block);
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "── Handoff ── The next prompt starts a fresh session that carries only \
+                             the {n} kept exchange{} (~{tokens} tokens), verbatim. Everything above \
+                             stays visible but is no longer sent.",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    );
+                    return true;
+                }
+
+                // Cross-tab: the target's session is replaced, so it must not
+                // be mid-turn — a streaming reply, a background task, or a
+                // parked permission belongs to the session being dropped.
+                let busy = {
+                    let conv = &self.conversations[target_idx];
+                    conv.is_streaming
+                        || conv.has_running_background_agents()
+                        || conv.pending_permission.is_some()
+                };
+                if busy {
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "Tab {} is mid-turn — finish or cancel it before handing off into it.",
+                            target_idx + 1
+                        ),
+                    );
+                    return true;
+                }
+
+                // A brand-new tab has no session to drop; an existing one
+                // does, so only it takes the reset (and its reset note).
+                if !self.conversations[target_idx].messages.is_empty() {
+                    self.reset_conversation_at(target_idx);
+                }
+                self.conversations[target_idx].carried_context = Some(block);
+                let source_title = self.conversations[idx].title.clone();
+                let target_title = self.conversations[target_idx].title.clone();
+                let plural = if n == 1 { "" } else { "s" };
+                // Target note first: on the desktop the source note is the
+                // one that scrolls into view (the command was typed there).
+                self.add_system_message_at(
+                    target_idx,
+                    &format!(
+                        "── Handoff ← from tab {} ({source_title}) ── The {n} kept exchange{plural} \
+                         (~{tokens} tokens) from that session ride along with your next prompt, \
+                         verbatim. Anything this tab held before is no longer sent.",
+                        idx + 1
+                    ),
+                );
                 self.add_system_message_at(
                     idx,
                     &format!(
-                        "── Handoff ── The next prompt starts a fresh session that carries only \
-                         the {n} kept exchange{} (~{tokens} tokens), verbatim. Everything above \
-                         stays visible but is no longer sent.",
-                        if n == 1 { "" } else { "s" }
+                        "── Handoff → tab {} ({target_title}) ── That tab starts a fresh session \
+                         carrying only the {n} kept exchange{plural} (~{tokens} tokens), verbatim; \
+                         the block goes out with its next prompt. This tab is unchanged and the \
+                         kept marks stay.",
+                        target_idx + 1
                     ),
                 );
                 true
@@ -2487,7 +2575,7 @@ impl AgentChatState {
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
                      /keep [clear]            — List (or unmark) the exchanges marked to keep. Mark them in browse mode: Ctrl+C with nothing selected, ↑/↓, Space\n\
-                     /handoff                 — Start a fresh session carrying only the kept exchanges, verbatim (detours left out)\n\
+                     /handoff [to <tab|new>]  — Start a fresh session carrying only the kept exchanges, verbatim (detours left out). Default: this tab. `to <n|title>` seeds another tab (this one is left untouched), `to new` opens one\n\
                      /compact [text|N]        — Claude: compact the session natively (optional extra guidance). Other providers: keep the last N messages of the replayed transcript (default 6)\n\n\
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
@@ -7645,6 +7733,205 @@ mod tests {
         state.text_input.text = "/reset".into();
         assert!(state.process_slash_command());
         assert!(state.conversations[idx].carried_context.is_none());
+    }
+
+    #[test]
+    fn handoff_to_another_tab_seeds_it_and_leaves_the_source_alone() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        // A second tab with a session and a transcript of its own.
+        state.new_conversation();
+        let target = state.active_conv;
+        assert_eq!(target, 1);
+        state.conversations[target].claude_session_id = Some("target-session".into());
+        state.conversations[target].push_message(
+            ChatRole::User,
+            "old target prompt".into(),
+            Vec::new(),
+        );
+
+        state.active_conv = source;
+        state.text_input.text = "/handoff to 2".into();
+        assert!(state.process_slash_command());
+
+        let t = &state.conversations[target];
+        assert!(t.claude_session_id.is_none(), "fresh provider session in the target");
+        assert!(
+            t.carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options")),
+            "the kept block landed in the other tab"
+        );
+        assert!(
+            t.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff ← from tab 1")),
+            "the target is told where the block came from"
+        );
+        assert_eq!(t.transcript_inline_mode, TranscriptInlineMode::Suppress);
+        assert!(
+            state
+                .context_messages_at(target)
+                .iter()
+                .all(|(_, text)| !text.contains("old target prompt")),
+            "the target's old transcript is no longer replayed"
+        );
+
+        let s = &state.conversations[source];
+        assert_eq!(
+            s.claude_session_id.as_deref(),
+            Some("source-session"),
+            "the source session is untouched"
+        );
+        assert!(s.carried_context.is_none(), "the block did not stay in the source");
+        assert!(
+            s.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff → tab 2")),
+            "the source notes where the block went"
+        );
+        assert!(s.messages[1].kept, "kept marks stay so the block can be sent again");
+
+        // ...and by title, not just by position.
+        state.conversations[target].title = "review branch".into();
+        state.conversations[target].carried_context = None;
+        state.text_input.text = "/handoff to review".into();
+        assert!(state.process_slash_command());
+        assert!(
+            state.conversations[target]
+                .carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options")),
+            "a unique title prefix resolves to the tab"
+        );
+    }
+
+    #[test]
+    fn handoff_to_new_creates_and_switches_to_a_fresh_tab() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        state.text_input.text = "/handoff to new".into();
+        assert!(state.process_slash_command());
+
+        assert_eq!(state.conversations.len(), 2, "one new tab");
+        let target = state.active_conv;
+        assert_eq!(target, 1, "Ctrl+T semantics: the new tab is the active one");
+        let t = &state.conversations[target];
+        assert!(t.claude_session_id.is_none());
+        assert!(
+            t.carried_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Research the lexer options"))
+        );
+        assert!(
+            t.messages
+                .iter()
+                .any(|m| m.content.contains("── Handoff ← from tab 1"))
+        );
+        assert!(
+            !t.messages.iter().any(|m| m.content.contains("Context cleared")),
+            "a brand-new tab has no stale session to reset"
+        );
+
+        let s = &state.conversations[source];
+        assert_eq!(s.claude_session_id.as_deref(), Some("source-session"));
+        assert!(s.carried_context.is_none());
+        assert!(s.messages[1].kept);
+    }
+
+    #[test]
+    fn handoff_reports_an_unresolvable_or_ambiguous_target() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+
+        // Out of range: reported, nothing reset.
+        state.text_input.text = "/handoff to 9".into();
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations.len(), 1, "no tab was created");
+        assert!(state.conversations[source].claude_session_id.is_some());
+        assert!(state.conversations[source].carried_context.is_none());
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("No tab 9")
+        );
+
+        // A bare `to` is a usage error, not a silent self-handoff.
+        state.text_input.text = "/handoff to".into();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[source].claude_session_id.is_some());
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .starts_with("Usage: /handoff")
+        );
+
+        // Two tabs sharing a word: the substring form must not guess.
+        state.new_conversation();
+        let second = state.active_conv;
+        state.conversations[source].title = "lexer research".into();
+        state.conversations[second].title = "lexer work".into();
+        state.active_conv = source;
+        state.text_input.text = "/handoff to lexer".into();
+        assert!(state.process_slash_command());
+        let last = &state.conversations[source].messages.last().unwrap().content;
+        assert!(
+            last.contains("matches 2 tabs")
+                && last.contains("lexer research")
+                && last.contains("lexer work"),
+            "{last}"
+        );
+        assert!(state.conversations[second].carried_context.is_none());
+        assert!(state.conversations[source].claude_session_id.is_some());
+    }
+
+    #[test]
+    fn handoff_refuses_a_target_tab_that_is_mid_turn() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].claude_session_id = Some("source-session".into());
+        state.conversations[source].toggle_keep_exchange(1);
+        state.new_conversation();
+        let target = state.active_conv;
+        state.conversations[target].is_streaming = true;
+        state.active_conv = source;
+
+        state.text_input.text = "/handoff to 2".into();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[target].is_streaming, "the target turn keeps running");
+        assert!(state.conversations[target].carried_context.is_none());
+        assert!(state.conversations[target].claude_session_id.is_none());
+        assert_eq!(
+            state.conversations[source].claude_session_id.as_deref(),
+            Some("source-session"),
+            "the source is untouched too"
+        );
+        assert!(
+            state.conversations[source]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("Tab 2 is mid-turn")
+        );
     }
 
     #[test]
