@@ -265,17 +265,19 @@ pub fn render_diff_overlay(
     let diff_lines = &state.cached_lines;
     let proposal = &state.proposal;
 
-    // Auto-scroll to keep current hunk visible
-    let current_hunk_first_line = diff_lines
-        .iter()
-        .position(|l| l.hunk_index == Some(state.current_hunk))
-        .unwrap_or(0);
-    let scroll_top = if current_hunk_first_line < state.scroll_top {
-        current_hunk_first_line
-    } else if current_hunk_first_line >= state.scroll_top + area.height as usize {
-        current_hunk_first_line.saturating_sub(area.height as usize / 3)
-    } else {
-        state.scroll_top
+    // Keep the current hunk visible, since a decision is taken per hunk.
+    let scroll_top = {
+        let current_hunk_first_line = diff_lines
+            .iter()
+            .position(|l| l.hunk_index == Some(state.current_hunk))
+            .unwrap_or(0);
+        if current_hunk_first_line < state.scroll_top {
+            current_hunk_first_line
+        } else if current_hunk_first_line >= state.scroll_top + area.height as usize {
+            current_hunk_first_line.saturating_sub(area.height as usize / 3)
+        } else {
+            state.scroll_top
+        }
     };
 
     let gutter_w: u16 = 5; // " + │ " or " - │ " or "   │ "
