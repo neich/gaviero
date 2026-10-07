@@ -7564,14 +7564,14 @@ mod tests {
         assert_eq!(state.context_limit_tokens(), 1_000_000);
         // Other models keep their own value.
         assert_eq!(state.context_limit_tokens_for("claude:haiku"), 200_000);
-        // The static fallback is the planner's profile table.
+        // The static fallback is the planner's profile table (DeepSeek: 1M).
         assert_eq!(
             state.context_limit_tokens_for("dsh:deepseek-v4-pro"),
-            128_000
+            1_000_000
         );
         assert_eq!(
             state.context_limit_tokens_for("deepseek:deepseek-v4-pro"),
-            128_000
+            1_000_000
         );
         assert_eq!(
             state.context_limit_tokens_for("ollama:qwen2.5-coder:7b"),

@@ -2197,6 +2197,24 @@ pub(crate) fn dispatch_prompt_core(
 
     let (agent_available_tools, agent_approved_tools) =
         app.workspace.resolve_agent_tools(Some(&root));
+    // The in-process loop's twin of the enforcement disclosure above: tools
+    // named in `agent.availableTools` (or extra MCP servers) it cannot serve
+    // are declared once per conversation, not silently skipped. Idempotent by
+    // content, like the notice above.
+    if let Some(notice) = gaviero_core::agent_session::tool_agent::tool_agent_disclosure(
+        &agent_available_tools,
+        &provider_profile,
+        &app.workspace,
+        Some(&root),
+    ) {
+        let announced = app.chat_state.conversations[conv_idx]
+            .messages
+            .iter()
+            .any(|m| m.role == crate::panels::agent_chat::ChatRole::System && m.content == notice);
+        if !announced {
+            app.chat_state.add_system_message_at(conv_idx, &notice);
+        }
+    }
     // Shell policy from the same cascade, handed to the session so the
     // in-process tool-agent and the Codex command gate never re-read the
     // settings file themselves.
