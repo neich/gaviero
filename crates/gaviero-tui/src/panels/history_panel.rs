@@ -13,6 +13,16 @@
 //! * **Every token number carries its provenance.** Per-item numbers are
 //!   prefixed `~` and the footer legend names the estimators; exact numbers
 //!   are labelled `exact` and come only from provider-reported usage.
+//! * **Diffs come from the turn-capture blob store, never from the workspace.**
+//!   The log keeps hashes only ([`ChangedFile`]), so `Enter` on a file reads both
+//!   sides back through `gaviero_core::turn_capture::file_texts` and opens them
+//!   with `crate::app::editing::open_diff_view` — the read-only diff *tab* the
+//!   editor already builds for the git panel, with its syntax highlighting,
+//!   gutter, wrapping and scrolling. The panel renders no diff of its own, so the
+//!   app keeps one whole-file diff viewer, not two. The handler does the reading
+//!   (render never touches disk); content the store has already reclaimed is
+//!   reported as such, never approximated from the file that happens to be on
+//!   disk now.
 //! * **Render is pure.** All state changes go through the action handler.
 
 use std::path::{Path, PathBuf};
@@ -24,8 +34,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use gaviero_core::history::{
-    CaptureMode, Estimator, HistoryKind, HistoryRecord, McpCall, MemoryInjection, ToolCall,
-    ToolOutput, TurnEnd, TurnRecords, TurnStart, TurnStatus, compact_count, grouped_count,
+    CaptureMode, ChangedFile, Estimator, FilesChanged, HistoryKind, HistoryRecord, McpCall,
+    MemoryInjection, ToolCall, ToolOutput, TurnEnd, TurnRecords, TurnStart, TurnStatus,
+    compact_count, grouped_count,
 };
 
 const COLOR_ACCENT: Color = Color::Rgb(97, 175, 239);
@@ -38,6 +49,9 @@ const COLOR_OK: Color = Color::Rgb(152, 195, 121);
 /// Below this inner width the turn list stacks above the detail instead of
 /// sitting beside it.
 const TWO_COLUMN_MIN_WIDTH: u16 = 90;
+
+/// Files `J`/`K` / `PgUp`/`PgDn` skip in the FILES list.
+pub const FILE_PAGE: isize = 10;
 
 /// The six detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`6` jump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +133,48 @@ pub fn load_history(path: &Path) -> HistoryLoad {
     }
 }
 
+/// `M` / `A` / `D` and its colour, from the record's `change` word.
+fn change_glyph(change: &str) -> (&'static str, Color) {
+    match change {
+        "added" => ("A", COLOR_OK),
+        "deleted" => ("D", COLOR_WARN),
+        _ => ("M", COLOR_WARN),
+    }
+}
+
+/// The FILES section's order: **modified, added, deleted** — what changed, what
+/// appeared, what went — each group by path so the list is stable across
+/// reloads. An unknown kind (a newer record) sorts last rather than panicking.
+pub fn ordered_files(turn: &TurnRecords) -> Vec<&ChangedFile> {
+    let Some(changed) = files_changed(turn) else {
+        return Vec::new();
+    };
+    let mut out: Vec<&ChangedFile> = changed.files.iter().collect();
+    out.sort_by(|a, b| {
+        change_rank(&a.change)
+            .cmp(&change_rank(&b.change))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
+
+fn change_rank(change: &str) -> u8 {
+    match change {
+        "modified" => 0,
+        "added" => 1,
+        "deleted" => 2,
+        _ => 3,
+    }
+}
+
+/// The turn's `files_changed` record, if capture recorded one.
+pub fn files_changed(turn: &TurnRecords) -> Option<&FilesChanged> {
+    turn.records.iter().find_map(|e| match &e.record.payload {
+        HistoryKind::FilesChanged(f) => Some(f),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoryPanelState {
     pub loaded: bool,
@@ -141,6 +197,8 @@ pub struct HistoryPanelState {
     pub active_conv: Option<String>,
     /// `Enter`: the focused section fills the whole panel.
     pub expanded: bool,
+    /// Cursor into the focused turn's [`ordered_files`] list (FILES section).
+    pub file_selected: usize,
 }
 
 impl Default for HistoryPanelState {
@@ -166,6 +224,7 @@ impl HistoryPanelState {
             scope: HistoryScope::AllConversations,
             active_conv: None,
             expanded: false,
+            file_selected: 0,
         }
     }
 
@@ -187,6 +246,8 @@ impl HistoryPanelState {
             })
             .unwrap_or(0);
         self.clamp_selection();
+        // A reload may have changed the file list under an open diff.
+        self.reset_file_cursor();
     }
 
     /// Indices into `turns` for the list, newest first, after scope and
@@ -219,6 +280,7 @@ impl HistoryPanelState {
         if self.selected + 1 < n {
             self.selected += 1;
             self.section_scroll = 0;
+            self.reset_file_cursor();
         }
     }
 
@@ -226,7 +288,53 @@ impl HistoryPanelState {
         if self.selected > 0 {
             self.selected -= 1;
             self.section_scroll = 0;
+            self.reset_file_cursor();
         }
+    }
+
+    /// Drop the FILES cursor: another turn's files are a different list.
+    pub fn reset_file_cursor(&mut self) {
+        self.file_selected = 0;
+    }
+
+    /// The focused turn's changed files, in the section's own order.
+    pub fn files(&self) -> Vec<&ChangedFile> {
+        self.selected_turn().map(ordered_files).unwrap_or_default()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files().len()
+    }
+
+    pub fn selected_file(&self) -> Option<&ChangedFile> {
+        self.files().get(self.file_selected).copied()
+    }
+
+    pub fn select_file_next(&mut self) {
+        let n = self.file_count();
+        if self.file_selected + 1 < n {
+            self.file_selected += 1;
+        }
+    }
+
+    pub fn select_file_prev(&mut self) {
+        self.file_selected = self.file_selected.saturating_sub(1);
+    }
+
+    /// `J`/`K` / `PgUp`/`PgDn` in the FILES section: jump whole pages of files.
+    pub fn select_file_by(&mut self, delta: isize) {
+        let last = self.file_count().saturating_sub(1) as isize;
+        let next = (self.file_selected as isize).saturating_add(delta);
+        self.file_selected = next.clamp(0, last.max(0)) as usize;
+    }
+
+    /// `Home` / `End` in the FILES section: the first / last file.
+    pub fn select_file_to(&mut self, bottom: bool) {
+        self.file_selected = if bottom {
+            self.file_count().saturating_sub(1)
+        } else {
+            0
+        };
     }
 
     pub fn set_section(&mut self, section: HistorySection) {
@@ -247,9 +355,10 @@ impl HistoryPanelState {
         };
         self.selected = 0;
         self.section_scroll = 0;
+        self.reset_file_cursor();
     }
 
-    /// `Esc`: close the expanded view, else stop editing the filter, else
+    /// `Esc`: collapse the expanded view, else stop editing the filter, else
     /// clear it. Returns whether anything changed.
     pub fn escape(&mut self) -> bool {
         if self.expanded {
@@ -287,7 +396,7 @@ impl HistoryPanelState {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         let title = if focused {
             "HISTORY (Tab/1-6: section · / filter · a scope · r reload · c copy · Enter expand)"
         } else {
@@ -425,7 +534,7 @@ impl HistoryPanelState {
             detail_header_lines(turn, self.section)
         };
         let header_len = lines.len();
-        lines.extend(section_lines(turn, self.section));
+        lines.extend(self.section_body(turn));
         // Keep the header pinned: scroll only the section body.
         let header: Vec<Line> = lines.drain(..header_len).collect();
         let header_height = (header.len() as u16).min(area.height);
@@ -440,6 +549,13 @@ impl HistoryPanelState {
             .wrap(Wrap { trim: false })
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
             .render(rest, buf);
+    }
+
+    /// The focused section's body, with the FILES cursor marked when the panel
+    /// has one. Shared by the side-by-side and the expanded layouts.
+    fn section_body(&self, turn: &TurnRecords) -> Vec<Line<'static>> {
+        let cursor = (self.section == HistorySection::Files).then_some(self.file_selected);
+        section_lines_with_cursor(turn, self.section, cursor)
     }
 }
 
@@ -716,8 +832,13 @@ fn tools_absent_reason(provider: Option<&str>) -> &'static str {
     }
 }
 
-/// The focused section's body.
-pub fn section_lines(turn: &TurnRecords, section: HistorySection) -> Vec<Line<'static>> {
+/// The focused section's body, with the FILES list's cursor marked (the panel
+/// passes its own `file_selected`; callers with no cursor pass `None`).
+pub fn section_lines_with_cursor(
+    turn: &TurnRecords,
+    section: HistorySection,
+    file_selected: Option<usize>,
+) -> Vec<Line<'static>> {
     let provider = turn
         .summary
         .provider
@@ -791,38 +912,58 @@ pub fn section_lines(turn: &TurnRecords, section: HistorySection) -> Vec<Line<'s
             }
         }
         HistorySection::Totals => totals_lines(turn, &provider, &mut lines, &heading, &muted),
-        HistorySection::Files => files_lines(turn, &mut lines, &heading, &muted),
+        HistorySection::Files => files_lines(turn, file_selected, &mut lines, &heading, &muted),
     }
     lines
 }
 
-/// FILES: what the turn changed on disk and the review decision per file.
+/// FILES: what the turn changed on disk, in the section's own order —
+/// **modified, added, deleted** — with the review decision per file and the
+/// panel's cursor. `selected` is the index into [`ordered_files`].
 fn files_lines(
     turn: &TurnRecords,
+    selected: Option<usize>,
     lines: &mut Vec<Line<'static>>,
     heading: &dyn Fn(String) -> Line<'static>,
     muted: &dyn Fn(String) -> Line<'static>,
 ) {
-    let changed = turn.records.iter().find_map(|e| match &e.record.payload {
-        HistoryKind::FilesChanged(f) => Some(f),
-        _ => None,
-    });
     let review = turn.records.iter().find_map(|e| match &e.record.payload {
         HistoryKind::TurnReview(r) => Some(r),
         _ => None,
     });
-    let Some(changed) = changed else {
+    let Some(changed) = files_changed(turn) else {
         lines.push(muted(
             "No file changes recorded for this turn (or turn capture was off).".into(),
         ));
         return;
     };
+    let files = ordered_files(turn);
+    let count = |kind: &str| files.iter().filter(|f| f.change == kind).count();
     lines.push(heading(format!(
-        "{} file(s) changed · turn {}",
-        changed.files.len(),
-        changed.outcome
+        "{} file(s) changed · {} · {} modified / {} added / {} deleted",
+        files.len(),
+        changed.outcome,
+        count("modified"),
+        count("added"),
+        count("deleted"),
     )));
-    for f in &changed.files {
+    if selected.is_some() && !files.is_empty() {
+        lines.push(muted(
+            "j/k pick a file · Enter: the whole file with its diffs · [ ] previous/next turn"
+                .into(),
+        ));
+    }
+    let mut group = "";
+    for (i, f) in files.iter().enumerate() {
+        if f.change != group {
+            group = f.change.as_str();
+            lines.push(Line::from(Span::styled(
+                format!("{} ({})", group.to_uppercase(), count(group)),
+                Style::default()
+                    .fg(COLOR_MUTED)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         let decision = review
             .and_then(|r| r.decisions.iter().find(|d| d.path == f.path))
             .map(|d| match &d.detail {
@@ -837,10 +978,28 @@ fn files_lines(
         if !f.revertible {
             flags.push_str("  not revertible");
         }
-        lines.push(Line::from(Span::styled(
-            format!("  {:<8} {}  → {decision}{flags}", f.change, f.path),
-            Style::default().fg(COLOR_TEXT),
-        )));
+        let (glyph, glyph_color) = change_glyph(&f.change);
+        let is_cursor = selected == Some(i);
+        let row = if is_cursor {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} [{i:>2}] ", if is_cursor { "›" } else { " " }),
+                row,
+            ),
+            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+            Span::styled(format!("{:<9}", f.change), Style::default().fg(COLOR_MUTED)),
+            Span::styled(f.path.clone(), row),
+            Span::styled(
+                format!("  → {decision}{flags}"),
+                Style::default().fg(COLOR_MUTED),
+            ),
+        ]));
     }
     for p in &changed.auto_reverted {
         lines.push(Line::from(Span::styled(
@@ -1412,7 +1571,7 @@ mod tests {
         state.select_next();
         let turn = state.selected_turn().unwrap();
         let text = |section| {
-            section_lines(turn, section)
+            section_lines_with_cursor(turn, section, None)
                 .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>()
@@ -1465,5 +1624,214 @@ mod tests {
         let mut buf = Buffer::empty(area);
         state.render(area, &mut buf, false);
         assert!(buffer_text(&buf).contains("No turns recorded yet"));
+    }
+
+    // ── FILES section: order, cursor, whole-file diff ──────────────────────
+
+    /// A closed turn whose only interesting record is its `files_changed`.
+    fn files_state(files: Vec<ChangedFile>) -> (tempfile::TempDir, HistoryPanelState) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        let r = HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
+        r.begin_turn("c1", "c1-1", start("edit the files", "files"), false);
+        r.push(
+            "c1-1",
+            HistoryKind::FilesChanged(FilesChanged {
+                outcome: "completed".into(),
+                files,
+                auto_reverted: Vec::new(),
+                between_turns: Vec::new(),
+                warnings: Vec::new(),
+            }),
+        );
+        r.end_turn("c1-1", TurnEnd::new(false, None, 0));
+        let mut state = HistoryPanelState::new();
+        state.apply_load(load_history(&path));
+        state.set_section(HistorySection::Files);
+        (dir, state)
+    }
+
+    fn changed(path: &str, change: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            change: change.into(),
+            before_sha256: None,
+            after_sha256: None,
+            revertible: true,
+            overlap_with: Vec::new(),
+        }
+    }
+
+    fn section_text(turn: &TurnRecords, selected: Option<usize>) -> String {
+        section_lines_with_cursor(turn, HistorySection::Files, selected)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn files_are_ordered_modified_then_added_then_deleted() {
+        let (_dir, state) = files_state(vec![
+            changed("z.rs", "added"),
+            changed("b.rs", "deleted"),
+            changed("m.rs", "modified"),
+            changed("a.rs", "added"),
+            changed("c.rs", "modified"),
+            changed("a-gone.rs", "deleted"),
+        ]);
+        let ordered: Vec<(&str, &str)> = state
+            .files()
+            .iter()
+            .map(|f| (f.change.as_str(), f.path.as_str()))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("modified", "c.rs"),
+                ("modified", "m.rs"),
+                ("added", "a.rs"),
+                ("added", "z.rs"),
+                ("deleted", "a-gone.rs"),
+                ("deleted", "b.rs"),
+            ]
+        );
+        // The record itself keeps whatever order capture wrote; only the view sorts.
+        assert_eq!(state.file_count(), 6);
+    }
+
+    #[test]
+    fn file_cursor_moves_pages_and_clamps() {
+        let (_dir, mut state) = files_state(vec![
+            changed("m1.rs", "modified"),
+            changed("m2.rs", "modified"),
+            changed("a1.rs", "added"),
+        ]);
+        assert_eq!(state.file_count(), 3);
+        assert_eq!(state.selected_file().unwrap().path, "m1.rs");
+
+        state.select_file_next();
+        assert_eq!(state.selected_file().unwrap().path, "m2.rs");
+        state.select_file_by(FILE_PAGE);
+        assert_eq!(state.file_selected, 2);
+        state.select_file_next();
+        assert_eq!(state.file_selected, 2, "clamped at the end");
+
+        state.select_file_prev();
+        assert_eq!(state.file_selected, 1);
+        state.select_file_by(-FILE_PAGE);
+        assert_eq!(state.file_selected, 0);
+        state.select_file_prev();
+        assert_eq!(state.file_selected, 0, "clamped at the start");
+
+        state.select_file_to(true);
+        assert_eq!(state.file_selected, 2);
+        state.select_file_to(false);
+        assert_eq!(state.file_selected, 0);
+
+        // Turning to another turn drops the cursor: another turn's files are a
+        // different list.
+        state.file_selected = 2;
+        state.reset_file_cursor();
+        assert_eq!(state.file_selected, 0);
+
+        // No files at all: every movement is a no-op rather than a panic.
+        let (_dir, mut empty) = files_state(Vec::new());
+        assert_eq!(empty.file_count(), 0);
+        assert!(empty.selected_file().is_none());
+        empty.select_file_next();
+        empty.select_file_prev();
+        empty.select_file_by(FILE_PAGE);
+        empty.select_file_by(-FILE_PAGE);
+        empty.select_file_to(true);
+        assert_eq!(empty.file_selected, 0);
+    }
+
+    #[test]
+    fn files_section_groups_the_three_kinds_and_hints_at_enter() {
+        let (_dir, state) = files_state(vec![
+            changed("b.rs", "deleted"),
+            changed("a.rs", "added"),
+            changed("m.rs", "modified"),
+        ]);
+        let turn = state.selected_turn().unwrap();
+        let text = section_text(turn, Some(1));
+        assert!(
+            text.contains("3 file(s) changed · completed · 1 modified / 1 added / 1 deleted"),
+            "{text}"
+        );
+        assert!(
+            text.contains("j/k pick a file · Enter: the whole file with its diffs"),
+            "{text}"
+        );
+        assert!(text.contains("› [ 1]"), "{text}");
+        assert!(text.contains("M modified m.rs"), "{text}");
+        let modified = text.find("MODIFIED (1)").expect(&text);
+        let added = text.find("ADDED (1)").expect(&text);
+        let deleted = text.find("DELETED (1)").expect(&text);
+        assert!(modified < added && added < deleted, "{text}");
+
+        // No cursor (the expanded body renders through the same path): no hint,
+        // and no row is marked.
+        let plain = section_text(turn, None);
+        assert!(!plain.contains("j/k pick a file"), "{plain}");
+        assert!(!plain.contains("› ["), "{plain}");
+
+        // A turn capture recorded nothing about: say so rather than render an
+        // empty list.
+        let (_dir, no_capture) = loaded();
+        let turn = no_capture.selected_turn().unwrap();
+        let text = section_text(turn, Some(0));
+        assert!(text.contains("No file changes recorded"), "{text}");
+    }
+
+    /// The panel renders the file list and nothing else: the diff `Enter` opens
+    /// is a buffer tab owned by the editor, so no diff rows appear here.
+    #[test]
+    fn render_shows_the_expanded_file_list_with_the_enter_hint() {
+        let (_dir, mut state) = files_state(vec![
+            changed("b.rs", "deleted"),
+            changed("a.rs", "added"),
+            changed("m.rs", "modified"),
+        ]);
+        state.expanded = true;
+        state.file_selected = 2;
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+        state.render(area, &mut buf, true);
+        let text = buffer_text(&buf);
+        // The ordinary panel title: no diff mode of its own.
+        assert!(text.contains("HISTORY (Tab/1-6: section"), "{text}");
+        assert!(text.contains("MODIFIED (1)"), "{text}");
+        assert!(text.contains("ADDED (1)"), "{text}");
+        assert!(text.contains("DELETED (1)"), "{text}");
+        // The cursor sits on the last file, and the hint says what Enter does.
+        // (`change` is padded to 9 columns so the paths line up under their
+        // kind heading, hence the run of spaces after `deleted`.)
+        assert!(text.contains("› [ 2] D deleted  b.rs"), "{text}");
+        assert!(
+            text.contains("Enter: the whole file with its diffs"),
+            "{text}"
+        );
+        // No diff gutter: the panel is not a diff renderer any more.
+        assert!(!text.contains(" - │ "), "{text}");
+        assert!(!text.contains("file diff"), "{text}");
+    }
+
+    #[test]
+    fn escape_collapses_the_expanded_view_then_the_filter() {
+        let (_dir, mut state) = files_state(vec![changed("m.rs", "modified")]);
+        state.expanded = true;
+        assert!(state.escape());
+        assert!(!state.expanded, "Esc collapses the expanded view first");
+
+        // The rest of the ladder is unchanged: filter editing, then the filter.
+        state.filter_editing = true;
+        assert!(state.escape());
+        assert!(!state.filter_editing);
+        state.filter = "zzz".into();
+        assert!(state.escape());
+        assert!(state.filter.is_empty());
+        assert!(!state.escape(), "nothing left to close");
     }
 }

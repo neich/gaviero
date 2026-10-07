@@ -11,6 +11,12 @@
 //!
 //! Every core call (hunks, drift checks, reverts) runs from a handler, never
 //! from the render path: render reads [`TurnReviewView::preview`] only.
+//!
+//! The panel summarizes; the *reading* is the editor's. `Enter` opens the
+//! selected file in the shared read-only diff tab
+//! ([`super::editing::open_change_diff`]) — the whole file with its changed
+//! lines highlighted, syntax highlighting and real scrolling — which is the
+//! same viewer the git panel and the HISTORY panel open.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -18,9 +24,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
+use gaviero_core::history::ChangedFile;
 use gaviero_core::turn_capture::{
-    ChangeKind, FileChange, FileDecision, PendingReview, ResolvedDecision, RevertOutcome,
-    ReviewedTurn, TurnOutcome, file_hunks, revert_file,
+    BlobRef, ChangeKind, FileChange, FileDecision, PendingReview, ResolvedDecision, RevertOutcome,
+    ReviewedTurn, TurnOutcome, file_hunks, file_texts, revert_file,
 };
 use gaviero_core::types::DiffHunk;
 
@@ -197,15 +204,14 @@ fn ensure_preview(app: &mut App) {
     let preview = match file_hunks(&app.turn_capture, &change) {
         Some(hunks) => Preview::Hunks(hunks),
         None => {
-            let removed = match (&change.kind, &change.before) {
-                (ChangeKind::Deleted, Some(b)) if b.stored && !change.binary => b
-                    .sha256
-                    .as_deref()
-                    .and_then(|h| app.turn_capture.store().get(h).ok())
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .map(|t| t.lines().map(str::to_string).collect())
-                    .unwrap_or_default(),
-                _ => Vec::new(),
+            // One rule for "which sides still have text" — the same core call the
+            // diff tab reads through — so a deleted file's content is fetched the
+            // same way here as it is rendered there.
+            let (before, _) = file_texts(&app.turn_capture, &change).unwrap_or_default();
+            let removed = if change.kind == ChangeKind::Deleted {
+                before.lines().map(str::to_string).collect()
+            } else {
+                Vec::new()
             };
             let note = if change.kind == ChangeKind::Deleted {
                 "Deleted by the turn — reject restores it".to_string()
@@ -272,6 +278,12 @@ pub(super) fn handle_turn_review_action(app: &mut App, action: &Action) -> bool 
                 app.turn_review_view.selected -= 1;
                 ensure_preview(app);
             }
+            true
+        }
+        // The whole file with its changes highlighted, in the editor's diff tab
+        // — the same viewer the git panel and the history panel open.
+        Action::Enter => {
+            open_selected_change(app);
             true
         }
         Action::InsertChar('J') | Action::PageDown => {
@@ -713,6 +725,105 @@ pub(super) fn undo_reviewed_turn(app: &mut App, turn_id: &str) -> String {
         msg.push_str(&format!(", skipped: {}", skipped.join("; ")));
     }
     msg
+}
+
+// ── History panel: whole-file diff ───────────────────────────────────
+
+/// `Enter` on a file in the HISTORY panel's FILES section: read both sides back
+/// from the turn-capture blob store and open them as a read-only **diff tab**.
+///
+/// The viewer is [`crate::app::editing::open_diff_view`] — the one the git panel
+/// already uses: a regular editor buffer holding the file with its hunks, with
+/// tree-sitter syntax highlighting, line-number gutter, `+`/`-` row tints,
+/// wrapping, fold suppression and the editor's own scrolling. The history panel
+/// contributes no rendering of its own, so the app keeps one whole-file diff
+/// viewer rather than two that would drift apart.
+///
+/// Handler-only, so the panel's render stays pure. The workspace's current copy
+/// is never read: the log keeps hashes only, and content the store has already
+/// reclaimed is reported as such rather than approximated from what is on disk
+/// now. Which sides have text at all is core's rule
+/// ([`gaviero_core::turn_capture::file_texts`]), shared with the turn-review
+/// preview, so both callers agree on what "no diff" means.
+pub(super) fn open_history_file_diff(app: &mut App) {
+    let Some(file) = app.history_panel.selected_file().cloned() else {
+        return;
+    };
+    match super::editing::open_change_diff(app, &recorded_change(app, &file)) {
+        Ok(()) => status(
+            app,
+            format!(
+                "{} — {} · diff of the turn's version",
+                file.path, file.change
+            ),
+        ),
+        // Same message the turn review shows for the same file.
+        Err(why) => status(app, why),
+    }
+}
+
+/// A history record's [`ChangedFile`] as the `FileChange` core's diff path
+/// takes, so the history panel reaches the shared viewer through exactly the
+/// type the turn review already holds.
+///
+/// A record keeps hashes only, so the two sides are named from them; the
+/// absolute path comes from the workspace root the record was written relative
+/// to. A record stores no binary flag, and core decides that from the bytes.
+fn recorded_change(app: &App, file: &ChangedFile) -> FileChange {
+    FileChange {
+        path: workspace_path(app, &file.path),
+        root: app.graph_workspace_root.clone().unwrap_or_default(),
+        rel: file.path.clone(),
+        kind: match file.change.as_str() {
+            "added" => ChangeKind::Added,
+            "deleted" => ChangeKind::Deleted,
+            _ => ChangeKind::Modified,
+        },
+        before: file.before_sha256.as_deref().map(recorded_blob),
+        after: file.after_sha256.as_deref().map(recorded_blob),
+        revertible: file.revertible,
+        binary: false,
+        overlap_with: file.overlap_with.clone(),
+    }
+}
+
+/// Open the file selected in the active review in the editor's diff tab — the
+/// same viewer `Enter` opens from the history panel's FILES list.
+fn open_selected_change(app: &mut App) {
+    let Some(change) = selected_change(app).cloned() else {
+        return;
+    };
+    match super::editing::open_change_diff(app, &change) {
+        Ok(()) => status(app, format!("{} — diff of the turn's version", change.rel)),
+        Err(why) => status(app, why),
+    }
+}
+
+/// A history record's root-relative, `/`-separated `path` as an absolute one.
+///
+/// The tab title, the language lookup (by extension) and the tab-reuse identity
+/// all key off the path, so it has to be the real file's path and not the
+/// record's spelling. Falls back to the record's own path when the workspace has
+/// no root, which is what a bare `App::default()`-style test sees.
+fn workspace_path(app: &App, rel: &str) -> std::path::PathBuf {
+    let Some(root) = app.graph_workspace_root.as_deref() else {
+        return std::path::PathBuf::from(rel);
+    };
+    // `Path::join` accepts `/` on every platform, but a record written on
+    // Windows can carry a drive-relative prefix; rebuilding segment by segment
+    // keeps the result under `root` either way.
+    rel.split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .fold(root.to_path_buf(), |p, seg| p.join(seg))
+}
+
+/// A hash the history record kept, as the blob reference core's diff path wants.
+fn recorded_blob(sha256: &str) -> BlobRef {
+    BlobRef {
+        sha256: Some(sha256.to_string()),
+        size: 0,
+        stored: true,
+    }
 }
 
 // ── Remote projection ────────────────────────────────────────────────
@@ -1401,8 +1512,30 @@ mod tests {
                 "{key:?} is not a turn review action"
             );
         }
-        assert!(!handle_turn_review_action(&mut f.app, &Action::Enter));
+        // `Enter` reads rather than decides — it opens the file in the editor's
+        // diff tab — so it is bound like the navigation keys.
+        assert!(handle_turn_review_action(&mut f.app, &Action::Enter));
         assert!(conv_has_pending_review(&f.app, &f.conv()));
+    }
+
+    /// `Enter` hands the selected file to the shared read-only diff tab — the
+    /// same viewer the git panel and the HISTORY panel open — instead of the
+    /// review panel rendering a diff of its own.
+    #[test]
+    fn enter_opens_the_selected_file_in_the_editors_diff_tab() {
+        let mut f = Fixture::new();
+        f.write("a.txt", "v1\n");
+        f.turn("t1", |f| f.write("a.txt", "v2\n"));
+        f.app.turn_capture.flush();
+        assert!(handle_turn_review_action(&mut f.app, &Action::Enter));
+        let buf = f
+            .app
+            .buffers
+            .iter()
+            .find(|b| b.diff_view.is_some())
+            .expect("Enter opens a diff-view tab");
+        assert_eq!(buf.path.as_deref(), Some(f.root().join("a.txt").as_path()));
+        assert_eq!(f.app.focus, Focus::Editor);
     }
 
     #[test]
