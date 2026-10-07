@@ -116,12 +116,27 @@ fn stored_text(cap: &TurnCapture, side: Option<&super::BlobRef>) -> Option<Strin
 /// Hunks from pre-turn to post-turn content, or `None` when the change only
 /// supports whole-file decisions (binary, deleted, or content not stored).
 pub fn file_hunks(cap: &TurnCapture, change: &FileChange) -> Option<Vec<DiffHunk>> {
-    if change.binary || change.after.is_none() {
+    // A deleted file has no post-turn text to hunk against: whole-file only.
+    change.after.as_ref()?;
+    let (before, after) = file_texts(cap, change)?;
+    Some(compute_hunks(&before, &after))
+}
+
+/// Both sides of a change as text, for callers that render the diff themselves
+/// (a side with no content reads as empty: an added file has no pre-turn text,
+/// a deleted one no post-turn text).
+///
+/// `None` as a whole means there is no text to compare: a binary file, or a side
+/// whose content the blob store does not hold (over [`super::MAX_BLOB_BYTES`],
+/// or reclaimed by GC past [`super::RETAINED_TURNS`]).
+pub fn file_texts(cap: &TurnCapture, change: &FileChange) -> Option<(String, String)> {
+    if change.binary {
         return None;
     }
-    let before = stored_text(cap, change.before.as_ref())?;
-    let after = stored_text(cap, change.after.as_ref())?;
-    Some(compute_hunks(&before, &after))
+    Some((
+        stored_text(cap, change.before.as_ref())?,
+        stored_text(cap, change.after.as_ref())?,
+    ))
 }
 
 /// Revert only the hunks at `revert` (indices into [`file_hunks`]).

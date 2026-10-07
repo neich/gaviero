@@ -2005,41 +2005,92 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
 /// recomputed against the latest contents). A separate writable buffer for
 /// the same path can coexist as another tab.
 pub(super) fn open_diff_view(app: &mut App, path: &Path, original: String, current: String) {
-    // Reuse an existing diff-view tab for the same path if any.
-    for (i, b) in app.buffers.iter().enumerate() {
-        if b.diff_view.is_some() && b.path.as_deref() == Some(path) {
-            app.active_buffer = i;
-            return;
-        }
-    }
+    // An existing diff-view tab for the same path is rebuilt in place rather
+    // than reused as it stands: one path can be diffed against several pairs of
+    // revisions (another git ref, another history turn), and a tab left holding
+    // the first pair would show the wrong diff for every later request.
+    let existing = app
+        .buffers
+        .iter()
+        .position(|b| b.diff_view.is_some() && b.path.as_deref() == Some(path));
 
     match Buffer::open_diff_view(path, original, current) {
         Ok(mut buf) => {
-            use gaviero_core::workspace::settings;
-            let lang = buf.lang_name.as_deref();
-            let tab_size = if let Some(lang) = lang {
-                app.workspace
-                    .resolve_language_setting(settings::TAB_SIZE, lang, None)
-            } else {
-                app.workspace.resolve_setting(settings::TAB_SIZE, None)
-            };
-            buf.tab_width = tab_size.as_u64().unwrap_or(4) as u8;
-            let word_wrap = app.workspace.resolve_setting(settings::WORD_WRAP, None);
-            buf.word_wrap = word_wrap.as_bool().unwrap_or(false);
-
-            if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language)
-                && !app.highlight_configs.contains_key(lang_name)
-                && let Ok(config) = load_highlight_config(language.clone(), lang_name)
-            {
-                app.highlight_configs.insert(lang_name.clone(), config);
+            configure_diff_buffer(app, &mut buf);
+            match existing {
+                Some(i) => {
+                    // Same file, new revision: keep where the reader was, so
+                    // flipping through one file's turns does not jump the view.
+                    buf.scroll = app.buffers[i].scroll.clone();
+                    buf.cursor = app.buffers[i].cursor.clone();
+                    app.buffers[i] = buf;
+                    app.active_buffer = i;
+                }
+                None => {
+                    app.buffers.push(buf);
+                    app.active_buffer = app.buffers.len() - 1;
+                }
             }
-            app.buffers.push(buf);
-            app.active_buffer = app.buffers.len() - 1;
         }
         Err(e) => {
             tracing::error!("Failed to open diff view for {}: {}", path.display(), e);
         }
     }
+}
+
+/// Apply the workspace-derived settings a diff-view tab takes from the
+/// workspace rather than from the file, and cache its language's highlight
+/// config. Shared by the insert and the in-place-rebuild paths.
+fn configure_diff_buffer(app: &mut App, buf: &mut Buffer) {
+    use gaviero_core::workspace::settings;
+
+    let lang = buf.lang_name.as_deref();
+    let tab_size = if let Some(lang) = lang {
+        app.workspace
+            .resolve_language_setting(settings::TAB_SIZE, lang, None)
+    } else {
+        app.workspace.resolve_setting(settings::TAB_SIZE, None)
+    };
+    buf.tab_width = tab_size.as_u64().unwrap_or(4) as u8;
+    let word_wrap = app.workspace.resolve_setting(settings::WORD_WRAP, None);
+    buf.word_wrap = word_wrap.as_bool().unwrap_or(false);
+
+    if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language)
+        && !app.highlight_configs.contains_key(lang_name)
+        && let Ok(config) = load_highlight_config(language.clone(), lang_name)
+    {
+        app.highlight_configs.insert(lang_name.clone(), config);
+    }
+}
+
+/// Why a recorded change can have no text to diff, in one line.
+pub(super) const NO_TEXT: &str = "binary, over 8 MiB, or reclaimed (the turn store keeps the last 5 \
+                                  reviewed turns) — nothing left to diff";
+
+/// Open one file captured by a turn in the shared read-only diff tab.
+///
+/// The turn review and the history panel both start from a
+/// [`gaviero_core::turn_capture::FileChange`] — one from the live pending
+/// review, one rebuilt from a history record — and both want the same viewer.
+/// Reading the two sides back out of the turn store is the only work either
+/// caller adds, so it lives here instead of in both of them, and both go
+/// through [`gaviero_core::turn_capture::file_texts`], so "binary", "over the
+/// blob cap" and "reclaimed" mean one thing everywhere.
+///
+/// The workspace's copy of the file is never substituted for a side the store
+/// has lost: content that is gone is reported, not approximated from what is
+/// on disk now.
+pub(super) fn open_change_diff(
+    app: &mut App,
+    change: &gaviero_core::turn_capture::FileChange,
+) -> Result<(), &'static str> {
+    let Some((before, after)) = gaviero_core::turn_capture::file_texts(&app.turn_capture, change)
+    else {
+        return Err(NO_TEXT);
+    };
+    open_diff_view(app, &change.path, before, after);
+    app.focus = Focus::Editor;
+    Ok(())
 }
 
 /// Re-point the preview's *derived* state at the buffer that just became

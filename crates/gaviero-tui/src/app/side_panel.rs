@@ -1267,6 +1267,14 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
         return;
     }
 
+    // FILES has its own cursor: `j`/`k` walk the file list, `Enter` opens the
+    // whole file with its hunks, and `[`/`]` still change turn. Keys it does not
+    // claim fall through to the mapping below.
+    if panel.section == HistorySection::Files && handle_history_files_action(app, &action) {
+        return;
+    }
+    let panel = &mut app.history_panel;
+
     match action {
         Action::CursorUp | Action::InsertChar('k') => panel.select_prev(),
         Action::CursorDown | Action::InsertChar('j') => panel.select_next(),
@@ -1333,6 +1341,35 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
 /// filter, or clear it. Returns whether the key was consumed.
 pub(super) fn handle_history_panel_escape(app: &mut App) -> bool {
     app.history_panel.escape()
+}
+
+/// The keys the HISTORY panel's FILES section claims: the file cursor, `Enter`
+/// to open the selected file's diff, and `[`/`]` for the turn. Returns whether
+/// the action was consumed, so every key it does not claim still reaches the
+/// section-agnostic mapping in [`handle_history_panel_action`].
+///
+/// Scrolling and closing the diff itself belong to the editor, which owns the
+/// tab `Enter` opened (see [`super::turn_review::open_history_file_diff`]).
+fn handle_history_files_action(app: &mut App, action: &Action) -> bool {
+    use crate::panels::history_panel::FILE_PAGE;
+
+    if app.history_panel.selected_turn().is_none() {
+        return false;
+    }
+    match action {
+        Action::Enter => super::turn_review::open_history_file_diff(app),
+        Action::CursorDown | Action::InsertChar('j') => app.history_panel.select_file_next(),
+        Action::CursorUp | Action::InsertChar('k') => app.history_panel.select_file_prev(),
+        Action::PageDown | Action::InsertChar('J') => app.history_panel.select_file_by(FILE_PAGE),
+        Action::PageUp | Action::InsertChar('K') => app.history_panel.select_file_by(-FILE_PAGE),
+        Action::Home => app.history_panel.select_file_to(false),
+        Action::End => app.history_panel.select_file_to(true),
+        // The turn list is reachable without leaving the FILES section.
+        Action::InsertChar('[') => app.history_panel.select_prev(),
+        Action::InsertChar(']') => app.history_panel.select_next(),
+        _ => return false,
+    }
+    true
 }
 
 /// Fire a debounced live-search against `MemoryStore::search_scoped`.

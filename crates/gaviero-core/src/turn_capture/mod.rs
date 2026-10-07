@@ -42,7 +42,7 @@ pub use changeset::{
     TurnChangeSet, TurnOutcome,
 };
 pub use ledger::HostWriteLedger;
-pub use revert::{RevertOutcome, file_hunks, has_drifted, revert_file, revert_hunks};
+pub use revert::{RevertOutcome, file_hunks, file_texts, has_drifted, revert_file, revert_hunks};
 pub use walk::CaptureScope;
 
 use manifest::{Entry, Manifest, under_any};
