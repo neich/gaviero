@@ -61,6 +61,14 @@ pub(super) fn handle_chat_cursor_up(app: &mut App) {
         return;
     }
 
+    // Starting to browse replaces the prompt, so it is only allowed from an
+    // empty prompt (or while already browsing). With a draft in the box, Up on
+    // the top visual row scrolls the conversation instead of discarding it.
+    if !app.chat_state.can_browse_history() {
+        app.chat_state.scroll_chat_up();
+        return;
+    }
+
     let before = app.chat_state.history_index;
     app.chat_state.history_up();
     if before.is_none() && app.chat_state.history_index.is_none() {
@@ -3170,6 +3178,54 @@ pub(crate) fn cancel_agent_conv(app: &mut App, conv_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::{display_dir_prefix, expand_tilde, list_filesystem_matches};
+
+    /// An `App` over a throwaway workspace. Mirrors `app::editing`'s helper.
+    fn chat_app(dir: &std::path::Path) -> crate::app::App {
+        std::fs::create_dir_all(dir.join(".gaviero")).unwrap();
+        std::fs::write(dir.join(".gaviero/settings.json"), "{}").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::app::App::new(
+            gaviero_core::workspace::Workspace::single_folder(dir.to_path_buf()),
+            tx,
+        )
+    }
+
+    /// `App::new` reads session state from the OS data dir, keyed by a hash of
+    /// the workspace path, so the directory has to go or the run litters it.
+    fn cleanup_session(dir: &std::path::Path) {
+        if let Some(state_dir) = gaviero_core::session_state::state_dir_for(dir) {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    #[test]
+    fn up_on_the_first_prompt_row_does_not_replace_a_non_empty_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = chat_app(dir.path());
+        app.layout.side_panel_area = Some(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
+        app.chat_state.add_user_message("previous prompt");
+
+        // The caret sits on the prompt's only visual row, so Up has nowhere to
+        // go inside the input — but it must not swap the draft for an old prompt.
+        app.chat_state.text_input.text = "draft".to_string();
+        app.chat_state.text_input.cursor = 0;
+        super::handle_chat_cursor_up(&mut app);
+        assert_eq!(app.chat_state.text_input.text, "draft");
+        assert!(app.chat_state.history_index.is_none());
+
+        // An empty prompt still browses history the shell way.
+        app.chat_state.text_input.clear();
+        super::handle_chat_cursor_up(&mut app);
+        assert_eq!(app.chat_state.text_input.text, "previous prompt");
+        assert_eq!(app.chat_state.history_index, Some(0));
+
+        cleanup_session(dir.path());
+    }
 
     #[test]
     fn list_filesystem_matches_lists_entries_in_directory() {
