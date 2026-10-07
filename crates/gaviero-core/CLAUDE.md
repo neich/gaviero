@@ -81,3 +81,4 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module map, swarm/memory pipelines, MCP topology, write-gate flow.
 - [README.md](README.md) — public-API reference.
 - [../../ARCHITECTURE.md](../../ARCHITECTURE.md) — workspace-wide design.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).
