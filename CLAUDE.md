@@ -14,7 +14,7 @@ cargo test
 ```
 
 
-Do not run rustfmt
+VERY IMPORTANT: **never run clippy or rustfmt unless it is in modified or new files, and only at the end of the turn**
 
 Binaries: `gaviero` (TUI), `gaviero-cli` (headless), `gaviero-mcp-shim` (subprocess→MCP bridge).
 
