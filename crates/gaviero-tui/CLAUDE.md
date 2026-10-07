@@ -74,3 +74,4 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — event loop, layout, panel patterns, observer bridge.
 - [README.md](README.md) — keybindings, settings cascade, themes.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).

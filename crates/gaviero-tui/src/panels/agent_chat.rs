@@ -1090,6 +1090,10 @@ pub struct AgentChatState {
     pub chat_dragging: bool,
     /// Whether mouse is dragging a selection inside the prompt input.
     pub input_dragging: bool,
+    /// Sticky column for Up/Down inside the prompt: `(cursor, column)` recorded
+    /// when the cursor moved vertically. The cursor index is part of the key, so
+    /// any other movement (typing, arrows) invalidates the goal by itself.
+    input_goal_col: Option<(usize, usize)>,
     /// Keyboard cursor line index into rendered_lines_cache, for Shift+Arrow selection.
     pub chat_output_kb_cursor: Option<usize>,
     /// When true, the user has manually scrolled during streaming, so auto-scroll is paused.
@@ -1168,6 +1172,7 @@ impl AgentChatState {
             text_sel_end: None,
             chat_dragging: false,
             input_dragging: false,
+            input_goal_col: None,
             chat_output_kb_cursor: None,
             user_scrolled_during_stream: false,
             auto_approve_next: false,
@@ -3419,6 +3424,41 @@ impl AgentChatState {
         self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
+    /// Column Up/Down aims for: the sticky goal while the cursor still sits
+    /// where it was recorded, else the cursor's own column.
+    fn goal_col_for(&self, current_col: usize) -> usize {
+        match self.input_goal_col {
+            Some((at, col)) if at == self.text_input.cursor => col,
+            _ => current_col,
+        }
+    }
+
+    /// Whether `vline` is the final visual row of its logical line.
+    ///
+    /// A wrapped continuation starts exactly where the previous row ends; a gap
+    /// between them means a newline was consumed, so the row before it closes
+    /// its logical line.
+    fn row_is_last_of_logical_line(lines: &[(usize, usize)], vline: usize) -> bool {
+        match lines.get(vline + 1) {
+            Some(&(next_start, _)) => next_start != lines[vline].0 + lines[vline].1,
+            None => true,
+        }
+    }
+
+    /// Highest column on visual row `vline` a caret may occupy.
+    ///
+    /// `len` (one past the row's last character) is a real cell only on the final
+    /// row of a logical line. On a wrapped row that position is drawn on the row
+    /// below, so a caret clamped to `len` would resolve back to the row it just
+    /// left — the row has to stop one column short instead.
+    fn last_owned_col(lines: &[(usize, usize)], vline: usize, len: usize) -> usize {
+        if Self::row_is_last_of_logical_line(lines, vline) {
+            len
+        } else {
+            len.saturating_sub(1)
+        }
+    }
+
     /// Move cursor up one visual line given the rendering widths.
     fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
         let lines = self.build_visual_lines(first_line_width, full_width);
@@ -3427,8 +3467,11 @@ impl AgentChatState {
         if cur_vline == 0 {
             return false;
         }
+        let goal = self.goal_col_for(cur_col);
         let (prev_start, prev_len) = lines[cur_vline - 1];
-        self.text_input.cursor = prev_start + cur_col.min(prev_len);
+        let max_col = Self::last_owned_col(&lines, cur_vline - 1, prev_len);
+        self.text_input.cursor = prev_start + goal.min(max_col);
+        self.input_goal_col = Some((self.text_input.cursor, goal));
         true
     }
 
@@ -3440,8 +3483,11 @@ impl AgentChatState {
         if cur_vline >= lines.len() - 1 {
             return false;
         }
+        let goal = self.goal_col_for(cur_col);
         let (next_start, next_len) = lines[cur_vline + 1];
-        self.text_input.cursor = next_start + cur_col.min(next_len);
+        let max_col = Self::last_owned_col(&lines, cur_vline + 1, next_len);
+        self.text_input.cursor = next_start + goal.min(max_col);
+        self.input_goal_col = Some((self.text_input.cursor, goal));
         true
     }
 
@@ -3491,26 +3537,26 @@ impl AgentChatState {
     }
 
     /// Find which visual line the cursor is on and the column within it.
+    ///
+    /// The row that owns the position is the last one starting at or before it.
+    /// At a wrap boundary that is the later row — the character under the cursor
+    /// is drawn there and the earlier row has no cell left for it. A position at
+    /// the end of a logical line stays on that line's own last row instead of
+    /// jumping to the row after the newline.
     fn find_cursor_in_visual_lines(
         lines: &[(usize, usize)],
         cursor_char_pos: usize,
     ) -> (usize, usize) {
-        for (i, &(start, len)) in lines.iter().enumerate() {
-            if cursor_char_pos >= start
-                && cursor_char_pos <= start + len
-                && (cursor_char_pos < start + len || i == lines.len() - 1)
-            {
-                return (i, cursor_char_pos - start);
-            }
-            if i + 1 < lines.len() && cursor_char_pos == lines[i + 1].0 {
-                return (i + 1, 0);
+        let mut idx = 0;
+        for (i, &(start, _)) in lines.iter().enumerate() {
+            if start <= cursor_char_pos {
+                idx = i;
+            } else {
+                break;
             }
         }
-        if let Some(&(start, _)) = lines.last() {
-            (lines.len() - 1, cursor_char_pos.saturating_sub(start))
-        } else {
-            (0, 0)
-        }
+        let (start, len) = lines[idx];
+        (idx, cursor_char_pos.saturating_sub(start).min(len))
     }
 
     /// Take the input text (for sending), clear the input field.
@@ -3518,9 +3564,20 @@ impl AgentChatState {
         let text = self.text_input.text.clone();
         self.history_index = None;
         self.history_stash.clear();
+        self.input_goal_col = None;
         self.text_input.clear();
         self.autocomplete.reset();
         text
+    }
+
+    /// Whether Up may browse sent messages instead of moving the caret.
+    ///
+    /// Only from an empty prompt, or while already browsing: otherwise the
+    /// draft being edited would be silently replaced by an old message — e.g.
+    /// Up on the first visual row of a wrapped prompt, where the caret has
+    /// nowhere to go inside the input.
+    pub fn can_browse_history(&self) -> bool {
+        self.text_input.text.is_empty() || self.history_index.is_some()
     }
 
     /// Get user messages from the active conversation (chronological, owned).
@@ -5439,9 +5496,9 @@ impl AgentChatState {
             // Show cursor at prompt position even with empty input
             if focused {
                 let cursor_style = Style::default().fg(bg).bg(theme::TEXT_FG);
-                if x < area.x + area.width && x < buf.area().right() && area.y < buf.area().bottom()
-                {
-                    buf[(x, area.y)].set_style(cursor_style);
+                let cx = x.min((area.x + area.width).saturating_sub(1));
+                if cx < buf.area().right() && area.y < buf.area().bottom() {
+                    buf[(cx, area.y)].set_style(cursor_style);
                 }
             }
         } else if text_width > 0 {
@@ -5494,17 +5551,19 @@ impl AgentChatState {
                 }
             }
 
-            // Position cursor
+            // Position cursor. When the caret column sits at the row's right
+            // edge there is no cell left *inside* the panel for it, so it is
+            // clamped onto the row's last cell (the readline convention) rather
+            // than dropped, which used to hide the caret at the end of a prompt
+            // that exactly filled its line.
             if focused && !self.active_conv_busy() {
                 let visible_cursor_line = cursor_line.saturating_sub(scroll);
                 if visible_cursor_line < total_rows {
                     let y = area.y + visible_cursor_line as u16;
                     let x_start = if cursor_line == 0 { x } else { area.x };
-                    let cursor_x = x_start + cursor_col as u16;
-                    if cursor_x < area.x + area.width
-                        && cursor_x < buf.area().right()
-                        && y < buf.area().bottom()
-                    {
+                    let row_right = area.x + area.width; // one past the row's last cell
+                    let cursor_x = (x_start + cursor_col as u16).min(row_right - 1);
+                    if cursor_x < buf.area().right() && y < buf.area().bottom() {
                         let cursor_style = Style::default().fg(bg).bg(theme::TEXT_FG);
                         buf[(cursor_x, y)].set_style(cursor_style);
                     }
@@ -8560,7 +8619,9 @@ mod tests {
         let panel_w = 15;
         assert!(state.input_overflows_viewport(panel_w));
         assert!(state.scroll_input_by_visual_lines(-1, panel_w));
-        assert_eq!(state.text_input.cursor, 12);
+        // Row 0 is a wrapped row, so its caret stops one column short of the
+        // boundary that row 1 already draws.
+        assert_eq!(state.text_input.cursor, 11);
         // At the top — further up does not move.
         state.text_input.cursor = 0;
         assert!(!state.scroll_input_by_visual_lines(-1, panel_w));
@@ -8619,7 +8680,7 @@ mod tests {
 
         assert!(state.input_has_multiple_visual_lines(panel_w));
         assert!(state.cursor_up_in_input(panel_w));
-        assert_eq!(state.text_input.cursor, 12);
+        assert_eq!(state.text_input.cursor, 11);
         assert!(state.history_index.is_none());
     }
 
@@ -8840,5 +8901,115 @@ mod tests {
 
         state.scroll_pending_permission(-1_000, 40);
         assert_eq!(scroll_of(&state), 0);
+    }
+
+    /// Cell the reversed block caret is painted on in `render_input`, if any.
+    ///
+    /// `Cell::style()` reports a colour for every field, so the caret is found
+    /// by its own fg/bg inversion rather than by comparing styles.
+    fn caret_cell(state: &AgentChatState, width: u16, height: u16) -> Option<(u16, u16)> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut buf = RataBuf::empty(area);
+        let theme = Theme::builtin_default();
+        state.render_input(area, &mut buf, true, &theme);
+        (0..height).find_map(|y| {
+            (0..width)
+                .find(|&x| {
+                    let cell = &buf[(x, y)];
+                    cell.fg == theme::INPUT_BG && cell.bg == theme::TEXT_FG
+                })
+                .map(|x| (x, y))
+        })
+    }
+
+    #[test]
+    fn caret_is_drawn_at_every_cursor_position_of_a_wrapped_prompt() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        // Inner width 14 → first row 12 chars, later rows 14.
+        let mut seen = Vec::new();
+        for cursor in 0..=26 {
+            state.text_input.cursor = cursor;
+            let cell = caret_cell(&state, 14, 4);
+            assert!(cell.is_some(), "no caret drawn at cursor {cursor}");
+            seen.push(cell.unwrap());
+        }
+        assert_eq!(seen[0], (2, 0));
+        assert_eq!(seen[11], (13, 0)); // last character of row 0
+        assert_eq!(seen[12], (0, 1)); // wrap boundary → first cell of row 1
+        assert_eq!(seen[25], (13, 1)); // last character of the prompt
+        // End of a row that exactly fills the line: clamped onto the row's last
+        // cell instead of being dropped (it used to draw nothing at all).
+        assert_eq!(seen[26], (13, 1));
+    }
+
+    #[test]
+    fn caret_is_drawn_at_the_end_of_a_prompt_that_fills_its_row() {
+        let mut state = AgentChatState::new();
+        // 12 chars = the first row's whole capacity at inner width 14.
+        state.text_input.text = "abcdefghijkl".to_string();
+        state.text_input.cursor = 12;
+        assert_eq!(state.build_visual_lines(12, 14), vec![(0, 12)]);
+        assert_eq!(caret_cell(&state, 14, 4), Some((13, 0)));
+    }
+
+    #[test]
+    fn caret_marks_a_newline_position_on_the_row_that_owns_it() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "line one\nline two".to_string();
+        // 8 = just before the '\n', i.e. the end of "line one" (row 0, x = 2 + 8).
+        state.text_input.cursor = 8;
+        let at_newline = caret_cell(&state, 41, 4);
+        // 9 = the first character of "line two", drawn on row 1.
+        state.text_input.cursor = 9;
+        let after_newline = caret_cell(&state, 41, 4);
+        assert_eq!(at_newline, Some((10, 0)));
+        assert_eq!(after_newline, Some((0, 1)));
+    }
+
+    #[test]
+    fn up_moves_a_row_up_instead_of_stalling_on_the_wrap_boundary() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = 26;
+        let panel_w = 15; // inner 14, first row 12 → rows [(0, 12), (12, 14)]
+        let lines = state.build_visual_lines(12, 14);
+        assert_eq!(lines, vec![(0, 12), (12, 14)]);
+
+        assert!(state.cursor_up_in_input(panel_w));
+        assert_eq!(state.text_input.cursor, 11);
+        assert_eq!(
+            AgentChatState::find_cursor_in_visual_lines(&lines, state.text_input.cursor),
+            (0, 11)
+        );
+
+        // Coming back down restores the column the short row above could not hold.
+        assert!(state.cursor_down_in_input(panel_w));
+        assert_eq!(state.text_input.cursor, 26);
+
+        // The first row has nothing above it.
+        assert!(state.cursor_up_in_input(panel_w));
+        assert_eq!(state.text_input.cursor, 11);
+        assert!(!state.cursor_up_in_input(panel_w));
+    }
+
+    #[test]
+    fn a_non_empty_draft_cannot_be_replaced_by_history() {
+        let mut state = AgentChatState::new();
+        state.add_user_message("previous prompt");
+        state.text_input.text = "draft".to_string();
+        assert!(!state.can_browse_history());
+
+        // Empty prompt (or an ongoing browse) may start walking history.
+        state.text_input.clear();
+        assert!(state.can_browse_history());
+        state.history_up();
+        assert_eq!(state.text_input.text, "previous prompt");
+        assert!(state.can_browse_history());
     }
 }

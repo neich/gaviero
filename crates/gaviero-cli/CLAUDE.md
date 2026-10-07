@@ -65,3 +65,4 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 - [README.md](README.md) — examples and complete flag reference.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — coordinated mode, memory integration, exit codes, observer wiring.
 - [`../gaviero-dsl/CLAUDE.md`](../gaviero-dsl/CLAUDE.md) — script semantics, var/tier/param precedence.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).

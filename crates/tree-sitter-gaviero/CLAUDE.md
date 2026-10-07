@@ -57,3 +57,4 @@ Crate-level tests in [`src/lib.rs`](src/lib.rs) verify the grammar against repre
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — grammar design, boundary with `gaviero-dsl`.
 - [README.md](README.md) — usage example, parsed-node scope.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).

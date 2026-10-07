@@ -58,3 +58,4 @@ Endpoint shape: `<workspace>/.gaviero/mcp.sock` or `\\.\pipe\gaviero-<hash>` ([`
 - [`gaviero_core::mcp`](../gaviero-core/src/mcp) — tools, config synth, observer, external-memory detection.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — bridge topology.
 - [`../../CLAUDE.md`](../../CLAUDE.md) — MCP read-only invariant.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).

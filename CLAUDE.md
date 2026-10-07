@@ -56,7 +56,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama, DeepSee
 - **Model spec is `provider:model`.** Bare names are rejected at dispatch (`validate_model_spec`, [crates/gaviero-core/src/swarm/backend/shared.rs](crates/gaviero-core/src/swarm/backend/shared.rs)). Prefixes: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:`.
 - **Lock discipline.** Never hold a `Mutex` across I/O, parsing, or embedding. The memory `writer` task is the single owner of SQLite writes.
 - **Two-layer graph context.** The pre-prompt assembler injects `<repo_topology>` (shallow filesystem-only folder map, [crates/gaviero-core/src/repo_map/topology.rs](crates/gaviero-core/src/repo_map/topology.rs)) plus `<repo_outline>` (PageRank-ranked code outline). The TUI `/lite` chat command drops `<repo_outline>` + memory + impact and keeps only topology.
-- **Plan production.** When drafting implementation plans for other agents, assume Claude Code (`claude:fable` / `claude:opus`) or Codex (`codex:gpt-5.6-sol`) unless the user will implement themselves. Plans must be agent-executable: concrete work units, ownership boundaries, expected files/modules, verification steps, sequencing constraints. Example client roster: [crates/gaviero-dsl/examples/clients.gaviero](crates/gaviero-dsl/examples/clients.gaviero).
+- **Plan production.** When drafting implementation plans for other agents, assume Claude Code (`claude:fable` / `claude:opus`) or Codex (`codex:gpt-5.6-sol`) unless the user will implement themselves. Plans must be agent-executable: concrete work units, ownership boundaries, expected files/modules, verification steps, sequencing constraints. Example client roster: [crates/gaviero-dsl/examples/clients.gaviero](crates/gaviero-dsl/examples/clients.gaviero). Drafting is separate from *consuming*: a stored plan binds only while it is being executed — see the `plans/` rule under Rules.
 
 ## Rules
 
@@ -66,6 +66,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama, DeepSee
 - Never emit a bare model name; always `provider:model`.
 - Never edit `tree-sitter-gaviero/src/parser.c` or `grammar.json` by hand — regenerate from `grammar.js`.
 - There is no `--no-memory` CLI flag; do not document or invent one — check [`Cli`](crates/gaviero-cli/src/main.rs) before adding flag docs.
+- **`plans/`, `docs/plans/`, and `research/` are history, not spec.** A document in those folders is valid context **only** when (a) the task at hand is actually executing that plan — an instruction to continue, finish, or implement that line of work counts even if no path is named — or (b) the prompt names that document. In every other case it carries no authority: a newer prompt may contradict it outright, and the prompt wins. When you spot such a contradiction, say so — name the file, quote the claim the prompt overturns, then do what the prompt asked. Never silently reshape a request to match an older plan, never cite one of these files as the reason a change is required unless the prompt invoked it, and never treat one as a locked decision. The rule governs *authority, not access* — read whatever you need to do the job. Same rule for `CLAUDE.original.md` / `*.original.md` archives.
 
 ## Dependencies
 

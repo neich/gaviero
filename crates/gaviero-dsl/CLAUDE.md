@@ -67,3 +67,4 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 - [README.md](README.md) — language reference + examples.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — compilation pipeline, output types, name resolution.
 - [`../gaviero-core/CLAUDE.md`](../gaviero-core/CLAUDE.md) — `CompiledPlan` consumer side.
+- [../../CLAUDE.md](../../CLAUDE.md) — workspace rules; **`plans/` + `research/` are history, not spec** (a newer prompt may contradict them and wins).
