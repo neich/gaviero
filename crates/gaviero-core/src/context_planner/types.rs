@@ -110,8 +110,11 @@ pub enum McpTransport {
     /// Provider accepts HTTP/SSE MCP endpoints only (dsh 0.1.5-rc.1 advertises
     /// `mcpCapabilities.http`). A stdio entry would be rejected on `session/new`.
     HttpOnly,
-    /// In-process harness — servers are linked as a live value, not spawned
-    /// over any transport.
+    /// In-process harness — the host process owns every MCP connection:
+    /// gaviero's own server is linked as a live value, and (for `deepseek:`)
+    /// foreign `mcp.extraServers` are connected by the in-process client. No
+    /// server is ever *handed to* the agent, so no `mcpServers` entry is
+    /// synthesized for it.
     InProcess,
 }
 
@@ -160,12 +163,13 @@ impl McpCapabilities {
 
     /// Whether this provider consumes MCP servers over any transport at all.
     ///
-    /// `false` for the in-process harness, which *links* servers as a live
-    /// value rather than spawning or connecting to them — so a `mcpServers`
-    /// entry is meaningless for it no matter what the two axes say. This is the
-    /// distinction that keeps `context7: true` (Phase 2d: the in-process loop
-    /// reaches context7 as a *native* tool) from also registering a context7
-    /// MCP server for a provider that would never read one.
+    /// `false` for the in-process harness, which never receives a server from
+    /// gaviero: it links gaviero's own server as a live value and connects any
+    /// extra server itself — so a `mcpServers` entry is meaningless for it no
+    /// matter what the two axes say. This is the distinction that keeps
+    /// `context7: true` (Phase 2d: the in-process loop reaches context7 as a
+    /// *native* tool) from also registering a context7 MCP server for a
+    /// provider that would never read one.
     pub const fn uses_mcp_servers(self) -> bool {
         !matches!(self.transport, McpTransport::InProcess)
     }
@@ -219,11 +223,17 @@ impl Provider {
             Provider::Dsh => McpCapabilities::permissive_over(McpTransport::HttpOnly),
             // Phase 2d: context7 reaches the in-process loop as a *native* tool
             // over context7's REST API (`tools/context7.rs`), not as an MCP
-            // server — so `context7` is allowed. `extra_servers` stays `false`
-            // and is not a gap: reaching a *foreign* MCP server would need the
-            // in-process MCP client §2.7-C left unbuilt, and no native adapter
-            // exists for arbitrary servers the way it does for context7.
-            Provider::Ollama | Provider::Deepseek => McpCapabilities {
+            // server — so `context7` is allowed. `deepseek:` also reaches
+            // `mcp.extraServers` (stdio and URL) through the in-process MCP
+            // client (`mcp/client.rs`), connected by `ToolAgentSession` itself.
+            Provider::Deepseek => McpCapabilities {
+                context7: true,
+                extra_servers: true,
+                transport: McpTransport::InProcess,
+            },
+            // `ollama:` runs `OllamaSession`, not the tool-agent loop, so it
+            // has no client to connect a foreign server with.
+            Provider::Ollama => McpCapabilities {
                 context7: true,
                 extra_servers: false,
                 transport: McpTransport::InProcess,
@@ -624,8 +634,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             continuity_mode: ContinuityMode::StatelessReplay,
             supports_tool_use: true,
             supports_native_resume: false,
-            max_context_tokens: Some(128_000),
-            // tool_use + 128k context ⇒ Strong.
+            // 1M for every DeepSeek chat model (pricing page, 2026-10).
+            max_context_tokens: Some(crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW),
+            // tool_use + a 1M context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
             mcp_transport: caps.transport,
             // Phase 2 wires context7 for the in-process loop.
@@ -641,7 +652,8 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             continuity_mode: ContinuityMode::ProcessBound,
             supports_tool_use: true,
             supports_native_resume: true,
-            max_context_tokens: Some(128_000),
+            // Same models as `deepseek:` — dsh is DeepSeek's own harness.
+            max_context_tokens: Some(crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW),
             bootstrap_tier: BootstrapTier::Strong,
             // dsh 0.1.5-rc.1 advertises `mcpCapabilities.http` only
             // (`dsh.rs`). Delivered (Phase 2, decisions #2/E): `session/new`
@@ -1007,14 +1019,14 @@ mod tests {
         assert_eq!(deepseek.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(deepseek.supports_tool_use);
         assert!(!deepseek.supports_native_resume);
-        assert_eq!(deepseek.max_context_tokens, Some(128_000));
+        assert_eq!(deepseek.max_context_tokens, Some(1_000_000));
 
         let dsh = build_provider_profile(&ModelSpec::parse("dsh:deepseek-v4-flash"), &runtime);
         assert_eq!(dsh.provider, "dsh");
         assert_eq!(dsh.continuity_mode, ContinuityMode::ProcessBound);
         assert!(dsh.supports_tool_use);
         assert!(dsh.supports_native_resume);
-        assert_eq!(dsh.max_context_tokens, Some(128_000));
+        assert_eq!(dsh.max_context_tokens, Some(1_000_000));
 
         let bare = build_provider_profile(&ModelSpec::parse("haiku"), &runtime);
         assert_eq!(bare.continuity_mode, ContinuityMode::NativeResume);
@@ -1176,7 +1188,7 @@ mod tests {
 
     #[test]
     fn dsh_is_http_only_and_structurally_unenforced() {
-        let p = profile("dsh:deepseek-chat");
+        let p = profile("dsh:deepseek-v4-pro");
         assert_eq!(p.mcp_transport, McpTransport::HttpOnly);
         // Decision #1: declared unenforced, not attempted.
         assert_eq!(p.tool_enforcement, ToolEnforcement::Unenforced);
@@ -1198,8 +1210,8 @@ mod tests {
             ("codex-app-server:gpt-5", Provider::CodexAppServer),
             ("cursor:gpt-5", Provider::Cursor),
             ("ollama:llama3.1", Provider::Ollama),
-            ("deepseek:deepseek-chat", Provider::Deepseek),
-            ("dsh:deepseek-chat", Provider::Dsh),
+            ("deepseek:deepseek-flash", Provider::Deepseek),
+            ("dsh:deepseek-flash", Provider::Dsh),
         ] {
             let p = profile(spec);
             let caps = provider.mcp_capabilities();
@@ -1266,7 +1278,7 @@ mod tests {
 
     #[test]
     fn in_process_loop_is_registry_enforced_over_a_linked_server() {
-        for spec in ["deepseek:deepseek-chat", "ollama:llama3.1"] {
+        for spec in ["deepseek:deepseek-flash", "ollama:llama3.1"] {
             let p = profile(spec);
             assert_eq!(p.mcp_transport, McpTransport::InProcess, "{spec}");
             assert_eq!(

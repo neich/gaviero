@@ -275,6 +275,7 @@ mod tests {
             policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
             auto_approve: true,
             observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         }
     }
 

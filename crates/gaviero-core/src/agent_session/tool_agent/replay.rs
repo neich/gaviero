@@ -24,23 +24,38 @@ pub(crate) fn apply_replay_compaction(
 }
 
 /// Assemble the initial message array for one API turn.
+///
+/// Replayed assistant turns carry `"reasoning_content": ""`. The ledger keeps
+/// text only, so the real chain of thought of an earlier turn is gone — but
+/// DeepSeek's thinking-mode guide requires the field on the assistant turns of
+/// *every* tools-bearing request, "even for turns where the model did not
+/// perform a tool call", and answers its absence with a 400. An empty string is
+/// the documented `string | null` shape, and is what rig's DeepSeek dialect
+/// sends for the same reason.
+///
+/// `user_content` is the current user message's `content`: a string, or the
+/// `[text, image_url…]` part array [`super::attachments::user_content`] builds.
+/// Images only ever ride the current user message — replay stays text.
 pub(crate) fn build_messages(
     system: &str,
     replay: Option<&ReplayPayload>,
-    user_prompt: &str,
+    user_content: impl Into<Value>,
 ) -> Vec<Value> {
     let mut messages = vec![json!({ "role": "system", "content": system })];
     if let Some(payload) = replay {
         for (role, content) in &payload.entries {
-            let role_str = match role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-            };
-            messages.push(json!({ "role": role_str, "content": content }));
+            messages.push(match role {
+                Role::User => json!({ "role": "user", "content": content }),
+                Role::Assistant => json!({
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": "",
+                }),
+                Role::System => json!({ "role": "system", "content": content }),
+            });
         }
     }
-    messages.push(json!({ "role": "user", "content": user_prompt }));
+    messages.push(json!({ "role": "user", "content": user_content.into() }));
     messages
 }
 
@@ -63,6 +78,20 @@ mod tests {
         assert_eq!(msgs[1]["content"], "old q");
         assert_eq!(msgs[2]["content"], "old a");
         assert_eq!(msgs[3]["content"], "new q");
+    }
+
+    #[test]
+    fn replayed_assistant_turns_carry_reasoning_content() {
+        let replay = ReplayPayload {
+            entries: vec![
+                (Role::User, "old q".into()),
+                (Role::Assistant, "old a".into()),
+            ],
+        };
+        let msgs = build_messages("sys", Some(&replay), "new q");
+        assert_eq!(msgs[2].get("reasoning_content"), Some(&json!("")));
+        assert!(msgs[1].get("reasoning_content").is_none());
+        assert!(msgs[3].get("reasoning_content").is_none());
     }
 
     #[test]

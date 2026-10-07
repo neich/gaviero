@@ -28,7 +28,7 @@
 //!   cargo test -p gaviero-core --test provider_annotation_compliance -- --ignored --nocapture
 //!
 //! # deepseek
-//! E2E_AGENT_MODEL=deepseek:deepseek-chat \
+//! E2E_AGENT_MODEL=deepseek:deepseek-flash \
 //!   cargo test -p gaviero-core --test provider_annotation_compliance -- --ignored --nocapture
 //! ```
 
