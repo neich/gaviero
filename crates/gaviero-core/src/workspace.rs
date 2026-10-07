@@ -40,6 +40,12 @@ pub mod settings {
     /// loop. See [`LoopLimits::from_workspace`] —
     /// `crates/gaviero-core/src/agent_session/tool_agent/agent_loop.rs`.
     pub const AGENT_TOOL_AGENT_MAX_ROUNDS: &str = "agent.toolAgent.maxRounds";
+    /// Dollar budget for one in-process tool-agent (`deepseek:`) turn. When the
+    /// turn's accumulated cost — priced per model and per DeepSeek peak window,
+    /// or by `providers.deepseek.pricing` — reaches it, the loop stops and asks
+    /// for a hand-off, exactly like the round cap. Unset (the default), zero,
+    /// or a non-positive value means no dollar ceiling.
+    pub const AGENT_TOOL_AGENT_COST_CEILING_USD: &str = "agent.toolAgent.costCeilingUsd";
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
     /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
     pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
@@ -372,6 +378,14 @@ pub mod settings {
     pub const SKILLS_EMIT_MAX_BYTES: &str = "skills.emit.maxBytes";
 
     /// `dsh --profile acp` launcher (P4). `@deepseek-ai/dsh-acp` is a library.
+    /// Base URL of the DeepSeek chat API for `deepseek:` (default
+    /// `https://api.deepseek.com`). The legacy snake_case spelling
+    /// `providers.deepseek.base_url` is still read when this key is unset.
+    pub const PROVIDERS_DEEPSEEK_BASE_URL: &str = "providers.deepseek.baseUrl";
+    /// `{ "cache_hit_in", "cache_miss_in", "out" }` in USD per 1M tokens,
+    /// overriding the built-in per-model, peak-aware DeepSeek price table for
+    /// every model. Unset = the list prices.
+    pub const PROVIDERS_DEEPSEEK_PRICING: &str = "providers.deepseek.pricing";
     pub const PROVIDERS_DSH_COMMAND: &str = "providers.dsh.command";
     pub const PROVIDERS_DSH_ARGS: &str = "providers.dsh.args";
     pub const PROVIDERS_DSH_PROFILE: &str = "providers.dsh.profile";

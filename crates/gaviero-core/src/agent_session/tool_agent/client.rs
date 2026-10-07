@@ -75,7 +75,9 @@ impl ApiClient for DeepseekClient {
         let resp = post_with_retry(&self.http, &url, cfg.api_key.expose(), &body).await?;
 
         let (tx, rx) = mpsc::channel::<Result<ApiEvent>>(64);
-        let pricing = cfg.pricing.clone();
+        // Priced at send time: the peak/off-peak rate is fixed by when the
+        // request goes out, and the model decides the table.
+        let pricing = cfg.price_for(&request.model);
         tokio::spawn(async move {
             if let Err(e) = drive_sse_stream(resp, &tx, &pricing).await {
                 let _ = tx.send(Ok(ApiEvent::Error(format!("{e:#}")))).await;
@@ -405,7 +407,13 @@ mod tests {
         ApiClientConfig {
             base_url: base.trim_end_matches('/').to_string(),
             api_key: ApiKey::new("test-key"),
-            pricing: PriceTable::default(),
+            // A fixed override keeps the expected cost independent of the
+            // wall clock (peak vs off-peak).
+            pricing: Some(PriceTable {
+                cache_hit_in: 0.07,
+                cache_miss_in: 0.56,
+                out: 1.68,
+            }),
         }
     }
 

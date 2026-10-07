@@ -54,12 +54,16 @@ impl Default for LoopLimits {
 }
 
 impl LoopLimits {
-    /// Resolve the round cap from the workspace cascade.
+    /// Resolve both bounds from the workspace cascade.
     ///
-    /// Key: `agent.toolAgent.maxRounds` (default [`DEFAULT_MAX_ROUNDS`]). An
+    /// `agent.toolAgent.maxRounds` (default [`DEFAULT_MAX_ROUNDS`]): an
     /// unparseable or zero value falls back to the default rather than
     /// disabling the bound — an unbounded tool loop is never the intent, and
     /// the plan that introduced this cap makes it mandatory.
+    ///
+    /// `agent.toolAgent.costCeilingUsd` (default: none): the turn's spend,
+    /// priced per model and per peak window, after which the loop stops and
+    /// asks for the same hand-off the round cap does.
     pub fn from_workspace(workspace: &Workspace, root: Option<&Path>) -> Self {
         let max_rounds = workspace
             .resolve_setting(settings::AGENT_TOOL_AGENT_MAX_ROUNDS, root)
@@ -67,9 +71,12 @@ impl LoopLimits {
             .filter(|n| *n > 0)
             .map(|n| n.min(u32::MAX as u64) as u32)
             .unwrap_or(DEFAULT_MAX_ROUNDS);
+        let cost_ceiling_usd = parse_cost_ceiling(
+            workspace.resolve_setting_opt(settings::AGENT_TOOL_AGENT_COST_CEILING_USD, root),
+        );
         Self {
             max_rounds,
-            cost_ceiling_usd: None,
+            cost_ceiling_usd,
         }
     }
 }
@@ -114,6 +121,10 @@ pub(crate) async fn run_agent_loop(
             model: model.to_string(),
             messages: messages.clone(),
             tools: schemas.clone(),
+            // Deliberately unset. In thinking mode DeepSeek defaults
+            // `max_tokens` to 64K (128K at `max` effort), and reasoning tokens
+            // count against it. `agent.maxTokens` defaults to 16 384, which
+            // would cut long chains of thought off mid-reasoning.
             max_tokens: None,
             reasoning_effort: reasoning_effort.clone(),
         };
@@ -251,44 +262,77 @@ pub(crate) async fn run_agent_loop(
             messages.push(tool_result_msg(&call.id, &content));
         }
 
+        // Checked only here, after this round's tool results are appended, so
+        // the hand-off's `user` instruction never follows an unanswered
+        // assistant `tool_calls` message.
         if let Some(ceiling) = limits.cost_ceiling_usd
             && total_cost >= ceiling
         {
-            visible.push_str(&format!(
-                "\n\n[stopped: cost ceiling ${ceiling:.4} reached (spent ${total_cost:.4})]"
-            ));
-            return LoopOutcome {
+            let marker = format!(
+                "\n\n[stopped: cost ceiling ${ceiling:.4} reached (spent ${total_cost:.4}); \
+                 asking for a hand-off]\n\n"
+            );
+            return finish_with_handoff(
+                client,
+                observer,
+                model,
+                reasoning_effort.as_deref(),
+                &messages,
+                cancel,
+                &marker,
                 visible,
-                error: None,
-                total_cost_usd: total_cost,
-            };
+                total_cost,
+            )
+            .await;
         }
     }
 
-    // The cap is a budget, not a failure. Spend one final tools-disabled round
-    // so the model hands off in prose instead of the transcript ending on a
-    // bare marker: that hand-off is what lets a "continue" resume rather than
-    // re-explore. `messages` currently ends on `tool` results (every round
-    // appends its results before the cap check), so appending a `user`
-    // instruction is valid — an unanswered `assistant` tool_calls message
-    // would be rejected by the API.
     let marker = format!(
         "\n\n[stopped: reached the {}-round tool limit; asking for a hand-off]\n\n",
         limits.max_rounds
     );
-    observer.on_stream_chunk(&marker);
-    visible.push_str(&marker);
-
-    if let Some(handoff) = handoff_round(
+    finish_with_handoff(
         client,
         observer,
         model,
         reasoning_effort.as_deref(),
         &messages,
         cancel,
+        &marker,
+        visible,
+        total_cost,
     )
     .await
-    {
+}
+
+/// End a turn that hit a budget (rounds or dollars).
+///
+/// The cap is a budget, not a failure. Spend one final tools-disabled round
+/// so the model hands off in prose instead of the transcript ending on a bare
+/// marker: that hand-off is what lets a "continue" resume rather than
+/// re-explore. `messages` ends on `tool` results (every round appends its
+/// results before either cap is checked), so appending a `user` instruction is
+/// valid — an unanswered `assistant` tool_calls message would be rejected by
+/// the API. The hand-off's own cost is part of the turn's spend.
+#[allow(clippy::too_many_arguments)]
+async fn finish_with_handoff(
+    client: &dyn ApiClient,
+    observer: &dyn AcpObserver,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    messages: &[Value],
+    cancel: &CancellationToken,
+    marker: &str,
+    mut visible: String,
+    mut total_cost: f64,
+) -> LoopOutcome {
+    observer.on_stream_chunk(marker);
+    visible.push_str(marker);
+
+    let (handoff, handoff_cost) =
+        handoff_round(client, observer, model, reasoning_effort, messages, cancel).await;
+    total_cost += handoff_cost;
+    if let Some(handoff) = handoff {
         visible.push_str(&handoff);
     }
 
@@ -299,12 +343,32 @@ pub(crate) async fn run_agent_loop(
     }
 }
 
-/// Final tools-disabled round after the round cap trips.
+/// Parse `agent.toolAgent.costCeilingUsd`: a positive, finite dollar amount.
+/// Absent or `0` means no ceiling; any other unusable value (negative, a
+/// string, …) also means none, but is logged so the operator learns it was
+/// ignored.
+fn parse_cost_ceiling(value: Option<Value>) -> Option<f64> {
+    let value = value?;
+    match value.as_f64() {
+        Some(usd) if usd.is_finite() && usd > 0.0 => Some(usd),
+        Some(0.0) => None,
+        _ => {
+            tracing::warn!(
+                "ignoring {} = {value}: expected a positive dollar amount",
+                settings::AGENT_TOOL_AGENT_COST_CEILING_USD
+            );
+            None
+        }
+    }
+}
+
+/// Final tools-disabled round after a budget trips.
 ///
-/// Returns the model's hand-off text, or `None` when the call failed, was
-/// cancelled, or produced nothing. Text is streamed to `observer` and also
-/// returned so the caller can fold it into the turn's visible output — that
-/// is what the TUI stores as the assistant transcript and replays next turn.
+/// Returns the model's hand-off text (`None` when the call failed, was
+/// cancelled, or produced nothing) and the round's cost. Text is streamed to
+/// `observer` and also returned so the caller can fold it into the turn's
+/// visible output — that is what the TUI stores as the assistant transcript
+/// and replays next turn.
 async fn handoff_round(
     client: &dyn ApiClient,
     observer: &dyn AcpObserver,
@@ -312,9 +376,9 @@ async fn handoff_round(
     reasoning_effort: Option<&str>,
     messages: &[Value],
     cancel: &CancellationToken,
-) -> Option<String> {
+) -> (Option<String>, f64) {
     if cancel.is_cancelled() {
-        return None;
+        return (None, 0.0);
     }
     let mut request_messages = messages.to_vec();
     request_messages.push(json!({ "role": "user", "content": HANDOFF_INSTRUCTION }));
@@ -332,14 +396,15 @@ async fn handoff_round(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("tool-agent hand-off round failed: {e:#}");
-            return None;
+            return (None, 0.0);
         }
     };
 
     let mut text = String::new();
+    let mut cost = 0.0_f64;
     loop {
         let event = tokio::select! {
-            _ = cancel.cancelled() => return None,
+            _ = cancel.cancelled() => return (None, cost),
             e = stream.next() => match e {
                 None => break,
                 Some(ev) => ev,
@@ -350,9 +415,18 @@ async fn handoff_round(
                 observer.on_stream_chunk(&t);
                 text.push_str(&t);
             }
+            Ok(ApiEvent::Usage(usage)) => {
+                cost += usage.cost_usd.unwrap_or(0.0);
+                observer.on_turn_token_usage(&crate::acp::protocol::TokenUsage {
+                    input_tokens: usage.input_tokens,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: usage.output_tokens,
+                });
+            }
             // A tools-disabled request should not yield calls; ignore any that
             // arrive rather than inventing tool results for them.
-            Ok(ApiEvent::ToolCall(_) | ApiEvent::Reasoning(_) | ApiEvent::Usage(_)) => {}
+            Ok(ApiEvent::ToolCall(_) | ApiEvent::Reasoning(_)) => {}
             Ok(ApiEvent::Done(_) | ApiEvent::Error(_)) => break,
             Err(_) => break,
         }
@@ -360,13 +434,20 @@ async fn handoff_round(
 
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return (None, cost);
     }
-    Some(format!("\n\n{trimmed}"))
+    (Some(format!("\n\n{trimmed}")), cost)
 }
 
 /// Build the assistant message that carries `tool_calls`. OpenAI requires
 /// `function.arguments` to be a JSON *string*.
+///
+/// `reasoning_content` is set **unconditionally** — `""` when the round
+/// streamed no reasoning. DeepSeek's thinking-mode guide: "For requests
+/// carrying the `tools` parameter, the `reasoning_content` must be fully passed
+/// back to the API in all subsequent requests … If your code does not
+/// correctly pass back `reasoning_content`, the API will return a 400 error."
+/// Omitting the key on an empty round is exactly the shape that rule rejects.
 fn assistant_tool_call_msg(text: &str, calls: &[ToolCall], reasoning: &str) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
@@ -378,15 +459,12 @@ fn assistant_tool_call_msg(text: &str, calls: &[ToolCall], reasoning: &str) -> V
             })
         })
         .collect();
-    let mut msg = json!({
+    json!({
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { json!(text) },
+        "reasoning_content": reasoning,
         "tool_calls": tool_calls,
-    });
-    if !reasoning.is_empty() {
-        msg["reasoning_content"] = json!(reasoning);
-    }
-    msg
+    })
 }
 
 fn tool_result_msg(call_id: &str, content: &str) -> Value {
@@ -461,6 +539,7 @@ mod tests {
             policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
             auto_approve: false,
             observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         }
     }
 
@@ -541,6 +620,20 @@ mod tests {
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
             .expect("assistant tool-call message on second request");
         assert_eq!(assistant["reasoning_content"], "let me think");
+    }
+
+    /// A tool-call round that streamed no reasoning still carries the key: the
+    /// API rejects a tools-bearing history whose assistant turns lack it.
+    #[test]
+    fn tool_call_message_carries_empty_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "echo".into(),
+            args: json!({}),
+        }];
+        let msg = assistant_tool_call_msg("", &calls, "");
+        assert_eq!(msg.get("reasoning_content"), Some(&json!("")));
+        assert!(msg["content"].is_null());
     }
 
     /// The resolved effort is attached to *every* API call in the turn — the
@@ -833,6 +926,77 @@ mod tests {
         );
     }
 
+    fn priced_tool_round(cost: f64) -> Vec<ApiEvent> {
+        vec![
+            tool_call("echo"),
+            ApiEvent::Usage(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+                cost_usd: Some(cost),
+                duration_ms: None,
+            }),
+            ApiEvent::Done(StopReason::ToolUse),
+        ]
+    }
+
+    /// The dollar ceiling trips like the round cap: it stops after the round's
+    /// tool results are appended, then runs the hand-off — whose own cost is
+    /// part of the turn's spend.
+    #[tokio::test]
+    async fn cost_ceiling_trip_runs_a_handoff_and_counts_its_cost() {
+        let client = ScriptedClient {
+            rounds: Mutex::new(VecDeque::from(vec![
+                priced_tool_round(0.6),
+                priced_tool_round(0.6),
+                vec![
+                    ApiEvent::Text("spent the budget on src/a.rs; next: tests".into()),
+                    ApiEvent::Usage(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cost_usd: Some(0.1),
+                        duration_ms: None,
+                    }),
+                    ApiEvent::Done(StopReason::EndTurn),
+                ],
+            ])),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let limits = LoopLimits {
+            max_rounds: 10,
+            cost_ceiling_usd: Some(1.0),
+        };
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &NoopObserver,
+            "m",
+            None,
+            initial_messages(),
+            &limits,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(outcome.error.is_none());
+        assert!(
+            outcome.visible.contains("cost ceiling $1.0000 reached"),
+            "{}",
+            outcome.visible
+        );
+        assert!(outcome.visible.contains("next: tests"), "{}", outcome.visible);
+        assert!((outcome.total_cost_usd - 1.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_ceiling_accepts_only_positive_amounts() {
+        assert_eq!(parse_cost_ceiling(Some(json!(2.5))), Some(2.5));
+        assert_eq!(parse_cost_ceiling(Some(json!(3))), Some(3.0));
+        assert_eq!(parse_cost_ceiling(None), None);
+        assert_eq!(parse_cost_ceiling(Some(json!(0))), None);
+        assert_eq!(parse_cost_ceiling(Some(json!(-1.0))), None);
+        assert_eq!(parse_cost_ceiling(Some(json!("5"))), None);
+    }
+
     /// A cancelled turn must not spend an extra API call on the hand-off.
     #[tokio::test]
     async fn cancelled_turn_skips_the_handoff_round() {
@@ -894,6 +1058,20 @@ mod tests {
         assert_eq!(
             LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).max_rounds,
             DEFAULT_MAX_ROUNDS
+        );
+        assert_eq!(
+            LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).cost_ceiling_usd,
+            None
+        );
+
+        std::fs::write(
+            gaviero.join("settings.json"),
+            r#"{ "agent": { "toolAgent": { "costCeilingUsd": 0.25 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).cost_ceiling_usd,
+            Some(0.25)
         );
     }
 

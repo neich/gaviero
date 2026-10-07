@@ -76,6 +76,14 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `memory.reranker.enabled` | `true` | Cross-encoder reranker |
 | `repoMap.symbolEnrichment.enabled` | `false` | Enables `symbol_search` / `symbol_doc` MCP tools |
 | `skills.extraRoots` | `[]` | Extra skill directories (`~` expanded); missing roots warn in the TUI |
+| `agent.toolAgent.maxRounds` | `40` | Tool rounds per `deepseek:` turn before it stops and asks for a hand-off |
+| `agent.toolAgent.costCeilingUsd` | unset | Dollar budget per `deepseek:` turn (priced per model, peak-aware); the turn hands off when reached |
+| `providers.deepseek.baseUrl` | `https://api.deepseek.com` | DeepSeek chat API base URL (legacy `base_url` still read) |
+| `providers.deepseek.pricing` | list prices | `{ "cache_hit_in", "cache_miss_in", "out" }` USD / 1M tokens, overriding the per-model table |
+
+**API key** (`deepseek:` and `dsh:`), first match wins: `DEEPSEEK_API_KEY`, then `[deepseek] api_key = "sk-…"` in `<workspace>/.gaviero/secrets.toml`, then the same in `~/.gaviero/secrets.toml`.
+
+`deepseek:` always runs in thinking mode. The effort maps onto DeepSeek's `low | high | max`, and an unset, `off`, or `auto` effort becomes `high`. `max_tokens` is left to the API's thinking default (64K, or 128K at `max`). The agent reaches `mcp.extraServers` (stdio and URL) through gaviero's in-process MCP client, and a TUI conversation names any `agent.availableTools` entry it cannot serve.
 
 ## API
 
