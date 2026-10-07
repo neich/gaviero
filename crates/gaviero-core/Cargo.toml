@@ -75,7 +75,13 @@ tempfile = "3"
 base64 = "0.22"
 # Tier A / A5: MCP server for exposing read-only memory + graph tools to
 # subprocess coding agents. `schemars` is for typed tool input schemas.
-rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "transport-async-rw", "transport-streamable-http-server"] }
+# `client` + `transport-streamable-http-client`: the in-process MCP client for
+# `mcp.extraServers` (`mcp/client.rs`). Both add no crates to the lockfile;
+# `transport-child-process` (process-wrap) and `…-client-reqwest` (reqwest 0.13)
+# are deliberately not enabled — gaviero owns the spawn and the HTTP client.
+rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "client", "transport-async-rw", "transport-streamable-http-server", "transport-streamable-http-client"] }
+# SSE decoding for the streamable-HTTP MCP client (already in the graph via rmcp).
+sse-stream = "0.2"
 schemars = { workspace = true }
 toml = "0.8"
 chrono = "0.4.44"

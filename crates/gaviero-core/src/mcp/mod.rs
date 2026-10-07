@@ -57,6 +57,8 @@
 //! nothing here bypasses the writer task or the Write Gate.
 
 pub mod agent_defs;
+pub mod client;
+pub mod client_http;
 pub mod config_synth;
 pub mod endpoint_file;
 pub mod external_memory;

@@ -1457,6 +1457,7 @@ dependencies = [
  "sha2",
  "similar",
  "sqlite-vec",
+ "sse-stream",
  "streaming-iterator",
  "subtle",
  "syn 2.0.117",
