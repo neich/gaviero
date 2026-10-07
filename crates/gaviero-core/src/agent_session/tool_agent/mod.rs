@@ -15,6 +15,7 @@
 //! them to call `blast_radius(path)` they could not reach.
 
 mod agent_loop;
+mod attachments;
 pub mod client;
 pub mod config;
 pub mod policy;
@@ -110,11 +111,14 @@ pub trait ApiClient: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ApiEvent>> + Send>>>;
 }
 
-/// In-process tool-agent session.
+/// In-process tool-agent session: the multi-round loop in [`agent_loop`] over
+/// the registry built from `agent.availableTools`, gaviero's MCP tools,
+/// context7, the ask tool, and — connected lazily on the first turn — the
+/// tools of every permitted `mcp.extraServers` entry.
 ///
-/// PR-1 scaffold: a single non-streaming round, no tools. `write_gate` and
-/// `cancel_token` are held now so later PRs (the loop + Option-B writes) wire
-/// them without changing construction.
+/// Writes go straight to disk: TUI chat reviews the turn through host capture,
+/// and outside it the per-turn snapshot reverts a failed turn. `write_gate` is
+/// held only because every session is constructed with one.
 pub struct ToolAgentSession {
     client: Box<dyn ApiClient>,
     observer: Arc<dyn AcpObserver>,
@@ -134,13 +138,16 @@ pub struct ToolAgentSession {
     /// `AgentOptions::effort`, the host-resolved default for this session.
     /// `Turn::effort` overrides it per turn; thinking mode is never disabled.
     effort: String,
-    #[allow(dead_code)] // Option-B writes are direct-to-disk; gate kept for parity
+    #[allow(dead_code)] // Option-B writes are direct-to-disk; see the struct doc
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     cancel_token: CancellationToken,
     /// `AgentOptions::host_capture`: the host records and reviews the turn's
     /// changes, so writes need no turn snapshot and nothing is reverted here
     /// on error or cancel (the review shows those turns too).
     host_capture: bool,
+    /// Whether [`Self::connect_extra_servers`] has run. Connections live in
+    /// the registry's `RemoteMcpTool`s and close when the session drops.
+    extra_servers_connected: bool,
 }
 
 impl ToolAgentSession {
@@ -262,13 +269,75 @@ impl ToolAgentSession {
             tools,
             retrieval_tools,
             limits: resolve_loop_limits(&workspace_root),
+            compaction: CompactionPolicy::for_context_window(profile.max_context_tokens),
             profile,
-            compaction: CompactionPolicy::default(),
             policy,
             effort,
             write_gate,
             cancel_token,
             host_capture,
+            extra_servers_connected: false,
+        }
+    }
+
+    /// Connect every permitted `mcp.extraServers` entry and register its
+    /// tools, once per session.
+    ///
+    /// Runs at the top of the first `send_turn`: construction is synchronous
+    /// while MCP `initialize` + `tools/list` are async, and a session that
+    /// never runs a turn never spawns a server. The gate is the one dsh's
+    /// `session/new` applies — the provider row, `mcp.extraServers`, and
+    /// `mcp.permissions` (server *and* per-tool) — so "the same MCPs" holds by
+    /// construction. A server that fails to connect is reported in the stream
+    /// and skipped; it never fails the turn.
+    async fn connect_extra_servers(&mut self) {
+        if self.extra_servers_connected {
+            return;
+        }
+        self.extra_servers_connected = true;
+        if !self.profile.extra_servers_allowed {
+            return;
+        }
+        let ws = crate::workspace::Workspace::single_folder(self.workspace_root.clone());
+        let root = Some(self.workspace_root.as_path());
+        let permissions = crate::mcp::resolve_mcp_permissions(&ws, root);
+        let servers: Vec<crate::mcp::ExtraMcpServer> =
+            crate::mcp::extra_servers_from_workspace(&ws, root)
+                .into_iter()
+                .filter(|s| permissions.server_allowed(&s.name))
+                .collect();
+        if servers.is_empty() {
+            return;
+        }
+
+        let cwd = self.workspace_root.clone();
+        let results = futures::future::join_all(
+            servers
+                .iter()
+                .map(|s| crate::mcp::client::RemoteMcpServer::connect(s, &cwd)),
+        )
+        .await;
+        let mut taken: std::collections::HashSet<String> =
+            self.tools.names().into_iter().map(str::to_string).collect();
+        for (server, result) in servers.iter().zip(results) {
+            match result {
+                Ok(remote) => {
+                    let tools = tools::remote_mcp::tools_for(
+                        Arc::new(remote),
+                        |tool| permissions.tool_allowed(&server.name, tool),
+                        &mut taken,
+                    );
+                    let added = self.tools.extend_remote(tools);
+                    tracing::info!(server = %server.name, tools = ?added, "mcp.extraServers entry connected");
+                }
+                Err(e) => {
+                    tracing::warn!(server = %server.name, "mcp.extraServers entry unavailable: {e:#}");
+                    self.observer.on_stream_chunk(&format!(
+                        "[mcp: extra server '{}' unavailable: {e:#}]\n\n",
+                        server.name
+                    ));
+                }
+            }
         }
     }
 
@@ -279,7 +348,8 @@ impl ToolAgentSession {
         Capabilities {
             tool_use: true,
             streaming: true,
-            vision: false,
+            // Model-derived: V4.1-Flash takes images, V4-Pro does not.
+            vision: self.vision(),
             extended_thinking: true,
             max_context_tokens: self.profile.max_context_tokens.unwrap_or(0),
             supports_system_prompt: true,
@@ -290,6 +360,10 @@ impl ToolAgentSession {
             // instructing the model to call a tool it cannot reach.
             retrieval: RetrievalToolset::from_exposed(&self.retrieval_tools),
         }
+    }
+
+    fn vision(&self) -> bool {
+        crate::swarm::backend::deepseek::deepseek_supports_vision(&self.model)
     }
 
     /// Assemble the user-facing prompt from the turn's planner selections.
@@ -317,10 +391,13 @@ impl AgentSession for ToolAgentSession {
         mut turn: Turn,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
         apply_replay_compaction(&mut turn, &self.compaction, self.profile.max_context_tokens);
+        self.connect_extra_servers().await;
 
         let system = default_editor_system_prompt(&self.capabilities());
         let prompt = Self::build_prompt(&turn);
-        let messages = build_messages(&system, turn.replay_history.as_ref(), &prompt);
+        let user_content =
+            attachments::user_content(prompt, &turn.file_refs, self.vision()).await;
+        let messages = build_messages(&system, turn.replay_history.as_ref(), user_content);
         // Per-turn effort, resolved the same way the ACP path resolves it:
         // the turn's value wins over the session default. Thinking mode is
         // always on, so an unset/`off`/`auto` effort becomes DeepSeek's `high`
@@ -337,6 +414,7 @@ impl AgentSession for ToolAgentSession {
             policy: self.policy.clone(),
             auto_approve: turn.auto_approve,
             observer: Some(self.observer.clone()),
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&self.workspace_root),
         };
 
         let outcome = agent_loop::run_agent_loop(
@@ -399,6 +477,80 @@ impl AgentSession for ToolAgentSession {
     async fn close(self: Box<Self>) {}
 }
 
+/// The notice a UI shows when `deepseek:` cannot honour part of the
+/// configured tool surface, or `None` when it honours all of it.
+///
+/// `agent.availableTools` is the single source of truth for every provider,
+/// and Claude/Cursor honour names the in-process loop has no implementation
+/// for (`WebSearch`, `WebFetch`, `Agent`, `Task`, `TodoWrite`, …). Skipping
+/// them silently is how a settings divergence goes unnoticed, so they are
+/// *declared* — the same posture [`crate::context_planner::ToolEnforcement::ui_disclosure`]
+/// takes for unenforced providers. Names the loop does serve through another
+/// channel are not reported: the registry tools, `AskUserQuestion` on a
+/// multi-choice prompt channel, `mcp__gaviero*`, `mcp__context7*` when context7
+/// is enabled and permitted, and `mcp__<server>*` for a permitted
+/// `mcp.extraServers` entry once the provider row allows extra servers. While
+/// the row does not, configured extra servers are reported as unreachable.
+///
+/// Deterministic for a given configuration, because the TUI announces it
+/// once per conversation by content.
+pub fn tool_agent_disclosure(
+    available_tools: &[String],
+    profile: &ProviderProfile,
+    workspace: &crate::workspace::Workspace,
+    root: Option<&Path>,
+) -> Option<String> {
+    if profile.provider != "deepseek" {
+        return None;
+    }
+    let permissions = crate::mcp::resolve_mcp_permissions(workspace, root);
+    let context7_on = profile.context7_allowed
+        && crate::mcp::resolve_context7_config(workspace, root).enabled
+        && permissions.server_allowed("context7");
+    let extras: Vec<String> = crate::mcp::extra_servers_from_workspace(workspace, root)
+        .into_iter()
+        .filter(|s| permissions.server_allowed(&s.name))
+        .map(|s| s.name)
+        .collect();
+
+    let mut unsupported: Vec<&str> = Vec::new();
+    for name in available_tools {
+        let served = if tools::REGISTRY_TOOLS.contains(&name.as_str()) {
+            true
+        } else if name == crate::acp::session::ASK_USER_QUESTION_TOOL {
+            profile.prompt_kind.has_multi_choice()
+        } else if let Some(rest) = name.strip_prefix("mcp__") {
+            let server = rest.split("__").next().unwrap_or(rest);
+            match server {
+                "gaviero" => true,
+                "context7" => context7_on,
+                other => profile.extra_servers_allowed && extras.iter().any(|e| e == other),
+            }
+        } else {
+            false
+        };
+        if !served && !unsupported.contains(&name.as_str()) {
+            unsupported.push(name);
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if !unsupported.is_empty() {
+        lines.push(format!(
+            "deepseek runs gaviero's in-process tool loop, which has no equivalent for {} \
+             (named in `agent.availableTools`); this agent cannot use them.",
+            unsupported.join(", ")
+        ));
+    }
+    if !profile.extra_servers_allowed && !extras.is_empty() {
+        lines.push(format!(
+            "`mcp.extraServers` {} cannot be reached by deepseek.",
+            extras.join(", ")
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join(" "))
+}
+
 /// Resolve the per-turn tool-round cap for this workspace.
 ///
 /// Path-based fallback, mirroring [`ToolPolicy::resolve`]: a host holding a
@@ -413,22 +565,166 @@ fn resolve_loop_limits(workspace_root: &Path) -> agent_loop::LoopLimits {
     agent_loop::LoopLimits::from_workspace(&ws, Some(workspace_root))
 }
 
-/// Resolve DeepSeek API config from workspace settings + env/secrets.
+/// Resolve DeepSeek API config from the settings cascade + env/secrets.
+///
+/// `providers.deepseek.baseUrl` / `.pricing` resolve like every other key
+/// (folder → workspace → user `~/.gaviero/settings.json`), root-scoped the same
+/// way as [`resolve_loop_limits`]. The legacy snake_case `base_url` is still
+/// honoured when the camelCase key is absent at every level.
 pub(crate) fn resolve_api_config(workspace_root: &std::path::Path) -> Result<ApiClientConfig> {
-    let settings_path = workspace_root.join(".gaviero").join("settings.json");
-    let (base_url, pricing) = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .map(|doc| {
-            let base = doc
-                .pointer("/providers/deepseek/base_url")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let pricing = doc
-                .pointer("/providers/deepseek/pricing")
-                .and_then(|p| serde_json::from_value(p.clone()).ok());
-            (base, pricing)
-        })
-        .unwrap_or((None, None));
+    use crate::workspace::settings;
+    let ws = crate::workspace::Workspace::single_folder(workspace_root.to_path_buf());
+    let root = Some(workspace_root);
+    let base_url = ws
+        .resolve_setting_opt(settings::PROVIDERS_DEEPSEEK_BASE_URL, root)
+        .or_else(|| ws.resolve_setting_opt("providers.deepseek.base_url", root))
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+        .filter(|s| !s.is_empty());
+    let pricing = ws
+        .resolve_setting_opt(settings::PROVIDERS_DEEPSEEK_PRICING, root)
+        .and_then(|v| match serde_json::from_value(v) {
+            Ok(table) => Some(table),
+            Err(e) => {
+                tracing::warn!(
+                    "ignoring invalid {}: {e}",
+                    settings::PROVIDERS_DEEPSEEK_PRICING
+                );
+                None
+            }
+        });
     ApiClientConfig::resolve_deepseek(workspace_root, base_url, pricing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_with(settings: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero = dir.path().join(".gaviero");
+        std::fs::create_dir_all(&gaviero).unwrap();
+        std::fs::write(gaviero.join("settings.json"), settings).unwrap();
+        std::fs::write(
+            gaviero.join("secrets.toml"),
+            "[deepseek]\napi_key = \"test-key\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn camel_case_provider_keys_resolve_through_the_cascade() {
+        let dir = workspace_with(
+            r#"{ "providers": { "deepseek": {
+                "baseUrl": "https://gateway.example/v1/",
+                "base_url": "https://legacy.example",
+                "pricing": { "cache_hit_in": 1.0, "cache_miss_in": 2.0, "out": 3.0 }
+            } } }"#,
+        );
+        let cfg = resolve_api_config(dir.path()).unwrap();
+        assert_eq!(cfg.base_url, "https://gateway.example/v1");
+        let pricing = cfg.pricing.expect("pricing override");
+        assert_eq!(pricing.out, 3.0);
+    }
+
+    #[test]
+    fn legacy_snake_case_base_url_is_still_read() {
+        let dir = workspace_with(
+            r#"{ "providers": { "deepseek": { "base_url": "https://legacy.example" } } }"#,
+        );
+        let cfg = resolve_api_config(dir.path()).unwrap();
+        assert_eq!(cfg.base_url, "https://legacy.example");
+        assert!(cfg.pricing.is_none());
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn profile(spec: &str) -> ProviderProfile {
+        crate::context_planner::build_provider_profile(
+            &crate::context_planner::ModelSpec::parse(spec),
+            &crate::context_planner::RuntimeConfig::default(),
+        )
+    }
+
+    /// The operator's real `agent.availableTools`: four names are served
+    /// outside the registry and must not be reported; four have no in-process
+    /// equivalent and must be.
+    #[test]
+    fn disclosure_reports_only_unserved_tool_names() {
+        let dir = workspace_with(r#"{ "mcp": { "context7": { "enabled": true } } }"#);
+        let ws = crate::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let available = names(&[
+            "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash", "AskUserQuestion",
+            "WebSearch", "WebFetch", "Agent", "mcp__gaviero", "mcp__context7", "mcp__arxiv",
+        ]);
+        let notice = tool_agent_disclosure(
+            &available,
+            &profile("deepseek:deepseek-flash"),
+            &ws,
+            Some(dir.path()),
+        )
+        .expect("unserved names must be disclosed");
+        assert!(
+            notice.contains("WebSearch, WebFetch, Agent, mcp__arxiv"),
+            "{notice}"
+        );
+        for served in ["Bash", "AskUserQuestion", "mcp__gaviero", "mcp__context7"] {
+            assert!(!notice.contains(served), "{served} is served: {notice}");
+        }
+    }
+
+    /// `deepseek:` reaches `mcp.extraServers` through its own client, so a
+    /// configured extra server is served, not disclosed — unless
+    /// `mcp.permissions` denies it.
+    #[test]
+    fn configured_extra_servers_are_served_unless_denied() {
+        let dir = workspace_with(
+            r#"{ "mcp": { "extraServers": [ { "name": "arxiv", "command": "arxiv-mcp" } ] } }"#,
+        );
+        let ws = crate::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let available = names(&["Read", "mcp__arxiv"]);
+        let deepseek = profile("deepseek:deepseek-v4-pro");
+        assert!(deepseek.extra_servers_allowed);
+        assert_eq!(
+            tool_agent_disclosure(&available, &deepseek, &ws, Some(dir.path())),
+            None
+        );
+
+        let dir = workspace_with(
+            r#"{ "mcp": {
+                "extraServers": [ { "name": "arxiv", "command": "arxiv-mcp" } ],
+                "permissions": { "deny": ["arxiv:*"] }
+            } }"#,
+        );
+        let ws = crate::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let notice = tool_agent_disclosure(&available, &deepseek, &ws, Some(dir.path()))
+            .expect("a denied server is not served");
+        assert!(notice.contains("mcp__arxiv"), "{notice}");
+    }
+
+    #[test]
+    fn disclosure_is_silent_when_everything_is_served_or_not_deepseek() {
+        let dir = workspace_with("{}");
+        let ws = crate::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let fs_only = names(&["Read", "Grep", "Bash", "mcp__gaviero"]);
+        assert_eq!(
+            tool_agent_disclosure(&fs_only, &profile("deepseek:deepseek-flash"), &ws, Some(dir.path())),
+            None
+        );
+        let web = names(&["WebSearch"]);
+        assert_eq!(
+            tool_agent_disclosure(&web, &profile("claude:sonnet"), &ws, Some(dir.path())),
+            None
+        );
+    }
+
+    #[test]
+    fn absent_provider_keys_fall_back_to_defaults() {
+        let dir = workspace_with("{}");
+        let cfg = resolve_api_config(dir.path()).unwrap();
+        assert_eq!(cfg.base_url, config::DEFAULT_DEEPSEEK_BASE_URL);
+        assert!(cfg.pricing.is_none());
+    }
 }

@@ -347,6 +347,7 @@ mod tests {
             policy: ToolPolicy::default(),
             auto_approve: false,
             observer,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         }
     }
 

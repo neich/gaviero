@@ -271,4 +271,9 @@ fn in_process_rows_do_not_claim_an_mcp_server_transport() {
             "{spec} must not register an MCP server entry"
         );
     }
+
+    // Only the tool-agent loop has an MCP client of its own, so only
+    // `deepseek:` reaches `mcp.extraServers`; `ollama:` runs `OllamaSession`.
+    assert!(profile("deepseek:x").mcp_capabilities().extra_servers);
+    assert!(!profile("ollama:x").mcp_capabilities().extra_servers);
 }

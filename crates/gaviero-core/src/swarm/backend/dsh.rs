@@ -44,7 +44,7 @@ impl DshBackend {
             streaming: true,
             vision: false,
             extended_thinking: true,
-            max_context_tokens: 128_000,
+            max_context_tokens: super::deepseek::DEEPSEEK_CONTEXT_WINDOW,
             supports_system_prompt: true,
             supports_file_blocks: false,
             retrieval,

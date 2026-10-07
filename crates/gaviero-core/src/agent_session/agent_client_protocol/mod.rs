@@ -870,7 +870,7 @@ fn capabilities(exposed: Option<&[String]>) -> Capabilities {
         streaming: true,
         vision: false,
         extended_thinking: true,
-        max_context_tokens: 128_000,
+        max_context_tokens: crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW,
         supports_system_prompt: true,
         supports_file_blocks: false,
         retrieval,
@@ -1640,7 +1640,10 @@ mod tests {
         assert!(c.tool_use);
         assert!(c.extended_thinking);
         assert!(!c.supports_file_blocks);
-        assert_eq!(c.max_context_tokens, 128_000);
+        assert_eq!(
+            c.max_context_tokens,
+            crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW
+        );
     }
 
     /// DeepSeek's `off` is the only advertised value that disables thinking;

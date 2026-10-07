@@ -182,6 +182,7 @@ mod tests {
             policy: ToolPolicy::default(),
             auto_approve,
             observer: Some(Arc::new(NoopObserver)),
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         }
     }
 

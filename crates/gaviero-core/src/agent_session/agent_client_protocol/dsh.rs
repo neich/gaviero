@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use crate::agent_session::tool_agent::config::ApiClientConfig;
 use crate::context_planner::types::McpCapabilities;
@@ -104,13 +104,11 @@ impl DshLaunchSpec {
             cmd.arg("--profile").arg(&self.profile);
         }
         if !self.skip_api_key {
-            let cfg = ApiClientConfig::resolve_deepseek(workspace_root, None, None).with_context(
-                || {
-                    "dsh: missing DeepSeek API key (set DEEPSEEK_API_KEY or \
-                         .gaviero/secrets.toml [deepseek] api_key)"
-                        .to_string()
-                },
-            )?;
+            // The inner error names every file that was searched (workspace,
+            // then `~/.gaviero/secrets.toml`), so it is surfaced whole rather
+            // than hidden behind a context line.
+            let cfg = ApiClientConfig::resolve_deepseek(workspace_root, None, None)
+                .map_err(|e| anyhow!("dsh: {e:#}"))?;
             cmd.env("DEEPSEEK_API_KEY", cfg.api_key.expose());
         }
         cmd.current_dir(workspace_root);
@@ -312,7 +310,7 @@ pub fn mcp_servers_for_session(root: &Path, caps: McpCapabilities) -> Vec<serde_
 pub fn missing_key_error() -> anyhow::Error {
     anyhow!(
         "dsh: no DeepSeek API key. Set DEEPSEEK_API_KEY or add `[deepseek] api_key` \
-         to <workspace>/.gaviero/secrets.toml"
+         to <workspace>/.gaviero/secrets.toml or ~/.gaviero/secrets.toml"
     )
 }
 
@@ -433,13 +431,14 @@ mod tests {
             vec!["context7", "semantic-scholar"]
         );
 
-        // The in-process row allows context7 as a *native* tool (Phase 2d) but
-        // denies foreign servers — and it has no MCP transport at all, so the
-        // same settings still register no MCP server entry. Gated on transport,
-        // not on `!context7`: every row now allows context7, so asserting that
-        // flag would pin a value the table has deliberately left behind.
+        // The in-process row allows context7 as a *native* tool (Phase 2d) and
+        // foreign servers through its own MCP client — but it has no MCP
+        // transport to *receive* a server on, so the same settings still
+        // register no MCP server entry. Gated on transport, not on the two
+        // axes: both are allowed here, and that is exactly the case the
+        // transport check exists for.
         let in_process = crate::context_planner::types::Provider::Deepseek.mcp_capabilities();
-        assert!(!in_process.extra_servers);
+        assert!(in_process.extra_servers);
         assert!(!in_process.uses_mcp_servers());
         assert!(mcp_servers_for_session(dir.path(), in_process).is_empty());
     }

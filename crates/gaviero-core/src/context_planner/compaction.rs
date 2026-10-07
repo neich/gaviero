@@ -59,7 +59,29 @@ impl Default for CompactionPolicy {
     }
 }
 
+/// Replay-char budget bounds for [`CompactionPolicy::for_context_window`].
+const MIN_REPLAY_CHARS: usize = 80_000;
+const MAX_REPLAY_CHARS: usize = 400_000;
+
 impl CompactionPolicy {
+    /// Defaults with the char budget scaled to the provider's context window.
+    ///
+    /// The default 80 000-char budget (≈ 20K tokens) is sized for an 8K–32K
+    /// local model, and it fires long before the token-pressure trigger on a
+    /// large window: 60 % of 128K is ≈ 307K chars. So a declared window alone
+    /// never relaxed compaction. This gives a large-window provider about 10 %
+    /// of its window as replay (4 chars/token), clamped to `[80 000, 400 000]`
+    /// chars — a 1M window replays up to ≈ 100K tokens, which a prefix cache
+    /// serves cheaply. `None` keeps the defaults.
+    pub fn for_context_window(max_context_tokens: Option<usize>) -> Self {
+        let mut policy = Self::default();
+        if let Some(window) = max_context_tokens {
+            policy.max_replay_chars = (window.saturating_mul(4) / 10)
+                .clamp(MIN_REPLAY_CHARS, MAX_REPLAY_CHARS);
+        }
+        policy
+    }
+
     /// Convenience constructor for tests or custom sessions.
     pub fn custom(max_turn_pairs: u32, max_replay_chars: usize, keep_turn_pairs: u32) -> Self {
         Self {
@@ -181,6 +203,20 @@ pub fn compact_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_char_budget_scales_with_the_window() {
+        let chars = |w| CompactionPolicy::for_context_window(w).max_replay_chars;
+        assert_eq!(chars(Some(1_000_000)), 400_000);
+        assert_eq!(chars(Some(200_000)), 80_000);
+        assert_eq!(chars(Some(500_000)), 200_000);
+        assert_eq!(chars(Some(8_192)), 80_000);
+        assert_eq!(chars(None), CompactionPolicy::default().max_replay_chars);
+        // Only the char budget moves; the other triggers keep their defaults.
+        let p = CompactionPolicy::for_context_window(Some(1_000_000));
+        assert_eq!(p.max_turn_pairs, CompactionPolicy::default().max_turn_pairs);
+        assert_eq!(p.keep_turn_pairs, CompactionPolicy::default().keep_turn_pairs);
+    }
 
     fn make_history(pairs: usize) -> Vec<(Role, String)> {
         (0..pairs)

@@ -53,6 +53,9 @@ impl Tool for GlobTool {
         };
         let workspace_root = ctx.workspace_root.clone();
         let pattern = pattern.to_string();
+        // Paths `Read` would refuse are not listed either: their existence is
+        // part of what the sensitive block-list protects.
+        let enforcer = ctx.enforcer();
 
         let result = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
@@ -70,7 +73,7 @@ impl Tool for GlobTool {
                 // POSIX-style, and the LLM-facing output contract is
                 // workspace-relative `/`-separated paths on all hosts.
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if glob_re.is_match(&rel_str) {
+                if glob_re.is_match(&rel_str) && enforcer.check_read(path).is_ok() {
                     out.push(rel_str);
                     if out.len() >= MAX_RESULTS {
                         break;
@@ -110,6 +113,7 @@ mod tests {
             policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
             auto_approve: false,
             observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         };
 
         let out = GlobTool.run(json!({ "pattern": "**/*.rs" }), &ctx).await;
@@ -117,5 +121,26 @@ mod tests {
         assert!(out.content.contains("src/a.rs"));
         assert!(out.content.contains("src/inner/b.rs"));
         assert!(!out.content.contains("c.txt"));
+    }
+
+    #[tokio::test]
+    async fn does_not_list_sensitive_files() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/secrets.toml"), "k = 1").unwrap();
+        std::fs::write(dir.path().join("config/app.toml"), "k = 2").unwrap();
+        let ctx = ToolCtx {
+            workspace_root: dir.path().to_path_buf(),
+            additional_roots: vec![],
+            scope: FileScope::default(),
+            snapshot: None,
+            policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
+            auto_approve: false,
+            observer: None,
+            sensitive: Default::default(),
+        };
+        let out = GlobTool.run(json!({ "pattern": "**/*.toml" }), &ctx).await;
+        assert!(out.content.contains("config/app.toml"), "{}", out.content);
+        assert!(!out.content.contains("secrets.toml"), "{}", out.content);
     }
 }

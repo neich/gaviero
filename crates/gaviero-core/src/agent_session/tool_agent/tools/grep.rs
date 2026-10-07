@@ -63,6 +63,9 @@ impl Tool for GrepTool {
         };
         let workspace_root = ctx.workspace_root.clone();
         let pattern = pattern.to_string();
+        // `Read` refuses a sensitive file; Grep must not hand back its lines
+        // either, or `.env` / `secrets.*` leak one match at a time.
+        let enforcer = ctx.enforcer();
 
         let result = tokio::task::spawn_blocking(move || {
             let mut hits: Vec<String> = Vec::new();
@@ -83,6 +86,9 @@ impl Tool for GrepTool {
                 if let Some(gre) = &glob_re
                     && !gre.is_match(&rel_str)
                 {
+                    continue;
+                }
+                if enforcer.check_read(path).is_err() {
                     continue;
                 }
                 // Non-UTF8 / binary files are skipped.
@@ -138,6 +144,7 @@ mod tests {
             policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
             auto_approve: false,
             observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         };
 
         let out = GrepTool
@@ -147,6 +154,40 @@ mod tests {
         assert!(out.content.contains("src/a.rs:1:fn alpha() {}"));
         // The .txt file is excluded by the glob filter.
         assert!(!out.content.contains("b.txt"));
+    }
+
+    fn ctx_for(root: &std::path::Path, sensitive: crate::scope_enforcer::SensitivePolicy) -> ToolCtx {
+        ToolCtx {
+            workspace_root: root.to_path_buf(),
+            additional_roots: vec![],
+            scope: FileScope::default(),
+            snapshot: None,
+            policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
+            auto_approve: false,
+            observer: None,
+            sensitive,
+        }
+    }
+
+    /// `Read` refuses `.env`; Grep must not return its lines either.
+    #[tokio::test]
+    async fn skips_sensitive_files_unless_exempted() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "API_TOKEN=hunter2\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "API_TOKEN is documented here\n").unwrap();
+
+        let strict = ctx_for(dir.path(), Default::default());
+        let out = GrepTool.run(json!({ "pattern": "API_TOKEN" }), &strict).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("notes.md"), "{}", out.content);
+        assert!(!out.content.contains("hunter2"), "{}", out.content);
+
+        let exempt = ctx_for(
+            dir.path(),
+            crate::scope_enforcer::SensitivePolicy::new(vec!["**/.env".into()]),
+        );
+        let out = GrepTool.run(json!({ "pattern": "API_TOKEN" }), &exempt).await;
+        assert!(out.content.contains("hunter2"), "{}", out.content);
     }
 
     #[tokio::test]
@@ -161,6 +202,7 @@ mod tests {
             policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
             auto_approve: false,
             observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
         };
         let out = GrepTool.run(json!({ "pattern": "zzz" }), &ctx).await;
         assert!(!out.is_error);

@@ -73,7 +73,7 @@ pub async fn run_turn(
     let reasoning_effort =
         crate::swarm::backend::deepseek::deepseek_reasoning_effort(req.effort.as_deref());
 
-    let messages = build_messages(&req.system_prompt, None, &req.user_prompt);
+    let messages = build_messages(&req.system_prompt, None, req.user_prompt.as_str());
     let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
     let policy = req
         .tool_policy
@@ -86,8 +86,13 @@ pub async fn run_turn(
         policy,
         auto_approve: req.auto_approve,
         observer: None,
+        sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&req.workspace_root),
     };
 
+    // Same cascade as chat (`agent.toolAgent.maxRounds` / `.costCeilingUsd`).
+    // A worktree has no `.gaviero/settings.json` of its own, so this reads the
+    // user level and the defaults there — never a looser bound than chat's.
+    let limits = super::resolve_loop_limits(&req.workspace_root);
     let outcome = super::agent_loop::run_agent_loop(
         &client,
         &tools,
@@ -96,7 +101,7 @@ pub async fn run_turn(
         &req.model,
         Some(reasoning_effort),
         messages,
-        &super::agent_loop::LoopLimits::default(),
+        &limits,
         cancel,
     )
     .await;

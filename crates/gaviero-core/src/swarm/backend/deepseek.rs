@@ -23,6 +23,22 @@ use super::{
     UnifiedStreamEvent,
 };
 
+/// Context window of every DeepSeek chat model gaviero can address
+/// (`deepseek-flash` and `deepseek-v4-pro` both serve 1M tokens with up to
+/// 384K output — <https://api-docs.deepseek.com/quick_start/pricing>). Shared
+/// by the `deepseek:` and `dsh:` profile rows and both backends' capabilities.
+pub const DEEPSEEK_CONTEXT_WINDOW: usize = 1_000_000;
+
+/// Whether `model` accepts image input. V4.1-Flash is natively multimodal and
+/// the legacy Flash names route to it; V4-Pro is text-only
+/// (<https://api-docs.deepseek.com/guides/vision>).
+pub fn deepseek_supports_vision(model: &str) -> bool {
+    matches!(
+        model.trim(),
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp"
+    )
+}
+
 /// DeepSeek's thinking-mode effort when gaviero names no level.
 ///
 /// The API's own default (see <https://api-docs.deepseek.com/guides/thinking_mode>),
@@ -80,13 +96,13 @@ impl DeepseekBackend {
         }
     }
 
-    fn capabilities_for_swarm() -> Capabilities {
+    fn capabilities_for_swarm(model: &str) -> Capabilities {
         Capabilities {
             tool_use: true,
             streaming: true,
-            vision: false,
+            vision: deepseek_supports_vision(model),
             extended_thinking: true,
-            max_context_tokens: 128_000,
+            max_context_tokens: DEEPSEEK_CONTEXT_WINDOW,
             supports_system_prompt: true,
             supports_file_blocks: false,
             // DeepSeek's in-process tool agent exposes Read/Grep/Glob/Bash/Write,
@@ -162,7 +178,8 @@ impl AgentBackend for DeepseekBackend {
         let exposed = request.exposed_tools.clone();
         let system = request.system_prompt.unwrap_or_else(|| {
             super::shared::default_editor_system_prompt(
-                &Self::capabilities_for_swarm().with_exposed_tools(exposed.as_deref()),
+                &Self::capabilities_for_swarm(&self.model)
+                    .with_exposed_tools(exposed.as_deref()),
             )
         });
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(256);
@@ -221,7 +238,7 @@ impl AgentBackend for DeepseekBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Self::capabilities_for_swarm()
+        Self::capabilities_for_swarm(&self.model)
     }
 
     fn name(&self) -> &str {
@@ -246,9 +263,25 @@ mod tests {
 
     #[test]
     fn capabilities_match_tool_agent() {
-        let caps = DeepseekBackend::capabilities_for_swarm();
+        let caps = DeepseekBackend::capabilities_for_swarm("deepseek-v4-pro");
         assert!(caps.tool_use);
         assert!(!caps.supports_file_blocks);
+        assert_eq!(caps.max_context_tokens, DEEPSEEK_CONTEXT_WINDOW);
+        assert!(!caps.vision, "V4-Pro is text-only");
+        assert!(DeepseekBackend::capabilities_for_swarm("deepseek-flash").vision);
+    }
+
+    #[test]
+    fn vision_follows_the_flash_family() {
+        for model in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            assert!(deepseek_supports_vision(model), "{model}");
+        }
+        assert!(!deepseek_supports_vision("deepseek-v4-pro"));
+        assert!(!deepseek_supports_vision("deepseek-chat"));
     }
 
     /// The exact table from the DeepSeek thinking-mode guide, shared by the

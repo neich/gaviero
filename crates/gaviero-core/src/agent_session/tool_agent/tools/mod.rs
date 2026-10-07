@@ -14,6 +14,7 @@ pub mod glob;
 pub mod grep;
 pub mod mcp;
 pub mod read;
+pub mod remote_mcp;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -28,7 +29,7 @@ use crate::agent_session::tool_agent::policy::ToolPolicy;
 use crate::agent_session::tool_agent::snapshot::TurnSnapshot;
 use crate::mcp::server::GavieroMcpServer;
 use crate::observer::AcpObserver;
-use crate::scope_enforcer::ScopeEnforcer;
+use crate::scope_enforcer::{ScopeEnforcer, SensitivePolicy};
 use crate::types::FileScope;
 
 /// Result of running a tool. `content` is fed back to the model as the `tool`
@@ -69,6 +70,9 @@ pub struct ToolCtx {
     pub auto_approve: bool,
     /// Observer for Bash permission prompts. Required for the `Bash` tool.
     pub observer: Option<Arc<dyn AcpObserver>>,
+    /// The workspace's `agent.permissions.sensitivePaths.allow` exemptions
+    /// ([`SensitivePolicy::resolve`]); the default exempts nothing.
+    pub sensitive: SensitivePolicy,
 }
 
 impl ToolCtx {
@@ -77,16 +81,21 @@ impl ToolCtx {
         confine(arg, &self.workspace_root, &self.additional_roots)
     }
 
+    /// The scope + sensitive-path enforcer every fs tool checks against.
+    pub fn enforcer(&self) -> ScopeEnforcer {
+        ScopeEnforcer::with_policy(self.scope.clone(), self.sensitive.clone())
+    }
+
     /// Sensitive-file read check (reuses [`ScopeEnforcer::check_read`]).
     pub fn check_read(&self, path: &Path) -> Result<()> {
-        ScopeEnforcer::new(self.scope.clone())
+        self.enforcer()
             .check_read(path)
             .map_err(|v| anyhow!(v.to_string()))
     }
 
     /// Write-scope check (reuses [`ScopeEnforcer::check_write`]).
     pub fn check_write(&self, path: &Path) -> Result<()> {
-        ScopeEnforcer::new(self.scope.clone())
+        self.enforcer()
             .check_write(path)
             .map_err(|v| anyhow!(v.to_string()))
     }
@@ -99,6 +108,17 @@ pub trait Tool: Send + Sync {
     /// OpenAI function-tool schema: `{ "type": "function", "function": { … } }`.
     fn schema(&self) -> Value;
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutcome;
+}
+
+/// The `agent.availableTools` names [`ToolRegistry::from_names`] turns into
+/// in-process tools.
+pub const REGISTRY_TOOLS: [&str; 7] = ["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash"];
+
+/// `agent.availableTools` entries the in-process loop serves through some
+/// other channel than the registry, if at all: the ask tool rides the prompt
+/// channel, and `mcp__<server>` names belong to the MCP adapters.
+pub(crate) fn served_outside_registry(name: &str) -> bool {
+    name == ask::AskQuestionTool.name() || name.starts_with("mcp__")
 }
 
 /// Holds the active tool set and emits the `tools` array sent to the API.
@@ -147,6 +167,12 @@ impl ToolRegistry {
     }
 
     /// Build a registry from an allow-list of tool names (swarm `allowed_tools`).
+    ///
+    /// Names in [`REGISTRY_TOOLS`] become tools. `AskUserQuestion` and
+    /// `mcp__*` entries are skipped quietly: the loop reaches them through the
+    /// prompt channel and the MCP adapters, never through this list. Anything
+    /// else has no in-process implementation; it is warned here and disclosed
+    /// to the user by [`super::tool_agent_disclosure`].
     pub fn from_names(names: &[String]) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         for name in names {
@@ -158,7 +184,10 @@ impl ToolRegistry {
                 "Edit" => tools.push(Box::new(write::EditTool)),
                 "MultiEdit" => tools.push(Box::new(write::MultiEditTool)),
                 "Bash" => tools.push(Box::new(bash::BashTool)),
-                other => tracing::warn!("unknown swarm tool name '{other}', skipping"),
+                other if served_outside_registry(other) => {
+                    tracing::debug!("tool '{other}' is not a registry tool; served elsewhere");
+                }
+                other => tracing::warn!("no in-process tool named '{other}', skipping"),
             }
         }
         Self::new(tools)
@@ -222,6 +251,16 @@ impl ToolRegistry {
     pub fn extend_ask(&mut self) -> Vec<String> {
         self.tools.push(Box::new(ask::AskQuestionTool));
         vec![ask::AskQuestionTool.name().to_string()]
+    }
+
+    /// Append the tools of the session's connected `mcp.extraServers`
+    /// ([`remote_mcp::tools_for`]), returning the names added. Called once,
+    /// after every other tool, so the earlier entries of the `tools` array —
+    /// and with them DeepSeek's prefix cache — stay byte-stable.
+    pub fn extend_remote(&mut self, tools: Vec<Box<dyn Tool>>) -> Vec<String> {
+        let names = tools.iter().map(|t| t.name().to_string()).collect();
+        self.tools.extend(tools);
+        names
     }
 
     pub fn schemas(&self) -> Vec<Value> {
