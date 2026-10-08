@@ -664,7 +664,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
                     LeftPanelMode::TurnReview => {
-                        super::turn_review::click_row(app, relative_row);
+                        // Click selects; clicking the already-selected row opens
+                        // its diff, matching the git and history panels.
+                        if let Some((_, was_selected)) =
+                            super::turn_review::click_row(app, relative_row)
+                            && was_selected
+                        {
+                            super::turn_review::open_selected_change(app);
+                        }
                     }
                 }
                 return;
@@ -759,6 +766,21 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height) {
                         app.git_panel.select_file(region, idx);
                         super::side_panel::open_selected_git_file(app);
+                        return;
+                    }
+                }
+
+                // History: same contract as the git panel — a click on a FILES
+                // row both picks it and opens its diff; a click on the turn list
+                // only moves the selection.
+                if app.side_panel == SidePanelMode::HistoryPanel {
+                    if let Some(idx) = app.history_panel.hit_test_file(area, col, row) {
+                        app.history_panel.select_file(idx);
+                        super::turn_review::open_history_file_diff(app);
+                        return;
+                    }
+                    if let Some(pos) = app.history_panel.hit_test_turn(area, col, row) {
+                        app.history_panel.select_turn(pos);
                         return;
                     }
                 }
