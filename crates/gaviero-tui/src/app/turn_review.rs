@@ -9,14 +9,17 @@
 //! send its next prompt; other conversations are unaffected, so the panel is
 //! a left-panel mode rather than a modal lock.
 //!
-//! Every core call (hunks, drift checks, reverts) runs from a handler, never
-//! from the render path: render reads [`TurnReviewView::preview`] only.
+//! Every core call (drift checks, reverts) runs from a handler, never from the
+//! render path: render reads the panel's list state only.
 //!
-//! The panel summarizes; the *reading* is the editor's. `Enter` opens the
+//! The panel is a *list*; the *reading* is the editor's. `Enter` opens the
 //! selected file in the shared read-only diff tab
 //! ([`super::editing::open_change_diff`]) — the whole file with its changed
-//! lines highlighted, syntax highlighting and real scrolling — which is the
-//! same viewer the git panel and the HISTORY panel open.
+//! lines highlighted, syntax highlighting and real scrolling.
+//!
+//! That one viewer serves every "what changed?" panel — the git panel, the
+//! HISTORY panel ([`open_history_file_diff`]) and this one. None of them paints
+//! a diff of its own, so there is a single diff mechanism to keep working.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -27,9 +30,8 @@ use ratatui::widgets::{Block, Borders, Widget};
 use gaviero_core::history::ChangedFile;
 use gaviero_core::turn_capture::{
     BlobRef, ChangeKind, FileChange, FileDecision, PendingReview, ResolvedDecision, RevertOutcome,
-    ReviewedTurn, TurnOutcome, file_hunks, file_texts, revert_file,
+    ReviewedTurn, TurnOutcome, revert_file,
 };
-use gaviero_core::types::DiffHunk;
 
 use super::*;
 
@@ -39,21 +41,9 @@ pub(crate) struct TurnReviewView {
     pub active: usize,
     pub selected: usize,
     pub scroll_offset: usize,
-    pub diff_scroll: usize,
-    /// Preview of the selected file, keyed by [`FileChange::key`].
-    pub preview: Option<(String, Preview)>,
     /// A reject was refused because the file changed after the turn ended;
     /// repeating the same key (`r:<file key>` or `R`) confirms overwriting.
     pub confirm_force: Option<String>,
-}
-
-pub(crate) enum Preview {
-    Hunks(Vec<DiffHunk>),
-    /// Whole-file only: a note plus the lines worth showing (deleted content).
-    Whole {
-        note: String,
-        removed: Vec<String>,
-    },
 }
 
 // ── Entry points ─────────────────────────────────────────────────────
@@ -147,7 +137,6 @@ fn show(app: &mut App, index: usize) {
     app.left_panel = LeftPanelMode::TurnReview;
     app.panel_visible.file_tree = true;
     app.focus = Focus::FileTree;
-    ensure_preview(app);
 }
 
 /// Reopen reviews persisted by a previous session (crash or quit).
@@ -183,48 +172,6 @@ fn active_review(app: &App) -> Option<&PendingReview> {
 
 fn selected_change(app: &App) -> Option<&FileChange> {
     active_review(app).and_then(|r| r.set.files.get(app.turn_review_view.selected))
-}
-
-/// Compute the selected file's preview if the cache is for another file.
-/// Handler-only: reads blobs through core.
-fn ensure_preview(app: &mut App) {
-    let Some(change) = selected_change(app).cloned() else {
-        app.turn_review_view.preview = None;
-        return;
-    };
-    let key = change.key();
-    if app
-        .turn_review_view
-        .preview
-        .as_ref()
-        .is_some_and(|(k, _)| *k == key)
-    {
-        return;
-    }
-    let preview = match file_hunks(&app.turn_capture, &change) {
-        Some(hunks) => Preview::Hunks(hunks),
-        None => {
-            // One rule for "which sides still have text" — the same core call the
-            // diff tab reads through — so a deleted file's content is fetched the
-            // same way here as it is rendered there.
-            let (before, _) = file_texts(&app.turn_capture, &change).unwrap_or_default();
-            let removed = if change.kind == ChangeKind::Deleted {
-                before.lines().map(str::to_string).collect()
-            } else {
-                Vec::new()
-            };
-            let note = if change.kind == ChangeKind::Deleted {
-                "Deleted by the turn — reject restores it".to_string()
-            } else if change.binary {
-                "Binary file".to_string()
-            } else {
-                "Content not stored (over 8 MiB) — can only be accepted".to_string()
-            };
-            Preview::Whole { note, removed }
-        }
-    };
-    app.turn_review_view.preview = Some((key, preview));
-    app.turn_review_view.diff_scroll = 0;
 }
 
 /// The decision taken on a file, or `None` while it is still undecided.
@@ -269,32 +216,22 @@ pub(super) fn handle_turn_review_action(app: &mut App, action: &Action) -> bool 
         Action::CursorDown | Action::InsertChar('j') => {
             if app.turn_review_view.selected + 1 < files {
                 app.turn_review_view.selected += 1;
-                ensure_preview(app);
             }
             true
         }
         Action::CursorUp | Action::InsertChar('k') => {
             if app.turn_review_view.selected > 0 {
                 app.turn_review_view.selected -= 1;
-                ensure_preview(app);
             }
             true
         }
         // The whole file with its changes highlighted, in the editor's diff tab
-        // — the same viewer the git panel and the history panel open.
+        // — the same viewer the git panel and the history panel open. Reading a
+        // file is therefore the editor's job, and the panel has no diff keys of
+        // its own: `j`/`k`/`↑`/`↓` move the list, `PgUp`/`PgDn`/`J`/`K` are
+        // free, and the diff tab scrolls with the editor's own keys.
         Action::Enter => {
             open_selected_change(app);
-            true
-        }
-        Action::InsertChar('J') | Action::PageDown => {
-            app.turn_review_view.diff_scroll += theme::DIFF_PAGE_SCROLL;
-            true
-        }
-        Action::InsertChar('K') | Action::PageUp => {
-            app.turn_review_view.diff_scroll = app
-                .turn_review_view
-                .diff_scroll
-                .saturating_sub(theme::DIFF_PAGE_SCROLL);
             true
         }
         // The four decisions. Each takes effect immediately.
@@ -529,7 +466,6 @@ fn advance_or_finish(app: &mut App) {
     match next {
         Some(i) => {
             app.turn_review_view.selected = i;
-            ensure_preview(app);
             persist(app);
         }
         None => finish(app),
@@ -1122,115 +1058,6 @@ pub(super) fn render_turn_review_list(app: &mut App, frame: &mut Frame, area: Re
     }
 }
 
-pub(super) fn render_turn_review_diff(app: &mut App, frame: &mut Frame, area: Rect) {
-    let Some(review) = app.pending_turn_reviews.get(app.turn_review_view.active) else {
-        return;
-    };
-    let Some(change) = review.set.files.get(app.turn_review_view.selected) else {
-        return;
-    };
-    let view = &app.turn_review_view;
-
-    let mut lines: Vec<Line> = Vec::new();
-    let kind = match change.kind {
-        ChangeKind::Added => "ADDED",
-        ChangeKind::Modified => "MODIFIED",
-        ChangeKind::Deleted => "DELETED",
-    };
-    let decision_label = match decided(review, change) {
-        None => "a: accept  r: reject (back to the pre-prompt version)",
-        Some(FileDecision::Keep) => "accepted — agent's version kept",
-        Some(FileDecision::Revert) => "rejected — back to the pre-prompt version",
-        Some(FileDecision::RevertHunks(_)) => "partially reverted",
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {} ({kind}) ", change.rel),
-            Style::default()
-                .fg(theme::FOCUS_BORDER)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("— {decision_label}"),
-            Style::default().fg(theme::TEXT_FG),
-        ),
-    ]));
-    if !change.overlap_with.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " ⚠ Also changed during overlapping turn(s): {} — this diff may include their edits",
-                change.overlap_with.join(", ")
-            ),
-            Style::default().fg(theme::WARNING),
-        )));
-    }
-
-    match view.preview.as_ref().filter(|(k, _)| *k == change.key()) {
-        None => lines.push(Line::from(" …")),
-        Some((_, Preview::Whole { note, removed })) => {
-            lines.push(Line::from(Span::styled(
-                format!(" {note}"),
-                Style::default().fg(theme::TEXT_DIM),
-            )));
-            for l in removed {
-                lines.push(Line::from(Span::styled(
-                    format!(" - │ {l}"),
-                    Style::default()
-                        .fg(theme::ERROR)
-                        .bg(theme::DIFF_REM_LINE_BG),
-                )));
-            }
-        }
-        Some((_, Preview::Hunks(hunks))) => {
-            for (i, h) in hunks.iter().enumerate() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        " @@ {}/{} · line {} ",
-                        i + 1,
-                        hunks.len(),
-                        h.proposed_range.0 + 1
-                    ),
-                    Style::default().fg(theme::TEXT_DIM),
-                )));
-                for l in h.original_text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!(" - │ {l}"),
-                        Style::default()
-                            .fg(theme::ERROR)
-                            .bg(theme::DIFF_REM_LINE_BG),
-                    )));
-                }
-                for l in h.proposed_text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!(" + │ {l}"),
-                        Style::default()
-                            .fg(theme::SUCCESS)
-                            .bg(theme::DIFF_ADD_LINE_BG),
-                    )));
-                }
-            }
-        }
-    }
-
-    let max_scroll = lines.len().saturating_sub(1);
-    let scroll = view.diff_scroll.min(max_scroll);
-    for (row, line) in lines
-        .into_iter()
-        .skip(scroll)
-        .take(area.height as usize)
-        .enumerate()
-    {
-        line.render(
-            Rect {
-                y: area.y + row as u16,
-                height: 1,
-                ..area
-            },
-            frame.buffer_mut(),
-        );
-    }
-}
-
 /// Bottom status-bar hint while the TURN REVIEW list has focus.
 pub(super) fn status_hint(app: &App) -> String {
     let (n, left) = active_review(app)
@@ -1246,7 +1073,7 @@ pub(super) fn status_hint(app: &App) -> String {
         .unwrap_or((0, 0));
     format!(
         "TURN REVIEW ({left} of {n} left)  a / r: accept / reject file  \
-         A / R: accept / reject whole turn"
+         A / R: accept / reject whole turn  Enter: read the whole file's diff"
     )
 }
 
@@ -1262,7 +1089,6 @@ pub(super) fn click_row(app: &mut App, relative_row: usize) {
     let files = active_review(app).map(|r| r.set.files.len()).unwrap_or(0);
     if idx < files {
         app.turn_review_view.selected = idx;
-        ensure_preview(app);
     }
 }
 
@@ -1338,7 +1164,6 @@ mod tests {
                 .position(|c| c.rel == rel)
                 .unwrap();
             self.app.turn_review_view.selected = idx;
-            ensure_preview(&mut self.app);
         }
     }
 
@@ -1506,16 +1331,63 @@ mod tests {
         let mut f = Fixture::new();
         f.write("a.txt", "v1\n");
         f.turn("t1", |f| f.write("a.txt", "v2\n"));
-        for key in ['f', 'q', 'n', 'p', ' ', 'h'] {
+        // `J`/`K` are in the list: the panel used to spend them scrolling a diff
+        // preview of its own. The editor's diff tab scrolls itself now.
+        for key in ['f', 'q', 'n', 'p', ' ', 'h', 'J', 'K'] {
             assert!(
                 !handle_turn_review_action(&mut f.app, &Action::InsertChar(key)),
                 "{key:?} is not a turn review action"
+            );
+        }
+        for action in [Action::PageDown, Action::PageUp] {
+            assert!(
+                !handle_turn_review_action(&mut f.app, &action),
+                "PageUp/PageDown are not turn review actions"
             );
         }
         // `Enter` reads rather than decides — it opens the file in the editor's
         // diff tab — so it is bound like the navigation keys.
         assert!(handle_turn_review_action(&mut f.app, &Action::Enter));
         assert!(conv_has_pending_review(&f.app, &f.conv()));
+    }
+
+    /// Draw the whole app and return the terminal contents.
+    fn render_to_text(app: &mut App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The review is a *list* panel. If it painted the editor area — as it used
+    /// to, with a hunk preview of its own — the diff tab `Enter` opens would be
+    /// drawn underneath it and the user would never see it. That was the bug.
+    #[test]
+    fn the_editor_area_shows_the_diff_tab_and_not_a_panel_preview() {
+        let mut f = Fixture::new();
+        f.write("a.txt", "v1\n");
+        f.turn("t1", |f| f.write("a.txt", "keep\nold\n"));
+        f.app.turn_capture.flush();
+        assert!(handle_turn_review_action(&mut f.app, &Action::Enter));
+
+        let text = render_to_text(&mut f.app);
+        assert!(text.contains("v1"), "the pre-turn line is drawn: {text}");
+        assert!(text.contains("keep"), "the post-turn line is drawn: {text}");
+        assert!(
+            !text.contains("@@ "),
+            "no hunk header from a panel-painted diff: {text}"
+        );
     }
 
     /// `Enter` hands the selected file to the shared read-only diff tab — the
