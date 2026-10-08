@@ -348,11 +348,10 @@ pub(super) fn render_editor(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    if app.left_panel == LeftPanelMode::TurnReview && !app.pending_turn_reviews.is_empty() {
-        super::turn_review::render_turn_review_diff(app, frame, area);
-        return;
-    }
-
+    // The turn review is a *list* panel: it never paints the editor area. The
+    // selected file is read by opening the shared read-only diff tab (`Enter`),
+    // exactly as the git and HISTORY panels do, so the editor pane keeps
+    // showing the active buffer.
     if let Some(ref mut review) = app.diff_review {
         diff_overlay::render_diff_overlay(area, frame.buffer_mut(), review, &app.theme);
         return;

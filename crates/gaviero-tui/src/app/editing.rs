@@ -1210,13 +1210,6 @@ fn scroll_editor_content(app: &mut App, up: bool) {
                 cs.diff_scroll + delta
             };
         }
-    } else if app.left_panel == LeftPanelMode::TurnReview && !app.pending_turn_reviews.is_empty() {
-        let view = &mut app.turn_review_view;
-        view.diff_scroll = if up {
-            view.diff_scroll.saturating_sub(delta)
-        } else {
-            view.diff_scroll + delta
-        };
     } else if let Some(ref mut review) = app.diff_review {
         review.scroll_top = if up {
             review.scroll_top.saturating_sub(delta)
