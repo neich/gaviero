@@ -725,7 +725,7 @@ fn recorded_change(app: &App, file: &ChangedFile) -> FileChange {
 
 /// Open the file selected in the active review in the editor's diff tab — the
 /// same viewer `Enter` opens from the history panel's FILES list.
-fn open_selected_change(app: &mut App) {
+pub(super) fn open_selected_change(app: &mut App) {
     let Some(change) = selected_change(app).cloned() else {
         return;
     };
@@ -1073,23 +1073,31 @@ pub(super) fn status_hint(app: &App) -> String {
         .unwrap_or((0, 0));
     format!(
         "TURN REVIEW ({left} of {n} left)  a / r: accept / reject file  \
-         A / R: accept / reject whole turn  Enter: read the whole file's diff"
+         A / R: accept / reject whole turn  Enter (or click the row again): \
+         read the whole file's diff"
     )
 }
 
 /// Select a row by mouse.
-pub(super) fn click_row(app: &mut App, relative_row: usize) {
+///
+/// Returns the row's file index and whether the click landed on the row that
+/// was *already* selected. A single click only moves the selection, because the
+/// list is also how a file gets accepted or rejected (`a` / `r` on the focused
+/// row); clicking the selected row again opens its diff, which is the same
+/// "click to view" contract the git and history panels offer.
+pub(super) fn click_row(app: &mut App, relative_row: usize) -> Option<(usize, bool)> {
     let header = 2 + active_review(app)
         .map(|r| r.set.warnings.len())
         .unwrap_or(0);
-    let Some(row) = relative_row.checked_sub(header) else {
-        return;
-    };
+    let row = relative_row.checked_sub(header)?;
     let idx = app.turn_review_view.scroll_offset + row;
     let files = active_review(app).map(|r| r.set.files.len()).unwrap_or(0);
-    if idx < files {
-        app.turn_review_view.selected = idx;
+    if idx >= files {
+        return None;
     }
+    let was_selected = app.turn_review_view.selected == idx;
+    app.turn_review_view.selected = idx;
+    Some((idx, was_selected))
 }
 
 #[cfg(test)]

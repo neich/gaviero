@@ -50,8 +50,28 @@ const COLOR_OK: Color = Color::Rgb(152, 195, 121);
 /// sitting beside it.
 const TWO_COLUMN_MIN_WIDTH: u16 = 90;
 
+/// Screen rows one turn occupies in the turn list (title + meta).
+const ROWS_PER_TURN: usize = 2;
+
 /// Files `J`/`K` / `PgUp`/`PgDn` skip in the FILES list.
 pub const FILE_PAGE: isize = 10;
+
+/// The rects the panel paints into, derived from its outer area.
+///
+/// `render` and the mouse hit-tests ([`HistoryPanelState::hit_test_turn`],
+/// [`HistoryPanelState::hit_test_file`]) both go through [`HistoryPanelState::panel_geometry`],
+/// so a click can never drift from what was drawn.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelGeometry {
+    /// The section body: the panel minus its status bar and legend.
+    pub body: Rect,
+    /// The turn-list column. `None` in the expanded view, which has no list.
+    pub list: Option<Rect>,
+    /// Where the detail (the focused section) is painted.
+    pub detail: Rect,
+    /// `Enter`: the detail fills the whole body and there is no list beside it.
+    pub expanded: bool,
+}
 
 /// The six detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`6` jump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +357,144 @@ impl HistoryPanelState {
         };
     }
 
+    /// Click on a FILES row: put the cursor there (clamped).
+    pub fn select_file(&mut self, idx: usize) {
+        self.file_selected = idx.min(self.file_count().saturating_sub(1));
+    }
+
+    /// Click on the turn list: select that turn and reset what belonged to the
+    /// previous one (`section_scroll`, the FILES cursor).
+    pub fn select_turn(&mut self, visible_idx: usize) {
+        let n = self.visible().len();
+        if n == 0 {
+            return;
+        }
+        let next = visible_idx.min(n - 1);
+        if next != self.selected {
+            self.selected = next;
+            self.section_scroll = 0;
+            self.reset_file_cursor();
+        }
+    }
+
+    /// The focused section's body plus the body-line index of each FILES row —
+    /// the map [`Self::hit_test_file`] turns a screen row back into a file.
+    pub fn body_with_rows(&self, turn: &TurnRecords) -> (Vec<Line<'static>>, Vec<usize>) {
+        let cursor = (self.section == HistorySection::Files).then_some(self.file_selected);
+        let mut rows = Vec::new();
+        let lines = section_lines_with_rows(turn, self.section, cursor, &mut rows);
+        (lines, rows)
+    }
+
+    /// Which visible turn is at `(col, row)`, or `None` off the turn list.
+    ///
+    /// Mirrors `render_list`: two rows per turn, scrolled so the selected turn
+    /// stays visible. The unit is a *visible* index (newest first), the unit
+    /// [`Self::selected`] already uses.
+    pub fn hit_test_turn(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
+        let list = self.panel_geometry(area)?.list?;
+        if !list.contains((col, row).into()) {
+            return None;
+        }
+        let visible = self.visible();
+        let capacity = (list.height as usize / ROWS_PER_TURN).max(1);
+        let first = self.selected.saturating_sub(capacity.saturating_sub(1));
+        let pos = first + (row - list.y) as usize / ROWS_PER_TURN;
+        (pos < visible.len()).then_some(pos)
+    }
+
+    /// Which row of the focused turn's [`ordered_files`] is at `(col, row)`, or
+    /// `None` off the FILES list (or on one of its headings).
+    pub fn hit_test_file(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
+        if self.section != HistorySection::Files {
+            return None;
+        }
+        let geo = self.panel_geometry(area)?;
+        if !geo.detail.contains((col, row).into()) {
+            return None;
+        }
+        let turn = self.selected_turn()?;
+        let (body, file_rows) = self.body_with_rows(turn);
+        let header = self.detail_header_height(turn, geo.expanded, geo.detail.height);
+        let screen = row.checked_sub(geo.detail.y.saturating_add(header))? as usize;
+        let width = geo.detail.width.max(1) as usize;
+        // `Paragraph::scroll` counts *wrapped* rows, so a file row that is too
+        // wide for the panel occupies several of them.
+        let target = screen + self.body_scroll(&body, width);
+        let mut top = 0usize;
+        for (line, text) in body.iter().enumerate() {
+            let height = wrapped_height(text, width);
+            if target < top + height {
+                return file_rows.binary_search(&line).ok();
+            }
+            top += height;
+        }
+        None
+    }
+
+    /// The clamped vertical scroll `render_detail` draws the body with. Both
+    /// sides must agree, or a click near the bottom of a long section would
+    /// name the wrong row.
+    fn body_scroll(&self, body: &[Line<'static>], width: usize) -> usize {
+        let total: usize = body.iter().map(|l| wrapped_height(l, width)).sum();
+        self.section_scroll.min(total.saturating_sub(1))
+    }
+
+    /// Rows the pinned detail header takes above the section body.
+    fn detail_header_height(&self, turn: &TurnRecords, expanded: bool, detail_height: u16) -> u16 {
+        if expanded {
+            0
+        } else {
+            (detail_header_lines(turn, self.section).len() as u16).min(detail_height)
+        }
+    }
+
+    /// Where everything lands inside `area` (the panel's own content rect).
+    /// `None` when the panel is too small to lay out at all, which is also
+    /// where `render` stops.
+    pub fn panel_geometry(&self, area: Rect) -> Option<PanelGeometry> {
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        if inner.height < 3 || inner.width < 10 {
+            return None;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let body = rows[1];
+        if self.expanded {
+            return Some(PanelGeometry {
+                body,
+                list: None,
+                detail: body,
+                expanded: true,
+            });
+        }
+        let (list, detail) = if body.width >= TWO_COLUMN_MIN_WIDTH {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+                .split(body);
+            (cols[0], cols[1])
+        } else {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(body);
+            (rows[0], rows[1])
+        };
+        Some(PanelGeometry {
+            body,
+            list: Some(list),
+            detail,
+            expanded: false,
+        })
+    }
+
     pub fn set_section(&mut self, section: HistorySection) {
         if self.section != section {
             self.section = section;
@@ -408,9 +566,11 @@ impl HistoryPanelState {
             .border_style(Style::default().fg(if focused { COLOR_ACCENT } else { COLOR_BORDER }));
         let inner = block.inner(area);
         block.render(area, buf);
-        if inner.height < 3 || inner.width < 10 {
+        // The same size gate `panel_geometry` applies, so `render` and the
+        // mouse hit-tests agree on when the panel has a body at all.
+        let Some(geo) = self.panel_geometry(area) else {
             return;
-        }
+        };
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -424,7 +584,7 @@ impl HistoryPanelState {
         Paragraph::new(legend_line(self.source.as_deref()))
             .style(Style::default().fg(COLOR_MUTED))
             .render(rows[2], buf);
-        let body = rows[1];
+        let body = geo.body;
 
         let Some(turn) = self.selected_turn() else {
             Paragraph::new(self.empty_message())
@@ -434,26 +594,14 @@ impl HistoryPanelState {
             return;
         };
 
-        if self.expanded {
-            self.render_detail(turn, body, buf, true);
+        if geo.expanded {
+            self.render_detail(turn, geo.detail, buf, true);
             return;
         }
-
-        let (list_area, detail_area) = if body.width >= TWO_COLUMN_MIN_WIDTH {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-                .split(body);
-            (cols[0], cols[1])
-        } else {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-                .split(body);
-            (rows[0], rows[1])
-        };
-        self.render_list(list_area, buf);
-        self.render_detail(turn, detail_area, buf, false);
+        if let Some(list_area) = geo.list {
+            self.render_list(list_area, buf);
+        }
+        self.render_detail(turn, geo.detail, buf, false);
     }
 
     fn status_line(&self) -> Line<'static> {
@@ -517,8 +665,7 @@ impl HistoryPanelState {
 
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
         let visible = self.visible();
-        let rows_per_turn = 2usize;
-        let capacity = (area.height as usize / rows_per_turn).max(1);
+        let capacity = (area.height as usize / ROWS_PER_TURN).max(1);
         let first = self.selected.saturating_sub(capacity.saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
         for (pos, &i) in visible.iter().enumerate().skip(first).take(capacity) {
@@ -543,8 +690,7 @@ impl HistoryPanelState {
             .constraints([Constraint::Length(header_height), Constraint::Min(0)])
             .areas(area);
         Paragraph::new(header).render(head, buf);
-        let max_scroll = lines.len().saturating_sub(1);
-        let scroll = self.section_scroll.min(max_scroll);
+        let scroll = self.body_scroll(&lines, area.width.max(1) as usize);
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
@@ -839,6 +985,20 @@ pub fn section_lines_with_cursor(
     section: HistorySection,
     file_selected: Option<usize>,
 ) -> Vec<Line<'static>> {
+    section_lines_with_rows(turn, section, file_selected, &mut Vec::new())
+}
+
+/// [`section_lines_with_cursor`], additionally reporting the body-line index of
+/// every FILES row into `rows` — the map that lets a mouse row be turned back
+/// into a file (see [`HistoryPanelState::hit_test_file`]). Both functions build
+/// the same lines in the same order, so the indices always agree with what
+/// [`HistoryPanelState::render_detail`] drew.
+pub fn section_lines_with_rows(
+    turn: &TurnRecords,
+    section: HistorySection,
+    file_selected: Option<usize>,
+    rows: &mut Vec<usize>,
+) -> Vec<Line<'static>> {
     let provider = turn
         .summary
         .provider
@@ -912,7 +1072,9 @@ pub fn section_lines_with_cursor(
             }
         }
         HistorySection::Totals => totals_lines(turn, &provider, &mut lines, &heading, &muted),
-        HistorySection::Files => files_lines(turn, file_selected, &mut lines, &heading, &muted),
+        HistorySection::Files => {
+            files_lines(turn, file_selected, rows, &mut lines, &heading, &muted)
+        }
     }
     lines
 }
@@ -920,9 +1082,13 @@ pub fn section_lines_with_cursor(
 /// FILES: what the turn changed on disk, in the section's own order —
 /// **modified, added, deleted** — with the review decision per file and the
 /// panel's cursor. `selected` is the index into [`ordered_files`].
+///
+/// Each file row's body-line index is pushed into `rows` (its position in
+/// `lines`), which is what makes the list clickable.
 fn files_lines(
     turn: &TurnRecords,
     selected: Option<usize>,
+    rows: &mut Vec<usize>,
     lines: &mut Vec<Line<'static>>,
     heading: &dyn Fn(String) -> Line<'static>,
     muted: &dyn Fn(String) -> Line<'static>,
@@ -987,6 +1153,7 @@ fn files_lines(
         } else {
             Style::default().fg(COLOR_TEXT)
         };
+        rows.push(lines.len());
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{} [{i:>2}] ", if is_cursor { "›" } else { " " }),
@@ -1019,6 +1186,21 @@ fn files_lines(
             Style::default().fg(COLOR_WARN),
         )));
     }
+}
+
+/// How many display rows `line` needs at `width`.
+///
+/// The section body is drawn with `Wrap { trim: false }`, and ratatui applies
+/// `Paragraph::scroll` *after* wrapping — so the scroll offset counts wrapped
+/// rows, not logical lines. The mouse hit-tests have to count them the same way.
+fn wrapped_height(line: &Line<'static>, width: usize) -> usize {
+    let text = line.to_string();
+    if text.is_empty() {
+        return 1;
+    }
+    crate::widgets::render_utils::word_wrap(&text, width)
+        .len()
+        .max(1)
 }
 
 fn find_start(turn: &TurnRecords) -> Option<&TurnStart> {
