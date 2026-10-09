@@ -7,6 +7,7 @@ mod panels;
 mod platform;
 mod setup;
 mod theme;
+mod thinking;
 mod widgets;
 
 use anyhow::{Context, Result};
