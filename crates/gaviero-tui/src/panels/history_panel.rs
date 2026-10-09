@@ -542,7 +542,7 @@ impl HistoryPanelState {
     }
 
     /// The focused section's records of the selected turn, as NDJSON — what
-    /// `c` copies.
+    /// `c` copies. The audit form: one raw log line per record, no formatting.
     pub fn focused_records_ndjson(&self) -> Option<String> {
         let turn = self.selected_turn()?;
         let lines: Vec<String> = turn
@@ -554,11 +554,53 @@ impl HistoryPanelState {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
+    /// The focused section as clipboard-ready **plain text** — what `y` copies.
+    ///
+    /// Deliberately not [`Self::focused_records_ndjson`]: this is the
+    /// human-readable form, so it can be pasted into an editor or sent again.
+    /// On PROMPT it is the prompt **verbatim** — no `turn_start` JSON, and none
+    /// of the panel's own decoration (byte count, estimator, workspace root) —
+    /// which is the point of the key. Every other section copies the body the
+    /// panel draws for it, line for line, minus the FILES row cursor and the
+    /// pinned header (turn identity plus the six section summaries), both of
+    /// which belong to the panel rather than to the section.
+    ///
+    /// `None` when there is nothing to copy: no selected turn, or a PROMPT
+    /// section whose turn carries no `turn_start` (an unattributed turn).
+    pub fn focused_text(&self) -> Option<String> {
+        let turn = self.selected_turn()?;
+        if self.section == HistorySection::Prompt {
+            return find_start(turn).map(|start| start.prompt.clone());
+        }
+        let text = section_lines_with_cursor(turn, self.section, None)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Blocks end with a blank separator line; a paste should not.
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Whether the focused turn's stored prompt is a truncated head of the real
+    /// prompt. `y` says so in its status line; the clipboard itself stays
+    /// verbatim, so what lands there is never silently cut.
+    pub fn prompt_is_truncated(&self) -> bool {
+        self.selected_turn()
+            .and_then(find_start)
+            .is_some_and(|s| s.prompt_truncated)
+    }
+
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
+        // The focused title is this panel's key help, so it states what `y` does
+        // for the *focused* section: "copy prompt" is true on PROMPT only.
         let title = if focused {
-            "HISTORY (Tab/1-6: section · / filter · a scope · r reload · c copy · Enter expand)"
+            format!(
+                "HISTORY (Tab/1-6: section · / filter · a scope · r reload · c copy json · {} · Enter expand)",
+                copy_text_help(self.section)
+            )
         } else {
-            "HISTORY"
+            "HISTORY".to_string()
         };
         let block = Block::default()
             .title(title)
@@ -988,6 +1030,19 @@ pub fn section_lines_with_cursor(
     section_lines_with_rows(turn, section, file_selected, &mut Vec::new())
 }
 
+/// What the `y` key does for a section, as the panel's own help spells it.
+///
+/// PROMPT is the one section where the plain-text copy is the prompt itself, so
+/// the help says "copy prompt" there and "copy text" everywhere else (those
+/// sections copy the body the panel draws). One source of truth for both help
+/// surfaces: the focused title and the PROMPT body's hint line.
+pub fn copy_text_help(section: HistorySection) -> &'static str {
+    match section {
+        HistorySection::Prompt => "y: copy prompt",
+        _ => "y: copy text",
+    }
+}
+
 /// [`section_lines_with_cursor`], additionally reporting the body-line index of
 /// every FILES row into `rows` — the map that lets a mouse row be turned back
 /// into a file (see [`HistoryPanelState::hit_test_file`]). Both functions build
@@ -1247,6 +1302,15 @@ fn prompt_lines(start: &TurnStart, out: &mut Vec<Line<'static>>) {
             start.estimator.unwrap_or(Estimator::WordsX13).label(),
             start.workspace_root,
         ),
+        Style::default().fg(COLOR_MUTED),
+    )));
+    // Name the key that copies this section, right where the prompt is read (the
+    // FILES section spells out its own keys the same way). Kept to the one key so
+    // it still reads in a narrow detail column, which the panel's title already
+    // clips. Display only: [`HistoryPanelState::focused_text`] copies
+    // `start.prompt` verbatim, so this line never reaches the clipboard.
+    out.push(Line::from(Span::styled(
+        copy_text_help(HistorySection::Prompt),
         Style::default().fg(COLOR_MUTED),
     )));
     text_lines(&start.prompt, Style::default().fg(COLOR_TEXT), out);
@@ -1560,7 +1624,9 @@ fn totals_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaviero_core::history::{HistoryRecorder, ProviderUsage, TurnEnd, tool_call_record};
+    use gaviero_core::history::{
+        HISTORY_MAX_PROMPT_BYTES, HistoryRecorder, ProviderUsage, TurnEnd, tool_call_record,
+    };
 
     fn start(prompt: &str, title: &str) -> TurnStart {
         TurnStart {
@@ -1656,6 +1722,14 @@ mod tests {
         out
     }
 
+    /// One buffer row, for the tests that care about the border title alone
+    /// (the body renders whether or not the panel is focused).
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
     #[test]
     fn loader_counts_malformed_lines_instead_of_failing() {
         let (_dir, path) = fixture();
@@ -1745,6 +1819,143 @@ mod tests {
         assert!(ndjson.contains("\"kind\":\"tool_call\""));
         state.set_section(HistorySection::Mcp);
         assert!(state.focused_records_ndjson().is_none());
+    }
+
+    // ── `y`: the same sections as human-readable text ──────────────────────
+
+    #[test]
+    fn copy_text_yields_the_prompt_verbatim_without_the_panels_decoration() {
+        let (_dir, mut state) = loaded();
+        state.select_next(); // c1-1
+        assert_eq!(state.section, HistorySection::Prompt);
+        let text = state.focused_text().expect("a prompt to copy");
+        assert_eq!(text, "explain the token estimator");
+        // No JSON wrapper, and none of the panel's own decoration: not the byte
+        // count / `~` estimate / estimator name, not the workspace root, and no
+        // truncation note.
+        assert!(!text.contains("turn_start"));
+        assert!(!text.contains('~'));
+        assert!(!text.contains("words×1.3"));
+        assert!(!text.contains("C:/w"));
+        // …nor the panel's copy hint, which is drawn but never copied.
+        assert!(!text.contains("y: copy prompt"));
+        assert!(!state.prompt_is_truncated());
+        // The NDJSON form is still the other key's job.
+        assert!(state.focused_records_ndjson().unwrap().contains("\"kind\""));
+    }
+
+    #[test]
+    fn copy_text_help_names_the_key_for_the_focused_section() {
+        assert_eq!(copy_text_help(HistorySection::Prompt), "y: copy prompt");
+        // Every other section copies the body the panel draws, so the help must
+        // not promise the prompt there.
+        for section in [
+            HistorySection::Tools,
+            HistorySection::Mcp,
+            HistorySection::Memory,
+            HistorySection::Totals,
+            HistorySection::Files,
+        ] {
+            assert_eq!(copy_text_help(section), "y: copy text");
+        }
+
+        let (_dir, mut state) = loaded();
+        state.select_next(); // c1-1, the PROMPT section
+        state.set_section(HistorySection::Prompt);
+        let area = Rect::new(0, 0, 120, 20);
+
+        // The focused title is the panel's key help and names this section's key.
+        let mut buf = Buffer::empty(area);
+        state.render(area, &mut buf, true);
+        let title = row_text(&buf, 0);
+        assert!(title.contains("y: copy prompt"), "{title}");
+        // Unfocused, the top border is just the panel's name.
+        let mut buf = Buffer::empty(area);
+        state.render(area, &mut buf, false);
+        let title = row_text(&buf, 0);
+        assert!(title.contains("HISTORY"), "{title}");
+        assert!(!title.contains("copy prompt"), "{title}");
+
+        // The second help surface is the hint line above the prompt text, which —
+        // unlike the title, already 105 columns long — survives a narrow panel.
+        state.expanded = true;
+        let narrow = Rect::new(0, 0, 24, 12);
+        let mut buf = Buffer::empty(narrow);
+        state.render(narrow, &mut buf, true);
+        assert!(
+            !row_text(&buf, 0).contains("copy prompt"),
+            "the title clips first: {}",
+            row_text(&buf, 0)
+        );
+        assert!(buffer_text(&buf).contains("y: copy prompt"), "{:?}", buffer_text(&buf));
+        state.expanded = false;
+
+        // Focus a section whose plain-text copy is its own body: the help says so,
+        // and no prompt hint leaks into it.
+        state.set_section(HistorySection::Tools);
+        let mut buf = Buffer::empty(area);
+        state.render(area, &mut buf, true);
+        let title = row_text(&buf, 0);
+        assert!(title.contains("y: copy text"), "{title}");
+        assert!(!title.contains("copy prompt"), "{title}");
+        // The PROMPT-only hint line does not leak into another section's body.
+        assert!(!buffer_text(&buf).contains("y: copy prompt"), "{title}");
+    }
+
+    #[test]
+    fn copy_text_of_the_other_sections_is_the_body_the_panel_draws() {
+        let (_dir, mut state) = loaded();
+        state.select_next(); // c1-1
+
+        state.set_section(HistorySection::Tools);
+        let tools = state.focused_text().unwrap();
+        assert!(tools.contains("src/tokens.rs"), "{tools}");
+        assert!(tools.contains("pub fn estimate()"), "{tools}");
+        assert!(!tools.ends_with('\n'), "trailing blanks trimmed: {tools:?}");
+
+        // A section with nothing recorded copies its explanation, so a paste
+        // still says what the section showed rather than being silently empty.
+        state.set_section(HistorySection::Mcp);
+        assert!(state.focused_text().unwrap().contains("No MCP calls"));
+
+        state.set_section(HistorySection::Memory);
+        assert!(
+            state
+                .focused_text()
+                .unwrap()
+                .contains("query: token estimator")
+        );
+
+        state.set_section(HistorySection::Totals);
+        assert!(state.focused_text().unwrap().contains("Estimates"));
+    }
+
+    #[test]
+    fn copy_text_reports_truncation_but_copies_what_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        let r = HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
+        // A prompt past the cap. `prompt_truncated` is *derived* from the real
+        // cut by the writer's `normalize`, so a long prompt is the only way to
+        // get a flagged one — a caller cannot set the flag itself.
+        let long = "x".repeat(HISTORY_MAX_PROMPT_BYTES + 4096);
+        r.begin_turn("c1", "c1-1", start(&long, "long"), false);
+        r.end_turn("c1-1", TurnEnd::new(false, None, 0));
+
+        let mut state = HistoryPanelState::new();
+        state.apply_load(load_history(&path));
+        assert!(state.prompt_is_truncated(), "the status line must say so");
+        // The clipboard gets exactly what the log holds — never a marker.
+        let text = state.focused_text().unwrap();
+        assert_eq!(text.len(), HISTORY_MAX_PROMPT_BYTES);
+        assert!(!text.contains("truncated"));
+        assert!(!text.contains('…'));
+
+        // No turn selected at all: nothing to copy rather than an empty string.
+        let empty = HistoryPanelState::new();
+        assert!(empty.focused_text().is_none());
+        assert!(!empty.prompt_is_truncated());
+        assert!(empty.focused_records_ndjson().is_none());
     }
 
     #[test]
