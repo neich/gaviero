@@ -1,0 +1,27 @@
+--- Cursor Agent Debug Session 2026-10-09T15:39:02.556Z ---
+{"event":"debug-session-start","directory":"C:\\Users\\natxm\\Dropbox\\work\\git\\gaviero\\gaviero\\.tmp-test\\cursor-agent-logs-natxm","logFile":"C:\\Users\\natxm\\Dropbox\\work\\git\\gaviero\\gaviero\\.tmp-test\\cursor-agent-logs-natxm\\session-2026-10-09T15-39-02-554Z-2308-1.log","pid":2308,"startTime":"2026-10-09T15:39:02.557Z"}
+[2026-10-09T15:39:02.557Z] ripgrep.configureSuccess {"ripgrepPath":"C:\\Users\\natxm\\AppData\\Local\\cursor-agent\\versions\\2026.10.01-e373342\\rg.exe","ripgrepSource":"colocated"}
+Stack trace:
+    at x (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:5779)
+    at J (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:9432)
+    at C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:10998
+[2026-10-09T15:39:02.557Z] sandbox.configureSuccess {"sandboxBinary":"C:\\Users\\natxm\\AppData\\Local\\cursor-agent\\versions\\2026.10.01-e373342\\cursorsandbox.exe","sandboxSource":"colocated"}
+Stack trace:
+    at x (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:5779)
+    at T (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:9694)
+    at C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:11002
+[2026-10-09T15:39:02.560Z] analytics.track {"eventName":"cli.launch"}
+[2026-10-09T15:39:02.584Z] statsig.setupLazyInit {"endpoint":"https://api2.cursor.sh"}
+[2026-10-09T15:39:02.602Z] statsig.initialize.success {"fromCache":true}
+[2026-10-09T15:39:02.612Z] privacy.refresh.start {"isStale":true,"sampleEvery":10}
+[2026-10-09T15:39:02.613Z] privacy.refresh.start {"isStale":true,"sampleEvery":10}
+[2026-10-09T15:39:02.614Z] privacy.refresh.start {"isStale":true,"sampleEvery":10}
+[2026-10-09T15:39:03.025Z] protoPrivacyToGhostMode {"privacyMode":2}
+[2026-10-09T15:39:03.027Z] FileBasedConfigProvider: failed to transform config Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.3b17bba1-65bf-41b1-a34c-80a1e498bbf6.tmp'
+[2026-10-09T15:39:03.027Z] privacy.refresh.error Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.3b17bba1-65bf-41b1-a34c-80a1e498bbf6.tmp' https://api2.cursor.sh
+[2026-10-09T15:39:03.143Z] protoPrivacyToGhostMode {"privacyMode":2}
+[2026-10-09T15:39:03.145Z] FileBasedConfigProvider: failed to transform config Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.74228cc9-1049-4114-b760-7693039d1df2.tmp'
+[2026-10-09T15:39:03.145Z] privacy.refresh.error Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.74228cc9-1049-4114-b760-7693039d1df2.tmp' https://api2.cursor.sh
+[2026-10-09T15:39:04.031Z] protoPrivacyToGhostMode {"privacyMode":2}
+[2026-10-09T15:39:04.033Z] FileBasedConfigProvider: failed to transform config Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.032e033c-8b9d-4e04-82ab-fd8b024077d0.tmp'
+[2026-10-09T15:39:04.033Z] privacy.refresh.error Error: EPERM: operation not permitted, open 'C:\Users\natxm\.cursor\cli-config.json.2308.032e033c-8b9d-4e04-82ab-fd8b024077d0.tmp' https://api2.cursor.sh
