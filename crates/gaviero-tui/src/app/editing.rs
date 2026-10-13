@@ -1070,6 +1070,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.mouse_dragging = false;
             app.scrollbar_dragging = None;
         }
+        // Windows no longer requests any-motion tracking (`?1003h`), so this
+        // arrives only on Unix — there the reports decode to `Event::Mouse`
+        // instead of leaking into the key stream as keystrokes. On Windows the
+        // hint is re-derived from `app.last_mouse` (recorded above for every
+        // event kind) by `scroll_preview_lines`; only motion-following is lost.
         MouseEventKind::Moved => {
             update_preview_hover(app, col, row);
         }

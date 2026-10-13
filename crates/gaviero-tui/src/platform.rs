@@ -24,11 +24,39 @@ use std::io::Write;
 /// press and paints its own unclamped highlight — the same full-window
 /// symptom — and no gaviero-side sequence can override that.
 ///
-/// `?1003h` (any-motion tracking) is required so markdown-preview link hover
-/// receives `MouseEventKind::Moved`. `?1015h` (urxvt encoding) that
-/// crossterm's Unix path also emits is still omitted: SGR (`?1006h`) is enough.
+/// **No `?1003h` (any-motion tracking) — deliberately omitted.** Gaviero never
+/// needed per-motion reports to *function*; they fed one cosmetic consumer,
+/// markdown-preview link hover (`app::editing::update_preview_hover`: a
+/// status-bar hint plus an underline). Windows pays a far higher price for them
+/// than Unix does. ConPTY re-encodes the reports the host terminal sends into
+/// **key** records and drops the ESC introducer, so under Windows Terminal /
+/// psmux a report stream surfaces as the literal text `[<35;106;53M` typed into
+/// the focused pane — the pane's shell echoes it, filling the console
+/// (`event::is_mouse_report_run` swallows those runs at the input boundary).
+/// Any-motion made that a per-pointer-move flood rather than a per-click
+/// oddity, so the request is dropped at the source.
+///
+/// This does **not** make the input-boundary filter redundant: press/release
+/// (`?1000h`) and drag (`?1002h`) reports are re-encoded and leak the same way.
+/// Dropping `?1003h` removes the volume, not the leak.
+///
+/// Cost on Windows: `MouseEventKind::Moved` no longer arrives, so preview link
+/// hover stops following bare pointer motion. It is not dead, though —
+/// `handle_mouse` records the pointer on *every* mouse event, so the hint is
+/// re-derived from that position by `scroll_preview_lines` and refreshed by the
+/// next wheel/click/drag; only the motion-following is lost. Unix keeps full
+/// hover: crossterm's own `EnableMouseCapture` writes `?1003h` there, where
+/// reports decode into `Event::Mouse` instead of leaking as keystrokes.
+/// `?1015h` (urxvt encoding) stays omitted too: SGR (`?1006h`) is enough.
+///
+/// **Ask only, never route.** gaviero consumes these events itself; it has no
+/// pane-side mouse forwarding (nothing under `gaviero_core::terminal` encodes a
+/// report).
 #[cfg(windows)]
-const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// `?1003l` is still written even though this build never enables it: exiting
+/// must clear any-motion tracking left on by an older gaviero (or by any other
+/// program sharing the terminal), never strand it enabled.
 #[cfg(windows)]
 const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
@@ -372,17 +400,34 @@ mod tests {
 
     /// The re-assert path (`App::maybe_reassert_vt_mouse`) depends on this
     /// write being the full enable set and nothing else — a disable byte
-    /// here would turn the keep-alive into a mouse kill switch.
+    /// here would turn the keep-alive into a mouse kill switch. The exact set
+    /// is pinned because `?1003h` (any-motion) must stay out: it is what
+    /// ConPTY re-encoded into the `[<35;106;53M` keystroke flood.
     #[cfg(windows)]
     #[test]
-    fn vt_mouse_passthrough_writes_only_enable_sequences() {
+    fn vt_mouse_passthrough_writes_only_enable_sequences_without_any_motion() {
         let mut out: Vec<u8> = Vec::new();
         enable_vt_mouse_passthrough(&mut out).unwrap();
+        assert_eq!(out, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h".to_vec());
+        assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
+        assert!(
+            !String::from_utf8_lossy(&out).contains("1003"),
+            "any-motion tracking must not be requested on Windows"
+        );
+    }
+
+    /// The disable half must still turn any-motion tracking off: this build
+    /// never enables `?1003h`, but an older gaviero (or another program in the
+    /// same terminal) may have left it on.
+    #[cfg(windows)]
+    #[test]
+    fn vt_mouse_teardown_clears_any_motion_tracking() {
+        let mut out: Vec<u8> = Vec::new();
+        disable_vt_mouse_passthrough(&mut out).unwrap();
         assert_eq!(
             out,
-            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".to_vec()
+            b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l".to_vec()
         );
-        assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
     }
 
     /// Windows image paste depends on us advertising `?2004h` so Windows

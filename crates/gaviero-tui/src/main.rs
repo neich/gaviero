@@ -123,7 +123,8 @@ fn restore_terminal() -> std::io::Result<()> {
 /// updates immediate. Keyboard, mouse (except pointer-move), resize, terminal,
 /// review, and lifecycle events still repaint immediately; only visible active
 /// chat stream output and spinner-only ticks are budgeted. `MouseEventKind::Moved`
-/// is skipped here and requests a paint only when preview link hover changes.
+/// is skipped here and requests a paint only when preview link hover changes —
+/// a Unix-only path since Windows stopped requesting any-motion tracking.
 struct RenderScheduler {
     last_chat_render: Instant,
     pending_chat_render: bool,

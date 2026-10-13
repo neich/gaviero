@@ -3,6 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+// Used by the leaked-report decoder below (`decode_mouse_report_run`), which
+// rebuilds the mouse events crossterm's Windows source can no longer deliver.
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
 use gaviero_core::terminal::TerminalEvent;
 use gaviero_core::types::WriteProposal;
 
@@ -386,7 +390,18 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     // move, or anything typed while the UI thread was busy sits in the same
     // console buffer. What the burst turns out to hold decides
     // (`looks_like_raw_paste`), not the fact that it was drainable.
-    if !event::poll(Duration::ZERO).unwrap_or(false) {
+    //
+    // `[` is the exception, and it gets the burst window rather than ZERO: it
+    // is the second byte of a leaked SGR report whose ESC the console already
+    // ate, and its `<Cb;Cx;CyM` half can land a tick later. Waiting ZERO there
+    // handed the pane a lone `[` and left `<35;106;53M` to arrive as a burst
+    // with no marker at all. 5 ms on a literal `[` is the entire cost.
+    let wait = if first_ch == '[' {
+        Duration::from_millis(crate::theme::PASTE_BURST_MS)
+    } else {
+        Duration::ZERO
+    };
+    if !event::poll(wait).unwrap_or(false) {
         return vec![first];
     }
 
@@ -410,6 +425,14 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
             trailing = Some(next);
             break;
         }
+    }
+
+    // Leaked mouse reports are neither typing nor a paste (`is_mouse_report_run`):
+    // they must not be replayed as keys, or the pane types their parameters.
+    if is_mouse_report_run(&text) {
+        let mut out = Vec::new();
+        out.extend(trailing);
+        return out;
     }
 
     let mut out = if looks_like_raw_paste(&text) {
@@ -446,6 +469,278 @@ fn looks_like_raw_paste(text: &str) -> bool {
         return false;
     };
     text.chars().count() >= crate::theme::RAW_PASTE_MIN_CHARS && rest.any(|c| c != first)
+}
+
+/// Report introducers, longest first. The bytes get eaten one at a time on the
+/// injection path this module exists for (see [`is_mouse_report_run`]), so the
+/// marker is matched whole (`ESC[<`), half-eaten (`[<`) or gone (`<`).
+const SGR_MARKERS: [&str; 3] = ["\x1b[<", "[<", "<"];
+const X10_MARKERS: [&str; 2] = ["\x1b[M", "[M"];
+
+/// Split `text` at the first matching marker, returning the marker's byte
+/// length and the body after it.
+fn strip_marker<'a>(text: &'a str, markers: &[&str]) -> Option<(usize, &'a str)> {
+    markers
+        .iter()
+        .find_map(|m| text.strip_prefix(m).map(|body| (m.len(), body)))
+}
+
+/// Byte length of one SGR mouse report at the start of `text` — `ESC[<Cb;Cx;CyM`
+/// (release uses `m`, extra modifier params are accepted), with the introducer
+/// whole, half-eaten or absent.
+fn sgr_report_len(text: &str) -> Option<usize> {
+    let (head, body) = strip_marker(text, &SGR_MARKERS)?;
+    let mut numbers = 0usize;
+    let mut digits = 0usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '0'..='9' => digits += 1,
+            ';' if digits > 0 => {
+                numbers += 1;
+                digits = 0;
+            }
+            'M' | 'm' if digits > 0 && numbers >= 2 => return Some(head + i + 1),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Byte length of one legacy X10 mouse report (`ESC[M` + button/x/y).
+fn x10_report_len(text: &str) -> Option<usize> {
+    let (head, body) = strip_marker(text, &X10_MARKERS)?;
+    let mut chars = body.char_indices();
+    let (i, c) = (0..3).filter_map(|_| chars.next()).last()?;
+    Some(head + i + c.len_utf8())
+}
+
+/// A truncated SGR report — the burst window cut it before the `M`/`m`
+/// (`[<35;106`). Requires the `[<` marker, `;`-separated all-digit params and
+/// at least three digits, so a typed `[<3;4` is still keystrokes.
+fn sgr_report_prefix_only(text: &str) -> bool {
+    let Some((_, body)) = strip_marker(text, &SGR_MARKERS) else {
+        return false;
+    };
+    let mut digits = 0usize;
+    let mut total = 0usize;
+    let mut semis = 0usize;
+    for c in body.chars() {
+        match c {
+            '0'..='9' => {
+                digits += 1;
+                total += 1;
+            }
+            ';' if digits > 0 => {
+                semis += 1;
+                digits = 0;
+            }
+            _ => return false,
+        }
+    }
+    semis >= 1 && total >= 3
+}
+
+/// Numeric tail of a report split across two bursts (`53M`, left behind by the
+/// `[<35;106;` half of the previous one).
+fn report_tail_len(text: &str) -> Option<usize> {
+    let mut digits = 0usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '0'..='9' => digits += 1,
+            ';' if digits > 0 => digits = 0,
+            'M' | 'm' if digits > 0 => return Some(i + 1),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `Cb` → kind + modifiers, byte-for-byte the mapping crossterm uses on the
+/// paths where it decodes a report itself (`event::sys::unix::parse::parse_cb`).
+/// Mirroring it matters: a report recovered here must be indistinguishable from
+/// one crossterm parsed natively, or clicks would land with different buttons /
+/// modifiers depending on which transport the host terminal happened to use.
+fn parse_cb(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 != 0;
+
+    let kind = match (button_number, dragging) {
+        (0, false) => MouseEventKind::Down(MouseButton::Left),
+        (1, false) => MouseEventKind::Down(MouseButton::Middle),
+        (2, false) => MouseEventKind::Down(MouseButton::Right),
+        (0, true) => MouseEventKind::Drag(MouseButton::Left),
+        (1, true) => MouseEventKind::Drag(MouseButton::Middle),
+        (2, true) => MouseEventKind::Drag(MouseButton::Right),
+        (3, false) => MouseEventKind::Up(MouseButton::Left),
+        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        (6, false) => MouseEventKind::ScrollLeft,
+        (7, false) => MouseEventKind::ScrollRight,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::empty();
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some((kind, modifiers))
+}
+
+/// A press kind becomes its release counterpart; everything else is unchanged.
+/// SGR reports a release as the same `Cb` with a lowercase final byte.
+fn released(kind: MouseEventKind) -> MouseEventKind {
+    match kind {
+        MouseEventKind::Down(b) => MouseEventKind::Up(b),
+        other => other,
+    }
+}
+
+/// Decode one SGR report at the start of `text` → `(event, bytes consumed)`.
+fn sgr_mouse_event(text: &str) -> Option<(MouseEvent, usize)> {
+    let (head, body) = strip_marker(text, &SGR_MARKERS)?;
+    let mut params = [0u32; 3];
+    let mut idx = 0usize;
+    let mut digits = 0usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '0'..='9' => {
+                if idx < params.len() {
+                    params[idx] = params[idx]
+                        .saturating_mul(10)
+                        .saturating_add(c as u32 - '0' as u32);
+                }
+                digits += 1;
+            }
+            ';' if digits > 0 => {
+                idx += 1;
+                digits = 0;
+            }
+            // Parameters past the third are ignored, as crossterm does.
+            'M' | 'm' if digits > 0 && idx >= 2 => {
+                let cb = u8::try_from(params[0]).ok()?;
+                let (kind, modifiers) = parse_cb(cb)?;
+                let kind = if c == 'm' { released(kind) } else { kind };
+                let column = u16::try_from(params[1]).ok()?.saturating_sub(1);
+                let row = u16::try_from(params[2]).ok()?.saturating_sub(1);
+                return Some((
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers,
+                    },
+                    head + i + 1,
+                ));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Decode one legacy X10 report at the start of `text` → `(event, bytes)`.
+/// Coordinates are single bytes offset by 32, so they saturate at 222 — the
+/// reason `?1006h` (SGR) is requested in the first place.
+fn x10_mouse_event(text: &str) -> Option<(MouseEvent, usize)> {
+    let (head, body) = strip_marker(text, &X10_MARKERS)?;
+    let mut chars = body.char_indices();
+    let (_, cb) = chars.next()?;
+    let (_, cx) = chars.next()?;
+    let (_, cy) = chars.next()?;
+    let cb = u8::try_from(cb as u32).ok()?;
+    if cb < 32 {
+        return None;
+    }
+    let (kind, modifiers) = parse_cb(cb - 32)?;
+    let coord = |c: char| u16::try_from(c as u32).ok().map(|v| v.saturating_sub(33));
+    let payload = cb.len_utf8() + cx.len_utf8() + cy.len_utf8();
+    Some((
+        MouseEvent {
+            kind,
+            column: coord(cx)?,
+            row: coord(cy)?,
+            modifiers,
+        },
+        head + payload,
+    ))
+}
+
+/// Turn a run that [`is_mouse_report_run`] accepted back into the
+/// `Event::Mouse` values crossterm would have produced had the reports reached
+/// it as records.
+///
+/// Every complete report in the run yields one event; a numeric tail left over
+/// from a report split across two bursts (`53M`) and an unfinished final report
+/// (`[<35;106`) carry no usable event and are consumed silently. A report whose
+/// `Cb` names a button crossterm does not model is skipped rather than guessed.
+pub(crate) fn decode_mouse_report_run(text: &str) -> Vec<MouseEvent> {
+    let mut rest = text;
+    if let Some(n) = report_tail_len(rest) {
+        rest = &rest[n..];
+    }
+    let mut events = Vec::new();
+    while let Some((event, n)) = sgr_mouse_event(rest).or_else(|| x10_mouse_event(rest)) {
+        events.push(event);
+        rest = &rest[n..];
+    }
+    events
+}
+
+/// Whether the whole of `text` is terminal *mouse reporting* that leaked into
+/// the key stream instead of arriving as `crossterm::event::Event::Mouse`.
+///
+/// **Where the leak comes from.** On Windows ConPTY, mouse input can be
+/// delivered to a child two ways: as `MOUSE_EVENT` records (what crossterm
+/// reads, and what a real `Event::Mouse` needs) or as VT bytes. Under psmux the
+/// choice is made per pane by `detect_vt_bridge` → `has_vt_bridge_descendant`,
+/// which walks the pane child's **whole process tree** looking for
+/// `wsl.exe`/`ssh.exe`; a hit switches the pane to
+/// `window_ops::inject_sgr_mouse`, which writes `ESC[<Cb;Cx;CyM` into the
+/// child's console input buffer as **KEY_EVENT** records — no `MOUSE_EVENT`
+/// record is injected at all. Conhost then hands those bytes to a
+/// `ReadConsoleInputW` reader such as crossterm as *keystrokes*, losing the
+/// introducer byte by byte. So the moment any descendant of the pane starts
+/// `ssh` — gaviero's own terminal pane, nvim's `:terminal` — **every** report
+/// for that pane arrives here as text like `[<35;106;53M`, and the pane stops
+/// seeing `Event::Mouse` entirely: keys keep working, the mouse goes dead.
+/// That is the whole of the "console fills with `[<35;106;53M`" flood *and* the
+/// "gaviero ignores the mouse while I'm ssh'd somewhere" report; they are one
+/// bug seen from two sides.
+///
+/// **What this gate is for.** The run must not be replayed as keystrokes (that
+/// types its parameters into whatever has focus — a remote shell echoes them
+/// back) nor handed to the coalescer's `Event::Paste`. It is instead recovered
+/// by [`decode_mouse_report_run`], which restores the clicks, drags and wheel
+/// events the pane was starved of.
+///
+/// Dropping `?1003h` from the Windows request set (see [`crate::platform`]) is
+/// what removed the per-pointer-move *volume* of these runs: psmux forwards
+/// bare motion only to a pane whose own screen asks for DECSET 1003
+/// (`window_ops::pane_wants_bare_motion`), so with the request gone the motion
+/// `Cb=35` reports stop being injected at all. It never stopped the leak —
+/// press/release/drag/wheel reports take the same KEY_EVENT route.
+pub(crate) fn is_mouse_report_run(text: &str) -> bool {
+    let mut rest = text;
+    if let Some(n) = report_tail_len(rest) {
+        rest = &rest[n..];
+    }
+    let mut complete = 0usize;
+    while let Some(n) = sgr_report_len(rest).or_else(|| x10_report_len(rest)) {
+        rest = &rest[n..];
+        complete += 1;
+    }
+    if complete == 0 {
+        // Nothing complete: only an unmistakable unfinished report.
+        return sgr_report_prefix_only(rest);
+    }
+    rest.is_empty() || sgr_report_prefix_only(rest)
 }
 
 const BP_START: &str = "\x1b[200~";
@@ -516,6 +811,14 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
         if !event::poll(Duration::from_millis(wait_ms)).unwrap_or(false) {
             break;
         }
+    }
+
+    // Same guard on the Esc-led path: an Esc followed by `[<Cb;Cx;CyM` is the
+    // host terminal's mouse report, not a paste burst.
+    if is_mouse_report_run(&text) {
+        let mut out = Vec::new();
+        out.extend(trailing);
+        return out;
     }
 
     let mut out = if let Some(payload) = strip_bracketed_paste(&text) {
@@ -1024,6 +1327,35 @@ mod tests {
         assert_eq!(strip_bracketed_paste("hello"), None);
         assert_eq!(strip_bracketed_paste("\x1b[200~no-end"), None);
         assert_eq!(strip_bracketed_paste(""), None);
+    }
+
+    #[test]
+    fn leaked_mouse_reports_are_never_keystrokes() {
+        // Windows ConPTY/psmux re-encode the host terminal's SGR reports into
+        // the key stream and lose the ESC introducer; replaying them types the
+        // parameters into the focused pane (ssh echoes them back).
+        assert!(is_mouse_report_run("[<35;106;53M"));
+        assert!(is_mouse_report_run("\x1b[<35;106;53M"));
+        assert!(is_mouse_report_run("[<35;106;53M[<35;109;53M[<0;30;59M"));
+        assert!(is_mouse_report_run("\x1b[<0;30;59m"));
+        // Burst boundary cut the report: prefix, numeric tail, or both.
+        assert!(is_mouse_report_run("[<35;106;53"));
+        assert!(is_mouse_report_run("[<35;106"));
+        assert!(is_mouse_report_run("53M[<35;109;53M"));
+        assert!(is_mouse_report_run("[<35;106;53M[<35;109"));
+        assert!(is_mouse_report_run("53M[<35;106"));
+        // Legacy X10 reports: ESC[M + button/x/y.
+        assert!(is_mouse_report_run("\x1b[Magb"));
+
+        // Not mouse reporting — typing, pastes, numbers, bracketed paste.
+        assert!(!is_mouse_report_run(""));
+        assert!(!is_mouse_report_run("cargo test -p gaviero-tui"));
+        assert!(!is_mouse_report_run("line one\nline two\n"));
+        assert!(!is_mouse_report_run("123"));
+        assert!(!is_mouse_report_run("[<3;4"));
+        assert!(!is_mouse_report_run("[<"));
+        assert!(!is_mouse_report_run("[M"));
+        assert!(!is_mouse_report_run("\x1b[200~hello\x1b[201~"));
     }
 
     #[test]
