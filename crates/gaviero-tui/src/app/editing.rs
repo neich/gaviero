@@ -627,7 +627,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             app.search_panel.editing = true;
                             return;
                         }
-                        let idx = app.search_panel.scroll.offset + relative_row.saturating_sub(2);
+                        let header = crate::panels::search::SearchPanelState::HEADER_ROWS;
+                        if relative_row < header {
+                            return;
+                        }
+                        let idx = app.search_panel.scroll.offset + relative_row - header;
                         if idx < app.search_panel.results.len() {
                             app.search_panel.scroll.selected = idx;
                             let result = app.search_panel.results[idx].clone();
@@ -1563,7 +1567,8 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 }
                 LeftPanelMode::Search => {
                     let total = app.search_panel.results.len();
-                    let viewport = track_height.saturating_sub(2);
+                    let viewport = track_height
+                        .saturating_sub(crate::panels::search::SearchPanelState::HEADER_ROWS);
                     if total <= viewport {
                         return;
                     }
