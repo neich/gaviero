@@ -1,0 +1,16 @@
+--- Cursor Agent Debug Session 2026-10-13T14:52:37.994Z ---
+{"event":"debug-session-start","directory":"C:\\Users\\natxm\\Dropbox\\work\\git\\gaviero\\gaviero\\zz-scope-test-tmp\\cursor-agent-logs-natxm","logFile":"C:\\Users\\natxm\\Dropbox\\work\\git\\gaviero\\gaviero\\zz-scope-test-tmp\\cursor-agent-logs-natxm\\session-2026-10-13T14-52-37-992Z-25852-1.log","pid":25852,"startTime":"2026-10-13T14:52:37.995Z"}
+[2026-10-13T14:52:37.995Z] ripgrep.configureSuccess {"ripgrepPath":"C:\\Users\\natxm\\AppData\\Local\\cursor-agent\\versions\\2026.10.01-e373342\\rg.exe","ripgrepSource":"colocated"}
+Stack trace:
+    at x (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:5779)
+    at J (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:9432)
+    at C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:10998
+[2026-10-13T14:52:37.995Z] sandbox.configureSuccess {"sandboxBinary":"C:\\Users\\natxm\\AppData\\Local\\cursor-agent\\versions\\2026.10.01-e373342\\cursorsandbox.exe","sandboxSource":"colocated"}
+Stack trace:
+    at x (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:5779)
+    at T (C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:9694)
+    at C:\Users\natxm\AppData\Local\cursor-agent\versions\2026.10.01-e373342\index.js:408:11002
+[2026-10-13T14:52:38.002Z] analytics.track {"eventName":"cli.launch"}
+[2026-10-13T14:52:38.031Z] statsig.setupLazyInit {"endpoint":"https://api2.cursor.sh"}
+[2026-10-13T14:52:38.050Z] statsig.initialize.success {"fromCache":true}
+[2026-10-13T14:52:39.720Z] statsig.saveCachedBootstrap.error {"error":{"errno":-4048,"code":"EPERM","syscall":"open","path":"C:\\Users\\natxm\\.cursor\\statsig-cache.json.25852.5cb20872-0d07-49c0-913e-3fa18ad0a5c0.tmp"}}
