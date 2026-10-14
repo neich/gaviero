@@ -112,6 +112,10 @@ pub const TICK_INTERVAL_MS: u64 = 33;
 /// was busy — the gap alone never proves a paste, which is why the raw path
 /// also requires `RAW_PASTE_MIN_CHARS`.
 pub const PASTE_BURST_MS: u64 = 5;
+/// Gap the Windows reader waits out when a burst stops mid mouse report
+/// (`[<35;106`). Ending the burst at `PASTE_BURST_MS` there loses the event —
+/// a dropped press/release leaves clicks and drags half-done.
+pub const MOUSE_REPORT_SPLIT_MS: u64 = 50;
 /// Minimum characters in a raw (non-bracketed) Windows key burst before it is
 /// rewritten as a single `Event::Paste`. Typing rolls and key auto-repeat
 /// deliver several characters in one batch; shorter bursts are replayed as
