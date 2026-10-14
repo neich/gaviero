@@ -412,7 +412,7 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     let mut text = String::from(first_ch);
     let mut keys = vec![first];
     let mut trailing: Option<Event> = None;
-    while event::poll(Duration::from_millis(crate::theme::PASTE_BURST_MS)).unwrap_or(false) {
+    while event::poll(burst_gap(&text)).unwrap_or(false) {
         let Ok(next) = event::read() else {
             break;
         };
@@ -429,10 +429,9 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
 
     // Leaked mouse reports are neither typing nor a paste (`is_mouse_report_run`):
     // they must not be replayed as keys, or the pane types their parameters.
+    // They are the clicks themselves, so they come back as `Event::Mouse`.
     if is_mouse_report_run(&text) {
-        let mut out = Vec::new();
-        out.extend(trailing);
-        return out;
+        return recover_mouse_report_run(&text, trailing);
     }
 
     let mut out = if looks_like_raw_paste(&text) {
@@ -740,7 +739,66 @@ pub(crate) fn is_mouse_report_run(text: &str) -> bool {
         // Nothing complete: only an unmistakable unfinished report.
         return sgr_report_prefix_only(rest);
     }
-    rest.is_empty() || sgr_report_prefix_only(rest)
+    // After a complete report any cut-off follow-up counts (`[<0;`), however
+    // short — it cannot be typing.
+    rest.is_empty() || sgr_report_prefix_only(rest) || unfinished_sgr_report(rest)
+}
+
+/// `text` after its complete reports — what [`is_mouse_report_run`] and
+/// [`ends_in_unfinished_report`] judge.
+fn after_complete_reports(text: &str) -> &str {
+    let mut rest = text;
+    if let Some(n) = report_tail_len(rest) {
+        rest = &rest[n..];
+    }
+    while let Some(n) = sgr_report_len(rest).or_else(|| x10_report_len(rest)) {
+        rest = &rest[n..];
+    }
+    rest
+}
+
+/// An SGR report stopped before its final byte: `ESC[` (the `<` not here yet)
+/// or a whole/half marker plus digits and `;` only (`[<35;106`, `ESC[<0;`).
+fn unfinished_sgr_report(rest: &str) -> bool {
+    if rest == "\x1b[" {
+        return true;
+    }
+    rest.strip_prefix("\x1b[<")
+        .or_else(|| rest.strip_prefix("[<"))
+        .is_some_and(|body| body.chars().all(|c| c.is_ascii_digit() || c == ';'))
+}
+
+/// Whether a drained burst stopped in the middle of a leaked mouse report, so
+/// the reader should wait for the rest instead of ending the burst there.
+fn ends_in_unfinished_report(text: &str) -> bool {
+    unfinished_sgr_report(after_complete_reports(text))
+}
+
+/// How long the Windows reader waits for the next record of a burst. Normally
+/// `PASTE_BURST_MS`; `MOUSE_REPORT_SPLIT_MS` while a mouse report is cut off,
+/// so a report that ConPTY hands over in two batches is still read whole. A
+/// typed `[<` costs at most that gap, and only when it already came in a burst.
+fn burst_gap(text: &str) -> Duration {
+    let ms = if ends_in_unfinished_report(text) {
+        crate::theme::MOUSE_REPORT_SPLIT_MS
+    } else {
+        crate::theme::PASTE_BURST_MS
+    };
+    Duration::from_millis(ms)
+}
+
+/// The events a burst that [`is_mouse_report_run`] accepted stands for: its
+/// decoded mouse reports, then the event that ended the burst.
+fn recover_mouse_report_run(
+    text: &str,
+    trailing: Option<crossterm::event::Event>,
+) -> Vec<crossterm::event::Event> {
+    let mut out: Vec<_> = decode_mouse_report_run(text)
+        .into_iter()
+        .map(crossterm::event::Event::Mouse)
+        .collect();
+    out.extend(trailing);
+    out
 }
 
 const BP_START: &str = "\x1b[200~";
@@ -801,14 +859,14 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
             break;
         }
 
-        let wait_ms = if saw_start && !text.contains(BP_END) {
+        let wait = if saw_start && !text.contains(BP_END) {
             // Still inside a bracketed paste — wait much longer for the next
             // byte / end marker than for a raw key-burst boundary.
-            crate::theme::PASTE_BURST_MS.saturating_mul(40).max(100)
+            Duration::from_millis(crate::theme::PASTE_BURST_MS.saturating_mul(40).max(100))
         } else {
-            crate::theme::PASTE_BURST_MS
+            burst_gap(&text)
         };
-        if !event::poll(Duration::from_millis(wait_ms)).unwrap_or(false) {
+        if !event::poll(wait).unwrap_or(false) {
             break;
         }
     }
@@ -816,9 +874,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
     // Same guard on the Esc-led path: an Esc followed by `[<Cb;Cx;CyM` is the
     // host terminal's mouse report, not a paste burst.
     if is_mouse_report_run(&text) {
-        let mut out = Vec::new();
-        out.extend(trailing);
-        return out;
+        return recover_mouse_report_run(&text, trailing);
     }
 
     let mut out = if let Some(payload) = strip_bracketed_paste(&text) {
@@ -1356,6 +1412,79 @@ mod tests {
         assert!(!is_mouse_report_run("[<"));
         assert!(!is_mouse_report_run("[M"));
         assert!(!is_mouse_report_run("\x1b[200~hello\x1b[201~"));
+    }
+
+    /// psmux injects a pane's mouse reports as keystrokes once `ssh.exe` runs
+    /// anywhere under it (gaviero's own terminal pane included). Swallowing
+    /// the run killed the mouse; it must come back as the clicks it encodes.
+    #[test]
+    fn leaked_mouse_reports_come_back_as_mouse_events() {
+        use crossterm::event::Event as CtEvent;
+
+        let trailing = CtEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            KeyModifiers::NONE,
+        ));
+        let out = recover_mouse_report_run("\x1b[<0;12;5M\x1b[<0;12;5m", Some(trailing.clone()));
+        assert_eq!(
+            out,
+            vec![
+                CtEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 11,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                CtEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: 11,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                trailing,
+            ]
+        );
+
+        // ESC already eaten, wheel report.
+        assert_eq!(
+            recover_mouse_report_run("[<65;3;7M", None),
+            vec![CtEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            })]
+        );
+    }
+
+    /// A report cut by the burst window keeps the reader waiting for its rest
+    /// (`burst_gap`); anything else ends the burst at the normal gap.
+    #[test]
+    fn unfinished_reports_extend_the_burst() {
+        assert!(ends_in_unfinished_report("\x1b["));
+        assert!(ends_in_unfinished_report("\x1b[<"));
+        assert!(ends_in_unfinished_report("[<0;"));
+        assert!(ends_in_unfinished_report("[<35;106"));
+        assert!(ends_in_unfinished_report("\x1b[<0;1;1M\x1b[<0;1"));
+        assert!(ends_in_unfinished_report("53M[<0"));
+
+        assert!(!ends_in_unfinished_report("\x1b"));
+        assert!(!ends_in_unfinished_report("["));
+        assert!(!ends_in_unfinished_report("[<0;1;1M"));
+        assert!(!ends_in_unfinished_report("[<a"));
+        assert!(!ends_in_unfinished_report("cargo"));
+        assert_eq!(
+            burst_gap("hello"),
+            Duration::from_millis(crate::theme::PASTE_BURST_MS)
+        );
+        assert_eq!(
+            burst_gap("[<35;106"),
+            Duration::from_millis(crate::theme::MOUSE_REPORT_SPLIT_MS)
+        );
+
+        // A short cut-off report after a complete one is still part of the run.
+        assert!(is_mouse_report_run("[<0;12;5M[<0;"));
+        assert!(is_mouse_report_run("\x1b[<0;12;5M\x1b["));
     }
 
     #[test]
