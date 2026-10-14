@@ -654,13 +654,13 @@ fn x10_mouse_event(text: &str) -> Option<(MouseEvent, usize)> {
     let (_, cb) = chars.next()?;
     let (_, cx) = chars.next()?;
     let (_, cy) = chars.next()?;
+    let payload = cb.len_utf8() + cx.len_utf8() + cy.len_utf8();
     let cb = u8::try_from(cb as u32).ok()?;
     if cb < 32 {
         return None;
     }
     let (kind, modifiers) = parse_cb(cb - 32)?;
     let coord = |c: char| u16::try_from(c as u32).ok().map(|v| v.saturating_sub(33));
-    let payload = cb.len_utf8() + cx.len_utf8() + cy.len_utf8();
     Some((
         MouseEvent {
             kind,

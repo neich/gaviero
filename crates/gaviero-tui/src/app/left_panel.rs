@@ -103,6 +103,27 @@ pub(super) fn run_search_from_input(app: &mut App) {
     app.search_panel.search_from_input(&roots, &excludes);
 }
 
+/// Scope the search panel to the explorer's highlighted folder (a highlighted
+/// file scopes to its folder). Re-runs the current query if the scope moved.
+pub(super) fn scope_search_to_tree_selection(app: &mut App) {
+    let dir = app.file_tree.selected_path().map(|path| {
+        if app.file_tree.selected_is_file() {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    });
+    set_search_scope(app, dir.as_deref());
+}
+
+/// `None` widens the search back to the whole workspace.
+pub(super) fn set_search_scope(app: &mut App, dir: Option<&Path>) {
+    let roots = app.workspace.roots();
+    if app.search_panel.set_scope(dir, &roots) {
+        app.run_search_from_input();
+    }
+}
+
 pub(super) fn open_selected_search_result(app: &mut App) {
     if let Some(result) = app.search_panel.selected_result().cloned()
         && result.abs_path.exists()

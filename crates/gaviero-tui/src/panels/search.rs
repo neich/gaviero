@@ -29,11 +29,23 @@ pub enum SearchMode {
     FileName,
 }
 
+/// A folder the search is narrowed to — the explorer selection at the time
+/// the panel was opened with `Ctrl+F`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchScope {
+    /// Absolute folder; only files under it are searched.
+    pub dir: PathBuf,
+    /// Root folder name + root-relative path, shown in the scope row.
+    pub label: String,
+}
+
 /// State for the workspace search panel.
 pub struct SearchPanelState {
     /// The interactive input field at the top of the panel.
     pub input: TextInput,
     pub mode: SearchMode,
+    /// `None` searches the whole workspace.
+    pub scope: Option<SearchScope>,
     /// The query that produced the current result set (may lag behind `input`
     /// while a debounce timer is pending).
     pub query: String,
@@ -189,10 +201,14 @@ fn collect_files(
 }
 
 impl SearchPanelState {
+    /// Rows above the results list: input, scope, summary.
+    pub const HEADER_ROWS: usize = 3;
+
     pub fn new() -> Self {
         Self {
             input: TextInput::new(),
             mode: SearchMode::default(),
+            scope: None,
             query: String::new(),
             results: Vec::new(),
             scroll: ScrollState::new(),
@@ -218,6 +234,41 @@ impl SearchPanelState {
             SearchMode::Content => SearchMode::FileName,
             SearchMode::FileName => SearchMode::Content,
         };
+    }
+
+    /// Narrow the search to `dir` (`None`: whole workspace). A folder outside
+    /// every root, or the only root of a single-folder workspace, means the
+    /// whole workspace. Returns whether the scope changed, so the caller
+    /// knows to re-run the search.
+    pub fn set_scope(&mut self, dir: Option<&Path>, roots: &[&Path]) -> bool {
+        let scope = dir.and_then(|dir| {
+            // Longest match: workspace folders may be nested.
+            let root = roots
+                .iter()
+                .copied()
+                .filter(|root| dir.starts_with(root))
+                .max_by_key(|root| root.components().count())?;
+            if roots.len() == 1 && dir == root {
+                return None;
+            }
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            let rel = rel_path_string(dir.strip_prefix(root).unwrap_or(Path::new("")));
+            let label = if rel.is_empty() {
+                format!("{name}/")
+            } else {
+                format!("{name}/{rel}/")
+            };
+            Some(SearchScope {
+                dir: dir.to_path_buf(),
+                label,
+            })
+        });
+        let changed = scope != self.scope;
+        self.scope = scope;
+        changed
     }
 
     /// Start a new search. Clears previous results.
@@ -254,7 +305,8 @@ impl SearchPanelState {
             return;
         };
         let query_lower = self.query.to_lowercase();
-        for file in &index.files {
+        let scope = self.scope.as_ref().map(|s| s.dir.as_path());
+        for file in index.files.iter().filter(|f| in_scope(f, scope)) {
             // Non-UTF-8 (binary) files fail to read and are skipped.
             let Ok(content) = std::fs::read_to_string(&file.abs) else {
                 continue;
@@ -277,9 +329,11 @@ impl SearchPanelState {
             return;
         };
         let query_lower = self.query.trim().to_lowercase();
+        let scope = self.scope.as_ref().map(|s| s.dir.as_path());
         let mut hits: Vec<(u8, &IndexedFile)> = index
             .files
             .iter()
+            .filter(|f| in_scope(f, scope))
             .filter_map(|f| file_name_rank(&f.display_lower, &query_lower).map(|rank| (rank, f)))
             .collect();
         // Best matches first: exact name, name prefix, name substring, then
@@ -401,8 +455,47 @@ impl SearchPanelState {
             }
         }
 
-        // ── Summary line (row 1) ────────────────────────────────
-        let summary_y = area.y + 1;
+        // ── Scope line (row 1) ──────────────────────────────────
+        let scope_y = area.y + 1;
+        if scope_y < area.bottom() {
+            let dim = Style::default().fg(theme::TEXT_DIM).bg(bg);
+            let prefix = " in ";
+            let (folder, folder_style, hint) = match &self.scope {
+                Some(scope) => (
+                    scope.label.as_str(),
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .bg(bg)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                    "  (Alt+F: whole workspace)",
+                ),
+                None => ("whole workspace", Style::default().fg(fg).bg(bg), ""),
+            };
+            // A deep folder keeps its tail — the part that tells it apart.
+            let room = (area.width as usize).saturating_sub(prefix.chars().count());
+            let folder_len = folder.chars().count();
+            let folder: String = if folder_len > room && room > 0 {
+                std::iter::once('…')
+                    .chain(folder.chars().skip(folder_len - room + 1))
+                    .collect()
+            } else {
+                folder.to_string()
+            };
+            let spans = [(prefix, dim), (folder.as_str(), folder_style), (hint, dim)];
+            let mut sx = area.x;
+            'scope: for (text, style) in spans {
+                for ch in text.chars() {
+                    if sx >= area.right() {
+                        break 'scope;
+                    }
+                    buf[(sx, scope_y)].set_char(ch).set_style(style);
+                    sx += 1;
+                }
+            }
+        }
+
+        // ── Summary line (row 2) ────────────────────────────────
+        let summary_y = area.y + 2;
         if summary_y < area.bottom() {
             let summary = match (self.mode, self.query.is_empty(), self.results.len()) {
                 (SearchMode::Content, true, _) => " Searching file contents".to_string(),
@@ -427,9 +520,9 @@ impl SearchPanelState {
             }
         }
 
-        // ── Results list (row 2+) ───────────────────────────────
-        let results_start = area.y + 2;
-        let viewport = (area.height as usize).saturating_sub(2);
+        // ── Results list (row 3+) ───────────────────────────────
+        let results_start = area.y + Self::HEADER_ROWS as u16;
+        let viewport = (area.height as usize).saturating_sub(Self::HEADER_ROWS);
         self.scroll.set_viewport(viewport);
         self.scroll.ensure_visible_on_render();
 
@@ -503,6 +596,12 @@ impl SearchPanelState {
             );
         }
     }
+}
+
+/// The index covers every root; a scope only filters it, so moving the scope
+/// never re-walks the workspace and paths stay workspace-relative.
+fn in_scope(file: &IndexedFile, scope: Option<&Path>) -> bool {
+    scope.is_none_or(|dir| file.abs.starts_with(dir))
 }
 
 /// '/'-joined relative path. Native separators (Windows `\`) never match the
@@ -647,6 +746,63 @@ mod tests {
         panel.toggle_mode();
         panel.search("needle", &[root], &[]);
         assert_eq!(panel.results.len(), 1, "content search skips tmp/ too");
+    }
+
+    #[test]
+    fn scope_limits_both_modes_to_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/panels")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/panels/needle.rs"), "needle").unwrap();
+        std::fs::write(root.join("src/needle.rs"), "needle").unwrap();
+        std::fs::write(root.join("docs/needle.md"), "needle").unwrap();
+
+        let mut panel = SearchPanelState::new();
+        assert!(panel.set_scope(Some(&root.join("src")), &[root]));
+        let name = root.file_name().unwrap().to_str().unwrap();
+        assert_eq!(panel.scope.as_ref().unwrap().label, format!("{name}/src/"));
+
+        panel.search("needle", &[root], &[]);
+        let mut paths: Vec<String> = panel
+            .results
+            .iter()
+            .map(|r| rel_path_string(&r.path))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["src/needle.rs", "src/panels/needle.rs"],
+            "workspace-relative paths, docs/ excluded"
+        );
+
+        panel.mode = SearchMode::FileName;
+        panel.search("needle", &[root], &[]);
+        assert_eq!(panel.results.len(), 2);
+
+        assert!(panel.set_scope(None, &[root]));
+        panel.search("needle", &[root], &[]);
+        assert_eq!(panel.results.len(), 3, "same cached index, widened");
+    }
+
+    #[test]
+    fn scope_on_the_only_root_is_the_whole_workspace() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let mut panel = SearchPanelState::new();
+        assert!(!panel.set_scope(Some(a.path()), &[a.path()]));
+        assert!(panel.scope.is_none());
+
+        // In a multi-folder workspace a root is a real narrowing.
+        assert!(panel.set_scope(Some(b.path()), &[a.path(), b.path()]));
+        let name = b.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(panel.scope.as_ref().unwrap().label, format!("{name}/"));
+        assert!(!panel.set_scope(Some(b.path()), &[a.path(), b.path()]));
+
+        // Outside every root: fall back to the whole workspace.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(panel.set_scope(Some(elsewhere.path()), &[a.path(), b.path()]));
+        assert!(panel.scope.is_none());
     }
 
     #[test]

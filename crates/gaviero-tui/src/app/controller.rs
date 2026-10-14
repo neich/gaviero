@@ -2140,6 +2140,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.left_panel = LeftPanelMode::Search;
             app.focus = Focus::FileTree;
             app.search_panel.focus_input();
+            super::left_panel::set_search_scope(app, None);
         }
         Action::SetLeftModeChanges => {
             if !app.panel_visible.file_tree {
@@ -2218,6 +2219,11 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             if app.focus == Focus::FileTree {
                 if !app.panel_visible.file_tree {
                     app.panel_visible.file_tree = true;
+                }
+                // From the explorer, search only the highlighted folder;
+                // from the search panel itself, keep the current scope.
+                if app.left_panel == LeftPanelMode::FileTree {
+                    super::left_panel::scope_search_to_tree_selection(app);
                 }
                 app.left_panel = LeftPanelMode::Search;
                 app.search_panel.focus_input();
