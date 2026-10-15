@@ -1519,6 +1519,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaviero-relay"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "futures",
+ "gaviero-remote",
+ "rand 0.9.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "gaviero-remote"
 version = "0.1.0"
 dependencies = [

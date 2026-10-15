@@ -8,11 +8,14 @@
 
 pub mod dto;
 pub mod envelope;
+pub mod relay_proto;
 pub mod schema;
 pub mod version;
 
 #[cfg(feature = "server")]
 pub mod pairing;
+#[cfg(feature = "server")]
+pub mod relay_client;
 #[cfg(feature = "server")]
 pub mod server;
 

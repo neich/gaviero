@@ -1,0 +1,47 @@
+[package]
+name = "gaviero-relay"
+version = "0.1.0"
+edition = "2024"
+description = "Rendezvous relay for Gaviero Remote: hosts dial out, phones connect in, TLS stays end to end."
+
+# Server-side binary, deployed on a VPS — never part of a gaviero install.
+# Build only this crate and its dependencies with:
+#   cargo build --release --locked -p gaviero-relay
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gaviero-relay"
+path = "src/main.rs"
+
+[dependencies]
+# Wire protocol only (`relay_proto`): plain serde types, no `server` feature,
+# so the relay never pulls in the sidecar.
+gaviero-remote = { path = "../gaviero-remote", default-features = false }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+futures = "0.3"
+subtle = "2.6"
+rand = "0.9"
+bytes = "1"
+# ClientHello parsing only (SNI peek). No crypto provider is needed: the
+# relay never completes a TLS handshake — TLS is end to end, phone ⇄ host.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# tests/e2e.rs drives the REAL host side (relay client + sidecar with a
+# pinned-CA leaf) and acts as the phone with a real TLS client.
+gaviero-remote = { path = "../gaviero-remote", features = ["server"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = "0.26"
+# Default features = aws-lc-rs, the provider the rest of the workspace uses.
+# Never enable `ring` here: dev-dependency features unify across the
+# workspace, and two providers make rustls panic in other crates' tests.
+rustls = "0.23"
+tempfile = "3"
