@@ -124,6 +124,9 @@ async fn qr_payload_pairs_a_client_end_to_end() {
         workspace_id: Some("4b156f1de41da274"),
         machine: Some(MAGIC_DNS_HOST),
         directory_url: None,
+        tls_ca: None,
+        relay_host: None,
+        relay_secret: None,
     });
     let scanned: serde_json::Value = serde_json::from_str(&qr).unwrap();
     assert_eq!(scanned["kind"], "gaviero-remote");
@@ -201,6 +204,120 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     assert!(hello.confirm_required.contains(&"/reset".to_string()));
     assert_eq!(hello.limits.max_prompt_bytes, 131_072);
     assert_eq!(envelope.instance_id, "inst-e2e");
+}
+
+/// VPS relay (`remote.tlsMode = "pinnedCa"`): a client that trusts ONLY the
+/// CA carried by the QR's `tls_ca` completes TLS against the generated leaf,
+/// while a different machine's CA or a different host name is refused.
+#[tokio::test]
+async fn pinned_ca_from_the_qr_is_the_only_trust_needed() {
+    use rustls::pki_types::pem::PemObject;
+
+    const RELAY_HOST: &str = "desk.example.com";
+    let dir = tempfile::tempdir().unwrap();
+    let pinned = pairing::ensure_pinned_ca(dir.path(), RELAY_HOST).unwrap();
+    let bundle = std::fs::read(&pinned.leaf_path).unwrap();
+    let token = pairing::generate_token();
+    let server = spawn_with(bundle.clone(), bundle, token.clone()).await;
+    let port = server.local_addr.port();
+
+    let qr = pairing::qr_payload_json(&pairing::QrPayloadInput {
+        url: &format!("wss://{RELAY_HOST}:{port}/v1/ws"),
+        token: &token,
+        workspace: "gaviero",
+        machine: Some(RELAY_HOST),
+        tls_ca: Some(&pinned.ca_der_b64),
+        ..Default::default()
+    });
+    let scanned: serde_json::Value = serde_json::from_str(&qr).unwrap();
+    assert!(!qr.contains("PRIVATE KEY"), "the QR never carries a key");
+
+    // Exactly what the app does: wrap the base64 DER as PEM, trust only it.
+    let client_for = |b64: &str| {
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap())
+            .unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    };
+    let handshake = |config: Arc<rustls::ClientConfig>, name: &'static str| async move {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("dial loopback");
+        tokio_rustls::TlsConnector::from(config)
+            .connect(
+                rustls::pki_types::ServerName::try_from(name).unwrap(),
+                stream,
+            )
+            .await
+    };
+
+    let ca = scanned["tls_ca"].as_str().unwrap();
+    handshake(client_for(ca), RELAY_HOST)
+        .await
+        .expect("the QR's CA validates the relay leaf");
+    assert!(
+        handshake(client_for(ca), "vps.example.com").await.is_err(),
+        "host-name checking stays on"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let foreign = pairing::ensure_pinned_ca(other.path(), RELAY_HOST).unwrap();
+    assert!(
+        handshake(client_for(&foreign.ca_der_b64), RELAY_HOST)
+            .await
+            .is_err(),
+        "another machine's CA must not validate this machine"
+    );
+}
+
+/// Minimal sidecar on an ephemeral loopback port. Keep the returned value
+/// alive: dropping it shuts the server down.
+async fn spawn_with(
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    token: String,
+) -> gaviero_remote::server::SpawnedServer {
+    let (ping, idle, hello_timeout) = RemoteServerConfig::timing_defaults();
+    spawn(RemoteServerConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        extra_bind_addrs: Vec::new(),
+        tls_cert_pem: cert_pem,
+        tls_key_pem: key_pem,
+        token,
+        instance_id: "inst-pinned".to_string(),
+        tui_version: "0.1.0".to_string(),
+        workspace: WorkspaceInfo {
+            id: "4b156f1de41da274".to_string(),
+            display_name: "gaviero".to_string(),
+        },
+        capabilities: Vec::new(),
+        machine: None,
+        token_path: None,
+        token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+        registry: None,
+        directory_bind_addrs: Vec::new(),
+        heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+        stale_after: gaviero_remote::server::registry::STALE_AFTER,
+        confirm_required: Vec::new(),
+        allowed_slash_commands: Vec::new(),
+        limits: Limits {
+            max_frame_bytes: 262_144,
+            max_prompt_bytes: 131_072,
+            command_rate_per_second: 10,
+        },
+        ping_interval: ping,
+        idle_timeout: idle,
+        hello_timeout,
+    })
+    .await
+    .expect("sidecar starts with the pinned leaf bundle")
 }
 
 #[tokio::test]

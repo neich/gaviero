@@ -128,10 +128,20 @@ Remote access (on by default) is configured under `remote.*`. Empty `magicDnsHos
     "autoCert": true,
     "tokenScope": "machine",
     "directoryEnabled": true,
-    "directoryPort": 49151
+    "directoryPort": 49151,
+    "bindMode": "loopback+tailnet",
+    "tlsMode": "tailscale"
   }
 }
 ```
+
+Without Tailscale (and without ntfy), through a VPS you control: run [gaviero-relay](../gaviero-relay/README.md) behind nginx on one subdomain, then set `remote.relay: { "host": "gaviero.wuilder.com", "secret": "…" }` on every machine.
+- **gaviero dials out:** it registers `<workspace-id>-<machine>.<host>`.
+- **The relay stays blind:** the phone reaches the instance by SNI through the relay, with TLS end to end against a per-machine CA (`~/.gaviero/remote/tls/pinned/`) that the app pins from the pairing QR.
+- **Notifications go to the relay:** AgentFinished/AgentWaiting are sent there for the app's background alert service.
+- **What relay mode forces:** `bindMode: "loopback"` and `tlsMode: "pinnedCa"`. Those two can also be set alone, for example behind a custom TLS-passthrough proxy.
+
+Full setup: [docs/remote-relay.md](../../docs/remote-relay.md).
 
 ### Agent notifications
 

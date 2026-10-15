@@ -49,6 +49,9 @@ pub enum CertSource {
     LegacyWorkspace,
     /// `~/.gaviero/remote/tls/` — shared by every workspace, auto-provisioned.
     Machine,
+    /// `remote.tlsMode = "pinnedCa"`: leaf issued by the machine's private
+    /// CA under `~/.gaviero/remote/tls/pinned/`; the QR carries the CA.
+    PinnedCa,
 }
 
 impl CertSource {
@@ -57,6 +60,58 @@ impl CertSource {
             Self::Explicit => "explicit (remote.certPath)",
             Self::LegacyWorkspace => "legacy workspace pair",
             Self::Machine => "machine pair (~/.gaviero/remote/tls)",
+            Self::PinnedCa => "pinned private CA (~/.gaviero/remote/tls/pinned)",
+        }
+    }
+}
+
+/// `remote.bindMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindMode {
+    /// Loopback plus detected Tailscale addresses — the default.
+    LoopbackTailnet,
+    /// Loopback only, no Tailscale needed: a relay (`ssh -R` tunnel or a
+    /// same-host nginx `stream` proxy) carries the traffic.
+    Loopback,
+}
+
+impl BindMode {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "loopback" => Self::Loopback,
+            _ => Self::LoopbackTailnet,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LoopbackTailnet => "loopback+tailnet",
+            Self::Loopback => "loopback",
+        }
+    }
+}
+
+/// `remote.tlsMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMode {
+    /// `tailscale cert` provisioning (the default).
+    Tailscale,
+    /// Per-machine private CA pinned by the app through the QR.
+    PinnedCa,
+}
+
+impl TlsMode {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pinnedca" | "pinned-ca" | "pinned" => Self::PinnedCa,
+            _ => Self::Tailscale,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tailscale => "tailscale",
+            Self::PinnedCa => "pinnedCa",
         }
     }
 }
@@ -86,6 +141,60 @@ impl TokenScope {
     }
 }
 
+/// Relay mode (`remote.relay.host` set): the sidecar stays on loopback and
+/// dials OUT to `gaviero-relay`; phones reach it by SNI through the relay.
+#[derive(Clone)]
+pub struct RelayConfig {
+    /// The relay's public name, e.g. `gaviero.wuilder.com`.
+    pub host: String,
+    pub secret: String,
+    /// `wss://<host>` unless `remote.relay.url` overrides it.
+    pub base_url: String,
+    /// Sanitised machine label (`remote.relay.machine` or the hostname).
+    pub machine: String,
+    /// This instance's route: `<wsid>-<machine>.<host>` — the URL host and
+    /// TLS server name the phone uses. Never resolved in DNS.
+    pub route: String,
+}
+
+impl std::fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("host", &self.host)
+            .field("secret", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("machine", &self.machine)
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+/// A DNS label from a machine name: lowercase `[a-z0-9-]`, no leading or
+/// trailing `-`, at most 40 characters (route = 16-hex wsid + `-` + this).
+pub fn machine_label(raw: &str) -> String {
+    let mapped: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed: String = mapped.trim_matches('-').chars().take(40).collect();
+    let trimmed = trimmed.trim_end_matches('-').to_string();
+    if trimmed.is_empty() {
+        "gaviero".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_default()
+}
+
 /// Resolved remote configuration, or the reason the sidecar cannot run.
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
@@ -104,6 +213,10 @@ pub struct RemoteConfig {
     /// The Plan A workspace pair, when both files exist.
     pub legacy_cert: Option<(PathBuf, PathBuf)>,
     pub allow_public_bind: bool,
+    pub bind_mode: BindMode,
+    pub tls_mode: TlsMode,
+    /// Relay mode; forces loopback bind, pinned CA, and no directory port.
+    pub relay: Option<RelayConfig>,
     pub max_frame_bytes: u64,
     pub max_prompt_bytes: u64,
     pub command_rate_per_second: u32,
@@ -153,6 +266,8 @@ pub enum RemoteUnavailable {
     },
     /// Token read/create failure.
     Token(String),
+    /// `remote.relay.host` is set but `remote.relay.secret` is empty.
+    RelaySecretMissing,
 }
 
 impl std::fmt::Display for RemoteUnavailable {
@@ -192,7 +307,8 @@ impl std::fmt::Display for RemoteUnavailable {
             Self::CertProvision(e) => write!(f, "could not provision the TLS certificate: {e}"),
             Self::NoTailnetAddress => write!(
                 f,
-                "no Tailscale address found on this machine — is Tailscale running and logged in?"
+                "no Tailscale address found on this machine — is Tailscale running and logged in? \
+                 (Behind a VPS relay, set `remote.bindMode: \"loopback\"` instead.)"
             ),
             Self::Bind(e) => write!(f, "could not bind the remote listener: {e}"),
             Self::NoFreePort { from, to } => write!(
@@ -200,6 +316,11 @@ impl std::fmt::Display for RemoteUnavailable {
                 "every port from {from} to {to} is busy — set `remote.port` to a free port"
             ),
             Self::Token(e) => write!(f, "could not read or create the pairing token: {e}"),
+            Self::RelaySecretMissing => write!(
+                f,
+                "`remote.relay.host` is set but `remote.relay.secret` is empty — copy the \
+                 relay's secret (gaviero-relay --secret-file) into ~/.gaviero/settings.json"
+            ),
         }
     }
 }
@@ -275,17 +396,52 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
     let legacy_pair = (legacy_dir.join("cert.pem"), legacy_dir.join("key.pem"));
     let legacy_cert = (legacy_pair.0.is_file() && legacy_pair.1.is_file()).then_some(legacy_pair);
 
-    let magic_dns_host = get(settings::REMOTE_MAGIC_DNS_HOST)
+    let mut magic_dns_host = get(settings::REMOTE_MAGIC_DNS_HOST)
         .as_str()
         .unwrap_or("")
         .trim()
         .trim_end_matches('.')
         .to_string();
+
+    let workspace_id = identity::workspace_id_hex16(&root);
+    let str_setting = |key: &str| get(key).as_str().unwrap_or("").trim().to_string();
+    let relay_host = str_setting(settings::REMOTE_RELAY_HOST)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let relay = if relay_host.is_empty() {
+        None
+    } else {
+        let secret = str_setting(settings::REMOTE_RELAY_SECRET);
+        if secret.is_empty() {
+            return Err(RemoteUnavailable::RelaySecretMissing);
+        }
+        let mut machine_setting = str_setting(settings::REMOTE_RELAY_MACHINE);
+        if machine_setting.is_empty() {
+            machine_setting = hostname();
+        }
+        let machine = machine_label(&machine_setting);
+        let url = str_setting(settings::REMOTE_RELAY_URL);
+        // The machine identity (QR `machine`, hello, ntfy/relay notify) is a
+        // name under the relay host; the route adds the workspace.
+        magic_dns_host = format!("{machine}.{relay_host}");
+        Some(RelayConfig {
+            base_url: if url.is_empty() {
+                format!("wss://{relay_host}")
+            } else {
+                url.trim_end_matches('/').to_string()
+            },
+            route: format!("{workspace_id}-{machine}.{relay_host}"),
+            host: relay_host,
+            secret,
+            machine,
+        })
+    };
     let host_source = if magic_dns_host.is_empty() {
         HostSource::Unresolved
     } else {
         HostSource::Setting
     };
+    let in_relay = relay.is_some();
 
     Ok(RemoteConfig {
         enabled,
@@ -299,6 +455,17 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
         allow_public_bind: get(settings::REMOTE_ALLOW_PUBLIC_BIND)
             .as_bool()
             .unwrap_or(false),
+        bind_mode: if in_relay {
+            BindMode::Loopback
+        } else {
+            BindMode::parse(get(settings::REMOTE_BIND_MODE).as_str().unwrap_or(""))
+        },
+        tls_mode: if in_relay {
+            TlsMode::PinnedCa
+        } else {
+            TlsMode::parse(get(settings::REMOTE_TLS_MODE).as_str().unwrap_or(""))
+        },
+        relay,
         max_frame_bytes: get(settings::REMOTE_MAX_FRAME_BYTES)
             .as_u64()
             .unwrap_or(262_144),
@@ -312,11 +479,14 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
         machine_state_dir,
         token_scope: TokenScope::parse(get(settings::REMOTE_TOKEN_SCOPE).as_str().unwrap_or("")),
         auto_cert: get(settings::REMOTE_AUTO_CERT).as_bool().unwrap_or(true),
-        directory_enabled: get(settings::REMOTE_DIRECTORY_ENABLED)
-            .as_bool()
-            .unwrap_or(true),
+        // Relay mode: every instance serves /v1/instances on its own route,
+        // and a loopback-only directory port would be unreachable anyway.
+        directory_enabled: !in_relay
+            && get(settings::REMOTE_DIRECTORY_ENABLED)
+                .as_bool()
+                .unwrap_or(true),
         directory_port,
-        workspace_id: identity::workspace_id_hex16(&root),
+        workspace_id,
         workspace_display_name: root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -348,11 +518,27 @@ pub async fn resolve_host(config: &mut RemoteConfig) {
 
 // ── Certificate selection and provisioning (§2.2 step 3) ────────────
 
-/// Explicit → legacy workspace pair (only if it still covers the host and
-/// is not expired) → machine pair. Sync: a couple of file reads at most.
+/// `~/.gaviero/remote/tls/pinned` (workspace state dir without a home).
+fn pinned_dir(config: &RemoteConfig) -> PathBuf {
+    config
+        .machine_state_dir
+        .clone()
+        .unwrap_or_else(|| config.state_dir.clone())
+        .join("tls")
+        .join(pairing::PINNED_DIR)
+}
+
+/// Explicit → (pinned-CA leaf when `tlsMode = "pinnedCa"`) → legacy
+/// workspace pair (only if it still covers the host and is not expired) →
+/// machine pair. Sync: a couple of file reads at most.
 pub fn select_cert(config: &RemoteConfig) -> (CertSource, PathBuf, PathBuf) {
     if let Some((cert, key)) = &config.explicit_cert {
         return (CertSource::Explicit, cert.clone(), key.clone());
+    }
+    if config.tls_mode == TlsMode::PinnedCa {
+        // One bundle holds the leaf certificate and its key.
+        let leaf = pinned_dir(config).join(pairing::LEAF_FILE);
+        return (CertSource::PinnedCa, leaf.clone(), leaf);
     }
     if let Some((cert, key)) = &config.legacy_cert {
         let usable = std::fs::read(cert)
@@ -383,15 +569,38 @@ pub fn select_cert(config: &RemoteConfig) -> (CertSource, PathBuf, PathBuf) {
 }
 
 /// Provision or renew the machine pair with `tailscale cert` when it is
-/// missing, does not cover the host, or expires within 7 days. Never
-/// touches an explicit or legacy pair. Returns whether a certificate was
-/// issued. Only ever awaited from the bootstrap task.
+/// missing, does not cover the host, or expires within 7 days. In pinned-CA
+/// mode, create the machine CA once and (re)issue its leaf instead — no
+/// Tailscale involved. Never touches an explicit or legacy pair. Returns
+/// whether a certificate was issued. Only ever awaited from the bootstrap
+/// task.
 pub async fn ensure_certificate(config: &RemoteConfig) -> Result<bool, RemoteUnavailable> {
-    if !config.auto_cert || config.magic_dns_host.is_empty() {
+    if config.magic_dns_host.is_empty() {
         return Ok(false);
     }
     let (source, cert_path, key_path) = select_cert(config);
-    if source != CertSource::Machine {
+    if source == CertSource::PinnedCa {
+        // Key generation and file writes: keep them off the async workers.
+        let dir = pinned_dir(config);
+        let host = config.magic_dns_host.clone();
+        // Relay mode: the leaf also covers every route under the relay host.
+        let extra: Vec<String> = config
+            .relay
+            .as_ref()
+            .map(|r| vec![format!("*.{}", r.host)])
+            .unwrap_or_default();
+        let pinned = tokio::task::spawn_blocking(move || {
+            pairing::ensure_pinned_ca_with(&dir, &host, &extra)
+        })
+            .await
+            .map_err(|e| RemoteUnavailable::CertProvision(e.to_string()))?
+            .map_err(RemoteUnavailable::CertProvision)?;
+        if pinned.issued {
+            tracing::info!(host = %config.magic_dns_host, "issued pinned-CA TLS material");
+        }
+        return Ok(pinned.issued);
+    }
+    if !config.auto_cert || source != CertSource::Machine {
         return Ok(false);
     }
     let cert_needs_issue = match std::fs::read(&cert_path)
@@ -534,6 +743,8 @@ pub struct Availability {
     pub cert: pairing::CertInfo,
     pub cert_source: CertSource,
     pub tailnet_addrs: Vec<IpAddr>,
+    /// Pinned-CA mode: the CA the QR carries as `tls_ca` (base64 DER).
+    pub tls_ca: Option<String>,
 }
 
 /// Fail-closed availability check. Every failure names the fix. Sync —
@@ -564,21 +775,40 @@ pub fn check_availability(config: &RemoteConfig) -> Result<Availability, RemoteU
             not_after: cert.not_after.clone(),
         });
     }
-    let tailnet_addrs = pairing::detect_tailscale_addrs();
-    if tailnet_addrs.is_empty() && !config.allow_public_bind {
-        return Err(RemoteUnavailable::NoTailnetAddress);
-    }
+    let tls_ca = if cert_source == CertSource::PinnedCa {
+        Some(pairing::pinned_ca_b64(&pinned_dir(config)).ok_or_else(|| {
+            RemoteUnavailable::CertLoad(format!(
+                "{}: no usable machine CA — restart gaviero to create it",
+                pinned_dir(config).display()
+            ))
+        })?)
+    } else {
+        None
+    };
+    // Loopback mode never looks for Tailscale: a relay carries the traffic.
+    let tailnet_addrs = match config.bind_mode {
+        BindMode::Loopback => Vec::new(),
+        BindMode::LoopbackTailnet => {
+            let addrs = pairing::detect_tailscale_addrs();
+            if addrs.is_empty() && !config.allow_public_bind {
+                return Err(RemoteUnavailable::NoTailnetAddress);
+            }
+            addrs
+        }
+    };
     Ok(Availability {
         cert_pem,
         key_pem,
         cert,
         cert_source,
         tailnet_addrs,
+        tls_ca,
     })
 }
 
-/// Bind list (§3.2): loopback plus detected tailnet addresses. Never a
-/// wildcard; anything else requires `remote.allowPublicBind`.
+/// Bind list (§3.2): loopback plus detected tailnet addresses (none in
+/// `bindMode: "loopback"`, where `check_availability` returns an empty
+/// list). Never a wildcard; anything else requires `remote.allowPublicBind`.
 #[cfg(test)]
 pub fn bind_addrs(config: &RemoteConfig, tailnet: &[IpAddr]) -> Vec<SocketAddr> {
     bind_addrs_on(config, tailnet, config.port)
@@ -599,14 +829,20 @@ fn bind_addrs_on(config: &RemoteConfig, tailnet: &[IpAddr], port: u16) -> Vec<So
     addrs
 }
 
-/// The pairing URL — always the MagicDNS hostname, never an IP or
-/// `localhost`, because the certificate is issued to that name (§3.1).
+/// The pairing URL — always `remote.magicDnsHost` (a MagicDNS name, or the
+/// relay host name behind a VPS relay), never an IP or `localhost`, because
+/// the certificate is issued to that name (§3.1).
 #[cfg(test)]
 pub fn pairing_url(config: &RemoteConfig) -> String {
     pairing_url_on(config, config.port)
 }
 
 pub fn pairing_url_on(config: &RemoteConfig, port: u16) -> String {
+    // Relay mode: the route is the URL host (the phone dials the relay on
+    // 443 and names the route in SNI), so the local port never appears.
+    if let Some(relay) = &config.relay {
+        return format!("wss://{}{}", relay.route, gaviero_remote::WS_PATH);
+    }
     format!(
         "wss://{}:{}{}",
         config.magic_dns_host,
@@ -616,7 +852,16 @@ pub fn pairing_url_on(config: &RemoteConfig, port: u16) -> String {
 }
 
 /// `https://<host>:<directoryPort>/v1/instances` when the directory is on.
+/// Relay mode: this instance's own route — every instance listener serves
+/// the machine's instance list.
 pub fn directory_url(config: &RemoteConfig) -> Option<String> {
+    if let Some(relay) = &config.relay {
+        return Some(format!(
+            "https://{}{}",
+            relay.route,
+            gaviero_remote::INSTANCES_PATH
+        ));
+    }
     config.directory_enabled.then(|| {
         format!(
             "https://{}:{}{}",
@@ -628,12 +873,14 @@ pub fn directory_url(config: &RemoteConfig) -> Option<String> {
 }
 
 /// The QR payload `/remote` renders: the 1.0 keys plus the 1.1 identity
-/// keys (workspace id, machine host, directory URL when known).
+/// keys (workspace id, machine host, directory URL when known) and, in
+/// pinned-CA mode, the CA certificate the app must trust (`tls_ca`).
 pub fn qr_payload_for(
     config: &RemoteConfig,
     url: &str,
     token: &str,
     directory_url: Option<&str>,
+    tls_ca: Option<&str>,
 ) -> String {
     pairing::qr_payload_json(&pairing::QrPayloadInput {
         url,
@@ -642,6 +889,9 @@ pub fn qr_payload_for(
         workspace_id: Some(&config.workspace_id),
         machine: Some(&config.magic_dns_host),
         directory_url,
+        tls_ca,
+        relay_host: config.relay.as_ref().map(|r| r.host.as_str()),
+        relay_secret: config.relay.as_ref().map(|r| r.secret.as_str()),
     })
 }
 
@@ -668,6 +918,8 @@ pub struct RemoteStarted {
     /// directory is disabled.
     pub directory_leader: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub max_prompt_bytes: usize,
+    /// Relay mode: the outbound relay client (status + notifications).
+    pub relay: Option<gaviero_remote::relay_client::RelayClient>,
 }
 
 impl std::fmt::Debug for RemoteStarted {
@@ -822,6 +1074,7 @@ pub async fn start(
                 .directory_enabled
                 .then(|| spawned.directory_leader.clone()),
             max_prompt_bytes: config.max_prompt_bytes as usize,
+            relay: None,
         });
     }
     if config.explicit_port {
@@ -870,6 +1123,24 @@ async fn bootstrap_inner(
     let instance_id = pairing::generate_token()[..16].to_string();
     let mut started = start(&config, availability, token, instance_id, event_tx).await?;
     started.cert_provisioned = provisioned;
+    if let Some(relay) = &config.relay {
+        started.relay = Some(gaviero_remote::relay_client::RelayClient::spawn(
+            gaviero_remote::relay_client::RelayClientConfig {
+                base_url: relay.base_url.clone(),
+                secret: relay.secret.clone(),
+                route: gaviero_remote::relay_client::RelayRoute {
+                    route: relay.route.clone(),
+                    machine: config.magic_dns_host.clone(),
+                    workspace_id: config.workspace_id.clone(),
+                    display_name: config.workspace_display_name.clone(),
+                },
+                local_addr: SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    started.port,
+                ),
+            },
+        ));
+    }
     Ok(started)
 }
 
@@ -878,12 +1149,28 @@ async fn bootstrap_inner(
 /// QR quiet zone, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
 
+/// Widest rendered QR (quiet zone included) that still fits a terminal
+/// side panel without wrapping.
+const MAX_QR_COLUMNS: usize = 120;
+
+/// Encode at error-correction level M; fall back to L when M would not fit
+/// [`MAX_QR_COLUMNS`] (the pinned-CA payload carries ~550 more bytes). A
+/// crisp on-screen code scans reliably at L.
+fn encode_qr(payload: &str) -> Result<qrcode::QrCode, String> {
+    let medium = qrcode::QrCode::new(payload.as_bytes())
+        .map_err(|e| format!("could not encode the pairing QR: {e}"))?;
+    if medium.width() + QUIET_ZONE * 2 <= MAX_QR_COLUMNS {
+        return Ok(medium);
+    }
+    qrcode::QrCode::with_error_correction_level(payload.as_bytes(), qrcode::EcLevel::L)
+        .map_err(|e| format!("could not encode the pairing QR: {e}"))
+}
+
 /// Render the pairing payload as a half-block QR sized for a terminal.
 /// Two vertical modules per character row keeps it scannable in a side
 /// panel; a quiet zone is included because scanners need it.
 pub fn render_qr(payload: &str) -> Result<String, String> {
-    let code = qrcode::QrCode::new(payload.as_bytes())
-        .map_err(|e| format!("could not encode the pairing QR: {e}"))?;
+    let code = encode_qr(payload)?;
     let width = code.width();
     // The spec requires a 4-module quiet zone; phone scanners are much
     // less reliable without it, and this code has exactly one job.
@@ -1024,6 +1311,9 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     report.push_str(&format!(
         "Host: {}\n",
         match config.host_source {
+            HostSource::Setting if config.relay.is_some() => {
+                format!("{} (relay machine name)", config.magic_dns_host)
+            }
             HostSource::Setting => format!("{} (remote.magicDnsHost)", config.magic_dns_host),
             HostSource::Detected =>
                 format!("{} (auto-detected via tailscale)", config.magic_dns_host),
@@ -1035,13 +1325,37 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         }
     ));
 
-    match check_availability(config) {
+    report.push_str(&format!(
+        "Bind: {}{}\nTLS mode: {}\n",
+        config.bind_mode.as_str(),
+        if config.bind_mode == BindMode::Loopback {
+            " (127.0.0.1/::1 only — reached through the VPS relay)"
+        } else {
+            ""
+        },
+        config.tls_mode.as_str()
+    ));
+    if let Some(relay) = &config.relay {
+        let state = match running.and_then(|s| s.relay.as_ref()) {
+            Some(client) => client.status().to_string(),
+            None => "not started".to_string(),
+        };
+        report.push_str(&format!(
+            "Relay: {} — route {} — {state}\n",
+            relay.base_url, relay.route
+        ));
+    }
+
+    let availability = check_availability(config);
+    match &availability {
         Ok(availability) => {
+            let auto_renews = availability.cert_source == CertSource::PinnedCa
+                || (availability.cert_source == CertSource::Machine && config.auto_cert);
             let expiry = if availability.cert.is_near_expiry() {
                 format!(
                     "{} (EXPIRES SOON — {})",
                     availability.cert.not_after,
-                    if availability.cert_source == CertSource::Machine && config.auto_cert {
+                    if auto_renews {
                         "renews automatically on the next start".to_string()
                     } else {
                         format!("renew with `tailscale cert {}`", config.magic_dns_host)
@@ -1051,16 +1365,21 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
                 availability.cert.not_after.clone()
             };
             report.push_str(&format!(
-                "Certificate: {} — valid until {}\nTailnet addresses: {}\n",
+                "Certificate: {} — valid until {}\n",
                 availability.cert_source.label(),
                 expiry,
-                availability
-                    .tailnet_addrs
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
             ));
+            if config.bind_mode == BindMode::LoopbackTailnet {
+                report.push_str(&format!(
+                    "Tailnet addresses: {}\n",
+                    availability
+                        .tailnet_addrs
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
         Err(e) => report.push_str(&format!("Certificate: unavailable — {e}\n")),
     }
@@ -1147,10 +1466,37 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         }
     }
 
+    // gaviero-relay: "instance offline" means the relay route isn't up.
+    if running.is_some() && !app.remote.client_connected && config.relay.is_some() {
+        report.push_str(
+            "\nIf the app says \"instance offline\", check the Relay line above: it must say \
+             \"registered\". A 401 means remote.relay.secret differs from the relay's \
+             --secret-file; \"timed out\"/\"refused\" means the relay or its nginx is down.\n",
+        );
+    }
+
+    // Behind an ssh -R relay, "instance offline" means the tunnel or the VPS proxy.
+    if running.is_some()
+        && !app.remote.client_connected
+        && config.bind_mode == BindMode::Loopback
+        && config.relay.is_none()
+    {
+        report.push_str(&format!(
+            "\nIf the app says \"instance offline\", check the relay: the `ssh -R` tunnel to the \
+             VPS must be up (it forwards this machine's ports {} and {port}), and the VPS nginx \
+             `stream` block must forward the public ports to it. On the VPS, \
+             `ss -ltnp | grep sshd` lists the tunnel ports.\n",
+            config.directory_port
+        ));
+    }
+
     // Listening with no client is usually the phone off the tailnet, then
     // (on Windows) the host firewall dropping inbound on the Tailscale NIC.
     // The app only reports "instance offline" for both.
-    if running.is_some() && !app.remote.client_connected {
+    if running.is_some()
+        && !app.remote.client_connected
+        && config.bind_mode == BindMode::LoopbackTailnet
+    {
         report.push_str(
             "\nIf the app says \"instance offline\", check `tailscale status` on this PC: \
              the phone must be listed without \"offline\" (open the Tailscale app on the phone, \
@@ -1171,14 +1517,25 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
 
     if let (Some(started), Ok(loaded)) = (running, &token) {
         let url = pairing_url_on(config, started.port);
-        let dir_url = started.directory_port.map(|p| {
-            format!(
-                "https://{}:{p}{}",
-                config.magic_dns_host,
-                gaviero_remote::INSTANCES_PATH
-            )
-        });
-        let payload = qr_payload_for(config, &url, &loaded.token, dir_url.as_deref());
+        let dir_url = if config.relay.is_some() {
+            directory_url(config)
+        } else {
+            started.directory_port.map(|p| {
+                format!(
+                    "https://{}:{p}{}",
+                    config.magic_dns_host,
+                    gaviero_remote::INSTANCES_PATH
+                )
+            })
+        };
+        let tls_ca = availability.as_ref().ok().and_then(|a| a.tls_ca.clone());
+        let payload = qr_payload_for(
+            config,
+            &url,
+            &loaded.token,
+            dir_url.as_deref(),
+            tls_ca.as_deref(),
+        );
         match render_qr(&payload) {
             Ok(qr) => report.push_str(&format!(
                 "\nScan this gaviero-remote pairing code with the Gaviero Remote app \
@@ -1503,6 +1860,206 @@ mod tests {
     }
 
     #[test]
+    fn bind_and_tls_modes_default_to_tailscale_and_parse_leniently() {
+        let (_dir, ws) = workspace_with(serde_json::json!({}));
+        let config = resolve_config(&ws).unwrap();
+        assert_eq!(config.bind_mode, BindMode::LoopbackTailnet);
+        assert_eq!(config.tls_mode, TlsMode::Tailscale);
+        assert_eq!(BindMode::parse(" Loopback "), BindMode::Loopback);
+        assert_eq!(BindMode::parse("nonsense"), BindMode::LoopbackTailnet);
+        assert_eq!(TlsMode::parse("pinnedCa"), TlsMode::PinnedCa);
+        assert_eq!(TlsMode::parse("PINNED-CA"), TlsMode::PinnedCa);
+        assert_eq!(TlsMode::parse(""), TlsMode::Tailscale);
+    }
+
+    fn relay_workspace() -> (tempfile::TempDir, Workspace) {
+        workspace_with(serde_json::json!({
+            "remote": {
+                "magicDnsHost": "desk.example.com",
+                "bindMode": "loopback",
+                "tlsMode": "pinnedCa",
+                "port": 50101,
+                "directoryPort": 50100
+            }
+        }))
+    }
+
+    /// W1: loopback mode never needs (or looks for) a Tailscale address,
+    /// and the bind list it produces is loopback only — never a wildcard.
+    #[tokio::test]
+    async fn loopback_mode_is_available_without_tailscale_and_binds_loopback_only() {
+        let (_dir, ws) = relay_workspace();
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        assert_eq!(config.bind_mode, BindMode::Loopback);
+        assert!(!config.allow_public_bind, "no allowPublicBind needed");
+        assert!(ensure_certificate(&config).await.unwrap(), "first start issues");
+
+        let availability = check_availability(&config).expect("available without a tailnet");
+        assert!(availability.tailnet_addrs.is_empty());
+        let addrs = bind_addrs(&config, &availability.tailnet_addrs);
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
+        assert!(addrs.iter().all(|a| a.port() == 50101));
+    }
+
+    /// W2: pinned-CA mode selects the pinned leaf, issues it once, and the
+    /// QR carries the CA (never a key) so the app can pin it.
+    #[tokio::test]
+    async fn pinned_ca_mode_issues_once_and_the_qr_carries_the_ca() {
+        let (_dir, ws) = relay_workspace();
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        let (source, cert, key) = select_cert(&config);
+        assert_eq!(source, CertSource::PinnedCa);
+        assert_eq!(cert, key, "one bundle holds the leaf and its key");
+        assert!(cert.starts_with(machine.path()), "machine-scoped: {cert:?}");
+
+        assert!(ensure_certificate(&config).await.unwrap());
+        assert!(
+            !ensure_certificate(&config).await.unwrap(),
+            "a second start re-issues nothing"
+        );
+        let availability = check_availability(&config).unwrap();
+        assert_eq!(availability.cert_source, CertSource::PinnedCa);
+        assert!(availability.cert.covers_host);
+        let tls_ca = availability.tls_ca.clone().expect("pinned mode exposes the CA");
+
+        let loaded = load_or_create_token(&config).unwrap();
+        let payload = qr_payload_for(
+            &config,
+            &pairing_url(&config),
+            &loaded.token,
+            directory_url(&config).as_deref(),
+            Some(&tls_ca),
+        );
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["url"], "wss://desk.example.com:50101/v1/ws");
+        assert_eq!(v["directory_url"], "https://desk.example.com:50100/v1/instances");
+        assert_eq!(v["tls_ca"], tls_ca.as_str());
+        assert!(!payload.contains("PRIVATE"), "never a key in the QR");
+        let qr = render_qr(&payload).expect("the pinned payload encodes");
+        let width = qr.lines().next().unwrap().chars().count();
+        assert!(width <= 120, "pinned QR is {width} columns — too wide");
+    }
+
+    /// Pinned mode without a CA on disk reports an actionable CertLoad.
+    #[test]
+    fn pinned_ca_mode_without_material_fails_closed() {
+        let (_dir, ws) = relay_workspace();
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        match check_availability(&config) {
+            Err(RemoteUnavailable::CertLoad(msg)) => assert!(msg.contains("pinned"), "{msg}"),
+            other => panic!("expected CertLoad, got {other:?}"),
+        }
+    }
+
+    /// An explicit pair still wins over `tlsMode: "pinnedCa"`.
+    #[test]
+    fn explicit_cert_wins_over_pinned_ca() {
+        let (_dir, ws) = workspace_with(serde_json::json!({
+            "remote": {
+                "magicDnsHost": "desk.example.com",
+                "tlsMode": "pinnedCa",
+                "certPath": "certs/cert.pem"
+            }
+        }));
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        assert_eq!(select_cert(&config).0, CertSource::Explicit);
+    }
+
+    #[test]
+    fn machine_labels_are_dns_safe() {
+        assert_eq!(machine_label("DESKTOP-ABC123"), "desktop-abc123");
+        assert_eq!(machine_label(" my_box.local "), "my-box-local");
+        assert_eq!(machine_label("---"), "gaviero");
+        assert_eq!(machine_label(&"x".repeat(80)).len(), 40);
+        assert!(!machine_label("a-very-long-name-that-ends-exactly-at-forty-x-y").ends_with('-'));
+    }
+
+    fn relay_mode_workspace() -> (tempfile::TempDir, Workspace) {
+        workspace_with(serde_json::json!({
+            "remote": { "relay": {
+                "host": "Gaviero.Example.com.",
+                "secret": "relay-secret-0123456789abcdef",
+                "machine": "Desk Top"
+            } }
+        }))
+    }
+
+    #[test]
+    fn relay_mode_derives_route_urls_and_forces_loopback_pinned_ca() {
+        let (_dir, ws) = relay_mode_workspace();
+        let config = resolve_config(&ws).unwrap();
+        let relay = config.relay.clone().expect("relay mode");
+        assert_eq!(relay.host, "gaviero.example.com");
+        assert_eq!(relay.machine, "desk-top");
+        assert_eq!(relay.base_url, "wss://gaviero.example.com");
+        assert_eq!(
+            relay.route,
+            format!("{}-desk-top.gaviero.example.com", config.workspace_id)
+        );
+        assert_eq!(config.magic_dns_host, "desk-top.gaviero.example.com");
+        assert_eq!(config.bind_mode, BindMode::Loopback);
+        assert_eq!(config.tls_mode, TlsMode::PinnedCa);
+        assert!(!config.directory_enabled, "no loopback directory port");
+        assert_eq!(
+            pairing_url(&config),
+            format!("wss://{}/v1/ws", relay.route),
+            "no port: the phone dials the relay on 443"
+        );
+        assert_eq!(
+            directory_url(&config).unwrap(),
+            format!("https://{}/v1/instances", relay.route)
+        );
+        assert!(!format!("{relay:?}").contains("relay-secret"), "Debug redacts the secret");
+    }
+
+    #[test]
+    fn relay_mode_without_a_secret_is_an_actionable_error() {
+        let (_dir, ws) = workspace_with(serde_json::json!({
+            "remote": { "relay": { "host": "gaviero.example.com" } }
+        }));
+        let err = resolve_config(&ws).expect_err("secret required");
+        assert!(matches!(err, RemoteUnavailable::RelaySecretMissing));
+        assert!(err.to_string().contains("remote.relay.secret"));
+    }
+
+    #[tokio::test]
+    async fn relay_mode_leaf_covers_the_route_and_the_qr_carries_relay_fields() {
+        let (_dir, ws) = relay_mode_workspace();
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        let relay = config.relay.clone().unwrap();
+        assert!(ensure_certificate(&config).await.unwrap());
+        let availability = check_availability(&config).expect("available without tailscale");
+        let leaf = std::fs::read(select_cert(&config).1).unwrap();
+        assert!(
+            pairing::inspect_cert(&leaf, &relay.route).unwrap().covers_host,
+            "the *.relay-host SAN covers the route"
+        );
+        let token = load_or_create_token(&config).unwrap();
+        let payload = qr_payload_for(
+            &config,
+            &pairing_url(&config),
+            &token.token,
+            directory_url(&config).as_deref(),
+            availability.tls_ca.as_deref(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["relay_host"], "gaviero.example.com");
+        assert_eq!(v["relay_secret"], "relay-secret-0123456789abcdef");
+        assert_eq!(v["machine"], "desk-top.gaviero.example.com");
+        assert_eq!(v["url"], format!("wss://{}/v1/ws", relay.route));
+        assert!(v["tls_ca"].is_string());
+        let qr = render_qr(&payload).expect("relay payload encodes");
+        let width = qr.lines().next().unwrap().chars().count();
+        assert!(width <= 120, "relay QR is {width} columns — too wide");
+    }
+
+    #[test]
     fn pairing_url_uses_magic_dns_never_an_ip() {
         let (_dir, ws) = workspace_with(serde_json::json!({
             "remote": { "magicDnsHost": "host.tailnet.ts.net", "port": 50123 }
@@ -1547,6 +2104,9 @@ mod tests {
             directory_url: Some(
                 "https://very-long-machine-name.tail9f2c81.ts.net:49151/v1/instances",
             ),
+            tls_ca: None,
+            relay_host: None,
+            relay_secret: None,
         });
         let qr = render_qr(&payload).expect("worst-case payload still encodes");
         let width = qr.lines().next().unwrap().chars().count();
@@ -1571,7 +2131,7 @@ mod tests {
             workspace: "gaviero",
             ..Default::default()
         });
-        let code = qrcode::QrCode::new(payload.as_bytes()).unwrap();
+        let code = encode_qr(&payload).unwrap();
         let width = code.width();
         let quiet = QUIET_ZONE;
         let rendered = render_qr(&payload).unwrap();
@@ -1634,8 +2194,10 @@ mod tests {
             &pairing_url(&config),
             &loaded.token,
             dir_url.as_deref(),
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(v.get("tls_ca").is_none(), "tailscale mode pins nothing");
         assert_eq!(v["kind"], "gaviero-remote");
         assert_eq!(v["protocol_major"], 1);
         assert_eq!(v["url"], "wss://host.tailnet.ts.net:50123/v1/ws");
@@ -1677,6 +2239,7 @@ mod tests {
                 cert,
                 cert_source: CertSource::Machine,
                 tailnet_addrs: Vec::new(),
+                tls_ca: None,
             }
         };
         let token = load_or_create_token(&config).unwrap();

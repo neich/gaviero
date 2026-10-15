@@ -12,9 +12,11 @@ fn invalidate_repo_map(app: &App) {
     });
 }
 
-/// ntfy does not honour terminal focus — the phone is the point. Still
-/// requires `notifications.agentFinished.enabled` / `agentWaiting.enabled`
-/// (`desktop_event_enabled`) plus the ntfy master switch.
+/// Phone notifications (ntfy and/or gaviero-relay) do not honour terminal
+/// focus — the phone is the point. Still requires
+/// `notifications.agentFinished.enabled` / `agentWaiting.enabled`
+/// (`desktop_event_enabled`); ntfy additionally needs its master switch.
+/// The relay gets only `{machine, workspace, conv, kind}`, never the body.
 fn publish_ntfy_for_event(
     app: &App,
     event: crate::notify::NotifyEvent,
@@ -24,6 +26,18 @@ fn publish_ntfy_for_event(
 ) {
     if !desktop_event_enabled {
         return;
+    }
+    if let crate::app::remote::RemoteStatus::Running(started) = &app.remote.status
+        && let Some(relay) = &started.relay
+    {
+        use gaviero_remote::relay_client::RelayNotifyKind;
+        relay.notify(
+            match event {
+                crate::notify::NotifyEvent::AgentFinished => RelayNotifyKind::AgentFinished,
+                crate::notify::NotifyEvent::AgentWaiting => RelayNotifyKind::AgentWaiting,
+            },
+            conv_id,
+        );
     }
     let roots = app.workspace.roots();
     let root = roots.first().copied();

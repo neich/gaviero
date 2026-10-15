@@ -22,7 +22,7 @@ Binaries: `gaviero` (TUI), `gaviero-cli` (headless), `gaviero-mcp-shim` (subproc
 
 ## Workspace
 
-Six crates — read the per-crate `CLAUDE.md` before touching its source.
+Crates — read the per-crate `CLAUDE.md` (where one exists) before touching its source.
 
 - [`gaviero-core/`](crates/gaviero-core/CLAUDE.md) — all runtime logic; no UI/DSL deps.
 - [`gaviero-tui/`](crates/gaviero-tui/CLAUDE.md) — terminal UI (ratatui + crossterm).
@@ -30,6 +30,7 @@ Six crates — read the per-crate `CLAUDE.md` before touching its source.
 - [`gaviero-dsl/`](crates/gaviero-dsl/CLAUDE.md) — `.gaviero` workflow compiler (logos + chumsky).
 - [`gaviero-mcp-shim/`](crates/gaviero-mcp-shim/CLAUDE.md) — stdio↔socket bridge (Unix socket / Windows named pipe). Zero workspace deps.
 - [`tree-sitter-gaviero/`](crates/tree-sitter-gaviero/CLAUDE.md) — `.gaviero` grammar.
+- [`gaviero-relay/`](crates/gaviero-relay/README.md) — VPS relay for Gaviero Remote. Built only with `-p gaviero-relay` and never installed with gaviero. It depends only on `gaviero-remote`'s plain wire types: `relay_proto` is the single protocol definition, shared with `gaviero_remote::relay_client`.
 
 Dependency rules: core has no UI/DSL deps. `tui` and `cli` depend on `core` + `dsl`. `dsl` depends on `core`. `gaviero-mcp-shim` is self-contained and reaches core only over the workspace MCP endpoint (`McpEndpoint`: `<workspace>/.gaviero/mcp.sock` on Unix, `\\.\pipe\gaviero-<hash>` on Windows). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full topology.
 

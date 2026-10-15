@@ -366,6 +366,21 @@ pub mod settings {
     pub const REMOTE_TOKEN_SCOPE: &str = "remote.tokenScope";
     pub const REMOTE_DIRECTORY_ENABLED: &str = "remote.directoryEnabled";
     pub const REMOTE_DIRECTORY_PORT: &str = "remote.directoryPort";
+    // VPS relay (research/vps-relay-gaviero-remote-2026-10-14.md).
+    // `bindMode: "loopback"` binds 127.0.0.1/::1 only and needs no Tailscale
+    // address — for an `ssh -R` tunnel or a same-host nginx `stream` relay.
+    // `tlsMode: "pinnedCa"` replaces `tailscale cert` with a per-machine
+    // private CA whose certificate the pairing QR carries (`tls_ca`).
+    pub const REMOTE_TLS_MODE: &str = "remote.tlsMode";
+    // gaviero-relay (research/bidirectional-relay-replacing-ntfy-2026-10-15.md).
+    // A non-empty `relay.host` turns relay mode on: loopback bind, pinned CA,
+    // the sidecar dials OUT to `wss://<host>` and phones reach it through
+    // the relay by SNI. `relay.machine` defaults to the sanitised hostname;
+    // `relay.url` overrides the relay base URL (tests, non-standard ports).
+    pub const REMOTE_RELAY_HOST: &str = "remote.relay.host";
+    pub const REMOTE_RELAY_SECRET: &str = "remote.relay.secret";
+    pub const REMOTE_RELAY_MACHINE: &str = "remote.relay.machine";
+    pub const REMOTE_RELAY_URL: &str = "remote.relay.url";
 
     /// Extra skill roots scanned in addition to `.gaviero/skills` and
     /// `~/.gaviero/skills`. JSON array of paths (a lone string is also
@@ -1621,6 +1636,11 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::REMOTE_TOKEN_SCOPE => serde_json::json!("machine"),
         settings::REMOTE_DIRECTORY_ENABLED => serde_json::json!(true),
         settings::REMOTE_DIRECTORY_PORT => serde_json::json!(49151),
+        settings::REMOTE_TLS_MODE => serde_json::json!("tailscale"),
+        settings::REMOTE_RELAY_HOST => serde_json::json!(""),
+        settings::REMOTE_RELAY_SECRET => serde_json::json!(""),
+        settings::REMOTE_RELAY_MACHINE => serde_json::json!(""),
+        settings::REMOTE_RELAY_URL => serde_json::json!(""),
 
         // H3 PR-9 — opt-in foreign skill roots (empty = no extra FS reads).
         settings::SKILLS_EXTRA_ROOTS => serde_json::json!([]),
