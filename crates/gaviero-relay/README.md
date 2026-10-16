@@ -99,12 +99,11 @@ All flags are listed under [Relay options](#relay-options).
 
 ### 4. nginx and the certificate
 
-The nginx config comes in three files. They follow the `*-available` / `*-enabled` layout: each file lives in an `-available` directory and is switched on with a symlink in the matching `-enabled` directory. Install them in this order:
+The nginx config comes in two files. They follow the `*-available` / `*-enabled` layout: each file lives in an `-available` directory and is switched on with a symlink in the matching `-enabled` directory.
 
 | File | Goes to (`-available`, linked from `-enabled`) | Contains |
 |---|---|---|
-| [`nginx-http.conf`](deploy/nginx-http.conf) | `/etc/nginx/sites-available/gaviero-relay-http` | Port 80: certbot challenges, redirect to HTTPS |
-| [`nginx-https.conf`](deploy/nginx-https.conf) | `/etc/nginx/sites-available/gaviero-relay-https` | The relay's HTTPS on `127.0.0.1:8444` (Let's Encrypt cert) → relay `:7080` |
+| [`nginx-site.conf`](deploy/nginx-site.conf) | `/etc/nginx/sites-available/gaviero-relay` | Port 80 (certbot renewals, redirect to HTTPS) and the relay's HTTPS on `127.0.0.1:8444` (Let's Encrypt cert) → relay `:7080` |
 | [`nginx-stream.conf`](deploy/nginx-stream.conf) | `/etc/nginx/streams-available/gaviero-relay` | `:443` SNI router: `gaviero.wuilder.com` → `:8444`, any other name → relay splice `:7443` |
 
 **Why there are separate `streams-*` directories:**
@@ -118,22 +117,21 @@ nginx -V 2>&1 | grep -o 'with-stream[^ ]*\|stream_ssl_preread\|http_realip'
 ```
 All three names must appear. On Debian/Ubuntu, `with-stream=dynamic` is fine once `libnginx-mod-stream` is installed.
 
-**4b. Port 80, then the certificate:**
+**4b. The certificate, before the site is enabled:**
 ```bash
-sudo install -m644 crates/gaviero-relay/deploy/nginx-http.conf /etc/nginx/sites-available/gaviero-relay-http
-sudo ln -s ../sites-available/gaviero-relay-http /etc/nginx/sites-enabled/gaviero-relay-http
-sudo nginx -t && sudo systemctl reload nginx
 sudo certbot certonly --nginx -d gaviero.wuilder.com --deploy-hook "systemctl reload nginx"
 ```
-- `certonly` obtains the certificate without editing your nginx files.
-- Renewals are automatic (certbot's systemd timer) and go through port 80, so keep it open.
-- Check renewal with `sudo certbot renew --dry-run`.
+- **Why first:** `nginx-site.conf` points at this certificate, and nginx refuses to load a site whose `ssl_certificate` doesn't exist yet.
+- **How certbot answers the challenge without our site:** nginx must be running with port 80 reachable. Certbot's nginx mode then serves the challenge from the `listen 80 default_server` block (Debian's `default` site), or adds a temporary block of its own, and removes it afterwards.
+- **`certonly`** obtains the certificate without editing your nginx files.
 
-**4c. The relay's HTTPS server:**
+**4c. The relay's site (port 80 + HTTPS):**
 ```bash
-sudo install -m644 crates/gaviero-relay/deploy/nginx-https.conf /etc/nginx/sites-available/gaviero-relay-https
-sudo ln -s ../sites-available/gaviero-relay-https /etc/nginx/sites-enabled/gaviero-relay-https
+sudo install -m644 crates/gaviero-relay/deploy/nginx-site.conf /etc/nginx/sites-available/gaviero-relay
+sudo ln -s ../sites-available/gaviero-relay /etc/nginx/sites-enabled/gaviero-relay
 ```
+- **Renewals** are automatic (certbot's systemd timer) and go through this site's port-80 block, so keep port 80 open.
+- **Check renewal** with `sudo certbot renew --dry-run` once step 4e is done.
 
 **4d. The `:443` SNI router (`streams-available` / `streams-enabled`, top level):**
 ```bash
@@ -194,7 +192,7 @@ curl -sN --max-time 5 -H "Authorization: Bearer $(head -1 ~/.config/gaviero-rela
 | Symptom | Likely cause |
 |---|---|
 | Connection refused or timeout | DNS, firewall, or the stream block isn't loaded (step 4d: the `streams-enabled` link or the top-level `include`) |
-| Certificate error | `gaviero-relay-https` isn't linked in `sites-enabled`, or the map doesn't send `gaviero.wuilder.com` to `:8444` |
+| Certificate error | `gaviero-relay` isn't linked in `sites-enabled`, or the map doesn't send `gaviero.wuilder.com` to `:8444` |
 | `502 Bad Gateway` | The relay isn't running (step 3) |
 | These checks pass and `/remote` says `registered`, but the phone can't open a session | The PROXY setting doesn't match: the relay's `--proxy-protocol` and `proxy_protocol on` in `nginx-stream.conf` must both be on. With `RUST_LOG=gaviero_relay=debug`, the journal shows `missing or bad PROXY header` or `no ClientHello` |
 | Journal: `no host registered for route` | The phone is paired with an instance that isn't running or isn't registered (check `/remote` on that machine) |
@@ -315,7 +313,7 @@ systemctl --user restart gaviero-relay
 Replace `gaviero.wuilder.com` in:
 - the DNS record;
 - `deploy/gaviero-relay.service` (`--public-host`);
-- the three `deploy/nginx-*.conf` files (`server_name`, the map, the certificate paths), or their copies in `sites-available` / `streams-available` if they're already installed;
+- both `deploy/nginx-*.conf` files (`server_name`, the map, the certificate paths), or their copies in `sites-available` / `streams-available` if they're already installed;
 - the certbot command;
 - `remote.relay.host` on every machine.
 
