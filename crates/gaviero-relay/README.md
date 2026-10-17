@@ -16,7 +16,7 @@ Wire protocol: [PROTOCOL.md](PROTOCOL.md). The types are `gaviero_remote::relay_
 3. [Configure gaviero](#configure-gaviero-on-every-machine) on every machine with the relay host and that secret.
 4. [Pair the phone](#phone) by scanning `/remote` once per machine.
 
-The examples use `gaviero.wuilder.com`. For another name, replace it everywhere it appears (see [Using another domain](#using-another-domain)).
+`gaviero.example.com` stands for your relay's name throughout this README and in the `deploy/` templates. You copy each template into place and then edit the copy: each step shows the exact lines, before and after. The templates in the repo never change.
 
 ## Build
 
@@ -49,10 +49,14 @@ cargo test -p gaviero-relay
 - Run every command from the workspace root (`~/gaviero`). The deploy files live in `crates/gaviero-relay/deploy/`.
 - Run steps 2–3 **as the service user, without `sudo`**: log in over SSH as that user, or use `sudo machinectl shell <user>@`. Under `su`, `systemctl --user` has no session bus. The one exception is `loginctl enable-linger`, which needs sudo.
 - Steps 4–6 need sudo.
+- **Set your relay's name once per shell.** The commands below use this variable:
+  ```bash
+  RELAY_HOST=gaviero.yourdomain.tld          # the subdomain you'll point at this VPS
+  ```
 
 ### 1. DNS
 
-Create one A/AAAA record, `gaviero.wuilder.com` → the VPS. Route names are never resolved, so no wildcard record is needed.
+Create one A/AAAA record, `$RELAY_HOST` → the VPS. Route names are never resolved, so no wildcard record is needed.
 
 ### 2. Binary and the shared secret
 
@@ -75,8 +79,28 @@ It decides who may use the relay at all; it is not what protects your sessions (
 
 ### 3. Service (systemd user unit)
 
+**Copy the unit:**
 ```bash
-install -Dm644 crates/gaviero-relay/deploy/gaviero-relay.service ~/.config/systemd/user/gaviero-relay.service
+install -d ~/.config/systemd/user
+cp crates/gaviero-relay/deploy/gaviero-relay.service ~/.config/systemd/user/
+nano ~/.config/systemd/user/gaviero-relay.service
+```
+
+**Edit one line** in the copy, the relay's name:
+
+Before:
+```ini
+    --public-host gaviero.example.com \
+```
+After (with your name):
+```ini
+    --public-host gaviero.yourdomain.tld \
+```
+
+`grep -n example ~/.config/systemd/user/gaviero-relay.service` must print nothing.
+
+**Start it:**
+```bash
 sudo loginctl enable-linger "$USER"          # start at boot, keep running after logout
 systemctl --user daemon-reload && systemctl --user enable --now gaviero-relay
 systemctl --user status gaviero-relay        # "active (running)"
@@ -86,7 +110,7 @@ journalctl --user -u gaviero-relay -f        # "gaviero-relay listening"
 **What the unit runs:** [`deploy/gaviero-relay.service`](deploy/gaviero-relay.service) starts the relay with:
 - `--http 127.0.0.1:7080 --splice 127.0.0.1:7443`;
 - `--secret-file ~/.config/gaviero-relay/secret`;
-- `--public-host gaviero.wuilder.com`;
+- `--public-host <your relay's name>` (the line you edited);
 - `--proxy-protocol`.
 
 All flags are listed under [Relay options](#relay-options).
@@ -103,8 +127,23 @@ The nginx config comes in two files. They follow the `*-available` / `*-enabled`
 
 | File | Goes to (`-available`, linked from `-enabled`) | Contains |
 |---|---|---|
-| [`nginx-site.conf`](deploy/nginx-site.conf) | `/etc/nginx/sites-available/gaviero-relay` | Port 80 (certbot renewals, redirect to HTTPS) and the relay's HTTPS on `127.0.0.1:8444` (Let's Encrypt cert) → relay `:7080` |
-| [`nginx-stream.conf`](deploy/nginx-stream.conf) | `/etc/nginx/streams-available/gaviero-relay` | `:443` SNI router: `gaviero.wuilder.com` → `:8444`, any other name → relay splice `:7443` |
+| [`nginx-site.conf`](deploy/nginx-site.conf) | `/etc/nginx/sites-available/gaviero-relay` | Port 80 (certbot renewals, redirect to HTTPS) and the relay's HTTPS on `127.0.0.1:8443` (Let's Encrypt cert) → relay `:7080` |
+| [`nginx-stream.conf`](deploy/nginx-stream.conf) | `/etc/nginx/streams-available/gaviero-relay` | `:443` SNI router: route names (`*.$RELAY_HOST`) → relay splice `:7443`; every other name, `$RELAY_HOST` included → `:8443` |
+
+**Why the HTTPS server listens on `127.0.0.1:8443` and not on 443:** port 443 carries two different kinds of traffic.
+
+| Traffic | TLS ends at | Who must handle it |
+|---|---|---|
+| `https://$RELAY_HOST/…`: gaviero's control WebSocket, the phone's notification stream, `/healthz` | **nginx**, with the Let's Encrypt certificate | An ordinary HTTPS server that proxies to the relay's `:7080` |
+| TLS to a route name (`<workspace-id>-<machine>.$RELAY_HOST`): the phone's live session | **The gaviero machine**, with its private CA | Nobody on the VPS may decrypt it. The relay forwards the raw bytes (`:7443`) |
+
+An `http {}` server on 443 would try to terminate every connection, which would break the end-to-end TLS of the second kind. So 443 belongs to the `stream {}` block in `nginx-stream.conf`.
+- That block reads only the server name from the ClientHello (`ssl_preread`), without decrypting anything.
+- It then forwards the still-encrypted connection.
+- Only route names (`*.$RELAY_HOST`) go to the relay's splice port.
+- Everything else, `$RELAY_HOST` and **all your other HTTPS sites**, goes to one shared internal port, `127.0.0.1:8443`. There nginx terminates TLS and picks the site by `server_name`, exactly as it did on 443.
+- That port is reachable only through the stream block, never from the internet directly.
+- `proxy_protocol` on that listener recovers the client's IP address, which would otherwise always be 127.0.0.1.
 
 **Why there are separate `streams-*` directories:**
 - `sites-enabled/*` is included **inside** `http {}`, but a `stream {}` block must sit at the **top level** of nginx.conf. It can't go in `sites-*`.
@@ -114,36 +153,143 @@ The nginx config comes in two files. They follow the `*-available` / `*-enabled`
 ```bash
 sudo apt install nginx libnginx-mod-stream certbot python3-certbot-nginx
 nginx -V 2>&1 | grep -o 'with-stream[^ ]*\|stream_ssl_preread\|http_realip'
+ls /etc/nginx/modules-enabled/ | grep stream             # e.g. 50-mod-stream.conf
 ```
-All three names must appear. On Debian/Ubuntu, `with-stream=dynamic` is fine once `libnginx-mod-stream` is installed.
+- **Built:** all three names must appear in `nginx -V`.
+- **Loaded:** `with-stream=dynamic` (Debian/Ubuntu) means the module is built but loaded only by a `load_module` line. `libnginx-mod-stream` installs that line as `modules-enabled/50-mod-stream.conf`, and `nginx.conf` must keep `include /etc/nginx/modules-enabled/*.conf;` at its top.
+- **Symptom when it isn't loaded:** `nginx -t` fails with `unknown directive "stream"`.
+- **Fix:**
+  - **Package missing:** install `libnginx-mod-stream`.
+  - **Package installed but no loader file:** create it with:
+    ```bash
+    echo 'load_module modules/ngx_stream_module.so;' | sudo tee /etc/nginx/modules-enabled/50-mod-stream.conf
+    ```
 
 **4b. The certificate, before the site is enabled:**
 ```bash
-sudo certbot certonly --nginx -d gaviero.wuilder.com --deploy-hook "systemctl reload nginx"
+sudo certbot certonly --nginx -d "$RELAY_HOST" --deploy-hook "systemctl reload nginx"
 ```
 - **Why first:** `nginx-site.conf` points at this certificate, and nginx refuses to load a site whose `ssl_certificate` doesn't exist yet.
 - **How certbot answers the challenge without our site:** nginx must be running with port 80 reachable. Certbot's nginx mode then serves the challenge from the `listen 80 default_server` block (Debian's `default` site), or adds a temporary block of its own, and removes it afterwards.
 - **`certonly`** obtains the certificate without editing your nginx files.
 
 **4c. The relay's site (port 80 + HTTPS):**
+
+**Copy the site:**
 ```bash
-sudo install -m644 crates/gaviero-relay/deploy/nginx-site.conf /etc/nginx/sites-available/gaviero-relay
-sudo ln -s ../sites-available/gaviero-relay /etc/nginx/sites-enabled/gaviero-relay
+sudo cp crates/gaviero-relay/deploy/nginx-site.conf /etc/nginx/sites-available/gaviero-relay
+sudo nano /etc/nginx/sites-available/gaviero-relay
 ```
+
+**Edit four lines** in the copy. Only the name changes, and the `listen` lines stay as they are.
+
+Before:
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name gaviero.example.com;
+    …
+}
+
+server {
+    listen 127.0.0.1:8443 ssl proxy_protocol;
+    server_name gaviero.example.com;
+    …
+    ssl_certificate     /etc/letsencrypt/live/gaviero.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/gaviero.example.com/privkey.pem;
+```
+
+After (with your name):
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name gaviero.yourdomain.tld;
+    …
+}
+
+server {
+    listen 127.0.0.1:8443 ssl proxy_protocol;
+    server_name gaviero.yourdomain.tld;
+    …
+    ssl_certificate     /etc/letsencrypt/live/gaviero.yourdomain.tld/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/gaviero.yourdomain.tld/privkey.pem;
+```
+
+**Check and enable it:**
+- The two certificate paths must match what `sudo certbot certificates` lists for this name (step 4b). A repeated issue can create `…/live/<name>-0001/`.
+- `grep -n example /etc/nginx/sites-available/gaviero-relay` must print nothing.
+- Then link it:
+  ```bash
+  sudo ln -s ../sites-available/gaviero-relay /etc/nginx/sites-enabled/gaviero-relay
+  ```
+
+**Notes:**
 - **Renewals** are automatic (certbot's systemd timer) and go through this site's port-80 block, so keep port 80 open.
 - **Check renewal** with `sudo certbot renew --dry-run` once step 4e is done.
 
 **4d. The `:443` SNI router (`streams-available` / `streams-enabled`, top level):**
+**Copy the router:**
 ```bash
 sudo install -d /etc/nginx/streams-available /etc/nginx/streams-enabled
-sudo install -m644 crates/gaviero-relay/deploy/nginx-stream.conf /etc/nginx/streams-available/gaviero-relay
-sudo ln -s ../streams-available/gaviero-relay /etc/nginx/streams-enabled/gaviero-relay
-grep -q 'streams-enabled/' /etc/nginx/nginx.conf || echo 'include /etc/nginx/streams-enabled/*;' | sudo tee -a /etc/nginx/nginx.conf
+sudo cp crates/gaviero-relay/deploy/nginx-stream.conf /etc/nginx/streams-available/gaviero-relay
+sudo nano /etc/nginx/streams-available/gaviero-relay
 ```
-- **The `include` is the only edit to nginx.conf.** Appending it to the end of the file puts it at top level, outside `http {}`, which is where `stream {}` must be.
-- **Check with `tail -3 /etc/nginx/nginx.conf`.** The `include` must come after the closing `}` of `http`, not inside it.
 
-Before reloading, read [Other HTTPS sites on the same nginx](#other-https-sites-on-the-same-nginx). If any other site in `sites-enabled` still has `listen 443`, nginx can't bind the port.
+**Edit two map entries** in the copy. Keep the leading `*.` on the second one.
+
+Before:
+```nginx
+    map $ssl_preread_server_name $gaviero_upstream {
+        hostnames;
+        gaviero.example.com    127.0.0.1:8443;   # the relay's own HTTPS (nginx-site.conf)
+        *.gaviero.example.com  127.0.0.1:7443;   # route names: phone TLS → relay splice port (--splice)
+        default                127.0.0.1:8443;   # every other name: all your HTTPS sites
+    }
+```
+
+After (with your name):
+```nginx
+    map $ssl_preread_server_name $gaviero_upstream {
+        hostnames;
+        gaviero.yourdomain.tld    127.0.0.1:8443;   # the relay's own HTTPS (nginx-site.conf)
+        *.gaviero.yourdomain.tld  127.0.0.1:7443;   # route names: phone TLS → relay splice port (--splice)
+        default                   127.0.0.1:8443;   # every other name: all your HTTPS sites
+    }
+```
+
+`grep -n example /etc/nginx/streams-available/gaviero-relay` must print nothing.
+
+**Enable it:**
+```bash
+sudo ln -s ../streams-available/gaviero-relay /etc/nginx/streams-enabled/gaviero-relay
+```
+
+**Edit `/etc/nginx/nginx.conf` once.** This is the only change to that file. Add one `include` line at the very end, after the closing `}` of `http`.
+
+Before:
+```nginx
+http {
+    …
+    include /etc/nginx/sites-enabled/*;
+}
+```
+
+After:
+```nginx
+http {
+    …
+    include /etc/nginx/sites-enabled/*;
+}
+
+include /etc/nginx/streams-enabled/*;
+```
+
+- **Why at the very end:** that puts the `include` at top level, outside `http {}`, which is where `stream {}` must be.
+- **Inside `http {}` it fails:** if it lands there, `nginx -t` reports `"stream" directive is not allowed here`.
+
+Before reloading, move your other HTTPS sites first; see [Other HTTPS sites on the same nginx](#other-https-sites-on-the-same-nginx). If any site in `sites-enabled` still has `listen 443`, nginx can't bind the port.
 
 **4e. Validate and reload:**
 ```bash
@@ -152,28 +298,68 @@ sudo nginx -t && sudo systemctl reload nginx
 
 #### Other HTTPS sites on the same nginx
 
-Once the `stream` block owns `:443`, **nothing else may `listen 443`** on this host. That includes ntfy while you still run it. Move each other HTTPS site to its own loopback port and add it to the map.
+Once the `stream` block owns `:443`, **nothing else may `listen 443`** on this host. That includes ntfy while you still run it.
 
-To find them, run `grep -l 'listen.*443' /etc/nginx/sites-enabled/*`.
+**What stays the same:**
+- Your sites keep their certificates, their `location`/`proxy_pass` blocks and their port-80 redirect blocks.
+- TLS still ends at nginx with each site's Let's Encrypt certificate.
+- The stream map needs no change: every name that isn't a relay route already goes to `127.0.0.1:8443`.
 
-1. **Change its `listen` lines.** In that site's file in `/etc/nginx/sites-available/`, find the `server { … }` with `listen 443 ssl` (and `listen [::]:443 ssl`, plus any `quic`/`http2` listen flags). Replace those lines with:
-   ```nginx
-   listen 127.0.0.1:8445 ssl proxy_protocol;   # one free loopback port per site
-   set_real_ip_from 127.0.0.1;
-   real_ip_header proxy_protocol;
-   ```
-   Keep its `ssl_certificate` lines. `http2 on;` may stay for ordinary sites.
-2. **Add the site to the map** in `/etc/nginx/streams-available/gaviero-relay`, above `default`:
-   ```nginx
-   ntfy.wuilder.com  127.0.0.1:8445;
-   ```
-3. **Validate and reload:** `sudo nginx -t && sudo systemctl reload nginx`.
+**The only change is each site's `listen 443` lines.**
 
-Certbot renewals for those sites keep working, because they use port 80.
+To find the sites, run `grep -ln 'listen.*443' /etc/nginx/sites-enabled/*`.
+
+A typical certbot-managed site, before:
+
+```nginx
+server {
+    server_name app.example.com;
+    location / { proxy_pass http://127.0.0.1:3000; … }
+
+    listen [::]:443 ssl ipv6only=on; # managed by Certbot
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/app.example.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/app.example.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+}
+```
+
+After (only the two `listen` lines change, plus two new lines):
+
+```nginx
+server {
+    server_name app.example.com;
+    location / { proxy_pass http://127.0.0.1:3000; … }
+
+    listen 127.0.0.1:8443 ssl proxy_protocol;   # was: listen 443 ssl + listen [::]:443 ssl
+    set_real_ip_from 127.0.0.1;                 # take the client IP from the PROXY line,
+    real_ip_header proxy_protocol;              #   so $remote_addr / logs stay correct
+    ssl_certificate /etc/letsencrypt/live/app.example.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/app.example.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+}
+```
+
+**Rules for the shared port:**
+- **Every** site uses the same `listen 127.0.0.1:8443 ssl proxy_protocol;`. Same port, same options; no per-site ports.
+- **Drop the IPv6 `listen [::]:443` line.** The stream block already listens on `[::]:443` and forwards over IPv4 loopback.
+- **Drop any `quic` / `listen 443 quic` lines.** HTTP/3 would need UDP 443, which this setup doesn't carry.
+- **HTTP/2:** keep `http2 on;` if a site has it, since it's per site. But replace the old `listen 443 ssl http2;` flag with the plain line above: on a shared port, that flag would switch HTTP/2 on for every site, including the relay's, which must stay HTTP/1.1 for its WebSockets.
+- **`default_server`:** if one site had `listen 443 ssl default_server`, keep the flag on exactly one site: `listen 127.0.0.1:8443 ssl proxy_protocol default_server;`.
+- **Don't change the port-80 blocks** (the `return 301 https://…` redirects certbot wrote). Renewals use them.
+
+**Then:**
+1. Validate and reload: `sudo nginx -t && sudo systemctl reload nginx`.
+2. Check each site: `curl -sI https://app.example.com | head -1`.
+3. Check renewals still work: `sudo certbot renew --dry-run`.
+
+**Adding a site later:** give it the same `listen 127.0.0.1:8443 ssl proxy_protocol;` and the two `real_ip` lines. If you run `certbot --nginx` (install mode), it may add `listen 443 ssl; # managed by Certbot` again; replace that line, then run `nginx -t`.
 
 ### 5. Firewall
 
-Open 80 and 443 only. The relay's own ports (7080, 7443) and nginx's loopback listeners (8444, …) are bound to 127.0.0.1. With ufw:
+Open 80 and 443 only. The relay's own ports (7080, 7443) and nginx's shared HTTPS listener (8443) are bound to 127.0.0.1. With ufw:
 
 ```bash
 sudo ufw allow OpenSSH && sudo ufw allow 80,443/tcp && sudo ufw enable
@@ -183,16 +369,28 @@ sudo ufw allow OpenSSH && sudo ufw allow 80,443/tcp && sudo ufw enable
 
 On the VPS:
 ```bash
-curl -s https://gaviero.wuilder.com/healthz                         # ok
-curl -si https://gaviero.wuilder.com/v1/phone/stream | head -1     # HTTP/1.1 401 (no secret)
-curl -sN --max-time 5 -H "Authorization: Bearer $(head -1 ~/.config/gaviero-relay/secret)" \
-  https://gaviero.wuilder.com/v1/phone/stream                       # {"type":"presence","epoch":"…","routes":[]}
+curl -sS "https://$RELAY_HOST/healthz"                             # ok
+curl -sSi "https://$RELAY_HOST/v1/phone/stream" | head -1         # HTTP/1.1 401 (no secret)
+curl -sSN --max-time 5 -H "Authorization: Bearer $(head -1 ~/.config/gaviero-relay/secret)" \
+  "https://$RELAY_HOST/v1/phone/stream"                            # {"type":"presence","epoch":"…","routes":[]}
 ```
+
+- **`-S` matters.** `-s` on its own hides every curl error, so a TLS failure or a timeout prints nothing at all.
+- The stream never ends by itself, so the last command finishing with `curl: (28) Operation timed out` **after** the presence line is expected.
+- **Nothing printed, or only the timeout:** run the last command again with `-v` instead of `-sS`, then ask the relay directly, bypassing nginx:
+  ```bash
+  curl -sSN --max-time 5 -H "Authorization: Bearer $(head -1 ~/.config/gaviero-relay/secret)" \
+    http://127.0.0.1:7080/v1/phone/stream
+  ```
+  If that prints the presence line, the relay is fine and the fault is in nginx (the table below). If it doesn't, check `journalctl --user -u gaviero-relay`.
 
 | Symptom | Likely cause |
 |---|---|
+| `curl: (28)` with no line before it | Something between nginx and the relay buffers the stream: the request reached a `server` other than `nginx-site.conf`'s (check with `-v` which certificate and headers come back), or the installed site lacks `proxy_buffering off` |
+| `HTTP/1.1 404` with an empty body | The running relay binary predates `/v1/phone/stream`: rebuild and reinstall it ([Updating](#updating)) |
 | Connection refused or timeout | DNS, firewall, or the stream block isn't loaded (step 4d: the `streams-enabled` link or the top-level `include`) |
-| Certificate error | `gaviero-relay` isn't linked in `sites-enabled`, or the map doesn't send `gaviero.wuilder.com` to `:8444` |
+| Certificate error, e.g. `curl: (60) no alternative certificate subject name matches` | No `server` on `127.0.0.1:8443` has `server_name $RELAY_HOST`, so nginx answers with another site's certificate. To see which one, run `openssl s_client -connect $RELAY_HOST:443 -servername $RELAY_HOST </dev/null 2>/dev/null \| openssl x509 -noout -subject`. Then check step 4c: the site is linked in `sites-enabled`, its `listen` is `127.0.0.1:8443` (an older template used 8444), and both `server_name` lines carry your name. Also check that the map sends `$RELAY_HOST` to `:8443` (step 4d) |
+| One of your other sites shows the wrong certificate or a connection error | That site still has `listen 443`, or it lacks `proxy_protocol` on its `127.0.0.1:8443` listen line |
 | `502 Bad Gateway` | The relay isn't running (step 3) |
 | These checks pass and `/remote` says `registered`, but the phone can't open a session | The PROXY setting doesn't match: the relay's `--proxy-protocol` and `proxy_protocol on` in `nginx-stream.conf` must both be on. With `RUST_LOG=gaviero_relay=debug`, the journal shows `missing or bad PROXY header` or `no ClientHello` |
 | Journal: `no host registered for route` | The phone is paired with an instance that isn't running or isn't registered (check `/remote` on that machine) |
@@ -209,7 +407,7 @@ ssh <user>@<vps> head -1 .config/gaviero-relay/secret
 
 ```json
 { "remote": { "relay": {
-    "host": "gaviero.wuilder.com",
+    "host": "gaviero.example.com",
     "secret": "<the 64-hex-character secret>"
 } } }
 ```
@@ -259,8 +457,8 @@ Tapping an alert opens that conversation.
 
 **The ntfy app is no longer needed.** Retire ntfy only after alerts work on your phone:
 1. stop and disable the ntfy user service;
-2. remove its line from the map in `streams-available/gaviero-relay`, remove its link from `sites-enabled`, then reload nginx and delete the DNS record;
-3. run `sudo certbot delete --cert-name ntfy.wuilder.com`;
+2. remove its link from `sites-enabled`, then reload nginx and delete the DNS record;
+3. run `sudo certbot delete --cert-name ntfy.example.com`;
 4. set `notifications.ntfy.enabled: false` in gaviero.
 
 ## Operations
@@ -308,17 +506,13 @@ systemctl --user restart gaviero-relay
 2. **On every machine**, put it in `remote.relay.secret` and restart gaviero.
 3. **On the phone**, re-pair each machine. The old QR carries the old secret.
 
-### Using another domain
+### Changing the relay's name
 
-Replace `gaviero.wuilder.com` in:
-- the DNS record;
-- `deploy/gaviero-relay.service` (`--public-host`);
-- both `deploy/nginx-*.conf` files (`server_name`, the map, the certificate paths), or their copies in `sites-available` / `streams-available` if they're already installed;
-- the certbot command;
-- `remote.relay.host` on every machine.
-
-For example:
-
-```bash
-sed -i 's/gaviero\.wuilder\.com/gaviero.example.org/g' crates/gaviero-relay/deploy/*
-```
+1. **On the VPS:**
+   - point the new DNS record at the VPS;
+   - set `RELAY_HOST` to the new name;
+   - change the name in the installed copies, using the same lines as in steps 3, 4c and 4d;
+   - issue a certificate for the new name (step 4b);
+   - reload nginx and restart the relay.
+2. **On every machine,** update `remote.relay.host` and restart gaviero.
+3. **On the phone,** re-pair each machine. Route names include the relay's name.

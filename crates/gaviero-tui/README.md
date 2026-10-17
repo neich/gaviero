@@ -135,7 +135,7 @@ Remote access (on by default) is configured under `remote.*`. Empty `magicDnsHos
 }
 ```
 
-Without Tailscale (and without ntfy), through a VPS you control: run [gaviero-relay](../gaviero-relay/README.md) behind nginx on one subdomain, then set `remote.relay: { "host": "gaviero.wuilder.com", "secret": "…" }` on every machine.
+Without Tailscale (and without ntfy), through a VPS you control: run [gaviero-relay](../gaviero-relay/README.md) behind nginx on one subdomain, then set `remote.relay: { "host": "gaviero.example.com", "secret": "…" }` on every machine.
 - **gaviero dials out:** it registers `<workspace-id>-<machine>.<host>`.
 - **The relay stays blind:** the phone reaches the instance by SNI through the relay, with TLS end to end against a per-machine CA (`~/.gaviero/remote/tls/pinned/`) that the app pins from the pairing QR.
 - **Notifications go to the relay:** AgentFinished/AgentWaiting are sent there for the app's background alert service.

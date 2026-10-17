@@ -145,7 +145,7 @@ impl TokenScope {
 /// dials OUT to `gaviero-relay`; phones reach it by SNI through the relay.
 #[derive(Clone)]
 pub struct RelayConfig {
-    /// The relay's public name, e.g. `gaviero.wuilder.com`.
+    /// The relay's public name, e.g. `gaviero.example.com`.
     pub host: String,
     pub secret: String,
     /// `wss://<host>` unless `remote.relay.url` overrides it.
