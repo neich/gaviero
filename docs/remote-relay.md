@@ -16,7 +16,7 @@ phone background service ◀── /v1/phone/stream (notifications, replaces ntf
 
 ```json
 { "remote": { "relay": {
-    "host": "gaviero.wuilder.com",
+    "host": "gaviero.example.com",
     "secret": "<the relay's --secret-file contents>"
 } } }
 ```
