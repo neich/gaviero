@@ -1,4 +1,6 @@
 # systemd USER unit (~/.config/systemd/user/gaviero-relay.service).
+# TEMPLATE: after copying, put your relay's name in the --public-host line
+# (README step 3 shows the edit).
 # Enable with:  systemctl --user daemon-reload && systemctl --user enable --now gaviero-relay
 # and once:     sudo loginctl enable-linger "$USER"   (start at boot, survive logout)
 [Unit]
@@ -9,7 +11,7 @@ ExecStart=%h/.local/bin/gaviero-relay \
     --http 127.0.0.1:7080 \
     --splice 127.0.0.1:7443 \
     --secret-file %h/.config/gaviero-relay/secret \
-    --public-host gaviero.wuilder.com \
+    --public-host gaviero.example.com \
     --proxy-protocol
 Environment=RUST_LOG=gaviero_relay=info
 Restart=on-failure
