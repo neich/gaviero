@@ -475,7 +475,7 @@ impl CodexAppServerSession {
 
         let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
         let thread_id = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            HANDSHAKE_TIMEOUT,
             handshake(
                 &mut stdin,
                 &mut lines,
@@ -726,11 +726,28 @@ async fn handshake(
     ));
     let request_id = next_id();
     write_msg(stdin, &rpc_request(method, request_id, params)).await?;
-    read_thread_id(lines).await
+    read_thread_id(lines, request_id)
+        .await
+        .with_context(|| format!("codex app-server: {method} failed"))
 }
 
-async fn read_until_response(
-    lines: &mut Lines<BufReader<ChildStdout>>,
+/// Handshake deadline. Codex holds `thread/start` until every
+/// `required = true` MCP server is ready, up to its `startup_timeout_sec`
+/// (60 s in the synthesized config), so the deadline must outlast that or a
+/// slow-but-healthy server reads as a hung app-server.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Message of a JSON-RPC error object, falling back to the raw object.
+fn rpc_error_message(error: &serde_json::Value) -> String {
+    error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
     expected_id: u64,
 ) -> Result<()> {
     while let Ok(Some(line)) = lines.next_line().await {
@@ -739,7 +756,7 @@ async fn read_until_response(
         };
         if value.get("id").and_then(|id| id.as_u64()) == Some(expected_id) {
             if let Some(error) = value.get("error") {
-                anyhow::bail!("codex app-server RPC error: {error}");
+                anyhow::bail!("codex app-server RPC error: {}", rpc_error_message(error));
             }
             return Ok(());
         }
@@ -747,7 +764,10 @@ async fn read_until_response(
     anyhow::bail!("codex app-server: stdout closed before receiving response id={expected_id}")
 }
 
-async fn read_thread_id(lines: &mut Lines<BufReader<ChildStdout>>) -> Result<String> {
+async fn read_thread_id<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    request_id: u64,
+) -> Result<String> {
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
@@ -755,6 +775,13 @@ async fn read_thread_id(lines: &mut Lines<BufReader<ChildStdout>>) -> Result<Str
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        // An error reply (e.g. a `required` MCP server failed to start) is
+        // final: no `thread/started` follows it.
+        if value.get("id").and_then(|id| id.as_u64()) == Some(request_id)
+            && let Some(error) = value.get("error")
+        {
+            anyhow::bail!("{}", rpc_error_message(error));
+        }
         if value.get("method").and_then(|method| method.as_str()) == Some("thread/started") {
             return Ok(value
                 .pointer("/params/thread/id")
@@ -2115,6 +2142,33 @@ mod tests {
     use crate::observer::WriteGateObserver;
     use crate::types::WriteProposal;
     use crate::write_gate::WriteMode;
+
+    fn lines_of(text: &'static str) -> Lines<BufReader<&'static [u8]>> {
+        BufReader::new(text.as_bytes()).lines()
+    }
+
+    #[tokio::test]
+    async fn read_thread_id_surfaces_the_thread_start_error() {
+        let mut lines = lines_of(concat!(
+            "{\"method\":\"account/updated\",\"params\":{}}\n",
+            "{\"id\":7,\"error\":{\"code\":-32603,\"message\":\"required MCP servers failed to initialize: arxiv\"}}\n",
+            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"late\"}}}\n",
+        ));
+        let err = read_thread_id(&mut lines, 7).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("required MCP servers failed to initialize: arxiv"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_thread_id_ignores_errors_for_other_requests() {
+        let mut lines = lines_of(concat!(
+            "{\"id\":3,\"error\":{\"message\":\"unrelated\"}}\n",
+            "{\"id\":7,\"result\":{\"thread\":{\"id\":\"t-1\"}}}\n",
+        ));
+        assert_eq!(read_thread_id(&mut lines, 7).await.unwrap(), "t-1");
+    }
 
     struct NoopAcpObserver;
 
