@@ -9,49 +9,100 @@
 use super::store::{EdgeKind, GraphStore, NodeKind};
 
 /// A raw reference extracted from source code, before cross-file resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawReference {
-    /// The identifier or path being referenced (e.g. "foo", "crate::bar::baz").
+    /// The referenced name: the last path segment of a call or an imported
+    /// item (`helper` for `beta_core::util::helper()`).
     pub target_name: String,
     /// What kind of reference this is.
     pub kind: RefKind,
     /// Line number in source where the reference appears.
     pub line: usize,
+    /// The written path, all segments including `target_name`
+    /// (`["beta_core", "util", "helper"]`), for scoped calls, imports and
+    /// implemented traits. Empty for bare and method calls.
+    pub path: Vec<String>,
+    /// How a call was written. `Bare` for non-calls.
+    pub style: CallStyle,
+    /// Local binding of an import when it differs from `target_name`
+    /// (`use a::b as c;`, `import { x as y }`, `from m import f as g`).
+    pub alias: Option<String>,
+    /// Import of everything in a module (`use p::*`, `from m import *`).
+    pub glob: bool,
+    /// Re-export (`pub use`, TS `export … from`).
+    pub public: bool,
+    /// TypeScript / Python import source as written (`./math`, `.tools`,
+    /// `pkg.core`).
+    pub module: Option<String>,
+    /// TypeScript / Python member call receiver when it is a plain
+    /// identifier (`m` in `m.mul()`).
+    pub receiver: Option<String>,
+    /// Rust method calls: how the receiver was written, locals
+    /// substituted (receiver-typing plan R3).
+    pub receiver_expr: Option<super::types::ReceiverExpr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RefKind {
     /// `use x::y` or `mod x` — module-level import.
     Import,
     /// `foo()` — function/method call.
+    #[default]
     Call,
     /// `impl Trait for Type` — trait implementation.
     Implements,
 }
 
+/// How a call was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallStyle {
+    /// `foo()`
+    #[default]
+    Bare,
+    /// `a::b::foo()`
+    Scoped,
+    /// `x.foo()`
+    Method,
+}
+
+impl RawReference {
+    pub(super) fn new(target_name: impl Into<String>, kind: RefKind, line: usize) -> Self {
+        Self {
+            target_name: target_name.into(),
+            kind,
+            line,
+            ..Default::default()
+        }
+    }
+}
+
 /// Extract raw references from a supported source extension.
 ///
 /// Resolution order:
-/// 1. **Query-driven** (`.scm`) extraction when an `edges.scm` is bundled
-///    or installed for the language ([`extract_via_edges_query`]).
-///    Available today for Rust, TypeScript / TSX, and Python.
-/// 2. **Hand-rolled Rust extractor** for the legacy code path —
-///    redundant once the query path is shown to be byte-identical, but
-///    kept so a regression in the `.scm` file silently degrades to the
-///    proven walker rather than producing zero edges.
+/// 1. **Structured extractors** for Rust, TypeScript / TSX and Python:
+///    iterative AST walks that keep what [`super::resolve`] needs (written
+///    paths, call style, import bindings, re-exports). They run the same
+///    everywhere, whether or not a `queries/` directory is found.
+/// 2. **Query-driven** (`.scm`) extraction when an `edges.scm` is bundled
+///    or installed for another language ([`extract_via_edges_query`]).
 /// 3. **Generic AST walker** for the remaining tree-sitter languages.
-///
-/// Go is intentionally not in the priority set: its grammar isn't
-/// registered in the workspace yet. Once `tree-sitter-go` lands, drop
-/// in `queries/go/edges.scm` and it will be picked up automatically.
 pub fn extract_references_for_extension(ext: &str, source: &str) -> Vec<RawReference> {
+    // Languages with a structured extractor use it everywhere: the result
+    // must not depend on whether a `queries/` directory happens to be found
+    // next to the binary or in the current directory.
+    match ext {
+        "rs" => return extract_rust_references(source),
+        "ts" | "tsx" | "py" | "pyi" => {
+            if let Some(refs) = extract_structured(ext, source) {
+                return refs;
+            }
+        }
+        _ => {}
+    }
     if let Some(refs) = extract_via_edges_query(ext, source) {
         return refs;
     }
-    match ext {
-        "rs" => extract_rust_references(source),
-        _ => extract_generic_references(ext, source),
-    }
+    extract_generic_references(ext, source)
 }
 
 /// Map a file extension to the language directory under `queries/`.
@@ -165,11 +216,11 @@ fn extract_via_edges_query(ext: &str, source: &str) -> Option<Vec<RawReference>>
         if matches!(kind, RefKind::Call) && is_noise_call(&target) {
             continue;
         }
-        refs.push(RawReference {
-            target_name: target,
+        refs.push(RawReference::new(
+            target,
             kind,
-            line: head_node.unwrap_or(node).start_position().row,
-        });
+            head_node.unwrap_or(node).start_position().row,
+        ));
     }
     Some(refs)
 }
@@ -192,29 +243,47 @@ fn classify_capture(name: &str) -> (Option<RefKind>, bool) {
 
 /// Extract raw references from Rust source using tree-sitter.
 pub fn extract_rust_references(source: &str) -> Vec<RawReference> {
+    extract_rust_file(source).refs
+}
+
+/// A file's references and, for Rust, its type facts.
+#[derive(Debug, Clone, Default)]
+pub struct Extracted {
+    pub refs: Vec<RawReference>,
+    pub facts: Option<super::rust_walk::RustFileFacts>,
+}
+
+/// References of any supported file plus, for Rust, the type facts the
+/// receiver-typing resolver needs. One parse.
+pub fn extract_file(ext: &str, source: &str) -> Extracted {
+    if ext == "rs" {
+        let e = extract_rust_file(source);
+        return Extracted { refs: e.refs, facts: Some(e.facts) };
+    }
+    Extracted { refs: extract_references_for_extension(ext, source), facts: None }
+}
+
+/// Rust references and type facts.
+pub fn extract_rust_file(source: &str) -> super::rust_walk::RustExtracted {
     let language = crate::tree_sitter::language_for_extension("rs");
     let Some(language) = language else {
         // Should never happen — Rust grammar is statically registered.
         // Log loudly because zero edges from a Rust file is otherwise
         // indistinguishable from "the file legitimately has no refs".
         tracing::warn!(target: "repo_map_edges", ext = "rs", "rust grammar unavailable; emitting zero edges");
-        return Vec::new();
+        return Default::default();
     };
 
     let mut parser = tree_sitter::Parser::new();
     if let Err(e) = parser.set_language(&language) {
         tracing::warn!(target: "repo_map_edges", ext = "rs", error = %e, "rust parser language assignment failed");
-        return Vec::new();
+        return Default::default();
     }
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!(target: "repo_map_edges", ext = "rs", source_bytes = source.len(), "rust parse returned no tree");
-        return Vec::new();
+        return Default::default();
     };
-
-    let bytes = source.as_bytes();
-    let mut refs = Vec::new();
-    collect_rust_references(tree.root_node(), bytes, &mut refs);
-    refs
+    super::rust_walk::walk(tree.root_node(), source.as_bytes())
 }
 
 fn extract_generic_references(ext: &str, source: &str) -> Vec<RawReference> {
@@ -247,11 +316,11 @@ fn collect_generic_references(node: tree_sitter::Node, source: &[u8], out: &mut 
             if let Ok(text) = node.utf8_text(source)
                 && let Some(name) = import_target_name(text)
             {
-                out.push(RawReference {
-                    target_name: name,
-                    kind: RefKind::Import,
-                    line: node.start_position().row,
-                });
+                out.push(RawReference::new(
+                    name,
+                    RefKind::Import,
+                    node.start_position().row,
+                ));
             }
         }
         "call_expression" | "call" => {
@@ -261,11 +330,11 @@ fn collect_generic_references(node: tree_sitter::Node, source: &[u8], out: &mut 
                 && let Some(name) = terminal_identifier(func_node, source)
                 && !is_noise_call(&name)
             {
-                out.push(RawReference {
-                    target_name: name,
-                    kind: RefKind::Call,
-                    line: node.start_position().row,
-                });
+                out.push(RawReference::new(
+                    name,
+                    RefKind::Call,
+                    node.start_position().row,
+                ));
             }
         }
         "class_declaration" => {
@@ -273,11 +342,11 @@ fn collect_generic_references(node: tree_sitter::Node, source: &[u8], out: &mut 
                 if let Some(parent) = node.child_by_field_name(field)
                     && let Some(name) = terminal_identifier(parent, source)
                 {
-                    out.push(RawReference {
-                        target_name: name,
-                        kind: RefKind::Implements,
-                        line: node.start_position().row,
-                    });
+                    out.push(RawReference::new(
+                        name,
+                        RefKind::Implements,
+                        node.start_position().row,
+                    ));
                 }
             }
         }
@@ -359,98 +428,449 @@ fn terminal_identifier(node: tree_sitter::Node, source: &[u8]) -> Option<String>
     }
 }
 
-fn collect_rust_references(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawReference>) {
+/// Rewrite leading `super`s written `depth` inline modules deep so the path
+/// is relative to the file's module: `super::x` → `self::x` at depth 1,
+/// `super::super::x` → `super::x`.
+pub(super) fn lift_inline_super(path: &mut Vec<String>, depth: usize) {
+    let supers = path.iter().take_while(|s| *s == "super").count();
+    if supers == 0 {
+        return;
+    }
+    let rest = path.split_off(supers);
+    *path = if supers <= depth {
+        vec!["self".to_string()]
+    } else {
+        vec!["super".to_string(); supers - depth]
+    };
+    path.extend(rest);
+}
+
+/// The reference a call's `function` node makes, if it is worth an edge.
+pub(super) fn rust_call(func: tree_sitter::Node, source: &[u8], line: usize) -> Option<RawReference> {
+    let func = match func.kind() {
+        // `foo::<T>(…)` / `a::b::<T>(…)`
+        "generic_function" => func.child_by_field_name("function")?,
+        _ => func,
+    };
+    match func.kind() {
+        "identifier" => {
+            let name = func.utf8_text(source).ok()?;
+            (!is_noise_call(name)).then(|| RawReference::new(name, RefKind::Call, line))
+        }
+        "scoped_identifier" => {
+            let text = func.utf8_text(source).ok()?;
+            let path = path_segments(text);
+            let joined = path.join("::");
+            let name = path.last()?.clone();
+            if is_noise_call(&joined) {
+                return None;
+            }
+            Some(RawReference {
+                path,
+                style: CallStyle::Scoped,
+                ..RawReference::new(name, RefKind::Call, line)
+            })
+        }
+        "field_expression" => {
+            let name = func
+                .child_by_field_name("field")
+                .and_then(|n| n.utf8_text(source).ok())?;
+            (!is_noise_call(name)).then(|| RawReference {
+                style: CallStyle::Method,
+                ..RawReference::new(name, RefKind::Call, line)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Split a written Rust path into segments, dropping generic arguments
+/// (`Vec::<u8>::new` → `["Vec", "new"]`) and a leading `::`.
+pub(crate) fn path_segments(text: &str) -> Vec<String> {
+    let mut clean = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => clean.push(ch),
+            _ => {}
+        }
+    }
+    clean
+        .split("::")
+        .map(|s| s.trim().trim_start_matches("dyn ").trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Expand one `use` tree into leaf references, prefixing `prefix`.
+/// Bounded nesting (malformed input degrades to fewer references).
+pub(super) fn expand_use_tree(
+    node: tree_sitter::Node,
+    source: &[u8],
+    prefix: &[String],
+    public: bool,
+    line: usize,
+    depth: usize,
+    out: &mut Vec<RawReference>,
+) {
+    if depth > 32 {
+        return;
+    }
+    let joined = |tail: Vec<String>| -> Vec<String> {
+        let mut p = prefix.to_vec();
+        p.extend(tail);
+        p
+    };
+    let text = |n: tree_sitter::Node| n.utf8_text(source).ok().map(path_segments).unwrap_or_default();
+    let leaf = |path: Vec<String>, alias: Option<String>, glob: bool, out: &mut Vec<RawReference>| {
+        if path.is_empty() {
+            return;
+        }
+        // `self` inside a list names the prefix module itself.
+        let mut path = path;
+        if path.last().is_some_and(|s| s == "self") && path.len() > 1 {
+            path.pop();
+        }
+        let name = path.last().cloned().unwrap_or_default();
+        out.push(RawReference {
+            path,
+            alias,
+            glob,
+            public,
+            ..RawReference::new(name, RefKind::Import, line)
+        });
+    };
     match node.kind() {
-        // `use foo::bar::baz;` or `use foo::bar::{baz, qux};`
-        "use_declaration" => {
-            if let Some(path) = extract_use_path(node, source) {
-                out.push(RawReference {
-                    target_name: path,
-                    kind: RefKind::Import,
-                    line: node.start_position().row,
-                });
+        "use_as_clause" => {
+            let path = node.child_by_field_name("path").map(text).unwrap_or_default();
+            let alias = node
+                .child_by_field_name("alias")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string);
+            leaf(joined(path), alias, false, out);
+        }
+        "use_wildcard" => {
+            // `p::*`: the path is the wildcard's first named child, if any.
+            let path = node.named_child(0).map(text).unwrap_or_default();
+            leaf(joined(path), None, true, out);
+        }
+        "scoped_use_list" => {
+            let base = joined(node.child_by_field_name("path").map(text).unwrap_or_default());
+            if let Some(list) = node.child_by_field_name("list") {
+                let mut c = list.walk();
+                for child in list.named_children(&mut c) {
+                    expand_use_tree(child, source, &base, public, line, depth + 1, out);
+                }
             }
         }
-
-        // `impl Trait for Type { ... }`
-        "impl_item" => {
-            // Look for trait name in `impl <trait> for <type>`
-            if let Some(trait_node) = node.child_by_field_name("trait")
-                && let Ok(trait_name) = trait_node.utf8_text(source)
-            {
-                out.push(RawReference {
-                    target_name: trait_name.to_string(),
-                    kind: RefKind::Implements,
-                    line: node.start_position().row,
-                });
+        "use_list" => {
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                expand_use_tree(child, source, prefix, public, line, depth + 1, out);
             }
         }
+        "scoped_identifier" | "identifier" | "crate" | "self" | "super" | "metavariable" => {
+            leaf(joined(text(node)), None, false, out);
+        }
+        _ => {}
+    }
+}
 
-        // `foo(args)` — function calls
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                let name = match func_node.kind() {
-                    "identifier" => func_node.utf8_text(source).ok().map(|s| s.to_string()),
-                    "field_expression" => {
-                        // method.call() — extract the method name
-                        func_node
-                            .child_by_field_name("field")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .map(|s| s.to_string())
+/// Parse with the extension's grammar and run its structured walker.
+/// `None` when the grammar is unavailable (falls back to the other paths).
+fn extract_structured(ext: &str, source: &str) -> Option<Vec<RawReference>> {
+    let language = crate::tree_sitter::language_for_extension(ext)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let Some(tree) = parser.parse(source, None) else {
+        tracing::warn!(target: "repo_map_edges", ext, source_bytes = source.len(), "parse returned no tree");
+        return Some(Vec::new());
+    };
+    let bytes = source.as_bytes();
+    let mut refs = Vec::new();
+    let mut visit = |node: tree_sitter::Node| match ext {
+        "py" | "pyi" => python_node_references(node, bytes, &mut refs),
+        _ => ts_node_references(node, bytes, &mut refs),
+    };
+    walk_preorder(tree.root_node(), &mut visit);
+    Some(refs)
+}
+
+/// Iterative pre-order traversal (deep trees must not overflow the stack).
+fn walk_preorder<'t>(root: tree_sitter::Node<'t>, visit: &mut impl FnMut(tree_sitter::Node<'t>)) {
+    let mut cursor = root.walk();
+    loop {
+        visit(cursor.node());
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
+fn node_text<'s>(node: tree_sitter::Node, source: &'s [u8]) -> Option<&'s str> {
+    node.utf8_text(source).ok()
+}
+
+/// A string literal's contents (`'./math'` → `./math`).
+fn string_literal(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let s = node_text(node, source)?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// `a`, `a.b.c` — a receiver made only of names (no calls or indexing).
+fn plain_receiver(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let text = node_text(node, source)?.trim();
+    let ok = !text.is_empty()
+        && text
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$'));
+    ok.then(|| text.to_string())
+}
+
+/// TypeScript / TSX references at one node: one `Import` per import
+/// binding (default → `default`, namespace → `*`, side-effect → the
+/// specifier), `export … from` as public imports, calls and `new` with
+/// their receiver, and `extends` / `implements` clauses.
+fn ts_node_references(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawReference>) {
+    let line = node.start_position().row;
+    let import = |target: &str, alias: Option<String>, module: &str, public: bool, glob: bool| RawReference {
+        alias,
+        module: Some(module.to_string()),
+        public,
+        glob,
+        ..RawReference::new(target, RefKind::Import, line)
+    };
+    match node.kind() {
+        "import_statement" => {
+            let Some(module) = node
+                .child_by_field_name("source")
+                .and_then(|s| string_literal(s, source))
+            else {
+                return;
+            };
+            let mut c = node.walk();
+            let clause = node.children(&mut c).find(|n| n.kind() == "import_clause");
+            let Some(clause) = clause else {
+                out.push(import(&module, None, &module, false, false));
+                return;
+            };
+            let mut c = clause.walk();
+            for part in clause.named_children(&mut c) {
+                match part.kind() {
+                    "identifier" => {
+                        let local = node_text(part, source).map(str::to_string);
+                        out.push(import("default", local, &module, false, false));
                     }
-                    "scoped_identifier" => {
-                        // module::function() — extract the full path
-                        func_node.utf8_text(source).ok().map(|s| s.to_string())
+                    "namespace_import" => {
+                        let mut c = part.walk();
+                        let local = part
+                            .named_children(&mut c)
+                            .find(|n| n.kind() == "identifier")
+                            .and_then(|n| node_text(n, source))
+                            .map(str::to_string);
+                        out.push(import("*", local, &module, false, false));
                     }
-                    _ => None,
+                    "named_imports" => {
+                        let mut c = part.walk();
+                        for spec in part.named_children(&mut c).filter(|n| n.kind() == "import_specifier") {
+                            let Some(name) = spec.child_by_field_name("name").and_then(|n| node_text(n, source)) else {
+                                continue;
+                            };
+                            let alias = spec
+                                .child_by_field_name("alias")
+                                .and_then(|n| node_text(n, source))
+                                .map(str::to_string);
+                            out.push(import(name, alias, &module, false, false));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "export_statement" => {
+            let Some(module) = node
+                .child_by_field_name("source")
+                .and_then(|s| string_literal(s, source))
+            else {
+                return;
+            };
+            let mut c = node.walk();
+            let clause = node.children(&mut c).find(|n| n.kind() == "export_clause");
+            match clause {
+                Some(clause) => {
+                    let mut c = clause.walk();
+                    for spec in clause.named_children(&mut c).filter(|n| n.kind() == "export_specifier") {
+                        let Some(name) = spec.child_by_field_name("name").and_then(|n| node_text(n, source)) else {
+                            continue;
+                        };
+                        let alias = spec
+                            .child_by_field_name("alias")
+                            .and_then(|n| node_text(n, source))
+                            .map(str::to_string);
+                        out.push(import(name, alias, &module, true, false));
+                    }
+                }
+                // `export * from 'm'` / `export * as ns from 'm'`
+                None => out.push(import("*", None, &module, true, true)),
+            }
+        }
+        "call_expression" | "new_expression" => {
+            let field = if node.kind() == "call_expression" { "function" } else { "constructor" };
+            let Some(func) = node.child_by_field_name(field) else { return };
+            if let Some(r) = js_like_call(func, source, line, "member_expression", "object", "property") {
+                out.push(r);
+            }
+        }
+        "extends_clause" | "implements_clause" => {
+            let mut c = node.walk();
+            for ty in node.named_children(&mut c) {
+                let ty = if ty.kind() == "generic_type" {
+                    ty.child_by_field_name("name").unwrap_or(ty)
+                } else {
+                    ty
                 };
-                if let Some(name) = name {
-                    // Skip common stdlib calls that don't produce useful edges
-                    if !is_noise_call(&name) {
-                        out.push(RawReference {
-                            target_name: name,
-                            kind: RefKind::Call,
-                            line: node.start_position().row,
-                        });
+                if let Some(mut r) = js_like_call(ty, source, line, "member_expression", "object", "property") {
+                    r.kind = RefKind::Implements;
+                    out.push(r);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The reference a call target makes: a plain name (`Bare`) or a member
+/// access (`Method`, with its receiver when that is plain names).
+fn js_like_call(
+    func: tree_sitter::Node,
+    source: &[u8],
+    line: usize,
+    member_kind: &str,
+    object_field: &str,
+    property_field: &str,
+) -> Option<RawReference> {
+    match func.kind() {
+        "identifier" | "type_identifier" => {
+            let name = node_text(func, source)?;
+            (!is_noise_call(name)).then(|| RawReference::new(name, RefKind::Call, line))
+        }
+        k if k == member_kind || k == "nested_type_identifier" => {
+            let (object, property) = if k == member_kind {
+                (func.child_by_field_name(object_field)?, func.child_by_field_name(property_field)?)
+            } else {
+                (func.child_by_field_name("module")?, func.child_by_field_name("name")?)
+            };
+            let name = node_text(property, source)?;
+            if is_noise_call(name) {
+                return None;
+            }
+            Some(RawReference {
+                style: CallStyle::Method,
+                receiver: plain_receiver(object, source),
+                ..RawReference::new(name, RefKind::Call, line)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Python references at one node: `import a.b [as x]` (empty target, the
+/// module in `module`), `from m import x [as y]` / `*` (relative dots kept
+/// in `module`), calls with their dotted receiver, and base classes.
+fn python_node_references(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawReference>) {
+    let line = node.start_position().row;
+    match node.kind() {
+        "import_statement" => {
+            let mut c = node.walk();
+            for name in node.children_by_field_name("name", &mut c) {
+                let (module, alias) = match name.kind() {
+                    "aliased_import" => (
+                        name.child_by_field_name("name").and_then(|n| node_text(n, source)),
+                        name.child_by_field_name("alias")
+                            .and_then(|n| node_text(n, source))
+                            .map(str::to_string),
+                    ),
+                    _ => (node_text(name, source), None),
+                };
+                if let Some(module) = module {
+                    out.push(RawReference {
+                        module: Some(module.trim().to_string()),
+                        alias,
+                        ..RawReference::new("", RefKind::Import, line)
+                    });
+                }
+            }
+        }
+        "import_from_statement" => {
+            let Some(module) = node
+                .child_by_field_name("module_name")
+                .and_then(|n| node_text(n, source))
+                .map(|s| s.split_whitespace().collect::<String>())
+            else {
+                return;
+            };
+            let mut c = node.walk();
+            if node.children(&mut c).any(|n| n.kind() == "wildcard_import") {
+                out.push(RawReference {
+                    module: Some(module),
+                    glob: true,
+                    ..RawReference::new("*", RefKind::Import, line)
+                });
+                return;
+            }
+            let mut c = node.walk();
+            for name in node.children_by_field_name("name", &mut c) {
+                let (target, alias) = match name.kind() {
+                    "aliased_import" => (
+                        name.child_by_field_name("name").and_then(|n| node_text(n, source)),
+                        name.child_by_field_name("alias")
+                            .and_then(|n| node_text(n, source))
+                            .map(str::to_string),
+                    ),
+                    _ => (node_text(name, source), None),
+                };
+                if let Some(target) = target {
+                    out.push(RawReference {
+                        module: Some(module.clone()),
+                        alias,
+                        ..RawReference::new(target.trim(), RefKind::Import, line)
+                    });
+                }
+            }
+        }
+        "call" => {
+            if let Some(func) = node.child_by_field_name("function")
+                && let Some(r) = js_like_call(func, source, line, "attribute", "object", "attribute")
+            {
+                out.push(r);
+            }
+        }
+        "class_definition" => {
+            if let Some(bases) = node.child_by_field_name("superclasses") {
+                let mut c = bases.walk();
+                for base in bases.named_children(&mut c) {
+                    if let Some(mut r) = js_like_call(base, source, line, "attribute", "object", "attribute") {
+                        r.kind = RefKind::Implements;
+                        out.push(r);
                     }
                 }
             }
         }
-
         _ => {}
     }
-
-    // Recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_rust_references(child, source, out);
-    }
-}
-
-/// Extract the path from a `use` declaration.
-/// Handles: `use foo::bar;`, `use foo::bar as baz;`, `use foo::bar::*;`
-fn extract_use_path(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    // The argument child contains the path
-    let arg = node.child_by_field_name("argument").or_else(|| {
-        // Some tree-sitter versions use a different structure
-        let mut cursor = node.walk();
-        node.children(&mut cursor).find(|c| {
-            c.kind() == "use_as_clause"
-                || c.kind() == "scoped_use_list"
-                || c.kind() == "use_wildcard"
-                || c.kind() == "scoped_identifier"
-                || c.kind() == "identifier"
-        })
-    })?;
-
-    // Get the text and clean it up
-    let text = arg.utf8_text(source).ok()?;
-    // Strip `as alias` suffix
-    let path = text.split(" as ").next().unwrap_or(text);
-    // Strip trailing ::* or ::{...}
-    let path = path.split("::{").next().unwrap_or(path);
-    let path = path.strip_suffix("::*").unwrap_or(path);
-    Some(path.trim().to_string())
 }
 
 /// Filter out common stdlib/macro calls that are noise for dependency analysis.
@@ -614,6 +1034,7 @@ pub fn is_test_file(file_path: &str) -> bool {
 pub fn node_kind_from_ts(ts_kind: &str, file_path: &str) -> NodeKind {
     match ts_kind {
         "function_item"
+        | "function_signature_item"
         | "function_definition"
         | "function_declaration"
         | "method_declaration"
@@ -663,6 +1084,216 @@ use super::models::WorkUnit;
             "imports: {:?}",
             imports
         );
+    }
+
+    fn imports(src: &str) -> Vec<(Vec<String>, Option<String>, bool, bool)> {
+        extract_rust_references(src)
+            .into_iter()
+            .filter(|r| r.kind == RefKind::Import)
+            .map(|r| (r.path, r.alias, r.glob, r.public))
+            .collect()
+    }
+
+    fn p(s: &str) -> Vec<String> {
+        s.split("::").map(str::to_string).collect()
+    }
+
+    #[test]
+    fn use_trees_expand_to_leaves_with_aliases_globs_and_visibility() {
+        let got = imports(
+            "extern crate beta_core;\n\
+             extern crate foo as bar;\n\
+             use beta_core::shapes::widget::Widget;\n\
+             use beta_core::util::{self, helper as h, nested::{deep, deeper::*}};\n\
+             use engine::*;\n\
+             use super::widget::Widget as W2;\n\
+             pub use shapes::gadget::Gadget;\n\
+             pub(crate) use crate::x;\n\
+             use self::parts::Part;\n",
+        );
+        let want = vec![
+            (p("beta_core"), None, false, false),
+            (p("foo"), Some("bar".into()), false, false),
+            (p("beta_core::shapes::widget::Widget"), None, false, false),
+            (p("beta_core::util"), None, false, false),
+            (p("beta_core::util::helper"), Some("h".into()), false, false),
+            (p("beta_core::util::nested::deep"), None, false, false),
+            (p("beta_core::util::nested::deeper"), None, true, false),
+            (p("engine"), None, true, false),
+            (p("super::widget::Widget"), Some("W2".into()), false, false),
+            (p("shapes::gadget::Gadget"), None, false, true),
+            (p("crate::x"), None, false, true),
+            (p("self::parts::Part"), None, false, false),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn calls_keep_their_written_path_and_style() {
+        let refs = extract_rust_references(
+            "fn main() {\n\
+             h();\n\
+             util::only_here();\n\
+             Widget::new();\n\
+             w.spin();\n\
+             beta_core::util::helper();\n\
+             Vec::<u8>::with_capacity(1);\n\
+             parse::<u32>();\n\
+             String::new();\n\
+             v.push(1);\n\
+             }\n\
+             impl beta_core::observe::Observer for X {}\n",
+        );
+        let calls: Vec<(String, CallStyle, Vec<String>)> = refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Call)
+            .map(|r| (r.target_name.clone(), r.style, r.path.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("h".into(), CallStyle::Bare, vec![]),
+                ("only_here".into(), CallStyle::Scoped, p("util::only_here")),
+                ("new".into(), CallStyle::Scoped, p("Widget::new")),
+                ("spin".into(), CallStyle::Method, vec![]),
+                ("helper".into(), CallStyle::Scoped, p("beta_core::util::helper")),
+                ("with_capacity".into(), CallStyle::Scoped, p("Vec::with_capacity")),
+                ("parse".into(), CallStyle::Bare, vec![]),
+            ],
+            "String::new and v.push stay filtered as noise"
+        );
+        let implements: Vec<&RawReference> =
+            refs.iter().filter(|r| r.kind == RefKind::Implements).collect();
+        assert_eq!(implements.len(), 1);
+        assert_eq!(implements[0].target_name, "Observer");
+        assert_eq!(implements[0].path, p("beta_core::observe::Observer"));
+    }
+
+    #[test]
+    fn malformed_use_degrades_without_panicking() {
+        let refs = extract_rust_references("use a::{b, ;\nuse ::{;\nuse ;\nfn f() { g(); }\n");
+        assert!(refs.iter().any(|r| r.kind == RefKind::Call && r.target_name == "g"));
+    }
+
+    #[test]
+    fn super_inside_an_inline_module_stays_in_the_file() {
+        let src = "use super::outer;\n\
+                   mod tests {\n    use super::*;\n    use super::super::up;\n    fn t() { super::helper(); }\n}\n\
+                   fn after() { super::x(); }\n";
+        let paths: Vec<String> = extract_rust_references(src)
+            .iter()
+            .map(|r| r.path.join("::"))
+            .collect();
+        assert_eq!(
+            paths,
+            ["super::outer", "self", "super::up", "self::helper", "super::x"],
+            "only references inside `mod tests {{ }}` are lifted"
+        );
+    }
+
+    #[test]
+    fn calls_to_local_closures_are_not_references() {
+        let src = "fn f() { let row = |x: i32| x + 1; row(1); other(2); }\n";
+        let calls: Vec<String> = extract_rust_references(src)
+            .into_iter()
+            .filter(|r| r.kind == RefKind::Call)
+            .map(|r| r.target_name)
+            .collect();
+        assert_eq!(calls, ["other"]);
+    }
+
+    /// `(kind, target, alias, module, receiver, public, glob)` per reference.
+    type Row = (RefKind, String, Option<String>, Option<String>, Option<String>, bool, bool);
+
+    fn rows(refs: &[RawReference]) -> Vec<Row> {
+        refs.iter()
+            .map(|r| {
+                (
+                    r.kind,
+                    r.target_name.clone(),
+                    r.alias.clone(),
+                    r.module.clone(),
+                    r.receiver.clone(),
+                    r.public,
+                    r.glob,
+                )
+            })
+            .collect()
+    }
+
+    fn row(kind: RefKind, t: &str, alias: Option<&str>, module: Option<&str>, recv: Option<&str>, public: bool, glob: bool) -> Row {
+        (
+            kind,
+            t.into(),
+            alias.map(Into::into),
+            module.map(Into::into),
+            recv.map(Into::into),
+            public,
+            glob,
+        )
+    }
+
+    #[test]
+    fn typescript_imports_exports_and_calls_keep_their_bindings() {
+        let src = "import { add, mul as times } from './math';\n\
+                   import * as ns from '../lib';\n\
+                   import makeCircle, { Circle } from './shapes';\n\
+                   import 'polyfill';\n\
+                   export { Circle as Round } from './circle';\n\
+                   export * from './all';\n\
+                   class Big extends Base implements Shape {}\n\
+                   add(1); ns.f(); a.b.c(); new Circle(); this.x.y(); makeCircle().area();\n";
+        let refs = extract_references_for_extension("ts", src);
+        let (imp, call) = (RefKind::Import, RefKind::Call);
+        let got = rows(&refs);
+        for want in [
+            row(imp, "add", None, Some("./math"), None, false, false),
+            row(imp, "mul", Some("times"), Some("./math"), None, false, false),
+            row(imp, "*", Some("ns"), Some("../lib"), None, false, false),
+            row(imp, "default", Some("makeCircle"), Some("./shapes"), None, false, false),
+            row(imp, "Circle", None, Some("./shapes"), None, false, false),
+            row(imp, "polyfill", None, Some("polyfill"), None, false, false),
+            row(imp, "Circle", Some("Round"), Some("./circle"), None, true, false),
+            row(imp, "*", None, Some("./all"), None, true, true),
+            row(RefKind::Implements, "Base", None, None, None, false, false),
+            row(RefKind::Implements, "Shape", None, None, None, false, false),
+            row(call, "add", None, None, None, false, false),
+            row(call, "f", None, None, Some("ns"), false, false),
+            row(call, "c", None, None, Some("a.b"), false, false),
+            row(call, "Circle", None, None, None, false, false),
+            row(call, "y", None, None, Some("this.x"), false, false),
+            row(call, "area", None, None, None, false, false),
+        ] {
+            assert!(got.contains(&want), "missing {want:?} in {got:#?}");
+        }
+    }
+
+    #[test]
+    fn python_imports_and_calls_keep_modules_aliases_and_receivers() {
+        let src = "import os\nimport pkg.core as pc, json\n\
+                   from .tools import tool, other as o\nfrom .. import sibling\nfrom pkg.extra import *\n\
+                   class C(Base, mod.Mixin):\n    pass\n\
+                   tool()\npkg.core.compute()\nself.save()\nget().go()\n";
+        let refs = extract_references_for_extension("py", src);
+        let (imp, call) = (RefKind::Import, RefKind::Call);
+        let got = rows(&refs);
+        for want in [
+            row(imp, "", None, Some("os"), None, false, false),
+            row(imp, "", Some("pc"), Some("pkg.core"), None, false, false),
+            row(imp, "", None, Some("json"), None, false, false),
+            row(imp, "tool", None, Some(".tools"), None, false, false),
+            row(imp, "other", Some("o"), Some(".tools"), None, false, false),
+            row(imp, "sibling", None, Some(".."), None, false, false),
+            row(imp, "*", None, Some("pkg.extra"), None, false, true),
+            row(RefKind::Implements, "Base", None, None, None, false, false),
+            row(RefKind::Implements, "Mixin", None, None, Some("mod"), false, false),
+            row(call, "tool", None, None, None, false, false),
+            row(call, "compute", None, None, Some("pkg.core"), false, false),
+            row(call, "save", None, None, Some("self"), false, false),
+            row(call, "go", None, None, None, false, false),
+        ] {
+            assert!(got.contains(&want), "missing {want:?} in {got:#?}");
+        }
     }
 
     #[test]
@@ -793,10 +1424,10 @@ def run():
     }
 
     /// Pin the `GAVIERO_QUERIES` env var to the workspace's bundled
-    /// queries so the query-driven extractor takes precedence over the
-    /// AST-walker fallback. Returns `false` when the queries dir isn't
-    /// on disk (stripped CI checkouts) — tests that need the query
-    /// path should early-return in that case.
+    /// queries. Rust, TypeScript and Python must extract the same with or
+    /// without them (their structured extractors never consult the
+    /// queries). Returns `false` when the queries dir isn't on disk
+    /// (stripped CI checkouts) — those tests early-return then.
     fn pin_workspace_queries() -> bool {
         let workspace_queries =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../queries");
@@ -827,7 +1458,7 @@ class Widget extends Base implements Renderable {
         let refs = extract_references_for_extension("ts", src);
         assert!(
             refs.iter()
-                .any(|r| r.kind == RefKind::Import && r.target_name.contains("base")),
+                .any(|r| r.kind == RefKind::Import && r.module.as_deref() == Some("./base")),
             "TS query path missed import: {refs:?}"
         );
         assert!(
@@ -861,7 +1492,7 @@ class Pipeline(Worker):
         let refs = extract_references_for_extension("py", src);
         assert!(
             refs.iter()
-                .any(|r| r.kind == RefKind::Import && r.target_name.contains("worker")),
+                .any(|r| r.kind == RefKind::Import && r.module.as_deref() == Some("service.worker")),
             "Python query path missed import: {refs:?}"
         );
         assert!(
@@ -915,11 +1546,7 @@ fn main() {
             )
             .unwrap();
 
-        let refs = vec![RawReference {
-            target_name: "process".into(),
-            kind: RefKind::Call,
-            line: 7,
-        }];
+        let refs = vec![RawReference::new("process", RefKind::Call, 7)];
 
         let count = resolve_and_insert_edges(&store, "tests/lib_test.rs", "tests::lib_test", &refs)
             .unwrap();
@@ -983,11 +1610,7 @@ fn main() {
             )
             .unwrap();
 
-        let refs = vec![RawReference {
-            target_name: "compute".into(),
-            kind: RefKind::Call,
-            line: 5,
-        }];
+        let refs = vec![RawReference::new("compute", RefKind::Call, 5)];
 
         let count = resolve_and_insert_edges(&store, "b.rs", "b.rs", &refs).unwrap();
         assert_eq!(count, 1);

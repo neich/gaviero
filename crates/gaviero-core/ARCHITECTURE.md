@@ -63,6 +63,11 @@ gaviero-core/src/
 ├─ terminal/              PTY (portable-pty) + OSC 133
 ├─ repo_map/              Code graph + ranking
 │  ├─ builder.rs / edges.rs / graph_builder.rs / page_rank.rs / store.rs
+│  ├─ resolve.rs          Qualified, import-aware reference → edge resolution
+│  ├─ resolve/receiver.rs Receiver typing: type facts → method targets
+│  ├─ rust_walk.rs        Rust reference walk + type facts + receiver expressions
+│  ├─ types.rs            Written types (TypeRef), receiver expressions, std model
+│  ├─ extraction.rs       Shared extraction policy + per-path outcome
 │  ├─ topology.rs         Shallow folder map → <repo_topology>
 │  ├─ symbol_enrichment.rs rustdoc-JSON sidecar (gaviero-cli --graph --enrich)
 │  └─ symbol_search.rs    Semantic search over enriched symbols
@@ -91,6 +96,7 @@ gaviero-core/src/
 │  ├─ config_synth.rs     Per-worktree .mcp.json / .codex/ / .cursor/
 │  ├─ preflight.rs        Shim PATH + URL checks
 │  ├─ telemetry_sink.rs   NDJSON call metrics (--mcp-stats)
+│  ├─ payload.rs          Estimated payload tokens (stats + outline budget)
 │  ├─ resolver.rs         Endpoint / config path resolution
 │  ├─ external_memory.rs  Competing memory-MCP detection
 │  └─ observer.rs         McpToolCallObserver
@@ -221,6 +227,62 @@ DBs: global `~/.config/gaviero/memory.db`; workspace+run `<workspace>/.gaviero/m
 ### MCP
 
 [`spawn_mcp_server`](src/mcp/server.rs) binds [`McpEndpoint`](src/mcp/transport.rs). Subprocess agents use `gaviero-mcp-shim`. Tools ([`tools.rs`](src/mcp/tools.rs)): `memory_search`, `memory_get`, `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`, `symbol_search`, `symbol_doc` (last two gated by `repoMap.symbolEnrichment.enabled`).
+
+Graph-tool output contracts:
+- **`blast_radius`** returns `{mode, nodes, not_shown, truncated}`. The nodes are `changed` rows, then up to `limit` ranked dependents (default 40, max 200, 0 allowed), then `test_gap` rows. Dependents are ordered by full-precision score with path as tie-break, and their scores are rounded to 3 decimals after ranking. `relation` appears only on changed and test-gap rows. Rows carry no `qualified_name` or `distance`.
+- **`node_doc`** symbols carry `qualified_name`, a 1-based `line` (null when unknown) and `signature` only when it differs from the name. There is no legacy `signatures` list. An empty result carries `status` (an extraction outcome, `unknown` or `not_indexed`) and `note`.
+- **`repo_outline`** entries are `{rendered}` in rank order. `token_estimate` is the estimate (`ceil(bytes/4)`, [`payload.rs`](src/mcp/payload.rs)) of the whole compact response and never exceeds the clamped `token_cap`.
+
+**Telemetry:** `ServerHandler::call_tool` and `call_tool_in_process` each emit exactly one entry per invocation, failures included (error set, null output). The `*_impl` cores never emit.
+
+**Extraction** ([`repo_map/extraction.rs`](src/repo_map/extraction.rs)) is one policy shared by `RepoMap` and the graph builder:
+- Limits: a 1 MB read limit, a 400 KB symbol-parse cap, a 2 s deadline, and exclusion of files with an `@generated` header (symbols and edges).
+- The outcome of each path is persisted in the graph's `file_extraction` table.
+- Changing `EXTRACTION_POLICY_VERSION` re-extracts every file on the next build.
+
+**Reference resolution** ([`repo_map/resolve.rs`](src/repo_map/resolve.rs)) turns extracted references into edges. Rust, TypeScript and Python each have one structured extractor in [`edges.rs`](src/repo_map/edges.rs). It keeps the written path, the call style (bare / scoped / method), import bindings and re-exports. Other languages keep bare-name resolution.
+
+- **Rust.**
+  - A crate/module map is built from `Cargo.toml` files and the `src/` tree.
+  - Each file gets an import table from its `use` / `extern crate`.
+  - `pub use` re-exports are followed (stored in the graph's `reexports` table, at most 4 hops).
+  - Symbol owners are recorded (`nodes.owner`: `impl:Type`, `impl:Type:Trait`, `trait:Name`).
+  - A scoped call resolves through its path. `Type::m` goes to the type's `impl` methods.
+  - A bare call resolves through its import binding, then a local definition, then glob imports.
+  - A method call goes to the trait's file when a trait declaring it is in scope, so `dyn Trait` impact lands on the trait. Otherwise it goes to `impl` methods of the types the file imports or defines.
+- **TypeScript.** Relative specifiers resolve to files; `export … from` is followed; namespace and named imports are bound.
+- **Python.** Modules come from the package tree. Relative imports are supported, and `mod.f()` resolves through module bindings.
+- **Receiver typing (Rust method calls).** The walk ([`rust_walk.rs`](src/repo_map/rust_walk.rs)) records each method call's receiver as written ([`types::ReceiverExpr`](src/repo_map/types.rs)):
+  - `self` (the impl type), parameters and annotated `let`s;
+  - `let x = …` (the initialiser substituted, ≤ 4 levels), field chains, method results, `T::new(…)`, `?`, `.await`, literals.
+
+  Pattern bindings and unannotated closure parameters are unknown. The walk also persists per-file **type facts**:
+  - `type_fields`, `fn_returns`, `type_impls`, `type_aliases`;
+  - `rust_imports`: every `use` binding, because a type written in another file is resolved with *that* file's imports;
+  - `type_methods`: each impl / trait block's methods, which survive the node collapse of same-named methods in one file. [`resolve/receiver.rs`](src/repo_map/resolve/receiver.rs) evaluates the receiver to a workspace type, an external type, trait bounds or unknown:
+  - `Box` / `Arc` / `Rc` / `&` / lock guards are dereferenced.
+  - A small std transform table covers `unwrap`, `expect`, `?`, `lock`, `read` / `write`, `borrow_mut`, `get`, `first` and `clone`.
+  - Aliases are expanded.
+
+  Then the method is looked up:
+  - **Workspace type:** inherent → trait impl → trait default; none (a derived or std trait method) → no edge.
+  - **Trait bounds** (`&dyn T`, `impl T`, `G: T`): the trait's file.
+  - **External type:** no edge, unless a workspace extension trait in scope is implemented for it.
+  - **Unknown:** the name-based steps above.
+- **Fallback.** The last fallback everywhere is the name: definitions in files of the same language, free functions only for `foo()` and methods only for `.foo()`. A `.foo()` whose receiver is unknown and whose name std also defines (`ok`, `send`, `elapsed`, … — [`std_methods.txt`](src/repo_map/std_methods.txt), generated from the toolchain's rustdoc HTML by `python -I research/gen_std_methods.py`; regenerate after a toolchain update, `--check` verifies) gets no edge.
+- **Filters.** Production files never target test files. Same-file targets need no edge.
+- **Ambiguity is dropped, not fanned out.** When candidates span more than `RESOLVE_MAX_TARGET_FILES` files (1, chosen on labelled samples), the reference gets no edge. `BuildResult.resolve` counts:
+  - resolution by step;
+  - local, unresolved and dropped references;
+  - deliberate no-edge outcomes (`external_receiver`, `typed_no_method`, `std_name_unknown_receiver`);
+  - receiver shapes.
+- **Staleness.** When any file's definitions, re-exports or type facts (field / return types, impl headers, aliases, `use` bindings, impl / trait methods) change, every unchanged structured-language file is re-resolved in the same build (about 1.7 s on this repo). A body-only or comment-only edit re-resolves nothing else.
+- **Known limits.**
+  - Type inference is syntactic only: no tuple or struct destructuring, no iterator element types (`for x in v`), no unannotated closure parameters, no generic substitution through user types, no workspace `Deref` impls. Such receivers fall back to the name-based steps.
+  - Two methods of one name in one file share a node (the `qualified_name` format); method lookups use the `type_methods` facts instead, but the edge's target node is the shared one.
+  - Macros are not expanded, and `#[path]` is not modelled. Inline `mod x { }` items stay in their file.
+  - A function-scoped `use` counts as file-wide.
+  - `source_qn` stays `{file}::{called name}`. `blast_radius` is file-level, and its meaning is unchanged.
 
 ### Two-layer graph context
 

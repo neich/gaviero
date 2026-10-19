@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 
 use petgraph::graph::DiGraph;
 
-use crate::tree_sitter::language_for_extension;
-
 use super::{FileNode, ReferenceEdge, Symbol};
 
 /// Walk `workspace` and build a `DiGraph<FileNode, ReferenceEdge>`.
@@ -113,57 +111,34 @@ pub const SKIP_DIRS: &[&str] = &[
     "temp",
 ];
 
-/// Build a `FileNode` for a single source file, or `None` if unreadable.
-/// Maximum file size to read for repo map (1 MB). Larger files (binary data,
-/// compiled artifacts, etc.) are skipped — they are not useful for context ranking.
-const MAX_FILE_BYTES: u64 = 1_000_000;
-
-/// Maximum content length to pass to tree-sitter for symbol extraction (200 KB).
-/// Generated files like parser.c can be several hundred KB and produce enormous
-/// in-memory ASTs that consume gigabytes — they also have no hand-authored symbols
-/// worth indexing, so skipping them is pure benefit.
-pub const MAX_PARSE_BYTES: usize = 200_000;
-
-/// Tree-sitter parse timeout to guard against pathological inputs (2 seconds).
-const PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
+pub use super::extraction::{MAX_FILE_BYTES, MAX_PARSE_BYTES};
 
 const BINARY_EXTENSIONS: &[&str] = &[
     "so", "a", "dylib", "dll", "exe", "o", "wasm", "pdf", "png", "jpg", "jpeg", "gif", "ico",
     "zip", "tar", "gz", "xz", "bz2", "db", "sqlite", "sqlite3", "bin", "dat",
 ];
 
+/// Build a `FileNode` for a single file, or `None` if it is binary, over
+/// the read limit, or unreadable. Symbols follow the shared extraction
+/// policy ([`super::extraction::extract`]).
 fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if BINARY_EXTENSIONS.contains(&ext) {
         return None;
     }
-
-    // Skip files that are too large to be source code (binary data, build artifacts, etc.)
-    if let Ok(meta) = std::fs::metadata(abs_path)
-        && meta.len() > MAX_FILE_BYTES
-    {
-        tracing::debug!(
-            "repo_map: skipping large file ({} bytes): {}",
-            meta.len(),
-            abs_path.display()
-        );
-        return None;
-    }
-
-    let content = match std::fs::read_to_string(abs_path) {
+    let content = match super::extraction::read_source(abs_path) {
         Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("repo_map: cannot read {}: {}", abs_path.display(), e);
+        Err(outcome) => {
+            tracing::debug!(
+                "repo_map: skipping {} ({})",
+                abs_path.display(),
+                outcome.as_str()
+            );
             return None;
         }
     };
     let token_estimate = content.len() / 4;
-
-    let symbols = if language_for_extension(ext).is_some() && content.len() <= MAX_PARSE_BYTES {
-        extract_symbols(ext, &content)
-    } else {
-        Vec::new()
-    };
+    let symbols = super::extraction::extract(ext, &content).symbols;
 
     Some(FileNode {
         path: rel_path,
@@ -172,39 +147,23 @@ fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     })
 }
 
-/// Extract top-level definition names from source content via tree-sitter.
+/// Extract top-level definition names from source content via tree-sitter,
+/// with the 2 s deadline but **no** size cap. Compatibility wrapper for
+/// callers that need only symbols; prefer [`super::extraction::extract`],
+/// which applies the whole policy and reports why a list is empty.
 pub fn extract_symbols(ext: &str, content: &str) -> Vec<Symbol> {
-    let Some(language) = language_for_extension(ext) else {
-        return Vec::new();
-    };
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
-        return Vec::new();
-    }
-    let bytes = content.as_bytes();
-    let len = bytes.len();
     let started = std::time::Instant::now();
-    let mut deadline = |_: &tree_sitter::ParseState| -> bool {
-        started.elapsed().as_micros() as u64 > PARSE_TIMEOUT_MICROS
-    };
-    let opts = tree_sitter::ParseOptions::new().progress_callback(&mut deadline);
-    let Some(tree) = parser.parse_with_options(
-        &mut |i, _| if i < len { &bytes[i..] } else { &[] },
-        None,
-        Some(opts),
-    ) else {
-        return Vec::new();
-    };
-
-    let source = content.as_bytes();
-    let mut symbols = Vec::new();
-    collect_symbols(tree.root_node(), source, &mut symbols);
-    symbols
+    super::extraction::parse_with_deadline(ext, content, &mut || {
+        started.elapsed().as_micros() as u64 > super::extraction::PARSE_TIMEOUT_MICROS
+    })
+    .symbols
 }
 
 const DEF_KINDS: &[&str] = &[
     "function_item",
+    // Bodiless trait methods (`fn notify(&self);`): the resolver needs them
+    // to send a `dyn Trait` method call to the trait's file.
+    "function_signature_item",
     "function_definition",
     "function_declaration",
     "method_declaration",
@@ -221,21 +180,76 @@ const DEF_KINDS: &[&str] = &[
     "companion_object",
 ];
 
-fn collect_symbols(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Symbol>) {
-    if DEF_KINDS.contains(&node.kind())
-        && let Some(name_node) = node.child_by_field_name("name")
-        && let Ok(name) = name_node.utf8_text(source)
-    {
-        out.push(Symbol {
-            name: name.to_string(),
-            kind: node.kind().to_string(),
-            line: node.start_position().row,
-        });
+/// The owner a Rust container gives the items inside it: `impl:Type`,
+/// `impl:Type:Trait` or `trait:Name`. `None` for any other node.
+pub(super) fn container_owner(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let text = |field: &str| {
+        node.child_by_field_name(field)
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(type_base_name)
+            .filter(|s| !s.is_empty())
+    };
+    match node.kind() {
+        "impl_item" => {
+            let ty = text("type")?;
+            Some(match text("trait") {
+                Some(tr) => format!("impl:{ty}:{tr}"),
+                None => format!("impl:{ty}"),
+            })
+        }
+        "trait_item" => text("name").map(|n| format!("trait:{n}")),
+        _ => None,
     }
+}
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_symbols(child, source, out);
+/// `crate::a::Foo<T>` / `&mut Foo` / `dyn Foo + Send` → `Foo`.
+pub(super) fn type_base_name(text: &str) -> String {
+    let t = text.trim();
+    let t = t.strip_prefix("dyn ").unwrap_or(t);
+    let t = t.trim_start_matches(['&', ' ']).trim_start_matches("mut ").trim();
+    let t = t.split(['<', '+', '(']).next().unwrap_or(t).trim();
+    t.rsplit("::").next().unwrap_or(t).trim().to_string()
+}
+
+/// Pre-order walk collecting definitions. Iterative on purpose: a deeply
+/// nested input (e.g. 180,000 nested parentheses) parses fine but blew the
+/// stack of the old recursive walk and aborted the whole process.
+pub(super) fn collect_symbols(root: tree_sitter::Node, source: &[u8], out: &mut Vec<Symbol>) {
+    let mut cursor = root.walk();
+    // Enclosing Rust `impl` / `trait` blocks as (end byte, owner), innermost
+    // last. Pre-order visits a container before its contents, so a block is
+    // popped once the walk reaches a node starting at or after its end.
+    let mut owners: Vec<(usize, String)> = Vec::new();
+    loop {
+        let node = cursor.node();
+        while owners.last().is_some_and(|(end, _)| node.start_byte() >= *end) {
+            owners.pop();
+        }
+        if DEF_KINDS.contains(&node.kind())
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source)
+        {
+            out.push(Symbol {
+                name: name.to_string(),
+                kind: node.kind().to_string(),
+                line: node.start_position().row,
+                owner: owners.last().map(|(_, o)| o.clone()),
+            });
+        }
+        if let Some(owner) = container_owner(node, source) {
+            owners.push((node.end_byte(), owner));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
@@ -254,6 +268,37 @@ pub trait Baz {}
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"foo"), "{:?}", names);
         assert!(names.contains(&"Bar"), "{:?}", names);
+    }
+
+    #[test]
+    fn symbols_record_their_impl_and_trait_owners() {
+        let src = "pub trait Observer {\n    fn notify(&self);\n    fn default_hook(&self) {}\n}\n\
+                   pub struct Gadget;\n\
+                   impl Gadget {\n    pub fn new() -> Self { Gadget }\n}\n\
+                   impl<T> crate::observe::Observer for Wrapper<T> {\n    fn notify(&self) {}\n}\n\
+                   pub fn free() {}\n";
+        let syms = extract_symbols("rs", src);
+        let owner = |name: &str, line: usize| {
+            syms.iter()
+                .find(|s| s.name == name && s.line == line)
+                .map(|s| s.owner.clone())
+                .unwrap_or_else(|| panic!("{name}@{line} missing: {syms:?}"))
+        };
+        assert_eq!(owner("Observer", 0), None);
+        assert_eq!(owner("notify", 1), Some("trait:Observer".into()), "bodiless trait method");
+        assert_eq!(owner("default_hook", 2), Some("trait:Observer".into()));
+        assert_eq!(owner("Gadget", 4), None);
+        assert_eq!(owner("new", 6), Some("impl:Gadget".into()));
+        assert_eq!(owner("notify", 9), Some("impl:Wrapper:Observer".into()));
+        assert_eq!(owner("free", 11), None, "owner scope ends with the block");
+    }
+
+    #[test]
+    fn type_base_names_drop_paths_generics_and_references() {
+        assert_eq!(type_base_name("crate::a::Foo<T>"), "Foo");
+        assert_eq!(type_base_name("&mut Foo"), "Foo");
+        assert_eq!(type_base_name("dyn Foo + Send"), "Foo");
+        assert_eq!(type_base_name("Vec<Vec<u8>>"), "Vec");
     }
 
     #[test]
