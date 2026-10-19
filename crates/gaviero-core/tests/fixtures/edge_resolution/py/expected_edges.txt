@@ -1,0 +1,25 @@
+# Expected cross-file edges for the Python fixture: kind<TAB>from<TAB>to.
+# A leading `?` marks an allowed-but-not-required edge.
+
+# ── app.py ──
+# `import pkg.core`
+Imports	app.py	pkg/core.py
+# `from pkg.util import tool as t` → the package's __init__.py.
+Imports	app.py	pkg/util/__init__.py
+# `from pkg.extra import *`
+Imports	app.py	pkg/extra.py
+# pkg.core.compute() through the module import.
+Calls	app.py	pkg/core.py
+# t() → `tool`, re-exported by pkg/util/__init__.py from .tools.
+Calls	app.py	pkg/util/tools.py
+# star_fn() through the glob import.
+Calls	app.py	pkg/extra.py
+# `os` is external; local_helper() is local.
+
+# ── pkg/util/__init__.py ──
+Imports	pkg/util/__init__.py	pkg/util/tools.py
+
+# ── pkg/sub.py ──
+# `from .core import compute as c2` and c2().
+Imports	pkg/sub.py	pkg/core.py
+Calls	pkg/sub.py	pkg/core.py
