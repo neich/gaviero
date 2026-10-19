@@ -7,10 +7,13 @@
 //! Supports incremental updates via file-hash diffing and blast-radius queries
 //! via recursive CTE.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+
+use super::rust_walk::RustFileFacts;
 
 // ── Schema ───────────────────────────────────────────────────────
 
@@ -70,7 +73,180 @@ CREATE TABLE IF NOT EXISTS graph_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Names a file re-exports (Rust `pub use`, TS `export … from`, Python
+-- from-imports), so references through them resolve to the defining file
+-- even when the re-exporting file did not change in this build.
+-- `target` is language-specific (see repo_map::resolve).
+CREATE TABLE IF NOT EXISTS reexports (
+    file_path TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    target    TEXT NOT NULL,
+    glob      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_reexports_file ON reexports(file_path);
+
+-- Rust type facts for receiver typing (repo_map::rust_walk::RustFileFacts).
+-- Type texts are repo_map::types::TypeRef display forms, written relative
+-- to file_path (resolved with that file's rust_imports).
+CREATE TABLE IF NOT EXISTS type_fields (
+    file_path TEXT NOT NULL,
+    type_name TEXT NOT NULL,
+    field     TEXT NOT NULL,
+    type_text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_type_fields_file ON type_fields(file_path);
+CREATE TABLE IF NOT EXISTS fn_returns (
+    file_path TEXT NOT NULL,
+    owner     TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    ret_text  TEXT NOT NULL,
+    is_async  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_fn_returns_file ON fn_returns(file_path);
+CREATE TABLE IF NOT EXISTS type_impls (
+    file_path  TEXT NOT NULL,
+    type_name  TEXT NOT NULL,
+    trait_path TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_type_impls_file ON type_impls(file_path);
+CREATE TABLE IF NOT EXISTS type_aliases (
+    file_path TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    params    TEXT NOT NULL,
+    type_text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_type_aliases_file ON type_aliases(file_path);
+CREATE TABLE IF NOT EXISTS rust_imports (
+    file_path TEXT NOT NULL,
+    local     TEXT NOT NULL,
+    path      TEXT NOT NULL,
+    glob      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_rust_imports_file ON rust_imports(file_path);
+CREATE TABLE IF NOT EXISTS type_methods (
+    file_path TEXT NOT NULL,
+    owner     TEXT NOT NULL,
+    name      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_type_methods_file ON type_methods(file_path);
+
+-- Why each indexed path has the symbols it has (repo_map::extraction).
+-- Absent row = unknown (a database built before this table existed).
+CREATE TABLE IF NOT EXISTS file_extraction (
+    file_path      TEXT PRIMARY KEY,
+    outcome        TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    content_hash   TEXT,
+    content_bytes  INTEGER,
+    symbol_count   INTEGER NOT NULL DEFAULT 0,
+    updated_at     REAL NOT NULL DEFAULT (julianday('now'))
+);
 ";
+
+/// The file-level impact CTE over `_impact_seed_files`.
+///
+/// `CROSS JOIN` pins the join order (SQLite never reorders it): affected
+/// file → its nodes (`idx_nodes_file`) → edges pointing at them
+/// (`idx_edges_tgt`). With plain JOINs the planner drove the recursive step
+/// from `edges` through `idx_edges_kind` — every edge, then a rescan of
+/// `affected` per edge — and a depth-1 query on a 441k-edge graph took 84 s
+/// instead of 17 ms.
+fn impact_cte_sql(max_depth: usize, edge_kinds: &str) -> String {
+    format!(
+        "WITH RECURSIVE affected(file, depth) AS (
+            SELECT fp, 0 FROM _impact_seed_files
+            UNION
+            SELECT DISTINCT e.file_path, a.depth + 1
+            FROM affected a
+            CROSS JOIN nodes n ON n.file_path = a.file
+            CROSS JOIN edges e ON e.target_qn = n.qualified_name
+            WHERE a.depth < {max_depth}
+              AND e.kind IN ({edge_kinds})
+              AND e.file_path != a.file
+        )
+        SELECT DISTINCT file FROM affected"
+    )
+}
+
+/// Cancellation for one graph query running on a blocking thread.
+///
+/// A `tokio::time::timeout` around `spawn_blocking` only stops *waiting*:
+/// the query kept running, holding a worker thread at full CPU long after
+/// the caller gave up. [`Self::cancel`] sets a flag that the query checks
+/// between steps and interrupts the SQLite statement in flight
+/// (`sqlite3_interrupt`), so the work actually ends. Attach the store the
+/// query runs on with [`Self::attach`] before starting.
+#[derive(Default)]
+pub struct GraphCancel {
+    cancelled: std::sync::atomic::AtomicBool,
+    /// Held only to store or read the handle; `interrupt` just sets a flag
+    /// inside SQLite, so nothing slow runs under the lock.
+    handle: std::sync::Mutex<Option<rusqlite::InterruptHandle>>,
+}
+
+impl GraphCancel {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Bind the connection the query will run on. Fails if the query was
+    /// already cancelled, so a late start never runs at all.
+    pub fn attach(&self, store: &GraphStore) -> Result<()> {
+        let mut slot = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(store.interrupt_handle());
+        drop(slot);
+        self.check()
+    }
+
+    /// Stop the query: later [`Self::check`]s fail and the statement in
+    /// flight, if any, returns an interrupt error.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let slot = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = slot.as_ref() {
+            h.interrupt();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `Err` once cancelled.
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!("graph query cancelled");
+        }
+        Ok(())
+    }
+}
+
+/// One non-file node, as the resolver sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definition {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    /// [`NodeKind::as_str`].
+    pub kind: String,
+    /// `impl:Type`, `impl:Type:Trait`, `trait:Name`, or `None`.
+    pub owner: Option<String>,
+}
+
+/// One `file_extraction` row: the persisted extraction outcome of a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileExtraction {
+    pub file_path: String,
+    /// [`crate::repo_map::extraction::ExtractionOutcome::as_str`].
+    pub outcome: String,
+    pub policy_version: String,
+    /// SHA-256 of the content, when it could be read.
+    pub content_hash: Option<String>,
+    pub content_bytes: Option<i64>,
+    pub symbol_count: i64,
+}
 
 /// C4: one-shot migration applied at every `open*` call.
 ///
@@ -97,11 +273,66 @@ CREATE TABLE IF NOT EXISTS graph_meta (
 /// surface the file via `mode=all`, but per-intent precision degrades
 /// until the rebuild lands.
 fn migrate_typed_edges(conn: &Connection) -> Result<()> {
+    // `OR REPLACE`: once edges are unique, a defaulted row may collide
+    // with an identical `Imports` row; keep one.
     conn.execute(
-        "UPDATE edges SET kind = 'Imports' WHERE kind IS NULL OR kind = ''",
+        "UPDATE OR REPLACE edges SET kind = 'Imports' WHERE kind IS NULL OR kind = ''",
         [],
     )
     .context("typed-edge migration: defaulting null kinds")?;
+    Ok(())
+}
+
+/// Adds `nodes.owner` (the enclosing `impl` / `trait` of a method, see
+/// [`crate::repo_map::Symbol::owner`]) to databases created before it
+/// existed. Old rows stay NULL until the next extraction rewrites them.
+fn migrate_node_owner(conn: &Connection) -> Result<()> {
+    let has_owner = {
+        let mut stmt = conn.prepare("PRAGMA table_info(nodes)")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for name in names {
+            if name? == "owner" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_owner {
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN owner TEXT")
+            .context("node migration: adding owner column")?;
+    }
+    Ok(())
+}
+
+/// One-time migration that makes edges unique on
+/// `(kind, source_qn, target_qn, file_path)`.
+///
+/// Reference resolution names an edge's source `<file>::<called name>`, so
+/// every call site of the same name in a file produced an identical row, and
+/// `insert_edge`'s `INSERT OR IGNORE` had no unique key to ignore against.
+/// On this repository the table held 441,314 edges, 63,785 distinct, which
+/// multiplied the work of every impact query and of PageRank's edge load.
+/// Keeps the first row of each group (its `line` is the first call site).
+/// Runs once: a database that already has the index skips the scan.
+fn migrate_unique_edges(conn: &Connection) -> Result<()> {
+    let has_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_edges_unique')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_index {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         DELETE FROM edges WHERE rowid NOT IN (
+             SELECT MIN(rowid) FROM edges GROUP BY kind, source_qn, target_qn, file_path
+         );
+         CREATE UNIQUE INDEX idx_edges_unique ON edges(kind, source_qn, target_qn, file_path);
+         COMMIT;",
+    )
+    .context("edge migration: removing duplicate edges")?;
     Ok(())
 }
 
@@ -467,6 +698,8 @@ impl GraphStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(SCHEMA_SQL)?;
         migrate_typed_edges(&conn)?;
+        migrate_unique_edges(&conn)?;
+        migrate_node_owner(&conn)?;
         Ok(Self { conn })
     }
 
@@ -475,7 +708,52 @@ impl GraphStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
         migrate_typed_edges(&conn)?;
+        migrate_unique_edges(&conn)?;
+        migrate_node_owner(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Record a node's owner (`impl:Type`, `impl:Type:Trait`, `trait:Name`).
+    pub fn set_node_owner(&self, qualified_name: &str, owner: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET owner = ?2 WHERE qualified_name = ?1",
+            params![qualified_name, owner],
+        )?;
+        Ok(())
+    }
+
+    /// Every non-file definition, for building the resolver's indexes.
+    pub fn all_definitions(&self) -> Result<Vec<Definition>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, qualified_name, file_path, kind, owner FROM nodes WHERE kind != 'File'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Definition {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+                kind: row.get(3)?,
+                owner: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete a file's reference edges (everything but `Defines`), so its
+    /// references can be resolved again without re-extracting its symbols.
+    pub fn delete_reference_edges(&self, file_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM edges WHERE file_path = ?1 AND kind != 'Defines'",
+            params![file_path],
+        )?;
+        Ok(())
+    }
+
+    /// Handle that aborts whatever statement this connection is running,
+    /// from another thread (`sqlite3_interrupt`). The interrupted call
+    /// returns an error. See [`GraphCancel`].
+    pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
+        self.conn.get_interrupt_handle()
     }
 
     // ── Node operations ──────────────────────────────────────────
@@ -661,12 +939,89 @@ impl GraphStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Delete all nodes and edges for a given file path.
+    /// Delete everything stored for a file path: nodes, edges, hash,
+    /// enrichment rows and extraction status.
     pub fn delete_file(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM symbol_docs WHERE file_path = ?1",
             params![file_path],
         )?;
+        self.conn.execute(
+            "DELETE FROM file_extraction WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        self.delete_file_graph(file_path)
+    }
+
+    /// Replace a file's re-exports: `(name, target, glob)`.
+    pub fn replace_reexports(&self, file_path: &str, rows: &[(String, String, bool)]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM reexports WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO reexports (file_path, name, target, glob) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (name, target, glob) in rows {
+            stmt.execute(params![file_path, name, target, *glob as i64])?;
+        }
+        Ok(())
+    }
+
+    /// What other files can resolve against in `file_path`: its
+    /// definitions (name, kind, owner), re-exports and Rust type facts
+    /// (field types, return types, impl headers, aliases, `use` bindings —
+    /// a field's type is resolved with its file's imports), in a stable
+    /// order. Two equal signatures mean no other file's resolution can
+    /// change.
+    pub fn definition_signature(&self, file_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 'd:' || name || ':' || kind || ':' || COALESCE(owner, '')
+               FROM nodes WHERE file_path = ?1 AND kind != 'File'
+             UNION
+             SELECT 'r:' || name || ':' || target || ':' || glob
+               FROM reexports WHERE file_path = ?1
+             UNION
+             SELECT 'f:' || type_name || ':' || field || ':' || type_text
+               FROM type_fields WHERE file_path = ?1
+             UNION
+             SELECT 'ret:' || owner || ':' || name || ':' || ret_text || ':' || is_async
+               FROM fn_returns WHERE file_path = ?1
+             UNION
+             SELECT 'i:' || type_name || ':' || trait_path
+               FROM type_impls WHERE file_path = ?1
+             UNION
+             SELECT 'a:' || name || ':' || params || ':' || type_text
+               FROM type_aliases WHERE file_path = ?1
+             UNION
+             SELECT 'u:' || local || ':' || path || ':' || glob
+               FROM rust_imports WHERE file_path = ?1
+             UNION
+             SELECT 'm:' || owner || ':' || name
+               FROM type_methods WHERE file_path = ?1
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every re-export: `(file, name, target, glob)`.
+    pub fn all_reexports(&self) -> Result<Vec<(String, String, String, bool)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, name, target, glob FROM reexports")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete a path's nodes, edges and hash, keeping its enrichment rows
+    /// and extraction status. For re-extracting *unchanged* content after an
+    /// extraction-policy change: enrichment is keyed by content and stays
+    /// valid; [`Self::prune_symbol_docs_for`] drops rows whose symbol the
+    /// new extraction no longer emits.
+    pub fn delete_file_graph(&self, file_path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM edges WHERE file_path = ?1", params![file_path])?;
         self.conn
@@ -675,7 +1030,167 @@ impl GraphStore {
             "DELETE FROM file_hashes WHERE file_path = ?1",
             params![file_path],
         )?;
+        self.conn.execute(
+            "DELETE FROM reexports WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        self.delete_type_facts(file_path)?;
         Ok(())
+    }
+
+    fn delete_type_facts(&self, file_path: &str) -> Result<()> {
+        for table in ["type_fields", "fn_returns", "type_impls", "type_aliases", "rust_imports", "type_methods"] {
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE file_path = ?1"),
+                params![file_path],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Replace a Rust file's type facts.
+    pub fn replace_type_facts(&self, file_path: &str, facts: &RustFileFacts) -> Result<()> {
+        self.delete_type_facts(file_path)?;
+        let mut s = self.conn.prepare_cached(
+            "INSERT INTO type_fields (file_path, type_name, field, type_text) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (ty, field, text) in &facts.fields {
+            s.execute(params![file_path, ty, field, text])?;
+        }
+        let mut s = self.conn.prepare_cached(
+            "INSERT INTO fn_returns (file_path, owner, name, ret_text, is_async) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (owner, name, ret, is_async) in &facts.returns {
+            s.execute(params![file_path, owner, name, ret, *is_async as i64])?;
+        }
+        let mut s = self
+            .conn
+            .prepare_cached("INSERT INTO type_impls (file_path, type_name, trait_path) VALUES (?1, ?2, ?3)")?;
+        for (ty, tr) in &facts.impls {
+            s.execute(params![file_path, ty, tr])?;
+        }
+        let mut s = self.conn.prepare_cached(
+            "INSERT INTO type_aliases (file_path, name, params, type_text) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (name, ps, text) in &facts.aliases {
+            s.execute(params![file_path, name, ps, text])?;
+        }
+        let mut s = self
+            .conn
+            .prepare_cached("INSERT INTO rust_imports (file_path, local, path, glob) VALUES (?1, ?2, ?3, ?4)")?;
+        for (local, path, glob) in &facts.imports {
+            s.execute(params![file_path, local, path, *glob as i64])?;
+        }
+        let mut s = self
+            .conn
+            .prepare_cached("INSERT INTO type_methods (file_path, owner, name) VALUES (?1, ?2, ?3)")?;
+        for (owner, name) in &facts.methods {
+            s.execute(params![file_path, owner, name])?;
+        }
+        Ok(())
+    }
+
+    /// Every file's type facts, keyed by file.
+    pub fn all_type_facts(&self) -> Result<HashMap<String, RustFileFacts>> {
+        let mut out: HashMap<String, RustFileFacts> = HashMap::new();
+        let mut s = self.conn.prepare("SELECT file_path, type_name, field, type_text FROM type_fields")?;
+        for row in s.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))? {
+            let (f, v) = row?;
+            out.entry(f).or_default().fields.push(v);
+        }
+        let mut s = self.conn.prepare("SELECT file_path, owner, name, ret_text, is_async FROM fn_returns")?;
+        for row in s.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0)))
+        })? {
+            let (f, v) = row?;
+            out.entry(f).or_default().returns.push(v);
+        }
+        let mut s = self.conn.prepare("SELECT file_path, type_name, trait_path FROM type_impls")?;
+        for row in s.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))? {
+            let (f, v) = row?;
+            out.entry(f).or_default().impls.push(v);
+        }
+        let mut s = self.conn.prepare("SELECT file_path, name, params, type_text FROM type_aliases")?;
+        for row in s.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))? {
+            let (f, v) = row?;
+            out.entry(f).or_default().aliases.push(v);
+        }
+        let mut s = self.conn.prepare("SELECT file_path, local, path, glob FROM rust_imports")?;
+        for row in s.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)))
+        })? {
+            let (f, v) = row?;
+            out.entry(f).or_default().imports.push(v);
+        }
+        let mut s = self.conn.prepare("SELECT file_path, owner, name FROM type_methods")?;
+        for row in s.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))? {
+            let (f, v) = row?;
+            out.entry(f).or_default().methods.push(v);
+        }
+        Ok(out)
+    }
+
+    /// Drop `symbol_docs` rows of `file_path` whose qualified name is no
+    /// longer a node of that file.
+    pub fn prune_symbol_docs_for(&self, file_path: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM symbol_docs WHERE file_path = ?1
+               AND qualified_name NOT IN (SELECT qualified_name FROM nodes WHERE file_path = ?1)",
+            params![file_path],
+        )?;
+        Ok(n)
+    }
+
+    /// Upsert a path's extraction status.
+    pub fn set_file_extraction(&self, rec: &FileExtraction) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_extraction
+                (file_path, outcome, policy_version, content_hash, content_bytes, symbol_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, julianday('now'))
+             ON CONFLICT(file_path) DO UPDATE SET
+                outcome = excluded.outcome,
+                policy_version = excluded.policy_version,
+                content_hash = excluded.content_hash,
+                content_bytes = excluded.content_bytes,
+                symbol_count = excluded.symbol_count,
+                updated_at = excluded.updated_at",
+            params![
+                rec.file_path,
+                rec.outcome,
+                rec.policy_version,
+                rec.content_hash,
+                rec.content_bytes,
+                rec.symbol_count
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A path's extraction status; `None` when unknown.
+    pub fn file_extraction(&self, file_path: &str) -> Result<Option<FileExtraction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, outcome, policy_version, content_hash, content_bytes, symbol_count
+             FROM file_extraction WHERE file_path = ?1",
+        )?;
+        let mut rows = stmt.query(params![file_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(FileExtraction {
+                file_path: row.get(0)?,
+                outcome: row.get(1)?,
+                policy_version: row.get(2)?,
+                content_hash: row.get(3)?,
+                content_bytes: row.get(4)?,
+                symbol_count: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Every path with an extraction status.
+    pub fn all_extraction_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT file_path FROM file_extraction")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     // ── Edge operations ──────────────────────────────────────────
@@ -795,20 +1310,7 @@ impl GraphStore {
         //    When target's file changes, source's file is affected.
         //    So: find edges where target_qn belongs to a seed file → the edge's file_path
         //    (which is the source file) is affected.
-        let cte_sql = format!(
-            "WITH RECURSIVE affected(file, depth) AS (
-                SELECT fp, 0 FROM _impact_seed_files
-                UNION
-                SELECT DISTINCT e.file_path, a.depth + 1
-                FROM affected a
-                JOIN nodes n ON n.file_path = a.file
-                JOIN edges e ON e.target_qn = n.qualified_name
-                WHERE a.depth < {max_depth}
-                  AND e.kind IN ({edge_kinds})
-                  AND e.file_path != a.file
-            )
-            SELECT DISTINCT file FROM affected"
-        );
+        let cte_sql = impact_cte_sql(max_depth, &edge_kinds);
         let mut stmt = self.conn.prepare(&cte_sql)?;
         let all_files: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -981,6 +1483,11 @@ impl GraphStore {
             }
         }
         s
+    }
+
+    /// Begin a graph build that rolls back on error or unwinding.
+    pub(crate) fn build_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.unchecked_transaction()?)
     }
 
     /// Begin a transaction for batch operations.
@@ -1731,5 +2238,193 @@ mod tests {
         );
         assert!(text.contains("more)"), "{text}");
         assert!(text.contains("200 missing tests"), "{text}");
+    }
+
+    // ── query plan, unique edges, cancellation ───────────────────────
+
+    fn edge_count(store: &GraphStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The recursive step must walk affected file → nodes → edges through
+    /// the file and target indexes, never start from a scan of `edges`.
+    #[test]
+    fn impact_cte_walks_from_files_through_the_indexes() {
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .conn
+            .execute_batch("CREATE TEMP TABLE _impact_seed_files (fp TEXT PRIMARY KEY)")
+            .unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            impact_cte_sql(2, BlastRadiusMode::All.edge_kind_sql_list())
+        );
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let text = plan.join("\n");
+        assert!(text.contains("idx_nodes_file"), "{text}");
+        assert!(text.contains("idx_edges_tgt"), "{text}");
+        assert!(!text.contains("idx_edges_kind"), "edges must not drive the step:\n{text}");
+    }
+
+    #[test]
+    fn duplicate_edges_are_ignored() {
+        let store = GraphStore::open_memory().unwrap();
+        for _ in 0..3 {
+            store
+                .insert_edge(EdgeKind::Calls, "a.rs::new", "b.rs::new", "a.rs", 7)
+                .unwrap();
+        }
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::new", "c.rs::new", "a.rs", 9)
+            .unwrap();
+        assert_eq!(edge_count(&store), 2);
+    }
+
+    /// An existing database full of duplicates is de-duplicated once on
+    /// open, keeping the first row of each group.
+    #[test]
+    fn opening_a_duplicated_database_removes_the_duplicates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.db");
+        {
+            let store = GraphStore::open(&db).unwrap();
+            store
+                .conn
+                .execute_batch("DROP INDEX idx_edges_unique")
+                .unwrap();
+            for line in [3, 5, 8] {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO edges (kind, source_qn, target_qn, file_path, line)
+                         VALUES ('Calls', 'a.rs::new', 'b.rs::new', 'a.rs', ?1)",
+                        params![line],
+                    )
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute(
+                    "INSERT INTO edges (kind, source_qn, target_qn, file_path, line)
+                     VALUES ('Imports', 'a.rs::new', 'b.rs::new', 'a.rs', 1)",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(edge_count(&store), 4);
+        }
+        let store = GraphStore::open(&db).unwrap();
+        assert_eq!(edge_count(&store), 2, "one Calls + one Imports edge remain");
+        let line: i64 = store
+            .conn
+            .query_row(
+                "SELECT line FROM edges WHERE kind = 'Calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(line, 3, "first row kept");
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::new", "b.rs::new", "a.rs", 99)
+            .unwrap();
+        assert_eq!(edge_count(&store), 2, "the unique index now holds");
+    }
+
+    #[test]
+    fn node_owners_round_trip_and_old_databases_gain_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            // A nodes table from before the `owner` column existed.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                   name TEXT NOT NULL, qualified_name TEXT NOT NULL UNIQUE, file_path TEXT NOT NULL,
+                   line_start INTEGER, line_end INTEGER, language TEXT, file_hash TEXT,
+                   updated_at REAL NOT NULL DEFAULT (julianday('now')));
+                 INSERT INTO nodes (kind, name, qualified_name, file_path)
+                   VALUES ('Function', 'new', 'w.rs::new', 'w.rs');",
+            )
+            .unwrap();
+        }
+        let store = GraphStore::open(&db).unwrap();
+        let defs = store.all_definitions().unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].owner, None, "legacy rows stay NULL");
+        store.set_node_owner("w.rs::new", Some("impl:Widget")).unwrap();
+        drop(store);
+        let store = GraphStore::open(&db).unwrap();
+        let defs = store.all_definitions().unwrap();
+        assert_eq!(defs[0].owner.as_deref(), Some("impl:Widget"));
+        assert_eq!(defs[0].kind, "Function");
+    }
+
+    #[test]
+    fn type_facts_round_trip_replace_delete_and_old_databases_gain_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            // A database from before the type-fact tables existed.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE graph_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+        }
+        let store = GraphStore::open(&db).unwrap();
+        let facts = RustFileFacts {
+            fields: vec![("App".into(), "git_panel".into(), "GitPanel".into())],
+            returns: vec![("impl:App".into(), "panel".into(), "&GitPanel".into(), false)],
+            impls: vec![("App".into(), String::new()), ("App".into(), "Observer".into())],
+            aliases: vec![("Res".into(), "T".into(), "Result<T,Error>".into())],
+            imports: vec![("GitPanel".into(), "crate::git::GitPanel".into(), false)],
+            methods: vec![("impl:App".into(), "panel".into())],
+        };
+        store.replace_type_facts("app.rs", &facts).unwrap();
+        store.replace_type_facts("app.rs", &facts).unwrap();
+        assert_eq!(store.all_type_facts().unwrap()["app.rs"], facts, "replace, not append");
+        store.delete_file_graph("app.rs").unwrap();
+        assert!(store.all_type_facts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_query_never_starts() {
+        let store = GraphStore::open_memory().unwrap();
+        let cancel = GraphCancel::new();
+        cancel.cancel();
+        assert!(cancel.attach(&store).is_err());
+        assert!(cancel.check().is_err());
+    }
+
+    /// `cancel` interrupts a statement that is already running on another
+    /// thread (here one that would never end on its own).
+    #[test]
+    fn cancel_interrupts_a_running_statement() {
+        let store = GraphStore::open_memory().unwrap();
+        let cancel = GraphCancel::new();
+        cancel.attach(&store).unwrap();
+        let worker = std::thread::spawn(move || {
+            store.conn.query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c)
+                 SELECT COUNT(*) FROM c",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        let result = worker.join().unwrap();
+        assert!(result.is_err(), "the endless statement must be interrupted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "interrupt took {:?}",
+            started.elapsed()
+        );
     }
 }

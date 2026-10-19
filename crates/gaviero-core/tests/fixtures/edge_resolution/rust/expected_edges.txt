@@ -1,0 +1,55 @@
+# Expected cross-file edges for the Rust fixture: kind<TAB>from<TAB>to.
+# `Defines` and same-file edges are not listed (always same-file).
+# A leading `?` marks an edge that is allowed but not required: a
+# documented limit of name-based resolution, neither a miss nor a hit.
+# Abbreviations used in the comments: M = alpha main.rs, E = engine/mod.rs,
+# P = engine/parts.rs, L = beta-core lib.rs, U = util.rs, O = observe.rs,
+# W = shapes/widget.rs, G = shapes/gadget.rs.
+
+# ── alpha/src/main.rs ──
+# `extern crate beta_core;` → the crate root.
+Imports	crates/alpha/src/main.rs	crates/beta-core/src/lib.rs
+Imports	crates/alpha/src/main.rs	crates/beta-core/src/shapes/widget.rs
+# `use beta_core::util::{self, helper as h};` → the util module (self + helper).
+Imports	crates/alpha/src/main.rs	crates/beta-core/src/util.rs
+# `use beta_core::Gadget;` is a `pub use` re-export in lib.rs; followed to the definition.
+Imports	crates/alpha/src/main.rs	crates/beta-core/src/shapes/gadget.rs
+# `use engine::*;` → the child module's file.
+Imports	crates/alpha/src/main.rs	crates/alpha/src/engine/mod.rs
+# h() (alias), util::only_here() (module via `self`), beta_core::util::helper() (absolute).
+Calls	crates/alpha/src/main.rs	crates/beta-core/src/util.rs
+# Widget::new() (type owner), w.spin() (method defined only on Widget),
+# w.describe(): `describe` is a method of both imported types, but
+# `let w = Widget::new()` types the receiver (receiver typing), so only
+# Widget's file is linked.
+Calls	crates/alpha/src/main.rs	crates/beta-core/src/shapes/widget.rs
+# Gadget::new() through the re-export.
+Calls	crates/alpha/src/main.rs	crates/beta-core/src/shapes/gadget.rs
+# run_engine() through the glob import.
+Calls	crates/alpha/src/main.rs	crates/alpha/src/engine/mod.rs
+# std::cmp::max and local() produce no edge.
+
+# ── alpha/src/engine/mod.rs ──
+Imports	crates/alpha/src/engine/mod.rs	crates/alpha/src/engine/parts.rs
+# Part::new(), p.tick(), crate::engine::parts::assemble().
+Calls	crates/alpha/src/engine/mod.rs	crates/alpha/src/engine/parts.rs
+
+# ── alpha/src/engine/parts.rs ──
+Imports	crates/alpha/src/engine/parts.rs	crates/beta-core/src/observe.rs
+Implements	crates/alpha/src/engine/parts.rs	crates/beta-core/src/observe.rs
+# o.notify() on `dyn Observer`: the trait's file, not the impls (G, P).
+Calls	crates/alpha/src/engine/parts.rs	crates/beta-core/src/observe.rs
+
+# ── beta-core/src/shapes/gadget.rs ──
+# `use super::widget::Widget;`
+Imports	crates/beta-core/src/shapes/gadget.rs	crates/beta-core/src/shapes/widget.rs
+Imports	crates/beta-core/src/shapes/gadget.rs	crates/beta-core/src/observe.rs
+Calls	crates/beta-core/src/shapes/gadget.rs	crates/beta-core/src/shapes/widget.rs
+Implements	crates/beta-core/src/shapes/gadget.rs	crates/beta-core/src/observe.rs
+
+# ── beta-core/src/lib.rs ──
+# `pub use shapes::gadget::Gadget;`
+Imports	crates/beta-core/src/lib.rs	crates/beta-core/src/shapes/gadget.rs
+
+# observe.rs: o.notify() resolves to the trait in the same file (no edge).
+# util.rs, widget.rs, shapes/mod.rs: no references.

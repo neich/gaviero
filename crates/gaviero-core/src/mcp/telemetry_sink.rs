@@ -68,8 +68,12 @@ pub struct McpCallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<u64>,
     /// Raw tool input JSON.
+    #[serde(default)]
     pub input: serde_json::Value,
-    /// Raw tool output JSON.
+    /// Raw tool output JSON. `null` (or absent, in older lines) on a
+    /// failed call or when the output was not captured; such records still
+    /// count as calls.
+    #[serde(default)]
     pub output: serde_json::Value,
 }
 
@@ -92,10 +96,12 @@ impl McpCallRecord {
 
 /// Heuristic "did this call return anything useful?" check over the raw
 /// output JSON. Inspects the first known result-bearing array field
-/// across the read-only tools (`results` for `memory_search`, `nodes`
-/// for `blast_radius`, `signatures`/`impls` for `node_doc`/symbol
-/// tools). A non-object output, or one with no recognised array, counts
-/// as non-empty.
+/// across the read-only tools (`results` for `memory_search` /
+/// `symbol_search`, `nodes` for `blast_radius`, `symbols` for `node_doc`,
+/// `entries` for `repo_outline`). `signatures` and `impls` stay last so
+/// records written before `node_doc` dropped its legacy `signatures`
+/// list keep their verdict. A non-object output, or one with no
+/// recognised array, counts as non-empty.
 ///
 /// Public because the history recorder labels an MCP record with the same
 /// verdict (`empty_result`) rather than re-deriving it.
@@ -103,7 +109,7 @@ pub fn output_is_empty(output: &serde_json::Value) -> bool {
     let Some(obj) = output.as_object() else {
         return false;
     };
-    for key in ["results", "nodes", "signatures", "impls"] {
+    for key in ["results", "nodes", "symbols", "entries", "signatures", "impls"] {
         if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
             return arr.is_empty();
         }
@@ -159,23 +165,37 @@ impl McpToolCallObserver for NdjsonTelemetrySink {
 
 /// Per-tool aggregate intrinsic metrics computed from the NDJSON sink.
 /// Intrinsic only (no task-success correlation): call count, p50/p95
-/// latency, error rate, and empty-result rate.
+/// latency, error rate, empty-result rate, and estimated output size.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolStats {
     pub tool_name: String,
     pub calls: usize,
+    /// Latency percentiles, nearest rank: sorted index `ceil(q·n) − 1`.
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub error_rate: f64,
+    /// Successful calls whose output was empty, over all calls.
     pub empty_result_rate: f64,
+    /// Successful calls whose output was measured.
+    pub output_samples: usize,
+    /// Successful calls with no usable output (`null` or absent in the
+    /// record). Unknown size, not zero tokens.
+    pub output_missing: usize,
+    /// Estimated output tokens of successful calls (see [`super::payload`]),
+    /// at sorted index `ceil(q·(n − 1))`. `None` without samples.
+    pub output_p50_tokens: Option<usize>,
+    pub output_p95_tokens: Option<usize>,
 }
 
 /// Streaming accumulator (kept private — `compute_stats` is the public
 /// seam).
+#[derive(Default)]
 struct Acc {
     durations_us: Vec<u64>,
     errors: usize,
     empties: usize,
+    output_tokens: Vec<usize>,
+    output_missing: usize,
 }
 
 /// Read the NDJSON telemetry file (plus its one rotated generation) and
@@ -195,6 +215,7 @@ pub fn compute_stats(path: &Path) -> std::io::Result<Vec<ToolStats>> {
         .into_iter()
         .map(|(tool_name, mut acc)| {
             acc.durations_us.sort_unstable();
+            acc.output_tokens.sort_unstable();
             let calls = acc.durations_us.len();
             let denom = calls.max(1) as f64;
             ToolStats {
@@ -204,6 +225,10 @@ pub fn compute_stats(path: &Path) -> std::io::Result<Vec<ToolStats>> {
                 p95_ms: percentile_us(&acc.durations_us, 95) / 1000.0,
                 error_rate: acc.errors as f64 / denom,
                 empty_result_rate: acc.empties as f64 / denom,
+                output_samples: acc.output_tokens.len(),
+                output_missing: acc.output_missing,
+                output_p50_tokens: index_percentile(&acc.output_tokens, 0.50),
+                output_p95_tokens: index_percentile(&acc.output_tokens, 0.95),
             }
         })
         .collect();
@@ -233,20 +258,39 @@ fn fold_file(path: &Path, by_tool: &mut BTreeMap<String, Acc>) -> std::io::Resul
         let Ok(rec) = serde_json::from_str::<McpCallRecord>(trimmed) else {
             continue;
         };
-        let acc = by_tool.entry(rec.tool_name).or_insert_with(|| Acc {
-            durations_us: Vec::new(),
-            errors: 0,
-            empties: 0,
-        });
+        let acc = by_tool.entry(rec.tool_name).or_default();
         acc.durations_us.push(rec.duration_us);
         if rec.error.is_some() {
+            // A failure has no successful payload: it neither counts as
+            // empty nor enters the output-size distribution.
             acc.errors += 1;
+            continue;
         }
         if rec.empty_result {
             acc.empties += 1;
         }
+        match &rec.output {
+            serde_json::Value::Null => acc.output_missing += 1,
+            output => match super::payload::compact_json_len(output) {
+                Some(bytes) => acc
+                    .output_tokens
+                    .push(super::payload::estimated_tokens(bytes)),
+                None => acc.output_missing += 1,
+            },
+        }
     }
     Ok(())
+}
+
+/// Output-size percentile at sorted index `ceil(q·(n − 1))`, the
+/// convention of the adoption report's replay (not the nearest rank used
+/// for latency). `None` for an empty slice.
+fn index_percentile(sorted: &[usize], q: f64) -> Option<usize> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = (q * (sorted.len() - 1) as f64).ceil() as usize;
+    Some(sorted[idx.min(sorted.len() - 1)])
 }
 
 /// Nearest-rank percentile (1-indexed `ceil(p/100 * n)`) over a
@@ -296,6 +340,29 @@ mod tests {
     }
 
     #[test]
+    fn output_is_empty_reads_modern_node_doc_and_outline_payloads() {
+        // node_doc without the legacy `signatures` list.
+        assert!(output_is_empty(&serde_json::json!({
+            "path": "a.md", "qualified_name": "a.md", "symbols": [], "note": "…"
+        })));
+        assert!(!output_is_empty(&serde_json::json!({
+            "path": "a.rs", "qualified_name": "a.rs",
+            "symbols": [{"qualified_name": "a.rs::f", "line": 1}]
+        })));
+        // repo_outline.
+        assert!(output_is_empty(&serde_json::json!({"entries": [], "token_estimate": 9})));
+        assert!(!output_is_empty(&serde_json::json!({
+            "entries": [{"rendered": "  a.rs (s1.00)"}], "token_estimate": 12
+        })));
+        // Legacy node_doc records carried both lists; the verdict is unchanged.
+        assert!(output_is_empty(&serde_json::json!({"signatures": [], "symbols": []})));
+        assert!(!output_is_empty(&serde_json::json!({"signatures": ["f"], "symbols": [{}]})));
+        assert!(output_is_empty(&serde_json::json!({"signatures": []})));
+        assert!(!output_is_empty(&serde_json::json!(null)));
+        assert!(!output_is_empty(&serde_json::json!([])));
+    }
+
+    #[test]
     fn append_then_compute_stats_aggregates_per_tool() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".gaviero").join(TELEMETRY_FILENAME);
@@ -333,7 +400,88 @@ mod tests {
         assert_eq!(stats[1].tool_name, "blast_radius");
         assert_eq!(stats[1].calls, 1);
         assert_eq!(stats[1].error_rate, 1.0);
-        assert_eq!(stats[1].empty_result_rate, 1.0);
+        // A failed call is not an empty *result*, whatever its output held.
+        assert_eq!(stats[1].empty_result_rate, 0.0);
+        assert_eq!(stats[1].output_samples, 0);
+        assert_eq!(stats[1].output_p50_tokens, None);
+    }
+
+    #[test]
+    fn index_percentile_matches_the_replay_convention() {
+        assert_eq!(index_percentile(&[], 0.5), None);
+        assert_eq!(index_percentile(&[7], 0.5), Some(7));
+        assert_eq!(index_percentile(&[7], 0.95), Some(7));
+        assert_eq!(index_percentile(&[1, 9], 0.5), Some(9), "ceil(0.5) = 1");
+        assert_eq!(index_percentile(&[1, 9], 0.95), Some(9));
+        let v: Vec<usize> = (0..21).collect();
+        assert_eq!(index_percentile(&v, 0.5), Some(10));
+        assert_eq!(index_percentile(&v, 0.95), Some(19));
+        let v: Vec<usize> = (0..22).collect();
+        assert_eq!(index_percentile(&v, 0.95), Some(20), "ceil(19.95)");
+    }
+
+    #[test]
+    fn output_sizes_ignore_failures_and_missing_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TELEMETRY_FILENAME);
+        let sink = NdjsonTelemetrySink::new(path.clone());
+        let d = Duration::from_micros(10);
+        // Two measured successes: 9 bytes → 3 tokens, 11 bytes ("→") → 3.
+        sink.on_tool_call(&entry("t", d, None, serde_json::json!({"a": "b"})));
+        sink.on_tool_call(&entry("t", d, None, serde_json::json!({"a": "→"})));
+        // A large one so p50 would move if the others were counted as 0.
+        let big = serde_json::json!({"results": ["x".repeat(400)]});
+        let big_tokens = serde_json::to_string(&big).unwrap().len().div_ceil(4);
+        sink.on_tool_call(&entry("t", d, None, big));
+        // Failures (null and non-null output) and a captured-but-null success.
+        sink.on_tool_call(&entry("t", d, Some("denied"), serde_json::Value::Null));
+        sink.on_tool_call(&entry("t", d, Some("boom"), serde_json::json!({"results": []})));
+        sink.on_tool_call(&entry("t", d, None, serde_json::Value::Null));
+
+        let s = &compute_stats(&path).unwrap()[0];
+        assert_eq!(s.calls, 6);
+        assert!((s.error_rate - 2.0 / 6.0).abs() < 1e-9);
+        assert_eq!(s.output_samples, 3);
+        assert_eq!(s.output_missing, 1);
+        assert_eq!(s.output_p50_tokens, Some(3));
+        assert_eq!(s.output_p95_tokens, Some(big_tokens));
+        // A successful empty array is measurable and counts as empty.
+        sink.on_tool_call(&entry("u", d, None, serde_json::json!({"results": []})));
+        let u = compute_stats(&path)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.tool_name == "u")
+            .unwrap();
+        assert_eq!(u.output_samples, 1);
+        assert_eq!(u.output_p50_tokens, Some(4), "{{\"results\":[]}} is 14 bytes");
+        assert_eq!(u.empty_result_rate, 1.0);
+    }
+
+    #[test]
+    fn legacy_records_without_output_still_count_across_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TELEMETRY_FILENAME);
+        // Rotated generation: an older line with no `input`/`output`, a
+        // malformed line, and a partial tail.
+        std::fs::write(
+            rotated_path(&path),
+            "{\"ts\":\"t\",\"tool_name\":\"node_doc\",\"duration_us\":5,\"empty_result\":false}\n\
+             {broken\n\
+             {\"ts\":\"t\",\"tool_name\":\"node_doc\",\"duration_us\":",
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            "{\"ts\":\"t\",\"tool_name\":\"node_doc\",\"duration_us\":7,\"error\":\"x\",\"empty_result\":false}\n\
+             {\"ts\":\"t\",\"tool_name\":\"node_doc\",\"duration_us\":9,\"empty_result\":false,\"input\":{},\"output\":{\"symbols\":[]}}\n",
+        )
+        .unwrap();
+        let s = &compute_stats(&path).unwrap()[0];
+        assert_eq!(s.calls, 3, "legacy line counted, malformed and partial lines skipped");
+        assert!((s.error_rate - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(s.output_missing, 1);
+        assert_eq!(s.output_samples, 1);
+        assert_eq!(s.output_p50_tokens, Some(4), "{{\"symbols\":[]}} is 14 bytes");
     }
 
     #[test]

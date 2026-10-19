@@ -1,0 +1,41 @@
+# Expected cross-file edges for the receiver-typing fixture: kind<TAB>from<TAB>to.
+# `Defines` and same-file edges are not listed. A leading `?` marks an edge
+# that is allowed but not required (a documented limit).
+# R = app/src/runner.rs, M = core-lib/src/model.rs, L = core-lib/src/lib.rs.
+# No line names core-lib/src/decoy.rs: an edge from app to it is a false
+# positive (t.elapsed() on Instant, rx.recv_many() on a tokio Receiver,
+# x.eq(&y) derived on Engine).
+
+# ── core-lib ──
+# `pub use model::Engine;`
+Imports	crates/core-lib/src/lib.rs	crates/core-lib/src/model.rs
+# `use crate::clock::Clock;`
+Imports	crates/core-lib/src/model.rs	crates/core-lib/src/clock.rs
+
+# ── app/src/runner.rs: imports ──
+Imports	crates/app/src/runner.rs	crates/core-lib/src/circle.rs
+Imports	crates/app/src/runner.rs	crates/core-lib/src/ext.rs
+# `use core_lib::model::{Inner, make_engine}` and `use core_lib::Engine` (re-export).
+Imports	crates/app/src/runner.rs	crates/core-lib/src/model.rs
+Imports	crates/app/src/runner.rs	crates/core-lib/src/observer.rs
+Imports	crates/app/src/runner.rs	crates/core-lib/src/square.rs
+
+# ── app/src/runner.rs: calls ──
+# self.engine.start(), self.engine.inner.poke(), self.boxed.start() (Box),
+# self.shared.start() (Arc), self.engine.shared.lock().unwrap().bump()
+# (Mutex guard → State), self.engine.cell.borrow_mut().bump() (RefCell),
+# e.start(), x/y/z.start() (annotation, Engine::new(), Engine::open()?),
+# w.inner().poke() (free fn return, then method return), i.poke(),
+# Engine::new() / Engine::open() / make_engine() themselves.
+Calls	crates/app/src/runner.rs	crates/core-lib/src/model.rs
+# self.engine.clock.tick() (field chain through two workspace types).
+Calls	crates/app/src/runner.rs	crates/core-lib/src/clock.rs
+# o.notify() on &dyn Observer, g.notify() with `where G: Observer`,
+# o.notify() on `impl Observer`: the trait's file.
+Calls	crates/app/src/runner.rs	crates/core-lib/src/observer.rs
+# sq.area() and c.area(): each goes to its own type, though both are imported.
+# `let e: Square` in shadow() shadows the `e: Engine` parameter.
+Calls	crates/app/src/runner.rs	crates/core-lib/src/square.rs
+Calls	crates/app/src/runner.rs	crates/core-lib/src/circle.rs
+# v.ext() on Vec<u8>: the extension trait's file.
+Calls	crates/app/src/runner.rs	crates/core-lib/src/ext.rs

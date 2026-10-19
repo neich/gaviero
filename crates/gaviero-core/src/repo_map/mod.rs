@@ -21,12 +21,16 @@ use petgraph::graph::{DiGraph, NodeIndex};
 
 pub mod builder;
 pub mod edges;
+pub mod extraction;
 pub mod graph_builder;
 pub mod page_rank;
+pub mod resolve;
+pub mod rust_walk;
 pub mod store;
 pub mod symbol_enrichment;
 pub mod symbol_search;
 pub mod topology;
+pub mod types;
 
 pub use topology::{TopologyConfig, build_folder_topology};
 
@@ -62,6 +66,11 @@ pub struct Symbol {
     pub kind: String,
     /// 0-based line number.
     pub line: usize,
+    /// Enclosing container, for methods: `impl:Type`, `impl:Type:Trait`
+    /// (an `impl Trait for Type` block) or `trait:Name`. `None` at top
+    /// level. Used by edge resolution to tell `Widget::new` from
+    /// `Gadget::new`; not part of the symbol's `qualified_name`.
+    pub owner: Option<String>,
 }
 
 /// A typed edge between two file nodes.
@@ -218,6 +227,40 @@ fn outline_line_cost(line: &str) -> usize {
     (line.len() / 4).max(1)
 }
 
+/// M3 per-selection tracing (V9 §11 M3 acceptance: "planner logs show ...
+/// graph file-score/mode per selection") plus the M0 aggregate
+/// `graph_selection` event, which baseline tooling greps for. Token-unit
+/// selections only.
+fn trace_graph_selection(out: &[GraphCandidate], budget_tokens: usize) {
+    for c in out {
+        tracing::info!(
+            target: "turn_metrics",
+            path = %c.path.display(),
+            rank_score = c.rank_score,
+            specificity = c.specificity,
+            decision = ?c.decision,
+            confidence = ?c.confidence,
+            token_estimate = c.token_estimate,
+            "graph_candidate"
+        );
+    }
+    let paths = |d: GraphDecision| -> Vec<String> {
+        out.iter()
+            .filter(|c| c.decision == d)
+            .map(|c| c.path.to_string_lossy().to_string())
+            .collect()
+    };
+    let tokens_used: usize = out.iter().map(|c| c.token_estimate).sum();
+    tracing::info!(
+        target: "turn_metrics",
+        graph_full_content = ?paths(GraphDecision::FullAttach),
+        graph_signatures = ?paths(GraphDecision::SignatureOnly),
+        graph_token_estimate = tokens_used,
+        graph_budget = budget_tokens,
+        "graph_selection"
+    );
+}
+
 /// C3 + C4: rank a set of files using mode-weighted PageRank +
 /// specificity, sourced from the persisted [`store::GraphStore`].
 ///
@@ -255,9 +298,32 @@ pub fn rank_files_with_weights(
     weights: store::EdgeWeights,
     config: SpecificityConfig,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+    rank_files_with_weights_cancellable(store, seeds, affected, weights, config, &|| false)
+}
+
+/// [`rank_files_with_weights`] that gives up with an error as soon as
+/// `cancelled()` returns true, checked before each SQL step and inside the
+/// per-file specificity loop (a statement that is already running is
+/// stopped separately, by [`store::GraphCancel`]'s interrupt).
+pub fn rank_files_with_weights_cancellable(
+    store: &store::GraphStore,
+    seeds: &[&str],
+    affected: &[String],
+    weights: store::EdgeWeights,
+    config: SpecificityConfig,
+    cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<HashMap<String, (f64, f64)>> {
     use petgraph::graph::DiGraph;
 
+    let check = || -> anyhow::Result<()> {
+        if cancelled() {
+            anyhow::bail!("graph query cancelled");
+        }
+        Ok(())
+    };
+
     // 1. Pull the projected file edges and the universe of files.
+    check()?;
     let edges = store.file_edges()?;
     let mut paths = store.all_file_paths()?;
     for s in seeds {
@@ -294,6 +360,7 @@ pub fn rank_files_with_weights(
     //    (seeds + affected). Walking every path in the DB was an N+1
     //    that turned a 24k-file scratch tree into a multi-minute
     //    `blast_radius` while the MCP graph mutex blocked `node_doc`.
+    check()?;
     let specificity_map: HashMap<NodeIndex, f64> = if config.enabled {
         let df = store.symbol_document_frequency()?;
         let n = paths.len().max(1) as f64;
@@ -322,6 +389,7 @@ pub fn rank_files_with_weights(
                 map.insert(idx, 1.0);
                 continue;
             }
+            check()?;
             let symbols = store.symbols_in_file(p).unwrap_or_default();
             let s = if symbols.is_empty() {
                 1.0
@@ -342,6 +410,7 @@ pub fn rank_files_with_weights(
     };
 
     // 4. Mode-weighted personalized PageRank seeded by the changed files.
+    check()?;
     let seed_indices: Vec<NodeIndex> = seeds
         .iter()
         .filter_map(|s| idx_for.get(*s).copied())
@@ -459,6 +528,38 @@ impl RepoMap {
         budget_tokens: usize,
         mode: store::BlastRadiusMode,
     ) -> Vec<GraphCandidate> {
+        let out = self.rank_candidates(owned, budget_tokens, mode, &outline_line_cost);
+        trace_graph_selection(&out, budget_tokens);
+        out
+    }
+
+    /// Same ranking and FullAttach → SignatureOnly → PathOnly downgrade as
+    /// [`Self::rank_for_agent_structured_with_mode`], but every candidate
+    /// line is charged `cost(line)` against `budget`, both in the caller's
+    /// unit. The MCP `repo_outline` tool uses it to budget the serialized
+    /// JSON entry (bytes) instead of the injected line (tokens).
+    ///
+    /// Each candidate's `token_estimate` is its `cost` in that unit. When
+    /// even the path-only line of the next-ranked file no longer fits, the
+    /// selection stops there (the same rule as the injector), so the result
+    /// is always a rank-ordered prefix. No tracing: the units are not tokens.
+    pub fn rank_with_line_cost(
+        &self,
+        owned: &[String],
+        budget: usize,
+        mode: store::BlastRadiusMode,
+        cost: &dyn Fn(&str) -> usize,
+    ) -> Vec<GraphCandidate> {
+        self.rank_candidates(owned, budget, mode, cost)
+    }
+
+    fn rank_candidates(
+        &self,
+        owned: &[String],
+        budget_tokens: usize,
+        mode: store::BlastRadiusMode,
+        line_cost: &dyn Fn(&str) -> usize,
+    ) -> Vec<GraphCandidate> {
         let owned_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
@@ -521,7 +622,7 @@ impl RepoMap {
             // PathOnly is the cheapest tier and the budget floor: when even a
             // path line won't fit, the outline budget is spent — stop.
             let path_line = format!("  {} (s{:.2})", path_str, specificity);
-            let path_cost = outline_line_cost(&path_line);
+            let path_cost = line_cost(&path_line);
             if path_cost > remaining {
                 break;
             }
@@ -532,7 +633,7 @@ impl RepoMap {
             // than dropping it once the budget tightens (breadth-preserving).
             let (decision, line, cost) = if owned_set.contains(idx) {
                 let own_line = format!("  OWN {} (s{:.2})", path_str, specificity);
-                let own_cost = outline_line_cost(&own_line);
+                let own_cost = line_cost(&own_line);
                 if own_cost <= remaining {
                     (GraphDecision::FullAttach, own_line, own_cost)
                 } else {
@@ -546,7 +647,7 @@ impl RepoMap {
                     specificity,
                     sym_names.join(", ")
                 );
-                let sig_cost = outline_line_cost(&sig_line);
+                let sig_cost = line_cost(&sig_line);
                 if sig_cost <= remaining {
                     (GraphDecision::SignatureOnly, sig_line, sig_cost)
                 } else {
@@ -576,44 +677,6 @@ impl RepoMap {
                 content_digest: None,
             });
         }
-
-        // M3 per-selection tracing (V9 §11 M3 acceptance: "planner logs show
-        // ... graph file-score/mode per selection").
-        for c in &out {
-            tracing::info!(
-                target: "turn_metrics",
-                path = %c.path.display(),
-                rank_score = c.rank_score,
-                specificity = c.specificity,
-                decision = ?c.decision,
-                confidence = ?c.confidence,
-                token_estimate = c.token_estimate,
-                "graph_candidate"
-            );
-        }
-
-        // M0 legacy aggregate event — emit even when consumers call the
-        // structured API directly, so M0 baseline tooling (which greps for
-        // `graph_selection`) keeps working unchanged.
-        let full_paths: Vec<String> = out
-            .iter()
-            .filter(|c| c.decision == GraphDecision::FullAttach)
-            .map(|c| c.path.to_string_lossy().to_string())
-            .collect();
-        let sig_paths: Vec<String> = out
-            .iter()
-            .filter(|c| c.decision == GraphDecision::SignatureOnly)
-            .map(|c| c.path.to_string_lossy().to_string())
-            .collect();
-        tracing::info!(
-            target: "turn_metrics",
-            graph_full_content = ?full_paths,
-            graph_signatures = ?sig_paths,
-            graph_token_estimate = tokens_used,
-            graph_budget = budget_tokens,
-            "graph_selection"
-        );
-
         out
     }
 
@@ -841,6 +904,7 @@ mod tests {
                 name: "seed".into(),
                 kind: "function_item".into(),
                 line: 0,
+                owner: None,
             }],
         });
         let by_call = g.add_node(FileNode {
@@ -850,6 +914,7 @@ mod tests {
                 name: "by_call".into(),
                 kind: "function_item".into(),
                 line: 0,
+                owner: None,
             }],
         });
         let by_test = g.add_node(FileNode {
@@ -859,6 +924,7 @@ mod tests {
                 name: "by_test".into(),
                 kind: "function_item".into(),
                 line: 0,
+                owner: None,
             }],
         });
         g.add_edge(seed, by_call, ReferenceEdge::new(EdgeKind::Calls));
@@ -929,6 +995,90 @@ mod tests {
         );
     }
 
+    /// The serialization-aware cost hook keeps the downgrade: a file whose
+    /// signature line does not fit the byte budget still appears as a
+    /// path-only line, and the selection is a rank-ordered prefix whose
+    /// summed cost never exceeds the budget.
+    #[test]
+    fn line_cost_hook_downgrades_to_pathonly_within_a_byte_budget() {
+        let mut g: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
+        let a = g.add_node(FileNode {
+            path: PathBuf::from("owned.rs"),
+            token_estimate: 9_000,
+            symbols: Vec::new(),
+        });
+        let symbols: Vec<Symbol> = (0..40)
+            .map(|i| Symbol {
+                name: format!("a_long_symbol_name_number_{i}"),
+                kind: "function_item".into(),
+                line: 0,
+                owner: None,
+            })
+            .collect();
+        let b = g.add_node(FileNode {
+            path: PathBuf::from("heavy.rs"),
+            token_estimate: 10,
+            symbols,
+        });
+        g.add_edge(
+            a,
+            b,
+            ReferenceEdge::new(crate::repo_map::store::EdgeKind::Calls),
+        );
+        let specificity_map = compute_specificity_map(&g, 0.5);
+        let map = RepoMap {
+            graph: g,
+            specificity_map,
+        };
+        // Bytes plus a JSON-ish per-entry overhead.
+        let cost = |line: &str| line.len() + 16;
+        let budget = 160;
+        let cands = map.rank_with_line_cost(
+            &["owned.rs".to_string()],
+            budget,
+            store::BlastRadiusMode::All,
+            &cost,
+        );
+        let heavy = cands
+            .iter()
+            .find(|c| c.path.to_string_lossy() == "heavy.rs")
+            .expect("heavy.rs must be downgraded, not dropped");
+        assert_eq!(heavy.decision, GraphDecision::PathOnly);
+        assert!(
+            !heavy.rendered_line.contains("a_long_symbol"),
+            "{}",
+            heavy.rendered_line.trim()
+        );
+        let spent: usize = cands.iter().map(|c| c.token_estimate).sum();
+        assert!(spent <= budget, "{spent} > {budget}");
+        for c in &cands {
+            assert_eq!(c.token_estimate, cost(&c.rendered_line));
+        }
+        // The token-unit injector path is unchanged by the hook.
+        let injected = map.rank_for_agent_structured(&["owned.rs".to_string()], 40);
+        assert!(injected.iter().all(|c| c.token_estimate == outline_line_cost(&c.rendered_line)));
+    }
+
+    #[test]
+    fn ranking_stops_when_cancelled() {
+        let store = store::GraphStore::open_memory().unwrap();
+        let affected = vec!["a.rs".to_string()];
+        let weights = store::EdgeWeights::default_for(store::BlastRadiusMode::All);
+        let config = SpecificityConfig::default();
+        let err = rank_files_with_weights_cancellable(
+            &store,
+            &["a.rs"],
+            &affected,
+            weights,
+            config,
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        let ok = rank_files_with_weights(&store, &["a.rs"], &affected, weights, config).unwrap();
+        assert!(ok.contains_key("a.rs"));
+    }
+
     #[test]
     fn downgrades_to_pathonly_instead_of_dropping() {
         // D2: a non-owned, symbol-heavy file whose full signature line won't
@@ -945,6 +1095,7 @@ mod tests {
                 name: format!("a_long_symbol_name_number_{i}"),
                 kind: "function_item".into(),
                 line: 0,
+                owner: None,
             })
             .collect();
         let b = g.add_node(FileNode {

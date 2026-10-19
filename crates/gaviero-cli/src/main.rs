@@ -3631,20 +3631,28 @@ fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>
         path.display()
     );
     println!(
-        "{:<16} {:>6} {:>10} {:>10} {:>8} {:>8}",
-        "tool", "calls", "p50(ms)", "p95(ms)", "err%", "empty%"
+        "{:<16} {:>6} {:>10} {:>10} {:>8} {:>8} {:>9} {:>9} {:>9}",
+        "tool", "calls", "p50(ms)", "p95(ms)", "err%", "empty%", "out n", "out p50", "out p95"
     );
+    let tokens = |t: Option<usize>| t.map_or_else(|| "n/a".to_string(), |t| t.to_string());
     for s in &stats {
         println!(
-            "{:<16} {:>6} {:>10.2} {:>10.2} {:>7.1}% {:>7.1}%",
+            "{:<16} {:>6} {:>10.2} {:>10.2} {:>7.1}% {:>7.1}% {:>9} {:>9} {:>9}",
             s.tool_name,
             s.calls,
             s.p50_ms,
             s.p95_ms,
             s.error_rate * 100.0,
             s.empty_result_rate * 100.0,
+            format!("{}/{}", s.output_samples, s.output_samples + s.output_missing),
+            tokens(s.output_p50_tokens),
+            tokens(s.output_p95_tokens),
         );
     }
+    println!(
+        "out: estimated tokens of successful payloads (compact JSON bytes / 4); \
+         out n = measured / successful calls."
+    );
     Ok(())
 }
 

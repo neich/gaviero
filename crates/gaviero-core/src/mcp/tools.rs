@@ -105,34 +105,56 @@ pub struct BlastRadiusInput {
     /// `"tests"`, or `"implementations"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Maximum ranked dependent rows. Defaults to 40; values above 200
+    /// clamp to 200; 0 returns no dependents. Changed-file and test-gap
+    /// rows are always returned and never count against the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
+/// One `blast_radius` row. `relation` is set only on the seed rows
+/// (`"changed"`) and the test-gap rows (`"test_gap"`); ordinary dependents
+/// carry the requested mode once, on [`BlastRadiusOutput::mode`].
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct BlastRadiusRelation {
     pub path: String,
-    /// Stable graph key for chaining to `symbol_doc` / `symbol_search`.
-    /// For file-level nodes this equals `path`.
-    pub qualified_name: String,
-    pub relation: String,
-    pub distance: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
     /// Populated when the Tier D1 NodeDoc schema lands; empty today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
-    /// C4: mode-weighted personalized PageRank score for this file.
-    /// Higher = more relevant for the requested `mode`. Optional so
-    /// pre-C4 callers ignore it cleanly.
+    /// C4: mode-weighted personalized PageRank score for this file,
+    /// rounded to 3 decimals after ranking. Higher = more relevant for the
+    /// requested `mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
-    /// C3: HippoRAG-style file-level node specificity in [0.0, 1.0].
-    /// 1.0 = domain-specific, ~0.0 = stop-symbol heavy. Optional so
-    /// agents can ignore it without breaking the schema.
+    /// C3: HippoRAG-style file-level node specificity in [0.0, 1.0],
+    /// rounded to 3 decimals. 1.0 = domain-specific, ~0.0 = stop-symbol
+    /// heavy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub specificity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct BlastRadiusOutput {
+    /// Normalized relation mode the dependents were ranked under.
+    pub mode: String,
+    /// Changed rows, then ranked dependents (best first), then test gaps.
     pub nodes: Vec<BlastRadiusRelation>,
+    /// Ranked dependents omitted by `limit`.
+    pub not_shown: usize,
+    /// True exactly when `not_shown > 0`.
+    pub truncated: bool,
+}
+
+pub const BLAST_RADIUS_DEFAULT_LIMIT: u32 = 40;
+pub const BLAST_RADIUS_MAX_LIMIT: u32 = 200;
+
+/// Resolve `blast_radius.limit`: absent → 40, above 200 → 200, 0 stays 0.
+pub fn clamp_blast_limit(limit: Option<u32>) -> usize {
+    limit
+        .unwrap_or(BLAST_RADIUS_DEFAULT_LIMIT)
+        .min(BLAST_RADIUS_MAX_LIMIT) as usize
 }
 
 // ── node_doc ──────────────────────────────────────────────────────
@@ -146,7 +168,13 @@ pub struct NodeDocInput {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct NodeDocSymbol {
     pub qualified_name: String,
-    pub signature: String,
+    /// Enriched signature. Omitted when it would only repeat the symbol
+    /// name (the last `::` segment of `qualified_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// 1-based start line, or null when the graph has none for this node.
+    #[serde(default)]
+    pub line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_snippet: Option<String>,
 }
@@ -158,15 +186,72 @@ pub struct NodeDoc {
     pub path: String,
     /// File-level graph key (same as `path` for File nodes).
     pub qualified_name: String,
-    /// Legacy flat list — mirrors `symbols[].signature`.
-    #[serde(default)]
-    pub signatures: Vec<String>,
     #[serde(default)]
     pub symbols: Vec<NodeDocSymbol>,
     #[serde(default)]
     pub purpose: String,
     #[serde(default)]
     pub summary: String,
+    /// Set only when `symbols` is empty: why, from the graph's persisted
+    /// extraction status. One of the `repo_map::extraction` outcome names
+    /// (`no_definitions`, `parse_size_excluded`, `generated_excluded`, …),
+    /// `unknown` (indexed before statuses were recorded) or `not_indexed`
+    /// (not in the graph). Never inferred from the file on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Set only when `symbols` is empty: a short factual reading of `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `status` and `note` for an empty `node_doc` result. `outcome` is the
+/// persisted extraction outcome of the path, if any; `has_file_node` says
+/// whether the graph holds the path at all.
+pub fn node_doc_empty_status(outcome: Option<&str>, has_file_node: bool) -> (String, String) {
+    use crate::repo_map::extraction::{ExtractionOutcome as O, MAX_FILE_BYTES, MAX_PARSE_BYTES};
+    let Some(raw) = outcome else {
+        return if has_file_node {
+            (
+                "unknown".into(),
+                "indexed before extraction status was recorded; rebuild the graph \
+                 (gaviero-cli --graph) to learn why it has no symbols"
+                    .into(),
+            )
+        } else {
+            (
+                "not_indexed".into(),
+                "not in the code graph: not a supported source file, excluded, or absent".into(),
+            )
+        };
+    };
+    let note = match O::parse(raw) {
+        Some(O::Symbols) => {
+            "extraction recorded symbols but none are stored; rebuild the graph".to_string()
+        }
+        Some(O::NoDefinitions) => "parsed; the file defines no symbols".to_string(),
+        Some(O::UnsupportedGrammar) => "no tree-sitter grammar for this file type".to_string(),
+        Some(O::LanguageSetupFailed) => "the grammar for this file type failed to load".to_string(),
+        Some(O::ParseTimeout) => "the parse exceeded the 2 s limit".to_string(),
+        Some(O::ParseFailed) => "the parser returned no syntax tree".to_string(),
+        Some(O::ReadFailed) => "the file could not be read as UTF-8 text".to_string(),
+        Some(O::ReadSizeExcluded) => format!("over the {MAX_FILE_BYTES}-byte read limit; not read"),
+        Some(O::ParseSizeExcluded) => {
+            format!("over the {MAX_PARSE_BYTES}-byte parse limit; symbols not extracted")
+        }
+        Some(O::GeneratedExcluded) => {
+            "generated source (@generated header); symbols not extracted".to_string()
+        }
+        None => format!("unrecognised extraction status {raw:?}"),
+    };
+    (raw.to_string(), note)
+}
+
+/// A stored 0-based start line as a 1-based `node_doc` line. Missing,
+/// negative, or unrepresentable values give `None`, never a made-up line.
+pub fn one_based_line(line_start: Option<i64>) -> Option<u32> {
+    line_start
+        .and_then(|l| u32::try_from(l).ok())
+        .and_then(|l| l.checked_add(1))
 }
 
 // ── repo_outline ──────────────────────────────────────────────────
@@ -189,20 +274,21 @@ pub struct RepoOutlineInput {
 }
 
 /// One ranked outline entry. `rendered` is byte-compatible with the
-/// corresponding line of the turn-1 `<repo_outline>` injection.
+/// corresponding line of the turn-1 `<repo_outline>` injection and already
+/// carries the path and a two-decimal specificity; the list order is the
+/// rank.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RepoOutlineEntry {
-    pub path: String,
-    pub rank_score: f64,
-    pub specificity: f64,
     pub rendered: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RepoOutlineOutput {
     pub entries: Vec<RepoOutlineEntry>,
-    /// Total estimated tokens across `entries` (outline-line cost, the
-    /// same budgeting the injector charges). Always ≤ the token cap.
+    /// Estimated tokens of this whole response as compact JSON, this field
+    /// included (`ceil(bytes / 4)`, see `mcp::payload`). Always ≤ the
+    /// effective token cap. Not a count of MCP envelope, pretty-printing or
+    /// model tokens.
     pub token_estimate: u32,
 }
 
@@ -449,6 +535,57 @@ mod tests {
         assert_eq!(clamp_blast_depth(None), 2);
         assert_eq!(clamp_blast_depth(Some(0)), 1);
         assert_eq!(clamp_blast_depth(Some(99)), 5);
+    }
+
+    #[test]
+    fn one_based_line_converts_or_gives_none() {
+        assert_eq!(one_based_line(Some(0)), Some(1));
+        assert_eq!(one_based_line(Some(41)), Some(42));
+        assert_eq!(one_based_line(None), None);
+        assert_eq!(one_based_line(Some(-1)), None);
+        assert_eq!(one_based_line(Some(i64::MAX)), None);
+        assert_eq!(one_based_line(Some(u32::MAX as i64)), None, "no wrap on +1");
+        assert_eq!(one_based_line(Some(u32::MAX as i64 - 1)), Some(u32::MAX));
+    }
+
+    #[test]
+    fn node_doc_symbol_serializes_compactly() {
+        let sym = NodeDocSymbol {
+            qualified_name: "src/a.rs::f".into(),
+            signature: None,
+            line: None,
+            doc_snippet: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&sym).unwrap(),
+            r#"{"qualified_name":"src/a.rs::f","line":null}"#
+        );
+    }
+
+    #[test]
+    fn blast_limit_defaults_clamps_and_keeps_zero() {
+        assert_eq!(clamp_blast_limit(None), 40);
+        assert_eq!(clamp_blast_limit(Some(0)), 0);
+        assert_eq!(clamp_blast_limit(Some(41)), 41);
+        assert_eq!(clamp_blast_limit(Some(200)), 200);
+        assert_eq!(clamp_blast_limit(Some(201)), 200);
+        assert_eq!(clamp_blast_limit(Some(u32::MAX)), 200);
+    }
+
+    #[test]
+    fn blast_limit_decoding_rejects_non_u32_values() {
+        let ok = |s: &str| serde_json::from_str::<BlastRadiusInput>(s).map(|i| i.limit);
+        assert_eq!(ok(r#"{"paths":["a"]}"#).unwrap(), None);
+        assert_eq!(ok(r#"{"paths":["a"],"limit":null}"#).unwrap(), None);
+        assert_eq!(ok(r#"{"paths":["a"],"limit":7}"#).unwrap(), Some(7));
+        for bad in [
+            r#"{"paths":["a"],"limit":-1}"#,
+            r#"{"paths":["a"],"limit":1.5}"#,
+            r#"{"paths":["a"],"limit":"10"}"#,
+            r#"{"paths":["a"],"limit":4294967296}"#,
+        ] {
+            assert!(ok(bad).is_err(), "{bad} must fail decoding");
+        }
     }
 
     #[test]

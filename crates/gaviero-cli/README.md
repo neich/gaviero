@@ -252,7 +252,7 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--mcp-stdio` | `name=cmd,args…` | Extra stdio MCP server (repeatable) |
 | `--mcp-codex-trust` | `granted\|denied\|unknown` | Codex trust for synthesized config |
 | `--skip-mcp-preflight` | — | Skip shim/URL validation before agents run |
-| `--mcp-stats` | — | Print per-tool MCP telemetry and exit |
+| `--mcp-stats` | — | Print per-tool MCP telemetry and exit: calls, latency p50/p95, error and empty rates, and estimated output tokens (p50/p95 of successful payloads, compact JSON bytes ÷ 4) |
 | `--mcp-stats-path` | `<path>` | Override NDJSON path for `--mcp-stats` |
 | `--mcp-reach-probe` | — | Probe vendor CLIs for nested MCP reach and write `.gaviero/mcp_reach.json` |
 | `--reach-providers` | `claude,codex,…` | Providers to probe (default: claude,codex,cursor,dsh) |

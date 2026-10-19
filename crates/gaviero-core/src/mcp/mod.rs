@@ -65,6 +65,7 @@ pub mod external_memory;
 pub mod http;
 mod legacy_handshake;
 pub mod observer;
+pub mod payload;
 pub mod preflight;
 pub mod probe;
 pub mod reach;

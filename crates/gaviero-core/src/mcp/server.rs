@@ -52,7 +52,8 @@ use super::tools::{
     MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
     NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
     SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolSearchHit,
-    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit,
+    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_blast_limit,
+    clamp_memory_search_limit, one_based_line,
     clamp_repo_outline_token_cap, clamp_symbol_search_limit, truncate_symbol_snippet,
 };
 
@@ -161,6 +162,14 @@ pub struct GavieroMcpServer {
     /// surface (tests / callers that skip the setting). `Some` is the
     /// allow-list; `memory_ping` is always listed unless permissions deny it.
     exposed_tools: Option<Vec<String>>,
+    /// Bound on one `blast_radius` graph query ([`GRAPH_QUERY_TIMEOUT`]).
+    graph_query_timeout: Duration,
+    /// Test hooks: a pause inside the blast query before it starts work,
+    /// and a count of blast queries that ran to completion.
+    #[cfg(test)]
+    blast_test_delay: Duration,
+    #[cfg(test)]
+    blast_completed: Arc<std::sync::atomic::AtomicUsize>,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -190,6 +199,133 @@ fn strip_schema_descriptions(schema: &mut serde_json::Value) {
 /// Bound for `blast_radius` so a stuck PageRank cannot hold the chat
 /// spinner for the 10–20 minutes observed in `mcp_calls.ndjson`.
 const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(12);
+
+// ── repo_outline payload budget ──────────────────────────────────
+//
+// The cap bounds the whole compact JSON response, estimated as
+// `ceil(bytes / 4)` (`super::payload`). Working in bytes: the response is
+// `{"entries":[E1,E2,…],"token_estimate":N}`, so it costs the empty
+// envelope plus each entry plus one comma per entry after the first. The
+// ranker charges every entry `bytes(entry) + 1`, over-counting one comma,
+// against `4·cap − bytes(envelope with N = cap)`. `token_estimate` never
+// exceeds `cap`, so reserving `cap`'s digits is enough, and the total stays
+// ≤ `4·cap − 1` bytes, i.e. ≤ `cap` estimated tokens.
+
+/// Compact bytes of `{"entries":[],"token_estimate":<cap>}`.
+fn outline_envelope_bytes(cap: u32) -> usize {
+    super::payload::compact_json_len(&RepoOutlineOutput {
+        entries: Vec::new(),
+        token_estimate: cap,
+    })
+    .unwrap_or(usize::MAX)
+}
+
+/// Byte budget the ranker may spend on entries for `cap`.
+fn outline_entry_budget_bytes(cap: u32) -> usize {
+    (cap as usize * 4).saturating_sub(outline_envelope_bytes(cap))
+}
+
+/// Compact bytes of one `{"rendered":"…"}` entry plus its comma,
+/// JSON escaping included.
+fn outline_entry_cost_bytes(line: &str) -> usize {
+    super::payload::compact_json_len(&RepoOutlineEntry {
+        rendered: line.to_string(),
+    })
+    .map_or(usize::MAX, |b| b + 1)
+}
+
+/// Build the response with a self-consistent `token_estimate`: the
+/// estimate of the payload that contains it. Adding digits can only grow
+/// the estimate, so the fixpoint is reached in a few steps.
+fn finish_outline(entries: Vec<RepoOutlineEntry>) -> RepoOutlineOutput {
+    let mut out = RepoOutlineOutput {
+        entries,
+        token_estimate: 0,
+    };
+    for _ in 0..8 {
+        let bytes = super::payload::compact_json_len(&out).unwrap_or(0);
+        let estimate = super::payload::estimated_tokens(bytes) as u32;
+        if estimate == out.token_estimate {
+            break;
+        }
+        out.token_estimate = estimate;
+    }
+    out
+}
+
+/// Round a score for output, after ranking. Non-finite values have no
+/// JSON form and are omitted.
+fn round_score(x: f64) -> Option<f64> {
+    x.is_finite().then(|| (x * 1000.0).round() / 1000.0)
+}
+
+/// Shape an impact query into the `blast_radius` response.
+///
+/// Changed rows come first (duplicate seeds collapsed, input order kept),
+/// then at most `limit` dependents ranked by full-precision score
+/// descending with path ascending as the tie-break (the impact query has
+/// no `ORDER BY`, so ties would otherwise follow SQL row order), then the
+/// test gaps. Scores are rounded only after ranking; NaN ranks last.
+/// `not_shown` counts the dependents the limit dropped, never seed or
+/// test-gap rows.
+fn format_blast_radius(
+    impact: &crate::repo_map::store::ImpactSummary,
+    ranks: &std::collections::HashMap<String, (f64, f64)>,
+    mode: BlastRadiusMode,
+    limit: usize,
+) -> BlastRadiusOutput {
+    let lookup = |p: &str| ranks.get(p).copied().unwrap_or((0.0, 1.0));
+    let row = |path: &str, relation: Option<&str>| {
+        let (score, sp) = lookup(path);
+        BlastRadiusRelation {
+            path: path.to_string(),
+            relation: relation.map(str::to_string),
+            purpose: None,
+            score: round_score(score),
+            specificity: round_score(sp),
+        }
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let seeds: Vec<&str> = impact
+        .changed_files
+        .iter()
+        .map(String::as_str)
+        .filter(|p| seen.insert(*p))
+        .collect();
+
+    let mut dependents: Vec<(&str, f64)> = impact
+        .affected_files
+        .iter()
+        .map(String::as_str)
+        .filter(|p| seen.insert(*p))
+        .map(|p| {
+            let score = lookup(p).0;
+            (p, if score.is_nan() { f64::NEG_INFINITY } else { score })
+        })
+        .collect();
+    dependents.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let not_shown = dependents.len().saturating_sub(limit);
+    dependents.truncate(limit);
+
+    let mut gaps_seen = std::collections::HashSet::new();
+    let mut nodes: Vec<BlastRadiusRelation> = seeds.iter().map(|p| row(p, Some("changed"))).collect();
+    nodes.extend(dependents.iter().map(|(p, _)| row(p, None)));
+    nodes.extend(
+        impact
+            .test_gaps
+            .iter()
+            .filter(|p| gaps_seen.insert(p.as_str()))
+            .map(|p| row(p, Some("test_gap"))),
+    );
+
+    BlastRadiusOutput {
+        mode: mode.as_str().to_string(),
+        nodes,
+        not_shown,
+        truncated: not_shown > 0,
+    }
+}
 
 /// Ensure the on-disk graph exists (first call in this process builds
 /// it under `graph_cache`), then open a *fresh* WAL connection for `f`.
@@ -271,8 +407,19 @@ impl GavieroMcpServer {
             probe_ledger: None,
             started_at: chrono::Utc::now(),
             exposed_tools: None,
+            graph_query_timeout: GRAPH_QUERY_TIMEOUT,
+            #[cfg(test)]
+            blast_test_delay: Duration::ZERO,
+            #[cfg(test)]
+            blast_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Override the `blast_radius` query bound (default 12 s).
+    pub fn with_graph_query_timeout(mut self, timeout: Duration) -> Self {
+        self.graph_query_timeout = timeout;
+        self
     }
 
     /// Clone the server for a freshly accepted connection, giving it its own
@@ -603,7 +750,6 @@ impl GavieroMcpServer {
         &self,
         input: MemorySearchInput,
     ) -> Result<Json<MemorySearchOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("memory_search")?;
         let limit = clamp_memory_search_limit(input.limit);
         // C1.6: resolve the kind filter. Default is `record`; `any`
@@ -745,22 +891,13 @@ impl GavieroMcpServer {
                 trust: m.trust_score,
             });
         }
-        let out = MemorySearchOutput { results };
-
-        self.emit_tool_call(
-            super::tools::TOOL_MEMORY_SEARCH,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+        Ok(Json(MemorySearchOutput { results }))
     }
 
     // ── blast_radius ────────────────────────────────────────────────
     #[tool(
         name = "blast_radius",
-        description = "Graph impact, callers, or tests for file paths. Read-only. Token cost: ~20-40 per relation.",
+        description = "Ranked dependents (impact, callers, tests) of file paths, best first; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~20-30 per row.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn blast_radius(
@@ -775,7 +912,6 @@ impl GavieroMcpServer {
         &self,
         input: BlastRadiusInput,
     ) -> Result<Json<BlastRadiusOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("blast_radius")?;
         if input.paths.is_empty() {
             return Err(ErrorData::invalid_params(
@@ -798,109 +934,71 @@ impl GavieroMcpServer {
         let excludes = self.graph_excludes.clone();
 
         // Build (if needed) under the sentinel mutex, then rank on a
-        // fresh connection so this call cannot block `node_doc`.
+        // fresh connection so this call cannot block `node_doc`. On timeout
+        // the query is cancelled, not merely abandoned: the in-flight SQL
+        // statement is interrupted and ranking stops at its next check.
+        // (A first-call graph *build* is not cancelled: it is cached work.)
+        let cancel = crate::repo_map::store::GraphCancel::new();
+        let job = Arc::clone(&cancel);
+        #[cfg(test)]
+        let (test_delay, completed) = (self.blast_test_delay, Arc::clone(&self.blast_completed));
         let compute = tokio::task::spawn_blocking(move || {
             with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
+                job.attach(store)?;
+                #[cfg(test)]
+                std::thread::sleep(test_delay);
+                job.check()?;
                 let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
                 let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
+                job.check()?;
                 let mut to_rank: Vec<String> = impact.changed_files.to_vec();
                 for f in &impact.affected_files {
                     if !to_rank.contains(f) {
                         to_rank.push(f.clone());
                     }
                 }
-                let ranks = crate::repo_map::rank_files_with_weights(
+                let ranks = crate::repo_map::rank_files_with_weights_cancellable(
                     store,
                     &seed_refs,
                     &to_rank,
                     weights,
                     specificity,
+                    &|| job.is_cancelled(),
                 )?;
+                #[cfg(test)]
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok((impact, ranks))
             })
         });
-        let (impact, ranks) = match tokio::time::timeout(GRAPH_QUERY_TIMEOUT, compute).await {
+        let (impact, ranks) = match tokio::time::timeout(self.graph_query_timeout, compute).await
+        {
             Ok(join) => join
                 .map_err(|e| ErrorData::internal_error(format!("blast_radius join: {e}"), None))?
                 .map_err(|e| ErrorData::internal_error(format!("blast_radius: {e}"), None))?,
             Err(_) => {
+                cancel.cancel();
                 return Err(ErrorData::internal_error(
                     format!(
                         "blast_radius timed out after {}s. Retry with a single source path.",
-                        GRAPH_QUERY_TIMEOUT.as_secs()
+                        self.graph_query_timeout.as_secs()
                     ),
                     None,
                 ));
             }
         };
 
-        let lookup = |p: &str| ranks.get(p).copied().unwrap_or((0.0, 1.0));
-
-        let mut nodes: Vec<BlastRadiusRelation> = Vec::new();
-        for path in &impact.changed_files {
-            let (score, sp) = lookup(path);
-            nodes.push(BlastRadiusRelation {
-                path: path.clone(),
-                qualified_name: path.clone(),
-                relation: "changed".to_string(),
-                distance: 0,
-                purpose: None,
-                score: Some(score),
-                specificity: Some(sp),
-            });
-        }
-        let mut affected_with_score: Vec<(String, f64, f64)> = impact
-            .affected_files
-            .iter()
-            .filter(|p| !impact.changed_files.contains(p))
-            .map(|p| {
-                let (s, sp) = lookup(p);
-                (p.clone(), s, sp)
-            })
-            .collect();
-        // Order affected dependents by mode-weighted rank (desc) so the
-        // first entries are the most relevant per the requested intent.
-        affected_with_score
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (path, score, sp) in affected_with_score {
-            nodes.push(BlastRadiusRelation {
-                path: path.clone(),
-                qualified_name: path,
-                relation: mode.as_str().to_string(),
-                distance: 1,
-                purpose: None,
-                score: Some(score),
-                specificity: Some(sp),
-            });
-        }
-        for path in &impact.test_gaps {
-            let (score, sp) = lookup(path);
-            nodes.push(BlastRadiusRelation {
-                path: path.clone(),
-                qualified_name: path.clone(),
-                relation: "test_gap".to_string(),
-                distance: 1,
-                purpose: None,
-                score: Some(score),
-                specificity: Some(sp),
-            });
-        }
-
-        let out = BlastRadiusOutput { nodes };
-        self.emit_tool_call(
-            super::tools::TOOL_BLAST_RADIUS,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+        Ok(Json(format_blast_radius(
+            &impact,
+            &ranks,
+            mode,
+            clamp_blast_limit(input.limit),
+        )))
     }
 
     // ── node_doc ────────────────────────────────────────────────────
     #[tool(
         name = "node_doc",
-        description = "One file's symbol signatures; chain qualified_name into symbol_doc. Read-only. Token cost: ~30-80.",
+        description = "One file's indexed symbols with 1-based lines; chain qualified_name into symbol_doc. Read-only. Token cost: ~15-25 per symbol.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn node_doc(
@@ -912,73 +1010,73 @@ impl GavieroMcpServer {
 
     /// In-process core of [`Self::node_doc`].
     async fn node_doc_impl(&self, input: NodeDocInput) -> Result<Json<NodeDoc>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("node_doc")?;
         let path = input.path.clone();
         let qualified_name = path.clone();
-        let log_input = serde_json::to_value(&input).unwrap_or_default();
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
         let graph_db = self.graph_db_path.clone();
         let excludes = self.graph_excludes.clone();
         let path_for_graph = path.clone();
 
-        let (symbols, signatures) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (symbols, empty_status) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
                 let nodes = store.nodes_for_file(&path_for_graph)?;
+                let has_file_node = nodes.iter().any(|n| n.kind == "File");
                 let mut symbols = Vec::new();
-                let mut signatures = Vec::new();
                 for node in nodes {
                     if node.kind == "File" {
                         continue;
                     }
-                    if let Some(doc) = store.symbol_doc(&node.qualified_name)? {
-                        let snippet = if doc.doc.is_empty() {
-                            None
-                        } else {
-                            Some(truncate_symbol_snippet(
-                                &doc.doc,
-                                SYMBOL_DOC_SNIPPET_MAX_CHARS,
-                            ))
-                        };
-                        signatures.push(doc.signature.clone());
-                        symbols.push(NodeDocSymbol {
-                            qualified_name: node.qualified_name.clone(),
-                            signature: doc.signature,
-                            doc_snippet: snippet,
-                        });
-                    } else {
-                        signatures.push(node.name.clone());
-                        symbols.push(NodeDocSymbol {
-                            qualified_name: node.qualified_name.clone(),
-                            signature: node.name.clone(),
-                            doc_snippet: None,
-                        });
-                    }
+                    let line = one_based_line(node.line_start);
+                    // Without a `symbol_docs` row the only "signature" is the
+                    // name, which `qualified_name` already ends with. An
+                    // enriched row whose signature is just the name is
+                    // omitted by the same rule; anything else is kept verbatim.
+                    let (signature, doc_snippet) = match store.symbol_doc(&node.qualified_name)? {
+                        Some(doc) => {
+                            let snippet = (!doc.doc.is_empty()).then(|| {
+                                truncate_symbol_snippet(&doc.doc, SYMBOL_DOC_SNIPPET_MAX_CHARS)
+                            });
+                            ((doc.signature != node.name).then_some(doc.signature), snippet)
+                        }
+                        None => (None, None),
+                    };
+                    symbols.push(NodeDocSymbol {
+                        qualified_name: node.qualified_name,
+                        signature,
+                        line,
+                        doc_snippet,
+                    });
                 }
-                Ok((symbols, signatures))
+                // An empty result says why, from the persisted extraction
+                // status only: no parse on demand, no guess from disk.
+                let empty_status = if symbols.is_empty() {
+                    let outcome = store.file_extraction(&path_for_graph)?.map(|r| r.outcome);
+                    Some(super::tools::node_doc_empty_status(
+                        outcome.as_deref(),
+                        has_file_node,
+                    ))
+                } else {
+                    None
+                };
+                Ok((symbols, empty_status))
             })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("node_doc join: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(format!("node_doc: {e}"), None))?;
 
-        let out = NodeDoc {
+        let (status, note) = empty_status.unzip();
+        Ok(Json(NodeDoc {
             qualified_name,
             path,
-            signatures,
             symbols,
             purpose: String::new(),
             summary: String::new(),
-        };
-        self.emit_tool_call(
-            super::tools::TOOL_NODE_DOC,
-            log_input,
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+            status,
+            note,
+        }))
     }
 
     // ── memory_get ──────────────────────────────────────────────────
@@ -999,7 +1097,6 @@ impl GavieroMcpServer {
         &self,
         input: MemoryGetInput,
     ) -> Result<Json<MemoryGetOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("memory_get")?;
         // `scope` names the owning *store* (ids are only unique per
         // physical DB — the BUG-1 lesson). Run rows live in the
@@ -1049,13 +1146,6 @@ impl GavieroMcpServer {
                 accessed_at: r.accessed_at,
             }),
         };
-        self.emit_tool_call(
-            super::tools::TOOL_MEMORY_GET,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
         Ok(Json(out))
     }
 
@@ -1077,7 +1167,6 @@ impl GavieroMcpServer {
         &self,
         input: MemoryPingInput,
     ) -> Result<Json<MemoryPingOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("memory_ping")?;
         let receipt = ping_receipt(&input.nonce, input.depth, self.started_at);
         let workspace_id = crate::workspace::identity::workspace_id_hex16(&self.workspace_root);
@@ -1089,19 +1178,11 @@ impl GavieroMcpServer {
                 receipt: receipt.clone(),
             });
         }
-        let out = MemoryPingOutput {
+        Ok(Json(MemoryPingOutput {
             receipt,
             depth: input.depth,
             workspace_id,
-        };
-        self.emit_tool_call(
-            super::tools::TOOL_MEMORY_PING,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+        }))
     }
 
     // ── memory_flag ─────────────────────────────────────────────────
@@ -1126,28 +1207,13 @@ impl GavieroMcpServer {
         &self,
         input: MemoryFlagInput,
     ) -> Result<Json<MemoryFlagOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("memory_flag")?;
 
-        let fail = |server: &Self, msg: String, err: ErrorData| -> ErrorData {
-            server.emit_tool_call(
-                super::tools::TOOL_MEMORY_FLAG,
-                serde_json::to_value(&input).unwrap_or_default(),
-                serde_json::Value::Null,
-                started,
-                Some(msg),
-            );
-            err
-        };
-
         let Some(sink) = self.signal_sink.as_ref() else {
-            let msg = "memory_flag is not wired on this server (no signal sink); \
-                       enable it with mcp.flag.enabled and restart the workspace"
-                .to_string();
-            return Err(fail(
-                self,
-                msg.clone(),
-                ErrorData::invalid_request(msg, None),
+            return Err(ErrorData::invalid_request(
+                "memory_flag is not wired on this server (no signal sink); \
+                 enable it with mcp.flag.enabled and restart the workspace",
+                None,
             ));
         };
 
@@ -1158,39 +1224,32 @@ impl GavieroMcpServer {
             "workspace" => (crate::memory::scope::SCOPE_WORKSPACE, None),
             "run" => (crate::memory::scope::SCOPE_RUN, None),
             other @ ("repo" | "module") => {
-                let msg = format!(
-                    "memory_flag.scope: {other:?} rows live in per-folder DBs keyed by a \
-                     repo_id the MCP surface does not carry; reachable scopes are \
-                     'global', 'workspace', and 'run'"
-                );
-                return Err(fail(
-                    self,
-                    msg.clone(),
-                    ErrorData::invalid_params(msg, None),
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_flag.scope: {other:?} rows live in per-folder DBs keyed by a \
+                         repo_id the MCP surface does not carry; reachable scopes are \
+                         'global', 'workspace', and 'run'"
+                    ),
+                    None,
                 ));
             }
             other => {
-                let msg = format!(
-                    "memory_flag.scope: unknown value {other:?}; expected 'global' | \
-                     'workspace' | 'run' (as returned by memory_search)"
-                );
-                return Err(fail(
-                    self,
-                    msg.clone(),
-                    ErrorData::invalid_params(msg, None),
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_flag.scope: unknown value {other:?}; expected 'global' | \
+                         'workspace' | 'run' (as returned by memory_search)"
+                    ),
+                    None,
                 ));
             }
         };
 
         let reason = input.reason.trim();
         if reason.is_empty() {
-            let msg = "memory_flag.reason must not be empty — it is recorded in the \
-                       audit row so a human can reverse the demotion"
-                .to_string();
-            return Err(fail(
-                self,
-                msg.clone(),
-                ErrorData::invalid_params(msg, None),
+            return Err(ErrorData::invalid_params(
+                "memory_flag.reason must not be empty — it is recorded in the \
+                 audit row so a human can reverse the demotion",
+                None,
             ));
         }
 
@@ -1202,29 +1261,18 @@ impl GavieroMcpServer {
                 reason: reason.to_string(),
             })
             .await
-            .map_err(|e| {
-                let msg = format!("memory_flag: {e}");
-                fail(self, msg.clone(), ErrorData::internal_error(msg, None))
-            })?;
+            .map_err(|e| ErrorData::internal_error(format!("memory_flag: {e}"), None))?;
 
-        let out = MemoryFlagOutput {
+        Ok(Json(MemoryFlagOutput {
             accepted: outcome.accepted,
             detail: outcome.detail,
-        };
-        self.emit_tool_call(
-            super::tools::TOOL_MEMORY_FLAG,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+        }))
     }
 
     // ── repo_outline ────────────────────────────────────────────────
     #[tool(
         name = "repo_outline",
-        description = "PageRank-ranked code outline for mid-run orientation. Read-only. Token cost: bounded by token_cap.",
+        description = "PageRank-ranked code outline lines for mid-run orientation. Read-only. Token cost: compact JSON payload ≤ token_cap (default 2000).",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn repo_outline(
@@ -1239,9 +1287,8 @@ impl GavieroMcpServer {
         &self,
         input: RepoOutlineInput,
     ) -> Result<Json<RepoOutlineOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("repo_outline")?;
-        let budget = clamp_repo_outline_token_cap(input.token_cap) as usize;
+        let cap = clamp_repo_outline_token_cap(input.token_cap);
         let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
         // Empty / omitted seeds → "." which the ranker treats as
         // match-all (every file is owned; whole-workspace outline).
@@ -1255,38 +1302,26 @@ impl GavieroMcpServer {
 
         let candidates = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             with_repo_map(&cache, &workspace_root, &excludes, |map| {
-                Ok(map.rank_for_agent_structured_with_mode(&seeds, budget, mode))
+                Ok(map.rank_with_line_cost(
+                    &seeds,
+                    outline_entry_budget_bytes(cap),
+                    mode,
+                    &outline_entry_cost_bytes,
+                ))
             })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("repo_outline join: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(format!("repo_outline: {e}"), None))?;
 
-        let mut token_estimate: u32 = 0;
-        let entries: Vec<RepoOutlineEntry> = candidates
-            .iter()
-            .map(|c| {
-                token_estimate = token_estimate.saturating_add(c.token_estimate as u32);
-                RepoOutlineEntry {
-                    path: c.path.to_string_lossy().to_string(),
-                    rank_score: c.rank_score,
-                    specificity: c.specificity,
-                    rendered: c.rendered_line.clone(),
-                }
+        let entries = candidates
+            .into_iter()
+            .map(|c| RepoOutlineEntry {
+                rendered: c.rendered_line,
             })
             .collect();
-
-        let out = RepoOutlineOutput {
-            entries,
-            token_estimate,
-        };
-        self.emit_tool_call(
-            super::tools::TOOL_REPO_OUTLINE,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
+        let out = finish_outline(entries);
+        debug_assert!(out.token_estimate <= cap, "{} > {cap}", out.token_estimate);
         Ok(Json(out))
     }
 
@@ -1308,7 +1343,6 @@ impl GavieroMcpServer {
         &self,
         input: SymbolSearchInput,
     ) -> Result<Json<SymbolSearchOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("symbol_search")?;
         if !self.symbol_enrichment_enabled {
             return Err(symbol_tools_disabled_error());
@@ -1369,15 +1403,7 @@ impl GavieroMcpServer {
                 }
             })
             .collect();
-        let out = SymbolSearchOutput { results };
-        self.emit_tool_call(
-            super::tools::TOOL_SYMBOL_SEARCH,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
-        Ok(Json(out))
+        Ok(Json(SymbolSearchOutput { results }))
     }
 
     // ── symbol_doc ──────────────────────────────────────────────────
@@ -1398,7 +1424,6 @@ impl GavieroMcpServer {
         &self,
         input: SymbolDocInput,
     ) -> Result<Json<SymbolDocOutput>, ErrorData> {
-        let started = Instant::now();
         self.ensure_tool_allowed("symbol_doc")?;
         if !self.symbol_enrichment_enabled {
             return Err(symbol_tools_disabled_error());
@@ -1454,13 +1479,6 @@ impl GavieroMcpServer {
         .map_err(|e| ErrorData::internal_error(format!("symbol_doc join: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(format!("symbol_doc: {e}"), None))?;
 
-        self.emit_tool_call(
-            super::tools::TOOL_SYMBOL_DOC,
-            serde_json::to_value(&input).unwrap_or_default(),
-            serde_json::to_value(&out).unwrap_or_default(),
-            started,
-            None,
-        );
         Ok(Json(out))
     }
 
@@ -1500,7 +1518,34 @@ impl GavieroMcpServer {
     ///
     /// Errors are flattened to `String` through `ErrorData`'s `Display` so
     /// callers outside this module need no rmcp types.
+    ///
+    /// This is one of the two observation owners (the other is
+    /// `ServerHandler::call_tool`): every invocation that reaches it emits
+    /// exactly one telemetry entry — success or failure, including a
+    /// rejected or unknown tool and undecodable arguments. The `*_impl`
+    /// cores never emit.
     pub async fn call_tool_in_process(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let started = Instant::now();
+        let input = args.clone();
+        let result = self.dispatch_in_process(name, args).await;
+        match &result {
+            Ok(output) => self.emit_tool_call(name, input, output.clone(), started, None),
+            Err(e) => self.emit_tool_call(
+                name,
+                input,
+                serde_json::Value::Null,
+                started,
+                Some(e.clone()),
+            ),
+        }
+        result
+    }
+
+    async fn dispatch_in_process(
         &self,
         name: &str,
         args: serde_json::Value,
@@ -1558,14 +1603,44 @@ impl ServerHandler for GavieroMcpServer {
         })
     }
 
+    /// The MCP observation owner (stdio, pipe and loopback HTTP all land
+    /// here). One telemetry entry per invocation, emitted after the router
+    /// returns, so a gate rejection, an unknown tool, undecodable arguments
+    /// and a core failure are observed exactly like a success. The logged
+    /// output is the logical payload (`structuredContent`) once, not also
+    /// its `content` text copy.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        self.ensure_tool_allowed(&request.name)?;
-        let tcc = ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        let started = Instant::now();
+        let name = request.name.to_string();
+        let input = request
+            .arguments
+            .clone()
+            .map(serde_json::Value::Object)
+            .unwrap_or(serde_json::Value::Null);
+        let result = match self.ensure_tool_allowed(&request.name) {
+            Ok(()) => {
+                let tcc = ToolCallContext::new(self, request, context);
+                self.tool_router.call(tcc).await
+            }
+            Err(e) => Err(e),
+        };
+        let (output, error) = match &result {
+            Ok(r) if r.is_error == Some(true) => (
+                serde_json::Value::Null,
+                Some(super::client::render_call_result(r)),
+            ),
+            Ok(r) => (
+                r.structured_content.clone().unwrap_or(serde_json::Value::Null),
+                None,
+            ),
+            Err(e) => (serde_json::Value::Null, Some(e.to_string())),
+        };
+        self.emit_tool_call(&name, input, output, started, error);
+        result
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -2249,11 +2324,508 @@ mod tests {
         let res = s
             .blast_radius(Parameters(BlastRadiusInput {
                 paths: vec![],
-                depth: None,
-                mode: None,
+                ..Default::default()
             }))
             .await;
         assert!(res.is_err());
+    }
+
+    // ── blast_radius formatting (X1) ────────────────────────────────
+
+    fn impact(
+        changed: &[&str],
+        affected: &[&str],
+        gaps: &[&str],
+    ) -> crate::repo_map::store::ImpactSummary {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        crate::repo_map::store::ImpactSummary {
+            changed_files: own(changed),
+            affected_files: own(affected),
+            test_gaps: own(gaps),
+            ..Default::default()
+        }
+    }
+
+    fn ranks(rows: &[(&str, f64)]) -> std::collections::HashMap<String, (f64, f64)> {
+        rows.iter()
+            .map(|(p, s)| (p.to_string(), (*s, 0.87654)))
+            .collect()
+    }
+
+    fn dependent_paths(out: &BlastRadiusOutput) -> Vec<&str> {
+        out.nodes
+            .iter()
+            .filter(|n| n.relation.is_none())
+            .map(|n| n.path.as_str())
+            .collect()
+    }
+
+    /// `n` dependents `d000..` with strictly decreasing scores.
+    fn many(n: usize) -> (Vec<String>, std::collections::HashMap<String, (f64, f64)>) {
+        let paths: Vec<String> = (0..n).map(|i| format!("src/d{i:03}.rs")).collect();
+        let r = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), (1.0 - i as f64 / 1000.0, 1.0)))
+            .collect();
+        (paths, r)
+    }
+
+    #[test]
+    fn blast_format_bounds_dependents_and_counts_omissions() {
+        for (n, limit, shown, not_shown) in [
+            (0, 40, 0, 0),
+            (40, 40, 40, 0),
+            (41, 40, 40, 1),
+            (41, 0, 0, 41),
+            (250, clamp_blast_limit(Some(10_000)), 200, 50),
+            (45, clamp_blast_limit(None), 40, 5),
+        ] {
+            let (paths, r) = many(n);
+            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut affected = vec!["src/seed.rs"];
+            affected.extend(refs.iter().copied());
+            let out = format_blast_radius(
+                &impact(&["src/seed.rs"], &affected, &["src/seed.rs"]),
+                &r,
+                BlastRadiusMode::Impact,
+                limit,
+            );
+            let deps = dependent_paths(&out);
+            assert_eq!(deps.len(), shown, "n={n} limit={limit}");
+            assert_eq!(deps, refs[..shown].to_vec(), "best-ranked first");
+            assert_eq!(out.not_shown, not_shown, "n={n} limit={limit}");
+            assert_eq!(out.truncated, not_shown > 0);
+            // Seed and test-gap rows survive every limit, including 0.
+            assert_eq!(out.nodes.first().unwrap().relation.as_deref(), Some("changed"));
+            assert_eq!(out.nodes.last().unwrap().relation.as_deref(), Some("test_gap"));
+            assert_eq!(out.mode, "impact");
+        }
+    }
+
+    #[test]
+    fn blast_format_is_stable_for_ties_and_sql_order() {
+        let r = ranks(&[
+            ("src/b.rs", 0.5),
+            ("src/a.rs", 0.5),
+            ("src/c.rs", 0.5),
+            ("src/hi.rs", 0.9),
+            // Both round to 0.123; full precision decides the order.
+            ("src/r2.rs", 0.1231),
+            ("src/r1.rs", 0.1234),
+        ]);
+        let orders: [&[&str]; 2] = [
+            &["src/b.rs", "src/r2.rs", "src/a.rs", "src/hi.rs", "src/c.rs", "src/r1.rs"],
+            &["src/r1.rs", "src/c.rs", "src/hi.rs", "src/a.rs", "src/r2.rs", "src/b.rs"],
+        ];
+        let outs: Vec<String> = orders
+            .iter()
+            .map(|affected| {
+                let out = format_blast_radius(
+                    &impact(&["src/seed.rs"], affected, &[]),
+                    &r,
+                    BlastRadiusMode::All,
+                    40,
+                );
+                assert_eq!(
+                    dependent_paths(&out),
+                    ["src/hi.rs", "src/a.rs", "src/b.rs", "src/c.rs", "src/r1.rs", "src/r2.rs"]
+                );
+                serde_json::to_string(&out).unwrap()
+            })
+            .collect();
+        assert_eq!(outs[0], outs[1], "SQL row order must not leak into the output");
+    }
+
+    #[test]
+    fn blast_format_collapses_duplicate_seeds_and_drops_non_finite_scores() {
+        let mut r = ranks(&[("src/x.rs", 0.2)]);
+        r.insert("src/nan.rs".into(), (f64::NAN, f64::INFINITY));
+        let out = format_blast_radius(
+            &impact(
+                &["src/s.rs", "src/t.rs", "src/s.rs"],
+                &["src/s.rs", "src/nan.rs", "src/t.rs", "src/x.rs"],
+                &["src/s.rs", "src/s.rs"],
+            ),
+            &r,
+            BlastRadiusMode::Callers,
+            40,
+        );
+        let changed: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.relation.as_deref() == Some("changed"))
+            .map(|n| n.path.as_str())
+            .collect();
+        assert_eq!(changed, ["src/s.rs", "src/t.rs"]);
+        assert_eq!(dependent_paths(&out), ["src/x.rs", "src/nan.rs"], "NaN ranks last");
+        let gaps = out
+            .nodes
+            .iter()
+            .filter(|n| n.relation.as_deref() == Some("test_gap"))
+            .count();
+        assert_eq!(gaps, 1);
+        let nan_row = out.nodes.iter().find(|n| n.path == "src/nan.rs").unwrap();
+        assert!(nan_row.score.is_none() && nan_row.specificity.is_none());
+        serde_json::to_string(&out).expect("non-finite scores never reach JSON");
+    }
+
+    #[test]
+    fn blast_format_emits_the_compact_shape() {
+        let out = format_blast_radius(
+            &impact(&["src/s.rs"], &["src/s.rs", "src/x.rs"], &[]),
+            &ranks(&[("src/x.rs", 0.123456789)]),
+            BlastRadiusMode::parse("not-a-mode"),
+            40,
+        );
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["mode"], "all", "unknown modes keep normalizing to all");
+        assert_eq!(v["not_shown"], 0);
+        assert_eq!(v["truncated"], false);
+        let dep = &v["nodes"][1];
+        assert_eq!(dep["path"], "src/x.rs");
+        assert_eq!(dep["score"], 0.123);
+        assert_eq!(dep["specificity"], 0.877);
+        for gone in ["qualified_name", "distance", "relation"] {
+            assert!(dep.get(gone).is_none(), "dependent row must not carry {gone}: {dep}");
+        }
+        assert_eq!(v["nodes"][0]["relation"], "changed");
+    }
+
+    /// A workspace where `src/core.rs` has `callers` dependents.
+    fn fan_out_workspace(callers: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("core.rs"), "pub fn gv_core_target() {}\n").unwrap();
+        for i in 0..callers {
+            std::fs::write(
+                src.join(format!("caller_{i:02}.rs")),
+                format!("pub fn gv_caller_{i:02}() {{ gv_core_target(); }}\n"),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn blast_radius_bounds_a_real_graph() {
+        let dir = fan_out_workspace(45);
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, dir.path().to_path_buf());
+        let call = |limit: Option<u32>| {
+            let s = s.clone();
+            async move {
+                s.blast_radius(Parameters(BlastRadiusInput {
+                    paths: vec!["src/core.rs".into()],
+                    depth: Some(1),
+                    mode: Some("callers".into()),
+                    limit,
+                }))
+                .await
+                .unwrap()
+                .0
+            }
+        };
+        let default = call(None).await;
+        assert_eq!(default.mode, "callers");
+        assert_eq!(dependent_paths(&default).len(), 40);
+        assert_eq!(default.not_shown, 5);
+        assert!(default.truncated);
+        let all = call(Some(200)).await;
+        assert_eq!(dependent_paths(&all).len(), 45);
+        assert!(!all.truncated);
+        // The description's "~20-30 per row" hint: rows here use short
+        // paths, so they must come in under the top of that band.
+        let bytes = serde_json::to_string(&all).unwrap().len();
+        let per_row = bytes.div_ceil(4) / all.nodes.len();
+        assert!(per_row <= 30, "{per_row} estimated tokens per row");
+        assert_eq!(
+            dependent_paths(&default),
+            dependent_paths(&all)[..40].to_vec(),
+            "the limit keeps the best-ranked prefix"
+        );
+        let none = call(Some(0)).await;
+        assert!(dependent_paths(&none).is_empty());
+        assert_eq!(none.not_shown, 45);
+        assert_eq!(none.nodes[0].path, "src/core.rs");
+    }
+
+    // ── observation ownership (X4) ──────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<McpCallLogEntry>>);
+
+    impl McpToolCallObserver for RecordingObserver {
+        fn on_tool_call(&self, entry: &McpCallLogEntry) {
+            self.0.lock().unwrap().push(entry.clone());
+        }
+    }
+
+    impl RecordingObserver {
+        fn take(&self) -> Vec<McpCallLogEntry> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    struct FailingSink;
+
+    #[async_trait::async_trait]
+    impl MemorySignalSink for FailingSink {
+        async fn flag(
+            &self,
+            _req: MemoryFlagRequest,
+        ) -> anyhow::Result<super::super::signal::MemoryFlagOutcome> {
+            anyhow::bail!("writer unavailable")
+        }
+    }
+
+    fn observed_server(
+        root: &std::path::Path,
+    ) -> (GavieroMcpServer, Arc<RecordingObserver>) {
+        let recorder = Arc::new(RecordingObserver::default());
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::new(
+            stores,
+            root.to_path_buf(),
+            recorder.clone() as Arc<dyn McpToolCallObserver>,
+            RetrievalConfig::default(),
+            RerankConfig::default(),
+            None,
+        );
+        (s, recorder)
+    }
+
+    /// Serve `server` over an in-memory duplex and connect a real rmcp
+    /// client — the same path a shim connection takes.
+    async fn mcp_client(
+        server: &GavieroMcpServer,
+    ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+        let (client_end, server_end) = tokio::io::duplex(256 * 1024);
+        spawn_connection(server, server_end);
+        let (r, w) = tokio::io::split(client_end);
+        ().serve(rmcp::transport::async_rw::AsyncRwTransport::new_client(r, w))
+            .await
+            .expect("client initialize")
+    }
+
+    /// One call through either entry point: `Ok(output)` or `Err(message)`.
+    async fn invoke(
+        via_mcp: Option<&rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+        server: &GavieroMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match via_mcp {
+            None => server.call_tool_in_process(name, args).await,
+            Some(client) => {
+                let mut params = CallToolRequestParams::new(name.to_string());
+                if let serde_json::Value::Object(map) = args {
+                    params = params.with_arguments(map);
+                }
+                match client.peer().call_tool(params).await {
+                    Ok(r) if r.is_error == Some(true) => Err(format!("{:?}", r.content)),
+                    Ok(r) => Ok(r.structured_content.unwrap_or(serde_json::Value::Null)),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// `(tool, args, expect_ok)` covering a success and the failure kinds
+    /// of every advertised tool except the gate-only cases tested below.
+    fn observation_cases() -> Vec<(&'static str, serde_json::Value, bool)> {
+        use serde_json::json;
+        vec![
+            ("memory_search", json!({"query": "x"}), true),
+            ("memory_search", json!({}), false),
+            ("memory_search", json!({"query": "x", "kind": "episode"}), false),
+            ("blast_radius", json!({"paths": ["src/core.rs"]}), true),
+            ("blast_radius", json!({"paths": ["src/core.rs"], "limit": 0}), true),
+            ("blast_radius", json!({"paths": []}), false),
+            ("blast_radius", json!({"paths": ["a"], "limit": -1}), false),
+            ("blast_radius", json!({"paths": ["a"], "limit": 1.5}), false),
+            ("blast_radius", json!({"paths": ["a"], "limit": "10"}), false),
+            ("node_doc", json!({"path": "src/core.rs"}), true),
+            ("node_doc", json!({"path": 7}), false),
+            ("memory_get", json!({"id": 1, "scope": "workspace"}), true),
+            ("memory_get", json!({"id": 1, "scope": "repo"}), false),
+            ("memory_ping", json!({"nonce": "n", "depth": 0}), true),
+            ("memory_ping", json!({"nonce": "n", "depth": 300}), false),
+            ("memory_flag", json!({"id": 1, "scope": "workspace", "reason": "stale"}), true),
+            ("memory_flag", json!({"id": 1, "scope": "workspace", "reason": "  "}), false),
+            ("memory_flag", json!({"id": 1, "scope": "cosmic", "reason": "stale"}), false),
+            ("memory_flag", json!({"id": 1, "scope": "workspace"}), false),
+            ("repo_outline", json!({}), true),
+            ("symbol_search", json!({"query": "  "}), false),
+            ("symbol_doc", json!({"qualified_name": "src/core.rs::nope"}), false),
+            ("definitely_not_a_tool", json!({}), false),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_invocation_is_observed_exactly_once_on_both_entry_points() {
+        let dir = fan_out_workspace(3);
+        let sink = Arc::new(RecordingSink {
+            accepted: true,
+            ..Default::default()
+        });
+        let (s, recorder) = observed_server(dir.path());
+        let s = s.with_signal_sink(sink.clone()).with_symbol_enrichment(true);
+        let client = mcp_client(&s).await;
+
+        for via_mcp in [false, true] {
+            let path = if via_mcp { "mcp" } else { "in-process" };
+            let flags_before = sink.seen.lock().unwrap().len();
+            for (tool, args, expect_ok) in observation_cases() {
+                let result = invoke(via_mcp.then_some(&client), &s, tool, args.clone()).await;
+                assert_eq!(result.is_ok(), expect_ok, "{path} {tool} {args}: {result:?}");
+                let rows = recorder.take();
+                assert_eq!(rows.len(), 1, "{path} {tool} {args}: one row per invocation");
+                let row = &rows[0];
+                assert_eq!(row.tool_name, tool);
+                assert_eq!(row.input, args, "{path} {tool}: input recorded as sent");
+                match &result {
+                    Ok(output) => {
+                        assert!(row.error.is_none(), "{path} {tool}");
+                        assert_eq!(&row.output, output, "{path} {tool}: logical payload once");
+                    }
+                    Err(_) => {
+                        assert!(row.error.is_some(), "{path} {tool} {args}");
+                        assert!(row.output.is_null(), "{path} {tool}: no payload on failure");
+                    }
+                }
+            }
+            assert_eq!(
+                sink.seen.lock().unwrap().len() - flags_before,
+                1,
+                "{path}: exactly one signal, from the one successful flag"
+            );
+        }
+        client.cancel().await.ok();
+    }
+
+    /// X8: the final payloads are identical through both dispatch paths,
+    /// byte for byte as compact JSON.
+    #[tokio::test]
+    async fn both_entry_points_return_the_same_logical_payload() {
+        let dir = fan_out_workspace(45);
+        let sink = Arc::new(RecordingSink {
+            accepted: true,
+            ..Default::default()
+        });
+        let (s, _rec) = observed_server(dir.path());
+        let s = s.with_signal_sink(sink).with_symbol_enrichment(true);
+        let client = mcp_client(&s).await;
+        let mut compared = 0;
+        for (tool, args, expect_ok) in observation_cases() {
+            if !expect_ok {
+                continue;
+            }
+            let local = invoke(None, &s, tool, args.clone()).await.unwrap();
+            let remote = invoke(Some(&client), &s, tool, args.clone()).await.unwrap();
+            assert_eq!(
+                serde_json::to_string(&local).unwrap(),
+                serde_json::to_string(&remote).unwrap(),
+                "{tool} {args}"
+            );
+            compared += 1;
+        }
+        assert!(compared >= 8, "{compared}");
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test]
+    async fn gate_rejections_are_observed_on_both_entry_points() {
+        let dir = fan_out_workspace(1);
+        let (denied, denied_rec) = observed_server(dir.path());
+        let denied = denied.with_permissions(super::super::McpPermissions {
+            allow: vec![],
+            deny: vec!["gaviero:blast_radius".into()],
+        });
+        let (hidden, hidden_rec) = observed_server(dir.path());
+        let hidden = hidden.with_exposed_tools(vec!["memory_search".into()]);
+        // Enrichment off: both symbol tools are hidden, not just failing.
+        let (plain, plain_rec) = observed_server(dir.path());
+        let (unwired, unwired_rec) = observed_server(dir.path());
+        let failing = observed_server(dir.path());
+        let failing_rec = failing.1.clone();
+        let failing = failing.0.with_signal_sink(Arc::new(FailingSink));
+
+        let flag = serde_json::json!({"id": 1, "scope": "workspace", "reason": "r"});
+        let cases: Vec<(&GavieroMcpServer, &RecordingObserver, &str, serde_json::Value)> = vec![
+            (&denied, &*denied_rec, "blast_radius", serde_json::json!({"paths": ["src/core.rs"]})),
+            (&hidden, &*hidden_rec, "node_doc", serde_json::json!({"path": "src/core.rs"})),
+            (&plain, &*plain_rec, "symbol_search", serde_json::json!({"query": "x"})),
+            (&plain, &*plain_rec, "symbol_doc", serde_json::json!({"qualified_name": "a::b"})),
+            (&unwired, &*unwired_rec, "memory_flag", flag.clone()),
+            (&failing, &*failing_rec, "memory_flag", flag),
+        ];
+        for (server, rec, tool, args) in cases {
+            let client = mcp_client(server).await;
+            for via_mcp in [false, true] {
+                let result = invoke(via_mcp.then_some(&client), server, tool, args.clone()).await;
+                assert!(result.is_err(), "{tool} via_mcp={via_mcp}: {result:?}");
+                let rows = rec.take();
+                assert_eq!(rows.len(), 1, "{tool} via_mcp={via_mcp}");
+                assert_eq!(rows[0].tool_name, tool);
+                assert!(rows[0].error.is_some());
+                assert!(rows[0].output.is_null());
+            }
+            client.cancel().await.ok();
+        }
+    }
+
+    /// The in-process path preserves the exact error text callers saw
+    /// before observation moved outward.
+    #[tokio::test]
+    async fn in_process_errors_keep_their_messages() {
+        let (s, _rec) = observed_server(std::path::Path::new("/tmp"));
+        let err = s
+            .call_tool_in_process("memory_flag", serde_json::json!({"id": 1, "scope": "workspace", "reason": "r"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("mcp.flag.enabled"), "{err}");
+        let err = s
+            .call_tool_in_process("blast_radius", serde_json::json!({"paths": ["a"], "limit": -1}))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("invalid arguments for blast_radius"), "{err}");
+    }
+
+    /// A timed-out `blast_radius` is cancelled, not abandoned: its blocking
+    /// work stops instead of running on after the caller gave up, and the
+    /// next call works normally.
+    #[tokio::test]
+    async fn a_timed_out_blast_radius_stops_its_work() {
+        let dir = fan_out_workspace(5);
+        let mut s = outline_server(dir.path());
+        s.blast_test_delay = Duration::from_millis(400);
+        s.graph_query_timeout = Duration::from_millis(50);
+        let input = || BlastRadiusInput {
+            paths: vec!["src/core.rs".into()],
+            ..Default::default()
+        };
+        let err = match s.blast_radius(Parameters(input())).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected the timeout"),
+        };
+        assert!(err.message.contains("timed out"), "{}", err.message);
+        // Give the abandoned job time to finish if it were still running.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            s.blast_completed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cancelled query must not run to completion"
+        );
+
+        s.blast_test_delay = Duration::ZERO;
+        s.graph_query_timeout = GRAPH_QUERY_TIMEOUT;
+        let out = s.blast_radius(Parameters(input())).await.unwrap().0;
+        assert_eq!(out.nodes[0].path, "src/core.rs");
+        assert_eq!(s.blast_completed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2420,6 +2992,186 @@ mod tests {
             .unwrap();
         assert_eq!(out.0.path, "src/lib.rs");
         assert_eq!(out.0.qualified_name, "src/lib.rs");
+    }
+
+    /// A long, realistic path so the per-symbol cost check below is not
+    /// flattered by short names.
+    const NODE_DOC_PATH: &str = "crates/gaviero-core/src/repo_map/node_doc_fixture.rs";
+
+    fn node_doc_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(NODE_DOC_PATH);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "pub fn gv_alpha() {}\n\npub struct GvBeta;\n\npub fn gv_gamma(x: u32) -> u32 { x }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# not source\n").unwrap();
+        dir
+    }
+
+    fn node_doc_server(dir: &std::path::Path) -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        GavieroMcpServer::with_defaults(stores, dir.to_path_buf()).with_symbol_enrichment(true)
+    }
+
+    async fn node_doc_of(s: &GavieroMcpServer, path: &str) -> NodeDoc {
+        s.node_doc(Parameters(NodeDocInput { path: path.into() }))
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn node_doc_returns_lines_without_duplicate_signatures() {
+        let dir = node_doc_workspace();
+        let s = node_doc_server(dir.path());
+        let out = node_doc_of(&s, NODE_DOC_PATH).await;
+
+        let by_name: std::collections::HashMap<&str, &NodeDocSymbol> = out
+            .symbols
+            .iter()
+            .map(|sym| (sym.qualified_name.rsplit("::").next().unwrap(), sym))
+            .collect();
+        assert_eq!(by_name["gv_alpha"].line, Some(1), "stored row 0 is line 1");
+        assert_eq!(by_name["GvBeta"].line, Some(3));
+        assert_eq!(by_name["gv_gamma"].line, Some(5));
+        for sym in &out.symbols {
+            assert!(sym.qualified_name.starts_with(&format!("{NODE_DOC_PATH}::")));
+            assert!(sym.signature.is_none(), "unenriched rows carry no signature");
+        }
+        assert!(out.note.is_none());
+
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(v.get("signatures").is_none(), "legacy list is gone: {v}");
+        assert!(!super::super::telemetry_sink::output_is_empty(&v));
+
+        // The description's "~15-25 per symbol" hint: the marginal cost of
+        // a symbol row, measured with a long path and real lines (the fixed
+        // header is paid once per call).
+        let bytes = serde_json::to_string(&out).unwrap().len();
+        let mut header_only = out.clone();
+        header_only.symbols.clear();
+        let header = serde_json::to_string(&header_only).unwrap().len();
+        let per_symbol = (bytes - header).div_ceil(4) / out.symbols.len();
+        assert!((15..=25).contains(&per_symbol), "{per_symbol} estimated tokens per symbol");
+    }
+
+    #[tokio::test]
+    async fn node_doc_keeps_real_enriched_signatures_and_symbol_doc_chaining() {
+        let dir = node_doc_workspace();
+        let s = node_doc_server(dir.path());
+        // Build the graph, then add enrichment rows the way `--enrich` would.
+        node_doc_of(&s, NODE_DOC_PATH).await;
+        let store = crate::repo_map::store::GraphStore::open(&s.graph_db_path).unwrap();
+        let enrich = |symbol: &str, signature: &str, doc: &str| {
+            store
+                .upsert_symbol_doc(&crate::repo_map::store::SymbolDoc {
+                    qualified_name: format!("{NODE_DOC_PATH}::{symbol}"),
+                    file_path: NODE_DOC_PATH.into(),
+                    file_hash: None,
+                    signature: signature.into(),
+                    bounds: String::new(),
+                    doc: doc.into(),
+                    role_summary: String::new(),
+                    embedding: None,
+                })
+                .unwrap();
+        };
+        enrich("gv_gamma", "pub fn gv_gamma(x: u32) -> u32", "Doubles nothing.");
+        // An enriched row whose signature is only the name.
+        enrich("GvBeta", "GvBeta", "");
+
+        let out = node_doc_of(&s, NODE_DOC_PATH).await;
+        let sym = |name: &str| {
+            out.symbols
+                .iter()
+                .find(|x| x.qualified_name.ends_with(&format!("::{name}")))
+                .unwrap()
+        };
+        assert_eq!(
+            sym("gv_gamma").signature.as_deref(),
+            Some("pub fn gv_gamma(x: u32) -> u32")
+        );
+        assert_eq!(sym("gv_gamma").doc_snippet.as_deref(), Some("Doubles nothing."));
+        assert_eq!(sym("gv_gamma").line, Some(5));
+        assert!(sym("GvBeta").signature.is_none());
+        assert!(sym("gv_alpha").signature.is_none());
+
+        let chained = s
+            .symbol_doc(Parameters(SymbolDocInput {
+                qualified_name: sym("gv_gamma").qualified_name.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(chained.signature, "pub fn gv_gamma(x: u32) -> u32");
+    }
+
+    #[tokio::test]
+    async fn node_doc_explains_empty_results_from_persisted_status() {
+        let dir = node_doc_workspace();
+        let root = dir.path();
+        std::fs::write(root.join("mods.rs"), "mod a;\n// nothing defined here\n").unwrap();
+        let mut big = String::from("pub fn gv_big() {}\n");
+        while big.len() <= crate::repo_map::extraction::MAX_PARSE_BYTES {
+            big.push_str("// padding padding padding padding padding padding\n");
+        }
+        std::fs::write(root.join("big.rs"), big).unwrap();
+        std::fs::write(
+            root.join("parser.c"),
+            "/* Automatically @generated by tree-sitter v0.25.10 */\nint f(void) { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("bad.rs"), [0xffu8, 0xfe, 0x00]).unwrap();
+        let s = node_doc_server(root);
+
+        for (path, status) in [
+            ("README.md", "not_indexed"),
+            ("src/absent.rs", "not_indexed"),
+            ("crates", "not_indexed"),
+            ("mods.rs", "no_definitions"),
+            ("big.rs", "parse_size_excluded"),
+            ("parser.c", "generated_excluded"),
+            ("bad.rs", "read_failed"),
+        ] {
+            let out = node_doc_of(&s, path).await;
+            assert!(out.symbols.is_empty(), "{path}");
+            assert_eq!(out.status.as_deref(), Some(status), "{path}");
+            assert!(out.note.as_deref().is_some_and(|n| !n.is_empty()), "{path}");
+            let v = serde_json::to_value(&out).unwrap();
+            assert!(super::super::telemetry_sink::output_is_empty(&v), "{path}: {v}");
+        }
+        // A nonempty result carries neither field.
+        let full = node_doc_of(&s, NODE_DOC_PATH).await;
+        assert!(full.status.is_none() && full.note.is_none());
+
+        // A graph built before statuses existed says `unknown`, not a guess.
+        let conn = rusqlite::Connection::open(&s.graph_db_path).unwrap();
+        conn.execute("DELETE FROM file_extraction WHERE file_path = 'mods.rs'", [])
+            .unwrap();
+        drop(conn);
+        assert_eq!(node_doc_of(&s, "mods.rs").await.status.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn node_doc_status_vocabulary_maps_every_outcome() {
+        use crate::repo_map::extraction::ExtractionOutcome;
+        let mut notes = std::collections::HashSet::new();
+        for o in ExtractionOutcome::ALL {
+            let (status, note) = super::super::tools::node_doc_empty_status(Some(o.as_str()), true);
+            assert_eq!(status, o.as_str());
+            assert!(!note.is_empty() && !note.contains("unrecognised"), "{status}");
+            notes.insert(note);
+        }
+        assert_eq!(notes.len(), ExtractionOutcome::ALL.len(), "one distinct note per outcome");
+        assert_eq!(super::super::tools::node_doc_empty_status(None, true).0, "unknown");
+        assert_eq!(super::super::tools::node_doc_empty_status(None, false).0, "not_indexed");
+        let (status, note) = super::super::tools::node_doc_empty_status(Some("from_the_future"), true);
+        assert_eq!(status, "from_the_future");
+        assert!(note.contains("unrecognised"));
     }
 
     #[tokio::test]
@@ -2924,7 +3676,166 @@ mod tests {
         );
         for e in &out.0.entries {
             assert!(!e.rendered.is_empty());
-            assert!(!e.path.is_empty());
+        }
+    }
+
+    // ── repo_outline payload budget (X5) ────────────────────────────
+
+    /// `n` source files with long, partly non-ASCII paths and several
+    /// symbols each, so rich lines, JSON escaping and the path-only
+    /// downgrade all matter.
+    fn outline_workspace(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("crates/gaviero-core/src/a_rather_long_module_directory_name/señal_→");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..n {
+            let mut src = String::new();
+            for j in 0..6 {
+                src.push_str(&format!("pub fn gv_outline_symbol_{i:03}_{j}() {{}}\n"));
+            }
+            if i > 0 {
+                src.push_str(&format!(
+                    "pub fn gv_link_{i:03}() {{ gv_outline_symbol_{:03}_0(); }}\n",
+                    i - 1
+                ));
+            }
+            std::fs::write(deep.join(format!("file_número_{i:03}.rs")), src).unwrap();
+        }
+        dir
+    }
+
+    fn outline_server(root: &std::path::Path) -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        GavieroMcpServer::with_defaults(stores, root.to_path_buf())
+    }
+
+    async fn outline(s: &GavieroMcpServer, input: RepoOutlineInput) -> RepoOutlineOutput {
+        s.repo_outline(Parameters(input)).await.unwrap().0
+    }
+
+    fn payload_tokens(out: &RepoOutlineOutput) -> u32 {
+        super::super::payload::estimated_tokens(
+            serde_json::to_string(out).unwrap().len(),
+        ) as u32
+    }
+
+    #[tokio::test]
+    async fn outline_payload_stays_within_the_effective_cap() {
+        let dir = outline_workspace(150);
+        let s = outline_server(dir.path());
+        for cap in [Some(0), Some(1), Some(100), Some(150), None, Some(4000), Some(8000), Some(999_999)] {
+            let effective = clamp_repo_outline_token_cap(cap);
+            let out = outline(
+                &s,
+                RepoOutlineInput {
+                    token_cap: cap,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let actual = payload_tokens(&out);
+            assert_eq!(out.token_estimate, actual, "cap {cap:?}: self-consistent estimate");
+            assert!(actual <= effective, "cap {cap:?}: {actual} > {effective}");
+            assert!(!out.entries.is_empty(), "cap {cap:?}: useful paths survive the overhead");
+            // Stable across calls.
+            let again = outline(
+                &s,
+                RepoOutlineInput {
+                    token_cap: cap,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(
+                serde_json::to_string(&out).unwrap(),
+                serde_json::to_string(&again).unwrap()
+            );
+        }
+        let big = outline(
+            &s,
+            RepoOutlineInput {
+                token_cap: Some(8000),
+                ..Default::default()
+            },
+        )
+        .await;
+        let v = serde_json::to_value(&big).unwrap();
+        for e in v["entries"].as_array().unwrap() {
+            assert_eq!(e.as_object().unwrap().len(), 1, "entries carry only `rendered`: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn outline_empty_seeds_mean_the_whole_workspace_and_empty_fits() {
+        let dir = outline_workspace(5);
+        let s = outline_server(dir.path());
+        let none = outline(&s, RepoOutlineInput::default()).await;
+        let empty = outline(
+            &s,
+            RepoOutlineInput {
+                seed_paths: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_string(&none).unwrap(),
+            serde_json::to_string(&empty).unwrap()
+        );
+        assert_eq!(none.entries.len(), 5);
+
+        let bare = tempfile::tempdir().unwrap();
+        let out = outline(
+            &outline_server(bare.path()),
+            RepoOutlineInput {
+                token_cap: Some(100),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.entries.is_empty());
+        assert_eq!(out.token_estimate, payload_tokens(&out));
+        assert!(out.token_estimate <= 100);
+    }
+
+    #[test]
+    fn outline_entry_cost_counts_escaping_and_the_comma() {
+        for line in ["  a.rs (s1.00)", "  dir/\"quoted\" \\back (s0.50)", "  señal_→/x.rs (s1.00)"] {
+            let entry = serde_json::to_string(&RepoOutlineEntry {
+                rendered: line.to_string(),
+            })
+            .unwrap();
+            assert_eq!(outline_entry_cost_bytes(line), entry.len() + 1, "{line}");
+        }
+        assert!(outline_entry_cost_bytes("\"") > outline_entry_cost_bytes("a"));
+    }
+
+    #[test]
+    fn finish_outline_estimate_is_self_consistent_across_digit_boundaries() {
+        // Grow the payload byte by byte through the 1→2, 2→3 and 3→4 digit
+        // transitions of `token_estimate`.
+        for n in 0..4200 {
+            let out = finish_outline(vec![RepoOutlineEntry {
+                rendered: "x".repeat(n),
+            }]);
+            assert_eq!(out.token_estimate, payload_tokens(&out), "n={n}");
+        }
+    }
+
+    #[test]
+    fn outline_budget_reserves_the_envelope_for_every_cap() {
+        for cap in [100u32, 101, 999, 1000, 2000, 8000] {
+            let budget = outline_entry_budget_bytes(cap);
+            // Fill exactly to the budget with one entry and check the cap.
+            let overhead = outline_entry_cost_bytes("");
+            let out = finish_outline(vec![RepoOutlineEntry {
+                rendered: "x".repeat(budget - overhead),
+            }]);
+            assert!(out.token_estimate <= cap, "cap {cap}: {}", out.token_estimate);
+            assert_eq!(out.token_estimate, payload_tokens(&out));
         }
     }
 
@@ -2983,8 +3894,7 @@ mod tests {
         match s
             .blast_radius(Parameters(BlastRadiusInput {
                 paths: vec!["src/lib.rs".into()],
-                mode: None,
-                depth: None,
+                ..Default::default()
             }))
             .await
         {
@@ -3132,8 +4042,7 @@ mod tests {
         match s
             .blast_radius(Parameters(BlastRadiusInput {
                 paths: vec!["src/lib.rs".into()],
-                depth: None,
-                mode: None,
+                ..Default::default()
             }))
             .await
         {

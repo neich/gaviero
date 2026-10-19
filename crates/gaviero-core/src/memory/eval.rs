@@ -2002,6 +2002,7 @@ mod tests {
             name: n.into(),
             kind: "fn".into(),
             line: 0,
+            owner: None,
         };
         let mut a = mk_candidate("crates/x/src/a.rs");
         a.symbols = vec![sym("Foo")];

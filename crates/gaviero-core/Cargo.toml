@@ -35,7 +35,11 @@ ort = "2.0.0-rc.12"
 # onnxruntime on windows-msvc (LNK2038 mismatch). esaxx only accelerates
 # Unigram *training*, which gaviero never runs — the pure-Rust fallback
 # (`suffix_rs`) covers the API.
-tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "onig"] }
+# `fancy-regex` instead of the default `onig`: a pure-Rust regex backend, so
+# no C build of Oniguruma (onig_sys) with the MSVC toolchain. Only ByteLevel
+# pre-tokenizers use it (gte-modernbert, jina-code); token ids were checked
+# identical to onig over this repo's sources (examples/tok_parity.rs).
+tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "fancy-regex"] }
 ndarray = "0.17"
 ropey = "1.6"
 portable-pty = "0.9"

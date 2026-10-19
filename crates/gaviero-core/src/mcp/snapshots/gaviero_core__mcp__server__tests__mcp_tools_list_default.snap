@@ -4,7 +4,7 @@ expression: "&default_pretty"
 ---
 [
   {
-    "description": "Graph impact, callers, or tests for file paths. Read-only. Token cost: ~20-40 per relation.",
+    "description": "Ranked dependents (impact, callers, tests) of file paths, best first; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~20-30 per row.",
     "name": "blast_radius"
   },
   {
@@ -24,11 +24,11 @@ expression: "&default_pretty"
     "name": "memory_search"
   },
   {
-    "description": "One file's symbol signatures; chain qualified_name into symbol_doc. Read-only. Token cost: ~30-80.",
+    "description": "One file's indexed symbols with 1-based lines; chain qualified_name into symbol_doc. Read-only. Token cost: ~15-25 per symbol.",
     "name": "node_doc"
   },
   {
-    "description": "PageRank-ranked code outline for mid-run orientation. Read-only. Token cost: bounded by token_cap.",
+    "description": "PageRank-ranked code outline lines for mid-run orientation. Read-only. Token cost: compact JSON payload ≤ token_cap (default 2000).",
     "name": "repo_outline"
   }
 ]

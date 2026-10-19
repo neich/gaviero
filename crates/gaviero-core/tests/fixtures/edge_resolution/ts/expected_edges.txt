@@ -1,0 +1,20 @@
+# Expected cross-file edges for the TypeScript fixture: kind<TAB>from<TAB>to.
+# A leading `?` marks an allowed-but-not-required edge.
+
+# ── src/app.ts ──
+# Named and namespace imports of './math'.
+Imports	src/app.ts	src/math.ts
+# Default import.
+Imports	src/app.ts	src/shapes/circle.ts
+# './shapes' is a directory specifier → its index.ts.
+Imports	src/app.ts	src/shapes/index.ts
+# add() (named import) and m.mul() (namespace import).
+Calls	src/app.ts	src/math.ts
+# makeCircle() (default import) and c.area() (member call, defined only in circle.ts).
+Calls	src/app.ts	src/shapes/circle.ts
+# 'fs' is a package specifier: external. helperHere() is local. `new Circle()` is
+# not a call expression.
+
+# ── src/shapes/index.ts ──
+# `export { Circle } from './circle';`
+Imports	src/shapes/index.ts	src/shapes/circle.ts
