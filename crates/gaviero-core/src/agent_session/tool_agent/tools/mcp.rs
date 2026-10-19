@@ -157,6 +157,74 @@ mod tests {
         assert!(out.ends_with("to see the rest.]"), "{out}");
     }
 
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<crate::mcp::observer::McpCallLogEntry>>);
+
+    impl crate::mcp::observer::McpToolCallObserver for Recorder {
+        fn on_tool_call(&self, entry: &crate::mcp::observer::McpCallLogEntry) {
+            self.0.lock().unwrap().push(entry.clone());
+        }
+    }
+
+    fn ctx() -> ToolCtx {
+        ToolCtx {
+            workspace_root: std::env::temp_dir(),
+            additional_roots: vec![],
+            scope: crate::types::FileScope::default(),
+            snapshot: None,
+            policy: crate::agent_session::tool_agent::policy::ToolPolicy::default(),
+            auto_approve: false,
+            observer: None,
+            sensitive: crate::scope_enforcer::SensitivePolicy::default(),
+        }
+    }
+
+    /// The adapter pretty-prints and truncates *after* the server has
+    /// observed the logical payload once: one record per run, carrying the
+    /// compact payload, while the delivered text is a separate, larger
+    /// measurement.
+    #[tokio::test]
+    async fn adapter_formats_after_a_single_logical_observation() {
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let embedder = std::sync::Arc::new(crate::memory::embedder::NullEmbedder::default())
+            as std::sync::Arc<dyn crate::memory::Embedder>;
+        let stores = crate::memory::MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let server = Arc::new(GavieroMcpServer::new(
+            stores,
+            std::env::temp_dir(),
+            recorder.clone() as Arc<dyn crate::mcp::observer::McpToolCallObserver>,
+            crate::memory::RetrievalConfig::default(),
+            crate::memory::RerankConfig::default(),
+            None,
+        ));
+        let spec = server
+            .in_process_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "memory_ping")
+            .unwrap();
+        let tool = McpTool::new(server, spec);
+
+        let ok = tool.run(json!({"nonce": "n", "depth": 0}), &ctx()).await;
+        assert!(!ok.is_error, "{}", ok.content);
+        let bad = tool.run(json!({"nonce": "n"}), &ctx()).await;
+        assert!(bad.is_error);
+
+        let rows = std::mem::take(&mut *recorder.0.lock().unwrap());
+        assert_eq!(rows.len(), 2, "one record per run, none added by the adapter");
+        let logical = crate::mcp::payload::compact_json_len(&rows[0].output).unwrap();
+        assert!(
+            ok.content.len() > logical,
+            "delivered pretty text {} B vs logical compact {logical} B",
+            ok.content.len()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&ok.content).unwrap(),
+            rows[0].output,
+            "same payload, different formatting"
+        );
+        assert!(rows[1].error.is_some() && rows[1].output.is_null());
+    }
+
     /// The cut point must land on a char boundary: slicing mid-codepoint would
     /// panic, and a 3-byte char straddling `MAX_OUTPUT_BYTES` is the realistic
     /// case for retrieval results carrying non-ASCII text.

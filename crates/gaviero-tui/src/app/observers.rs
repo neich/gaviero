@@ -349,6 +349,57 @@ mod tests {
         assert_eq!(mcp.1.attribution, Attribution::TurnInferred);
     }
 
+    /// Failed MCP calls now reach the observer: one History record carrying
+    /// the error and one status event with `error` set, per call, even in a
+    /// burst of rejections.
+    #[test]
+    fn mcp_observer_records_each_failure_once_with_its_error() {
+        let (_dir, history) = recorder();
+        history.begin_turn("c1", "c1-1", start(), false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = TuiMcpObserver {
+            tx,
+            history: history.clone(),
+        };
+        for _ in 0..3 {
+            observer.on_tool_call(&gaviero_core::mcp::McpCallLogEntry {
+                tool_name: "blast_radius".into(),
+                input: serde_json::json!({"paths": ["a"], "limit": -1}),
+                output: serde_json::Value::Null,
+                duration: std::time::Duration::from_millis(1),
+                error: Some("invalid arguments for blast_radius".into()),
+                first_tool_call_initiated: false,
+                session_id: None,
+                turn: None,
+            });
+        }
+
+        let mut events = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::McpToolCall { error, .. } => {
+                    assert_eq!(error.as_deref(), Some("invalid arguments for blast_radius"));
+                    events += 1;
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(events, 3);
+        let failures: Vec<_> = gaviero_core::history::read_records(history.path(), false)
+            .records
+            .into_iter()
+            .filter_map(|e| match e.record.payload {
+                HistoryKind::McpCall(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 3, "one History record per call");
+        for m in failures {
+            assert!(m.error.is_some());
+            assert!(m.output.is_null());
+        }
+    }
+
     #[test]
     fn acp_observer_pairs_tool_start_and_completion_into_one_record() {
         let (_dir, history) = recorder();

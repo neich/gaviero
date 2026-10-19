@@ -1084,6 +1084,72 @@ mod tests {
         assert_eq!(r.sole_active_turn(), None);
     }
 
+    /// A failed tool call (now observed) is stored with its error and a
+    /// null output, and the reader parses it back like any other record.
+    #[test]
+    fn mcp_failure_records_round_trip_with_null_output() {
+        let (_dir, r) = rec();
+        r.begin_turn("c1", "c1-1", start("a"), false);
+        let mut e = mcp_entry("blast_radius");
+        e.output = serde_json::Value::Null;
+        e.error = Some("gaviero MCP tool \"blast_radius\" is disabled".into());
+        r.record_mcp_call(&e);
+        let out = reader::read_records(r.path(), true);
+        let m = out
+            .records
+            .iter()
+            .find_map(|rec| match &rec.record.payload {
+                HistoryKind::McpCall(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("failure record is kept");
+        assert_eq!(m.error, e.error);
+        assert!(m.output.is_null());
+        assert!(!m.empty_result, "a failure is not an empty result");
+        assert_eq!(m.attribution, Attribution::TurnInferred);
+    }
+
+    #[test]
+    fn mcp_records_flag_empty_modern_node_doc_and_outline_payloads() {
+        let (_dir, r) = rec();
+        let call = |tool: &str, output: serde_json::Value| {
+            let mut e = mcp_entry(tool);
+            e.output = output;
+            r.record_mcp_call(&e);
+        };
+        call(
+            "node_doc",
+            serde_json::json!({"path": "a.md", "qualified_name": "a.md", "symbols": [], "note": "x"}),
+        );
+        call(
+            "node_doc",
+            serde_json::json!({"path": "a.rs", "qualified_name": "a.rs",
+                               "symbols": [{"qualified_name": "a.rs::f", "line": 1}]}),
+        );
+        call("repo_outline", serde_json::json!({"entries": [], "token_estimate": 9}));
+        call(
+            "repo_outline",
+            serde_json::json!({"entries": [{"rendered": "  a.rs (s1.00)"}], "token_estimate": 12}),
+        );
+        let flags: Vec<(String, bool)> = reader::read_records(r.path(), true)
+            .records
+            .into_iter()
+            .filter_map(|e| match e.record.payload {
+                HistoryKind::McpCall(m) => Some((m.tool, m.empty_result)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("node_doc".into(), true),
+                ("node_doc".into(), false),
+                ("repo_outline".into(), true),
+                ("repo_outline".into(), false),
+            ]
+        );
+    }
+
     #[test]
     fn mcp_records_keep_verbatim_io_and_estimates() {
         let (_dir, r) = rec();
