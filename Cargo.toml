@@ -19,3 +19,10 @@ chumsky = "0.12"
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
 ignore = "0.4"
+
+[profile.dev]
+debug = "line-tables-only"   # keeps file:line in panic backtraces, drops variable/type info
+# debug = false              # use this to drop debug info entirely
+
+[profile.dev.package."*"]
+debug = false                # no debug info for dependencies
