@@ -251,6 +251,9 @@ pub struct App {
     // History panel (per-turn prompt / tools / MCP / memory / totals)
     pub history_panel: crate::panels::history_panel::HistoryPanelState,
 
+    /// CODE GRAPH panel (`Alt+r`): the rendered document for the active file.
+    pub code_graph_panel: crate::panels::code_graph_panel::CodeGraphPanel,
+
     /// Ambiguous go-to-definition picker (`F12` / `Alt+.`). Modal: while it
     /// is open it consumes every key.
     pub definition_picker: Option<nav::DefinitionPicker>,
@@ -528,6 +531,7 @@ impl App {
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             history_panel: crate::panels::history_panel::HistoryPanelState::new(),
+            code_graph_panel: Default::default(),
             definition_picker: None,
             mcp_server: None,
             mcp_tool_server: None,
@@ -560,12 +564,18 @@ impl App {
             self.remote.push_frame(frame);
         }
         controller::handle_event(self, event);
-
+        // Single lifecycle hook for the CODE GRAPH panel: a no-op unless the
+        // visible panel's source file no longer matches the active buffer.
+        self.maybe_refresh_code_graph_panel();
         // Post-reducer projection + delivery (§2.1 path 2, invariant 11):
         // drain reducer frames and summary changes with try_send only.
         projection::pump_remote(self);
     }
 
+    /// Refresh the CODE GRAPH panel when the active buffer's file changed.
+    pub(crate) fn maybe_refresh_code_graph_panel(&mut self) {
+        side_panel::maybe_refresh_code_graph_panel(self);
+    }
 
     /// Re-assert the host-terminal VT mouse-passthrough request and (on
     /// Windows) the shared console *input* modes, throttled to
@@ -737,6 +747,9 @@ impl App {
         side_panel::handle_history_panel_action(self, action);
     }
 
+    fn handle_code_graph_action(&mut self, action: Action) {
+        side_panel::handle_code_graph_action(self, action);
+    }
 
     /// Reload the HISTORY panel from `.gaviero/history/turns.ndjson`.
     fn refresh_history_panel(&mut self) {

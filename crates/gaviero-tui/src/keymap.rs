@@ -29,7 +29,8 @@ pub enum Action {
     SetSideModeGit,
     /// Tier A / A4: memory inspection panel.
     SetSideModeMemory,
-
+    /// Code graph document for the active file.
+    SetSideModeGraph,
 
     // Editor actions
     InsertChar(char),
@@ -174,7 +175,8 @@ impl Keymap {
             KeyCode::Char('h') if alt => Action::SetSideModeHistory,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
-
+            // Alt+R: open / refresh the code graph panel (Alt+R was unbound).
+            KeyCode::Char('r') | KeyCode::Char('R') if alt => Action::SetSideModeGraph,
             // Alt+Y: toggle auto-approve permissions for next prompt
             KeyCode::Char('y') if alt => Action::ToggleAutoApprove,
 
@@ -540,6 +542,23 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('.'), KeyModifiers::NONE)),
             Action::InsertChar('.')
+        );
+    }
+
+    #[test]
+    fn alt_r_opens_the_code_graph_panel() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('r'), KeyModifiers::ALT)),
+            Action::SetSideModeGraph
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('R'), KeyModifiers::ALT)),
+            Action::SetSideModeGraph
+        );
+        // A bare 'r' is still text (it is the panel's refresh key).
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Action::InsertChar('r')
         );
     }
 }

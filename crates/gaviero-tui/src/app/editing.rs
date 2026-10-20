@@ -756,6 +756,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             {
                 app.focus = Focus::SidePanel;
 
+                // Must run before the chat scrollbar branch below, or a click
+                // in the panel's rightmost column is routed to the chat.
+                if app.side_panel == SidePanelMode::CodeGraph
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                {
+                    super::side_panel::click_code_graph(app, area, col, row);
+                    return;
+                }
 
                 if app.side_panel == SidePanelMode::AgentChat && row == area.y {
                     let tab_area_x = area.x + 1;
@@ -1299,7 +1307,18 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             app.history_panel
                 .scroll_section(if up { -delta } else { delta });
         }
-
+        SidePanelMode::CodeGraph => {
+            // Must not fall through to the chat arm: this panel has its own
+            // scroll state and no chat transcript.
+            let delta = theme::MOUSE_SCROLL_DELTA;
+            if up {
+                app.code_graph_panel.scroll.scroll_up(delta);
+            } else {
+                app.code_graph_panel
+                    .scroll
+                    .scroll_down(delta, app.code_graph_panel.lines.len());
+            }
+        }
         _ => {
             // Wheel while chat is focused: prefer the overflowing prompt unless
             // the pointer is explicitly over the transcript. Focus-first routing

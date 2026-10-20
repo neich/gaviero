@@ -451,7 +451,7 @@ fn action_escapes_terminal(action: &Action) -> bool {
             | SetSideModeHistory
             | SetSideModeGit
             | SetSideModeMemory
-
+            | SetSideModeGraph
             | GoToDefinition
             | ToggleAutoApprove
             | SwitchLayout(_)

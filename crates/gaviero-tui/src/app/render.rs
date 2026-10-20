@@ -275,7 +275,8 @@ pub(super) fn side_panel_title(app: &App, fullscreen: bool) -> &'static str {
         (SidePanelMode::GitPanel, true) => "GIT (fullscreen)",
         (SidePanelMode::MemoryPanel, false) => "MEMORY",
         (SidePanelMode::MemoryPanel, true) => "MEMORY (fullscreen)",
-
+        (SidePanelMode::CodeGraph, false) => "CODE GRAPH",
+        (SidePanelMode::CodeGraph, true) => "CODE GRAPH (fullscreen)",
     }
 }
 
@@ -1252,7 +1253,10 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
             app.history_panel
                 .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
         }
-
+        SidePanelMode::CodeGraph => {
+            let base = app.theme.default_style();
+            app.code_graph_panel.render(area, frame.buffer_mut(), base);
+        }
     }
 }
 

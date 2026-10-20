@@ -2015,7 +2015,15 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.focus = Focus::SidePanel;
             app.refresh_memory_panel();
         }
-
+        Action::SetSideModeGraph => {
+            app.panel_visible.side_panel = true;
+            app.side_panel = SidePanelMode::CodeGraph;
+            app.focus = Focus::SidePanel;
+            if let Err(e) = super::side_panel::refresh_code_graph_panel(app) {
+                app.status_message =
+                    Some((format!("Graph panel: {e}"), std::time::Instant::now()));
+            }
+        }
         Action::ToggleTerminal => {
             if app.focus == Focus::SidePanel && matches!(app.side_panel, SidePanelMode::AgentChat) {
                 if !app.chat_state.active_conv_busy() {
@@ -2281,7 +2289,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             SidePanelMode::HistoryPanel => app.handle_history_panel_action(action),
             SidePanelMode::GitPanel => app.handle_git_panel_action(action),
             SidePanelMode::MemoryPanel => app.handle_memory_panel_action(action),
-
+            SidePanelMode::CodeGraph => app.handle_code_graph_action(action),
         },
         _ => {}
     }

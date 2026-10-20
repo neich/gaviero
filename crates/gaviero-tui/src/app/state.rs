@@ -116,16 +116,20 @@ pub enum SidePanelMode {
     GitPanel,
     /// Tier A / A4: memory inspection panel. Activated via `Alt+m`.
     MemoryPanel,
+    /// Code graph document for the active file. Activated via `Alt+r`.
+    CodeGraph,
 }
 
 impl SidePanelMode {
-    /// The side-panel header arrow's cycle: CHAT → HISTORY → GIT → MEMORY → CHAT.
+    /// The side-panel header arrow's cycle:
+    /// CHAT → HISTORY → GIT → MEMORY → CODE GRAPH → CHAT.
     pub fn next_in_header_cycle(self) -> Self {
         match self {
             SidePanelMode::AgentChat => SidePanelMode::HistoryPanel,
             SidePanelMode::HistoryPanel => SidePanelMode::GitPanel,
             SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
-            SidePanelMode::MemoryPanel => SidePanelMode::AgentChat,
+            SidePanelMode::MemoryPanel => SidePanelMode::CodeGraph,
+            SidePanelMode::CodeGraph => SidePanelMode::AgentChat,
         }
     }
 }
@@ -325,7 +329,7 @@ mod tests {
     fn header_cycle_visits_history_between_chat_and_git() {
         let mut mode = SidePanelMode::AgentChat;
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             mode = mode.next_in_header_cycle();
             seen.push(mode);
         }
@@ -335,6 +339,7 @@ mod tests {
                 SidePanelMode::HistoryPanel,
                 SidePanelMode::GitPanel,
                 SidePanelMode::MemoryPanel,
+                SidePanelMode::CodeGraph,
                 SidePanelMode::AgentChat,
             ]
         );
