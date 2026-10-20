@@ -263,7 +263,7 @@ fn spawn_persistent(
 ) -> Result<PersistentSession> {
     use std::process::Stdio;
 
-    let tools_str = tools.join(",");
+    let tools_str = crate::acp::session::allowed_tools_arg(tools);
 
     let mut cmd = crate::util::spawn::agent_command("claude");
     // No --print — persistent conversation mode
@@ -287,9 +287,7 @@ fn spawn_persistent(
         cmd.arg("--append-system-prompt").arg(system_prompt);
     }
 
-    if !tools_str.is_empty() {
-        cmd.arg("--allowedTools").arg(&tools_str);
-    }
+    cmd.arg("--allowedTools").arg(&tools_str);
 
     cmd.arg("--add-dir").arg(cwd);
 

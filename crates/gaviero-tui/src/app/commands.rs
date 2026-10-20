@@ -41,14 +41,22 @@ pub(super) fn handle_mcp_command(app: &mut App, line: &str) {
 
 /// Returns `true` when the Codex trust consent has not yet been given
 /// or denied for this workspace — i.e. the value resolves to
-/// `"unknown"` (the hardcoded default). Gates the codex chat dispatch.
+/// `"unknown"` (the hardcoded default) — and there is something it would
+/// unlock. Gaviero's own server reaches Codex without it, so only context7
+/// or `mcp.extraServers` make the question worth asking. Gates the codex
+/// chat dispatch.
 pub(super) fn should_prompt_codex_trust(app: &App) -> bool {
     use gaviero_core::workspace::settings as S;
     let root = app.workspace.roots().first().map(|p| p.to_path_buf());
     let value = app
         .workspace
         .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, root.as_deref());
-    matches!(value.as_str(), Some("unknown"))
+    if !matches!(value.as_str(), Some("unknown")) {
+        return false;
+    }
+    gaviero_core::mcp::resolve_context7_config(&app.workspace, root.as_deref()).enabled
+        || !gaviero_core::mcp::extra_servers_from_workspace(&app.workspace, root.as_deref())
+            .is_empty()
 }
 
 /// Re-synthesize the per-workspace MCP config files (`.mcp.json`,

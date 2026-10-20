@@ -1425,11 +1425,11 @@ pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect
 
     let lines: Vec<String> = vec![
         String::new(),
-        "  Enable Codex MCP integration?".to_string(),
+        "  Enable Codex's extra MCP servers?".to_string(),
         String::new(),
-        "  Gaviero can expose its memory + graph tools to Codex".to_string(),
-        "  subprocesses via a per-worktree MCP config.".to_string(),
-        "  Writes `.codex/config.toml` with a trust_level stanza.".to_string(),
+        "  Gaviero's own tools already reach Codex. Trusting Codex".to_string(),
+        "  here also adds context7 / mcp.extraServers to".to_string(),
+        "  `.codex/config.toml` and marks the folder trusted.".to_string(),
         String::new(),
         "  [y] Yes, trust Codex here   [n / Esc] No, skip".to_string(),
         String::new(),

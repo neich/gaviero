@@ -102,7 +102,15 @@ An isolated run refuses a folder another gaviero process serves: rewriting its a
 
 Reads the same `.gaviero/settings.json` cascade as the editor (see [gaviero-tui](../gaviero-tui/README.md#configuration)), from the discovered workspace.
 
-**MCP extra servers** — merged into every agent worktree (`--mcp-url` overrides same-named entries):
+**gaviero's own MCP server** is on and pre-approved for every provider by default — no `agent.approvedTools` or `codexTrust` entry is needed (Claude `--allowedTools mcp__gaviero`, Codex `default_tools_approval_mode = "approve"`, Cursor `Mcp(gaviero:*)`). Turn it off with:
+
+```json
+{ "mcp.gavieroServer.enabled": false }
+```
+
+Per-tool limits still go through `mcp.permissions` (e.g. `"deny": ["gaviero:memory_flag"]`).
+
+**MCP extra servers** — merged into every agent worktree (`--mcp-url` overrides same-named entries). Codex receives them (and context7) only with `codexTrust` granted:
 
 ```json
 {

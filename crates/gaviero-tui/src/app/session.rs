@@ -41,8 +41,9 @@ pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyE
     match dialog.pending {
         super::state::PendingAfterTrust::ChatSend => {
             // On grant, re-synthesize so the next codex-exec turn picks up the
-            // gaviero MCP server (fresh subprocess reads .codex/config.toml at
-            // spawn — no restart needed). On deny, codex runs without it. The
+            // trust-gated servers (fresh subprocess reads .codex/config.toml at
+            // spawn — no restart needed). On deny, codex runs with gaviero's
+            // own server only. The
             // typed prompt is still in the chat input buffer, so replaying
             // `send_chat_message` dispatches it; trust is now persisted, so the
             // codex gate no longer fires (no dialog loop).

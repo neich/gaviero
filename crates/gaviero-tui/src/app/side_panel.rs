@@ -1879,11 +1879,11 @@ fn display_dir_prefix(query: &str) -> String {
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
-    // Codex needs MCP trust consent before its first turn — without it a codex
-    // chat turn would dispatch *silently* without gaviero MCP tools
-    // (`.codex/config.toml` is gated on `codexTrust == granted`). When the
-    // active model is codex and trust is still "unknown", open the consent
-    // dialog instead. The typed prompt stays in the input buffer (the dialog
+    // Codex needs MCP trust consent before its first turn when context7 or
+    // `mcp.extraServers` are configured — without it a codex chat turn would
+    // dispatch *silently* without them (they are gated on `codexTrust ==
+    // granted`; gaviero's own server is not). When the active model is codex
+    // and trust is still "unknown", open the consent dialog instead. The typed prompt stays in the input buffer (the dialog
     // captures all keys), and `handle_codex_trust_key` re-synthesizes the
     // codex config and replays this send on grant.
     if app.chat_state.effective_model().starts_with("codex:")

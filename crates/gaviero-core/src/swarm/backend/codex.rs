@@ -328,7 +328,12 @@ fn codex_exec_args(
     //   is the user-facing opt-in to this trade. The synthesized
     //   `.codex/rules/gaviero.rules` denylist still applies under the
     //   bypass flag (see the module docs).
-    let has_mcp = crate::mcp::codex_synth_has_any_mcp(workspace_root);
+    //
+    // Without the trust grant the config still declares gaviero's own
+    // server, which alone must not loosen the sandbox: the locked-down
+    // shape is kept and gaviero's calls rely on its pre-approval.
+    let has_mcp = crate::mcp::codex_synth_has_any_mcp(workspace_root)
+        && crate::mcp::codex_synth_trusted(workspace_root);
     if has_mcp {
         tracing::warn!(
             target: "backend.codex",
@@ -923,7 +928,8 @@ url = "https://example/mcp/"
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
-            "[mcp_servers.semantic-scholar]\nurl = \"https://example/mcp/\"\n",
+            "[mcp_servers.semantic-scholar]\nurl = \"https://example/mcp/\"\n\n\
+             [projects.\"/wt\"]\ntrust_level = \"trusted\"\n",
         )
         .unwrap();
         let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
@@ -956,7 +962,8 @@ url = "https://example/mcp/"
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
-            "[mcp_servers.gaviero]\ncommand = \"gaviero-mcp-shim\"\nargs = [\"--socket\", \"/tmp/mcp.sock\"]\n",
+            "[mcp_servers.gaviero]\ncommand = \"gaviero-mcp-shim\"\nargs = [\"--socket\", \"/tmp/mcp.sock\"]\n\n\
+             [projects.\"/wt\"]\ntrust_level = \"trusted\"\n",
         )
         .unwrap();
         let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
@@ -968,6 +975,35 @@ url = "https://example/mcp/"
         assert!(
             !args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
             "stale --sandbox read-only override leaked into {args:?}",
+        );
+    }
+
+    #[test]
+    fn test_codex_exec_args_keep_the_sandbox_without_a_trust_grant() {
+        // Without `codexTrust` the config declares only gaviero's own,
+        // pre-approved server; that must not loosen the sandbox.
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.gaviero]\ncommand = \"gaviero-mcp-shim\"\n\
+             default_tools_approval_mode = \"approve\"\n\n\
+             [projects.\"/wt\"]\ntrust_level = \"untrusted\"\n",
+        )
+        .unwrap();
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass without a trust grant in {args:?}",
+        );
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(
+            args.windows(2).any(|w| w[0] == "--config"
+                && w[1] == r#"mcp_servers.gaviero.default_tools_approval_mode="approve""#),
+            "gaviero is still declared, pre-approved: {args:?}",
         );
     }
 
