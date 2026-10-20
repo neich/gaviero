@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use crate::agent_session::tool_agent::config::ApiClientConfig;
 use crate::context_planner::types::McpCapabilities;
@@ -19,7 +19,45 @@ pub const DEFAULT_DSH_PROFILE: &str = "acp";
 pub const DSH_COMMAND_SETTING: &str = "providers.dsh.command";
 pub const DSH_ARGS_SETTING: &str = "providers.dsh.args";
 pub const DSH_PROFILE_SETTING: &str = "providers.dsh.profile";
+pub const DSH_CREDENTIAL_SOURCE_SETTING: &str = "providers.dsh.credentialSource";
 pub const DSH_COMMAND_OVERRIDE_KEY: &str = "dsh_command";
+
+/// dsh patch overlay that disables dsh's stored-credential store (the same
+/// three rows dsh's own `headless` profile disables), so the
+/// `DEEPSEEK_API_KEY` gaviero injects is the key dsh uses.
+pub const GAVIERO_ACP_PATCH: &str = "\
+# Written by gaviero; regenerated on every dsh: launch. Do not edit.
+# Disables dsh's stored credentials so gaviero's DEEPSEEK_API_KEY wins
+# (dsh >= 0.2.1-alpha.2 prefers ~/.dsh/.credentials.yaml over the env).
+- id: credentials
+  disabled: true
+- id: authorization
+  disabled: true
+- id: deepseek-account
+  disabled: true
+";
+pub const GAVIERO_ACP_PATCH_FILE: &str = "gaviero-acp.patch.yml";
+
+/// Whose DeepSeek key `dsh:` uses (`providers.dsh.credentialSource`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DshCredentialSource {
+    /// gaviero's resolved key, enforced by [`GAVIERO_ACP_PATCH`].
+    #[default]
+    Gaviero,
+    /// dsh's own stored credentials win when present; no patch.
+    Dsh,
+}
+
+fn parse_credential_source(v: Option<&str>) -> DshCredentialSource {
+    match v {
+        Some("dsh") => DshCredentialSource::Dsh,
+        None | Some("gaviero") => DshCredentialSource::Gaviero,
+        Some(s) => {
+            tracing::warn!(value = %s, "unknown providers.dsh.credentialSource; using \"gaviero\"");
+            DshCredentialSource::Gaviero
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DshLaunchSpec {
@@ -27,6 +65,7 @@ pub struct DshLaunchSpec {
     pub args: Vec<String>,
     pub profile: String,
     pub skip_api_key: bool,
+    pub credential_source: DshCredentialSource,
 }
 
 impl DshLaunchSpec {
@@ -47,6 +86,7 @@ impl DshLaunchSpec {
                     .find(|(k, _)| k == "dsh_profile")
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default(),
+                credential_source: DshCredentialSource::Gaviero,
             };
         }
         if let Ok(cmd) = std::env::var("GAVIERO_DSH_COMMAND")
@@ -57,6 +97,7 @@ impl DshLaunchSpec {
                 command: cmd,
                 args: Vec::new(),
                 profile: String::new(),
+                credential_source: DshCredentialSource::Gaviero,
             };
         }
         let settings = read_settings(root);
@@ -85,11 +126,19 @@ impl DshLaunchSpec {
             .and_then(|p| p.as_str())
             .unwrap_or(DEFAULT_DSH_PROFILE)
             .to_string();
+        let credential_source = parse_credential_source(
+            settings
+                .get("providers")
+                .and_then(|p| p.get("dsh"))
+                .and_then(|d| d.get("credentialSource"))
+                .and_then(|c| c.as_str()),
+        );
         Self {
             skip_api_key: is_fake_agent(&command),
             command,
             args,
             profile,
+            credential_source,
         }
     }
 
@@ -97,12 +146,23 @@ impl DshLaunchSpec {
         Path::new(&self.command).is_file() || resolve_program(&self.command).is_some()
     }
 
+    /// Launcher arguments: the configured args, `--profile` unless the args
+    /// already set one, then `--patch <patch>` when given.
+    pub fn launch_args(&self, patch: Option<&Path>) -> Vec<std::ffi::OsString> {
+        let mut out: Vec<std::ffi::OsString> = self.args.iter().map(Into::into).collect();
+        if !self.profile.is_empty() && !args_already_set_profile(&self.args) {
+            out.push("--profile".into());
+            out.push(self.profile.as_str().into());
+        }
+        if let Some(patch) = patch {
+            out.push("--patch".into());
+            out.push(patch.as_os_str().to_owned());
+        }
+        out
+    }
+
     pub fn build_command(&self, workspace_root: &Path) -> Result<tokio::process::Command> {
         let mut cmd = agent_command(&self.command);
-        cmd.args(&self.args);
-        if !self.profile.is_empty() && !args_already_set_profile(&self.args) {
-            cmd.arg("--profile").arg(&self.profile);
-        }
         if !self.skip_api_key {
             // The inner error names every file that was searched (workspace,
             // then `~/.gaviero/secrets.toml`), so it is surfaced whole rather
@@ -111,10 +171,46 @@ impl DshLaunchSpec {
                 .map_err(|e| anyhow!("dsh: {e:#}"))?;
             cmd.env("DEEPSEEK_API_KEY", cfg.api_key.expose());
         }
+        // Resolved after the key so a missing key is reported before
+        // anything is written under `~/.gaviero`.
+        let patch = if !self.skip_api_key && self.credential_source == DshCredentialSource::Gaviero
+        {
+            Some(ensure_acp_patch_file(&acp_patch_dir().ok_or_else(|| {
+                anyhow!(
+                    "dsh: cannot locate ~/.gaviero for the credential patch; \
+                     set providers.dsh.credentialSource to \"dsh\""
+                )
+            })?)?)
+        } else {
+            None
+        };
+        cmd.args(self.launch_args(patch.as_deref()));
         cmd.current_dir(workspace_root);
         cmd.env("NO_COLOR", "1");
         Ok(cmd)
     }
+}
+
+/// `~/.gaviero/dsh/`, beside the user settings file.
+fn acp_patch_dir() -> Option<std::path::PathBuf> {
+    crate::workspace::user_settings_path().and_then(|p| p.parent().map(|d| d.join("dsh")))
+}
+
+/// Write [`GAVIERO_ACP_PATCH`] to `<dir>/gaviero-acp.patch.yml` (tmp + rename)
+/// unless it is already current, and return its path.
+pub fn ensure_acp_patch_file(dir: &Path) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("dsh: creating {}", dir.display()))?;
+    let path = dir.join(GAVIERO_ACP_PATCH_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|s| s == GAVIERO_ACP_PATCH) {
+        return Ok(path);
+    }
+    let tmp = dir.join(format!("{GAVIERO_ACP_PATCH_FILE}.tmp"));
+    std::fs::write(&tmp, GAVIERO_ACP_PATCH)
+        .with_context(|| format!("dsh: writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("dsh: replacing {}", path.display()))?;
+    Ok(path)
 }
 
 fn args_already_set_profile(args: &[String]) -> bool {
@@ -363,6 +459,59 @@ mod tests {
     }
 
     #[test]
+    fn credential_source_defaults_to_gaviero() {
+        let dir = tempdir().unwrap();
+        let spec = DshLaunchSpec::from_workspace_root(dir.path(), &[]);
+        assert_eq!(spec.credential_source, DshCredentialSource::Gaviero);
+    }
+
+    #[test]
+    fn credential_source_reads_dsh_setting() {
+        let dir = tempdir().unwrap();
+        write_settings(
+            dir.path(),
+            r#"{"providers":{"dsh":{"credentialSource":"dsh"}}}"#,
+        );
+        let spec = DshLaunchSpec::from_workspace_root(dir.path(), &[]);
+        assert_eq!(spec.credential_source, DshCredentialSource::Dsh);
+    }
+
+    fn acp_spec() -> DshLaunchSpec {
+        DshLaunchSpec {
+            command: "dsh".into(),
+            args: vec![],
+            profile: "acp".into(),
+            skip_api_key: false,
+            credential_source: DshCredentialSource::Gaviero,
+        }
+    }
+
+    #[test]
+    fn launch_args_add_patch_after_profile() {
+        let args = acp_spec().launch_args(Some(Path::new("p.yml")));
+        assert_eq!(args, ["--profile", "acp", "--patch", "p.yml"]);
+    }
+
+    #[test]
+    fn launch_args_without_patch_unchanged() {
+        assert_eq!(acp_spec().launch_args(None), ["--profile", "acp"]);
+    }
+
+    #[test]
+    fn acp_patch_file_is_written_once_and_disables_three_rows() {
+        let dir = tempdir().unwrap();
+        let first = ensure_acp_patch_file(dir.path()).unwrap();
+        let second = ensure_acp_patch_file(dir.path()).unwrap();
+        assert_eq!(first, second);
+        let text = std::fs::read_to_string(&first).unwrap();
+        assert_eq!(text, GAVIERO_ACP_PATCH);
+        for row in ["- id: credentials", "- id: authorization", "- id: deepseek-account"] {
+            assert!(text.contains(row), "{row}");
+        }
+        assert!(!dir.path().join(format!("{GAVIERO_ACP_PATCH_FILE}.tmp")).exists());
+    }
+
+    #[test]
     fn missing_api_key_is_a_clear_error() {
         if std::env::var_os("DEEPSEEK_API_KEY").is_some()
             || std::env::var_os("GAVIERO_DSH_COMMAND").is_some()
@@ -370,6 +519,10 @@ mod tests {
             return;
         }
         let dir = tempdir().unwrap();
+        // A machine with `~/.gaviero/secrets.toml` resolves a key anyway.
+        if ApiClientConfig::resolve_deepseek(dir.path(), None, None).is_ok() {
+            return;
+        }
         let spec = DshLaunchSpec::from_workspace_root(dir.path(), &[]);
         let err = spec.build_command(dir.path()).unwrap_err();
         let msg = format!("{err:#}");

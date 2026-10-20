@@ -404,6 +404,12 @@ pub mod settings {
     pub const PROVIDERS_DSH_COMMAND: &str = "providers.dsh.command";
     pub const PROVIDERS_DSH_ARGS: &str = "providers.dsh.args";
     pub const PROVIDERS_DSH_PROFILE: &str = "providers.dsh.profile";
+    /// Which DeepSeek key `dsh:` uses. `"gaviero"` (default): gaviero launches
+    /// dsh with a `--patch` that disables dsh's own credential store, so the
+    /// key gaviero resolves (env, then secrets.toml) is the one dsh uses —
+    /// dsh >= 0.2.1-alpha.2 otherwise prefers `~/.dsh/.credentials.yaml`.
+    /// `"dsh"`: no patch; dsh's stored key wins when it has one.
+    pub const PROVIDERS_DSH_CREDENTIAL_SOURCE: &str = "providers.dsh.credentialSource";
 }
 
 /// Canonical workspace identity (Plan A §3.3) — the ONE portable helper
@@ -1650,6 +1656,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::PROVIDERS_DSH_COMMAND => serde_json::json!("dsh"),
         settings::PROVIDERS_DSH_ARGS => serde_json::json!([]),
         settings::PROVIDERS_DSH_PROFILE => serde_json::json!("acp"),
+        settings::PROVIDERS_DSH_CREDENTIAL_SOURCE => serde_json::json!("gaviero"),
 
         _ => serde_json::Value::Null,
     }
