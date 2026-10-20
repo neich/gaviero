@@ -44,13 +44,18 @@ fn dsh_acp_on_path() -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs dsh + DEEPSEEK_API_KEY"]
+#[ignore = "needs dsh + a DeepSeek key gaviero can resolve"]
 async fn dsh_acp_smoke() {
     assert!(
         dsh_acp_on_path(),
         "dsh not on PATH (npm i -g @deepseek-ai/dsh)"
     );
-    std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY");
+    gaviero_core::agent_session::tool_agent::config::ApiClientConfig::resolve_deepseek(
+        &std::env::current_dir().unwrap(),
+        None,
+        None,
+    )
+    .expect("no DeepSeek key resolvable by gaviero");
     let spec = ModelSpec::parse("dsh:deepseek-v4-flash");
     let profile = build_provider_profile(&spec, &RuntimeConfig::default());
     #[allow(deprecated)]
@@ -91,6 +96,7 @@ async fn dsh_acp_smoke() {
         .expect("dsh ACP spawn");
     let mut saw_text = false;
     let mut saw_done = false;
+    let mut saw_usage = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(120), stream.next()).await {
             Ok(Some(Ok(UnifiedStreamEvent::TextDelta(_)))) => saw_text = true,
@@ -98,6 +104,7 @@ async fn dsh_acp_smoke() {
                 saw_done = true;
                 break;
             }
+            Ok(Some(Ok(UnifiedStreamEvent::Usage(u)))) if u.input_tokens > 0 => saw_usage = true,
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(e))) => panic!("{e:#}"),
             Ok(None) => break,
@@ -105,8 +112,8 @@ async fn dsh_acp_smoke() {
         }
     }
     assert!(
-        saw_text && saw_done,
-        "saw_text={saw_text} saw_done={saw_done}"
+        saw_text && saw_done && saw_usage,
+        "saw_text={saw_text} saw_done={saw_done} saw_usage={saw_usage}"
     );
 }
 

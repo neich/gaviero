@@ -109,6 +109,17 @@ fn tool_end(update: &Value) -> Vec<UnifiedStreamEvent> {
 
 fn usage(update: &Value) -> Option<UnifiedStreamEvent> {
     let used = update.get("used").or_else(|| update.get("usage"))?;
+    // Live dsh-acp sends `used` as the session's total context tokens
+    // (a number, with `size` = window); the TUI keeps the last report as
+    // context occupancy, so it maps onto input_tokens.
+    if let Some(n) = used.as_u64() {
+        return Some(UnifiedStreamEvent::Usage(TokenUsage {
+            input_tokens: n,
+            output_tokens: 0,
+            cost_usd: None,
+            duration_ms: None,
+        }));
+    }
     let input = used
         .get("inputTokens")
         .or_else(|| used.get("input_tokens"))
@@ -199,5 +210,17 @@ mod tests {
             map_stop_reason(&json!({"stopReason":"cancelled"})),
             StopReason::Timeout
         );
+    }
+
+    #[test]
+    fn maps_numeric_usage_as_context_tokens() {
+        let u = json!({"sessionUpdate":"usage_update","used":123456,"size":1000000});
+        match &map_session_update(&u, Path::new("."))[..] {
+            [UnifiedStreamEvent::Usage(t)] => {
+                assert_eq!(t.input_tokens, 123456);
+                assert_eq!(t.output_tokens, 0);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
