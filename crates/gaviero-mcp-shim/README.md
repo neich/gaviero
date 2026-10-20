@@ -69,7 +69,7 @@ No library API — single binary with a `bridge` loop using byte-faithful `tokio
 | Tool | Availability |
 |---|---|
 | `memory_search`, `memory_get` | Always |
-| `blast_radius`, `node_doc`, `repo_outline` | Always |
+| `blast_radius`, `node_doc`, `repo_outline`, `symbol_refs` | Always |
 | `symbol_search`, `symbol_doc` | `repoMap.symbolEnrichment.enabled` |
 
 ## See Also

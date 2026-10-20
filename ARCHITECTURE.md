@@ -82,7 +82,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 ### Memory + MCP + write path
 
 - [`MemoryStores`](crates/gaviero-core/src/memory/stores.rs) + [`WriterHandle`](crates/gaviero-core/src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — nine tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs) (stdio shim) plus a loopback streamable-HTTP listener ([`mcp/http.rs`](crates/gaviero-core/src/mcp/http.rs)). Eight read-only (including `memory_ping`) plus write-adjacent `memory_flag`. Nested-agent reach is probed (`--mcp-reach-probe`) and recorded in `.gaviero/mcp_reach.json`. `gaviero-mcp-shim --resolve` walks up for `mcp-endpoint.json`. User-scope MCP registration: `--mcp-register-user`. Lean tool list: `mcp.gavieroServer.exposedTools`. DeepSeek `deepseek:` does not use the shim; `dsh:` mounts gaviero MCP on `session/new`.
+- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — ten tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs) (stdio shim) plus a loopback streamable-HTTP listener ([`mcp/http.rs`](crates/gaviero-core/src/mcp/http.rs)). Nine read-only (including `memory_ping` and the function-level `symbol_refs`) plus write-adjacent `memory_flag`. Nested-agent reach is probed (`--mcp-reach-probe`) and recorded in `.gaviero/mcp_reach.json`. `gaviero-mcp-shim --resolve` walks up for `mcp-endpoint.json`. User-scope MCP registration: `--mcp-register-user`. Lean tool list: `mcp.gavieroServer.exposedTools`. DeepSeek `deepseek:` does not use the shim; `dsh:` mounts gaviero MCP on `session/new`.
 - [`WriteGatePipeline`](crates/gaviero-core/src/write_gate.rs) — every agent file change.
 
 ### Observers

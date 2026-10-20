@@ -1,8 +1,9 @@
 //! Tool input/output schemas (Tier A / A5).
 //!
-//! Nine tools: eight read-only (`memory_search`, `memory_get`,
+//! Ten tools: nine read-only (`memory_search`, `memory_get`,
 //! `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`,
-//! `symbol_search`, `symbol_doc`) plus write-adjacent `memory_flag`,
+//! `symbol_refs`, `symbol_search`, `symbol_doc`) plus write-adjacent
+//! `memory_flag`,
 //! which emits a signal that the S2 writer task turns into a trust
 //! demotion. It creates and deletes nothing. `memory_ping` writes only
 //! to an in-memory probe ledger. Each input/output struct derives
@@ -18,6 +19,7 @@ pub const TOOL_NODE_DOC: &str = "node_doc";
 pub const TOOL_SYMBOL_SEARCH: &str = "symbol_search";
 pub const TOOL_SYMBOL_DOC: &str = "symbol_doc";
 pub const TOOL_REPO_OUTLINE: &str = "repo_outline";
+pub const TOOL_SYMBOL_REFS: &str = "symbol_refs";
 pub const TOOL_MEMORY_GET: &str = "memory_get";
 pub const TOOL_MEMORY_FLAG: &str = "memory_flag";
 pub const TOOL_MEMORY_PING: &str = "memory_ping";
@@ -31,6 +33,7 @@ pub const ALL_MCP_TOOLS: &[&str] = &[
     TOOL_BLAST_RADIUS,
     TOOL_NODE_DOC,
     TOOL_REPO_OUTLINE,
+    TOOL_SYMBOL_REFS,
     TOOL_SYMBOL_SEARCH,
     TOOL_SYMBOL_DOC,
     TOOL_MEMORY_FLAG,
@@ -111,11 +114,16 @@ pub struct BlastRadiusInput {
     /// rows are always returned and never count against the limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// "dependents" (default): files that use the seeds; "dependencies":
+    /// files the seeds use; "both".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// One `blast_radius` row. `relation` is set only on the seed rows
-/// (`"changed"`) and the test-gap rows (`"test_gap"`); ordinary dependents
-/// carry the requested mode once, on [`BlastRadiusOutput::mode`].
+/// (`"changed"`) and the test-gap rows (`"test_gap"`); ranked rows carry
+/// the requested mode and direction once, on [`BlastRadiusOutput`], plus
+/// their own `depth` and `via`. Seed and test-gap rows carry neither.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct BlastRadiusRelation {
     pub path: String,
@@ -134,12 +142,23 @@ pub struct BlastRadiusRelation {
     /// heavy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub specificity: Option<f64>,
+    /// Hops from the nearest seed; ranked rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// The edge that reached this file: "<Kind> <source> -> <target>
+    /// L<line>", line in the referencing file. The side in this row's file
+    /// is the bare symbol name, the other side a folder-relative
+    /// qualified name. Ranked rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct BlastRadiusOutput {
     /// Normalized relation mode the dependents were ranked under.
     pub mode: String,
+    /// Normalized walk direction: `dependents`, `dependencies` or `both`.
+    pub direction: String,
     /// Changed rows, then ranked dependents (best first), then test gaps.
     pub nodes: Vec<BlastRadiusRelation>,
     /// Ranked dependents omitted by `limit`.
@@ -156,6 +175,66 @@ pub fn clamp_blast_limit(limit: Option<u32>) -> usize {
     limit
         .unwrap_or(BLAST_RADIUS_DEFAULT_LIMIT)
         .min(BLAST_RADIUS_MAX_LIMIT) as usize
+}
+
+// ── symbol_refs ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct SymbolRefsInput {
+    /// A symbol's qualified_name as node_doc returns it (`<path>::<name>`).
+    /// An absolute `<path>` selects the workspace folder that contains it.
+    pub qualified_name: String,
+    /// `"callers"`, `"callees"` or `"both"` (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Maximum rows. Defaults to 40; values above 200 clamp to 200; 0
+    /// returns none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One `symbol_refs` row: a symbol one reference away.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolRef {
+    /// `"caller"` or `"callee"`.
+    pub role: String,
+    /// The other symbol; a file path when the reference sits at file top
+    /// level or targets a module.
+    pub qualified_name: String,
+    /// File of `qualified_name`.
+    pub path: String,
+    /// 1-based: the call site (callers) or the definition (callees); null
+    /// when unknown.
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// `Calls`, `Imports` or `Implements`.
+    pub kind: String,
+    /// True when the caller is test code (a test file or a Rust test
+    /// function).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolRefsOutput {
+    /// The symbol asked about.
+    pub qualified_name: String,
+    /// Callers first, then callees.
+    pub refs: Vec<SymbolRef>,
+    /// Rows omitted by `limit`.
+    pub not_shown: usize,
+    /// True exactly when `not_shown > 0`.
+    pub truncated: bool,
+}
+
+pub const SYMBOL_REFS_DEFAULT_LIMIT: u32 = 40;
+pub const SYMBOL_REFS_MAX_LIMIT: u32 = 200;
+
+/// Resolve `symbol_refs.limit`: absent → 40, above 200 → 200, 0 stays 0.
+pub fn clamp_symbol_refs_limit(limit: Option<u32>) -> usize {
+    limit
+        .unwrap_or(SYMBOL_REFS_DEFAULT_LIMIT)
+        .min(SYMBOL_REFS_MAX_LIMIT) as usize
 }
 
 // ── node_doc ──────────────────────────────────────────────────────
@@ -655,13 +734,17 @@ mod tests {
         assert_eq!(TOOL_MEMORY_SEARCH, "memory_search");
         assert_eq!(TOOL_BLAST_RADIUS, "blast_radius");
         assert_eq!(TOOL_NODE_DOC, "node_doc");
+        assert_eq!(TOOL_SYMBOL_REFS, "symbol_refs");
         assert_eq!(TOOL_SYMBOL_SEARCH, "symbol_search");
         assert_eq!(TOOL_SYMBOL_DOC, "symbol_doc");
         assert_eq!(TOOL_REPO_OUTLINE, "repo_outline");
         assert_eq!(TOOL_MEMORY_GET, "memory_get");
         assert_eq!(TOOL_MEMORY_FLAG, "memory_flag");
         assert_eq!(TOOL_MEMORY_PING, "memory_ping");
-        assert_eq!(ALL_MCP_TOOLS.len(), 9);
+        assert_eq!(ALL_MCP_TOOLS.len(), 10);
+        assert_eq!(clamp_symbol_refs_limit(None), 40);
+        assert_eq!(clamp_symbol_refs_limit(Some(500)), 200);
+        assert_eq!(clamp_symbol_refs_limit(Some(0)), 0);
         assert_eq!(
             LEAN_EXPOSED_TOOLS,
             [TOOL_MEMORY_SEARCH, TOOL_MEMORY_GET, TOOL_MEMORY_PING]

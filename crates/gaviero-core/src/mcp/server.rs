@@ -4,7 +4,7 @@
 //! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
 //! on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
-//! framing, initialize, and tools/list. Gaviero owns only the nine
+//! framing, initialize, and tools/list. Gaviero owns only the ten
 //! tool handlers below.
 //!
 //! **The invariant this module enforces is #11: every write goes
@@ -15,7 +15,7 @@
 //! `store_scoped`. Rejected `memory_store` / `memory_update` /
 //! `memory_delete` tools remain unimplementable by construction.
 //!
-//! Eight of the nine tools are strictly read-only. `memory_ping` writes
+//! Nine of the ten tools are strictly read-only. `memory_ping` writes
 //! only to an in-memory [`super::probe::ProbeLedger`]. `memory_flag` is
 //! write-adjacent: it emits a signal through
 //! [`super::signal::MemorySignalSink`] — a narrow trait object, not the
@@ -51,14 +51,15 @@ use super::tools::{
     MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemoryPingInput, MemoryPingOutput,
     MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
     NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
-    SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolSearchHit,
-    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_blast_limit,
-    clamp_memory_search_limit, one_based_line,
+    SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolRef,
+    SymbolRefsInput, SymbolRefsOutput, SymbolSearchHit, SymbolSearchInput, SymbolSearchOutput,
+    clamp_blast_depth, clamp_blast_limit, clamp_memory_search_limit, clamp_symbol_refs_limit,
+    one_based_line,
     clamp_repo_outline_token_cap, clamp_symbol_search_limit, truncate_symbol_snippet,
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
-/// dispatches tool calls to the nine handlers below (eight read-only
+/// dispatches tool calls to the ten handlers below (nine read-only
 /// plus write-adjacent `memory_flag`).
 ///
 /// `tool_router` is the rmcp-macro-generated dispatch table — see
@@ -248,19 +249,21 @@ fn round_score(x: f64) -> Option<f64> {
     x.is_finite().then(|| (x * 1000.0).round() / 1000.0)
 }
 
-/// Shape an impact query into the `blast_radius` response.
+/// Shape a blast-radius walk into the `blast_radius` response.
 ///
 /// Changed rows come first (duplicate seeds collapsed, input order kept),
-/// then at most `limit` dependents ranked by full-precision score
-/// descending with path ascending as the tie-break (the impact query has
-/// no `ORDER BY`, so ties would otherwise follow SQL row order), then the
-/// test gaps. Scores are rounded only after ranking; NaN ranks last.
-/// `not_shown` counts the dependents the limit dropped, never seed or
-/// test-gap rows.
+/// then at most `limit` reached files ranked by full-precision score
+/// descending with path ascending as the tie-break, then the test gaps.
+/// Scores are rounded only after ranking; NaN ranks last. `not_shown`
+/// counts the ranked rows the limit dropped, never seed or test-gap rows.
+/// Ranked rows carry their walk `depth` and witness edge (`via`).
 fn format_blast_radius(
-    impact: &crate::repo_map::store::ImpactSummary,
+    seeds: &[String],
+    steps: &[crate::repo_map::WalkStep],
+    test_gaps: &[String],
     ranks: &std::collections::HashMap<String, (f64, f64)>,
     mode: BlastRadiusMode,
+    direction: crate::repo_map::store::WalkDirection,
     limit: usize,
 ) -> BlastRadiusOutput {
     let lookup = |p: &str| ranks.get(p).copied().unwrap_or((0.0, 1.0));
@@ -272,37 +275,39 @@ fn format_blast_radius(
             purpose: None,
             score: round_score(score),
             specificity: round_score(sp),
+            depth: None,
+            via: None,
         }
     };
 
     let mut seen = std::collections::HashSet::new();
-    let seeds: Vec<&str> = impact
-        .changed_files
+    let seed_rows: Vec<&str> = seeds
         .iter()
         .map(String::as_str)
         .filter(|p| seen.insert(*p))
         .collect();
 
-    let mut dependents: Vec<(&str, f64)> = impact
-        .affected_files
+    let mut reached: Vec<(&crate::repo_map::WalkStep, f64)> = steps
         .iter()
-        .map(String::as_str)
-        .filter(|p| seen.insert(*p))
-        .map(|p| {
-            let score = lookup(p).0;
-            (p, if score.is_nan() { f64::NEG_INFINITY } else { score })
+        .filter(|s| seen.insert(s.file.as_str()))
+        .map(|s| {
+            let score = lookup(&s.file).0;
+            (s, if score.is_nan() { f64::NEG_INFINITY } else { score })
         })
         .collect();
-    dependents.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    let not_shown = dependents.len().saturating_sub(limit);
-    dependents.truncate(limit);
+    reached.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.file.cmp(&b.0.file)));
+    let not_shown = reached.len().saturating_sub(limit);
+    reached.truncate(limit);
 
     let mut gaps_seen = std::collections::HashSet::new();
-    let mut nodes: Vec<BlastRadiusRelation> = seeds.iter().map(|p| row(p, Some("changed"))).collect();
-    nodes.extend(dependents.iter().map(|(p, _)| row(p, None)));
+    let mut nodes: Vec<BlastRadiusRelation> = seed_rows.iter().map(|p| row(p, Some("changed"))).collect();
+    nodes.extend(reached.iter().map(|(step, _)| BlastRadiusRelation {
+        depth: Some(step.depth as u32),
+        via: Some(format_via(&step.via, &step.file)),
+        ..row(&step.file, None)
+    }));
     nodes.extend(
-        impact
-            .test_gaps
+        test_gaps
             .iter()
             .filter(|p| gaps_seen.insert(p.as_str()))
             .map(|p| row(p, Some("test_gap"))),
@@ -310,10 +315,35 @@ fn format_blast_radius(
 
     BlastRadiusOutput {
         mode: mode.as_str().to_string(),
+        direction: direction.as_str().to_string(),
         nodes,
         not_shown,
         truncated: not_shown > 0,
     }
+}
+
+/// `blast_radius`'s `via`: `"<Kind> <source> -> <target> L<line>"`, the
+/// line 1-based in the referencing file. A side whose file is `row_file`
+/// shows the bare symbol name (`"<file>"` for a file-level reference),
+/// the other side its full qualified name.
+fn format_via(w: &crate::repo_map::store::FileEdgeWitness, row_file: &str) -> String {
+    let side = |qn: &str, file: &str| {
+        if file == row_file {
+            match qn.strip_prefix(file).and_then(|r| r.strip_prefix("::")) {
+                Some(name) => name.to_string(),
+                None => qn.to_string(),
+            }
+        } else {
+            qn.to_string()
+        }
+    };
+    format!(
+        "{} {} -> {} L{}",
+        w.kind.as_str(),
+        side(&w.source_qn, &w.source_file),
+        side(&w.target_qn, &w.target_file),
+        w.line + 1
+    )
 }
 
 /// A folder root as shown in tool output: `/`-separated, no trailing `/`.
@@ -877,7 +907,7 @@ impl GavieroMcpServer {
     // ── blast_radius ────────────────────────────────────────────────
     #[tool(
         name = "blast_radius",
-        description = "Ranked dependents (impact, callers, tests) of file paths, best first; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~20-30 per row.",
+        description = "Ranked dependents (or dependencies) of file paths with hop depth and the edge that reached each; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~30-40 per row.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn blast_radius(
@@ -901,6 +931,15 @@ impl GavieroMcpServer {
         }
         let depth = clamp_blast_depth(input.depth);
         let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
+        let direction = match input.direction.as_deref() {
+            None => crate::repo_map::store::WalkDirection::Dependents,
+            Some(d) => crate::repo_map::store::WalkDirection::parse(d).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "direction must be \"dependents\", \"dependencies\" or \"both\"",
+                    None,
+                )
+            })?,
+        };
         // Every path must resolve to the same workspace folder's graph.
         let mut resolved = Vec::with_capacity(input.paths.len());
         for p in &input.paths {
@@ -915,6 +954,7 @@ impl GavieroMcpServer {
         }
         let service = resolved[0].1.clone();
         let paths: Vec<String> = resolved.into_iter().map(|(_, _, rel)| rel).collect();
+        let paths_out = paths.clone();
         let specificity = self.specificity;
         let weights = self
             .edge_weights
@@ -940,12 +980,13 @@ impl GavieroMcpServer {
                     std::thread::sleep(test_delay);
                     job.check()?;
                     let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-                    let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
+                    let witnesses = store.file_edge_witnesses()?;
                     job.check()?;
-                    let mut to_rank: Vec<String> = impact.changed_files.to_vec();
-                    for f in &impact.affected_files {
-                        if !to_rank.contains(f) {
-                            to_rank.push(f.clone());
+                    let steps = crate::repo_map::walk_files(&witnesses, &seed_refs, depth as usize, mode, direction);
+                    let mut to_rank: Vec<String> = paths.clone();
+                    for s in &steps {
+                        if !to_rank.contains(&s.file) {
+                            to_rank.push(s.file.clone());
                         }
                     }
                     let ranks = crate::repo_map::rank_files_with_weights_cancellable(
@@ -953,17 +994,20 @@ impl GavieroMcpServer {
                         &seed_refs,
                         &to_rank,
                         weights,
+                        direction,
                         specificity,
                         &|| job.is_cancelled(),
                     )?;
+                    job.check()?;
+                    let gaps = store.test_gaps(&seed_refs)?;
                     #[cfg(test)]
                     completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok((impact, ranks))
+                    Ok((steps, gaps, ranks))
                 })
             })
             .await
         };
-        let (impact, ranks) = match tokio::time::timeout(self.graph_query_timeout, compute).await
+        let (steps, gaps, ranks) = match tokio::time::timeout(self.graph_query_timeout, compute).await
         {
             Ok(join) => join
                 .map_err(|e| ErrorData::internal_error(format!("blast_radius join: {e}"), None))?
@@ -980,7 +1024,15 @@ impl GavieroMcpServer {
             }
         };
 
-        let mut out = format_blast_radius(&impact, &ranks, mode, clamp_blast_limit(input.limit));
+        let mut out = format_blast_radius(
+            &paths_out,
+            &steps,
+            &gaps,
+            &ranks,
+            mode,
+            direction,
+            clamp_blast_limit(input.limit),
+        );
         if folder != 0 {
             for node in &mut out.nodes {
                 node.path = Self::display_path(folder, &service, &node.path);
@@ -1067,6 +1119,113 @@ impl GavieroMcpServer {
             summary: String::new(),
             status,
             note,
+        }))
+    }
+
+    // ── symbol_refs ─────────────────────────────────────────────────
+    #[tool(
+        name = "symbol_refs",
+        description = "Function-level callers and callees of one qualified_name from node_doc, with file and line. Read-only. Token cost: ~20-30 per row.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn symbol_refs(
+        &self,
+        Parameters(input): Parameters<SymbolRefsInput>,
+    ) -> Result<Json<SymbolRefsOutput>, ErrorData> {
+        self.symbol_refs_impl(input).await
+    }
+
+    /// In-process core of [`Self::symbol_refs`].
+    async fn symbol_refs_impl(&self, input: SymbolRefsInput) -> Result<Json<SymbolRefsOutput>, ErrorData> {
+        self.ensure_tool_allowed("symbol_refs")?;
+        let (callers, callees) = match input.direction.as_deref().map(|d| d.trim().to_ascii_lowercase()) {
+            None => (true, true),
+            Some(d) if d == "both" => (true, true),
+            Some(d) if d == "callers" => (true, false),
+            Some(d) if d == "callees" => (false, true),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "direction must be \"callers\", \"callees\" or \"both\"",
+                    None,
+                ));
+            }
+        };
+        let Some((file_part, rest)) = input.qualified_name.split_once("::") else {
+            return Err(ErrorData::invalid_params(
+                "qualified_name must be <path>::<name> (from node_doc); for a whole file use blast_radius",
+                None,
+            ));
+        };
+        let (folder, service, rel) = self.resolve_graph_path(file_part)?;
+        let qn = format!("{rel}::{rest}");
+        service.flush().await;
+
+        let reader = service.clone();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            reader.with_reader(|store| {
+                if !store.has_node(&qn)? {
+                    return Ok(None);
+                }
+                let mut rows = Vec::new();
+                if callers {
+                    for r in store.symbol_callers(&qn)? {
+                        let test = r.node_kind.as_deref() == Some("Test")
+                            || crate::repo_map::edges::is_test_file(&r.file_path);
+                        rows.push(("caller", r, test));
+                    }
+                }
+                if callees {
+                    for r in store.symbol_callees(&qn)? {
+                        rows.push(("callee", r, false));
+                    }
+                }
+                Ok(Some(rows))
+            })
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("symbol_refs join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("symbol_refs: {e}"), None))?;
+        let Some(rows) = rows else {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "no symbol {} in the code graph; take qualified_name from node_doc(path)",
+                    input.qualified_name
+                ),
+                None,
+            ));
+        };
+
+        // A non-primary folder's paths are shown absolute, in the row's
+        // `path` and in the file part of each qualified name.
+        let show = |path: &str| Self::display_path(folder, &service, path);
+        let show_qn = |qn: &str| match qn.split_once("::") {
+            Some((file, name)) => format!("{}::{name}", show(file)),
+            None => show(qn),
+        };
+        let limit = clamp_symbol_refs_limit(input.limit);
+        let not_shown = rows.len().saturating_sub(limit);
+        let refs = rows
+            .into_iter()
+            .take(limit)
+            .map(|(role, r, test)| SymbolRef {
+                role: role.to_string(),
+                qualified_name: show_qn(&r.qualified_name),
+                path: show(&r.file_path),
+                line: one_based_line(r.line),
+                kind: r.kind.as_str().to_string(),
+                test,
+            })
+            .collect();
+        let qualified_name = if folder == 0 {
+            input.qualified_name
+        } else {
+            show_qn(&format!("{rel}::{rest}"))
+        };
+        Ok(Json(SymbolRefsOutput {
+            qualified_name,
+            refs,
+            not_shown,
+            truncated: not_shown > 0,
         }))
     }
 
@@ -1566,7 +1725,7 @@ impl GavieroMcpServer {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         self.ensure_tool_allowed(name).map_err(|e| e.to_string())?;
-        // Arity + remapping are identical for all nine tools, so the mapping
+        // Arity + remapping are identical for all ten tools, so the mapping
         // table below is the only per-tool code. `tools_are_dispatchable_...`
         // pins this table against `in_process_tool_specs()`.
         macro_rules! call {
@@ -1586,6 +1745,7 @@ impl GavieroMcpServer {
             "memory_ping" => call!("memory_ping", MemoryPingInput, memory_ping_impl),
             "memory_flag" => call!("memory_flag", MemoryFlagInput, memory_flag_impl),
             "repo_outline" => call!("repo_outline", RepoOutlineInput, repo_outline_impl),
+            "symbol_refs" => call!("symbol_refs", SymbolRefsInput, symbol_refs_impl),
             "symbol_search" => call!("symbol_search", SymbolSearchInput, symbol_search_impl),
             "symbol_doc" => call!("symbol_doc", SymbolDocInput, symbol_doc_impl),
             other => Err(format!(
@@ -2347,18 +2507,56 @@ mod tests {
 
     // ── blast_radius formatting (X1) ────────────────────────────────
 
-    fn impact(
-        changed: &[&str],
-        affected: &[&str],
-        gaps: &[&str],
-    ) -> crate::repo_map::store::ImpactSummary {
+    /// Seeds, walk steps (every `affected` file that is not a seed, at
+    /// depth 1, reached by a `Calls` edge into the first seed) and gaps.
+    struct Walked {
+        seeds: Vec<String>,
+        steps: Vec<crate::repo_map::WalkStep>,
+        gaps: Vec<String>,
+    }
+
+    fn impact(changed: &[&str], affected: &[&str], gaps: &[&str]) -> Walked {
         let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        crate::repo_map::store::ImpactSummary {
-            changed_files: own(changed),
-            affected_files: own(affected),
-            test_gaps: own(gaps),
-            ..Default::default()
+        let seed = changed.first().copied().unwrap_or("src/seed.rs");
+        let mut seen: std::collections::HashSet<&str> = changed.iter().copied().collect();
+        let steps = affected
+            .iter()
+            .filter(|p| seen.insert(**p))
+            .map(|p| crate::repo_map::WalkStep {
+                file: p.to_string(),
+                depth: 1,
+                via: crate::repo_map::store::FileEdgeWitness {
+                    source_file: p.to_string(),
+                    target_file: seed.to_string(),
+                    kind: crate::repo_map::store::EdgeKind::Calls,
+                    source_qn: format!("{p}::caller"),
+                    target_qn: format!("{seed}::target"),
+                    line: 4,
+                },
+            })
+            .collect();
+        Walked {
+            seeds: own(changed),
+            steps,
+            gaps: own(gaps),
         }
+    }
+
+    fn fmt_blast(
+        w: &Walked,
+        ranks: &std::collections::HashMap<String, (f64, f64)>,
+        mode: BlastRadiusMode,
+        limit: usize,
+    ) -> BlastRadiusOutput {
+        format_blast_radius(
+            &w.seeds,
+            &w.steps,
+            &w.gaps,
+            ranks,
+            mode,
+            crate::repo_map::store::WalkDirection::Dependents,
+            limit,
+        )
     }
 
     fn ranks(rows: &[(&str, f64)]) -> std::collections::HashMap<String, (f64, f64)> {
@@ -2400,7 +2598,7 @@ mod tests {
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             let mut affected = vec!["src/seed.rs"];
             affected.extend(refs.iter().copied());
-            let out = format_blast_radius(
+            let out = fmt_blast(
                 &impact(&["src/seed.rs"], &affected, &["src/seed.rs"]),
                 &r,
                 BlastRadiusMode::Impact,
@@ -2436,7 +2634,7 @@ mod tests {
         let outs: Vec<String> = orders
             .iter()
             .map(|affected| {
-                let out = format_blast_radius(
+                let out = fmt_blast(
                     &impact(&["src/seed.rs"], affected, &[]),
                     &r,
                     BlastRadiusMode::All,
@@ -2456,7 +2654,7 @@ mod tests {
     fn blast_format_collapses_duplicate_seeds_and_drops_non_finite_scores() {
         let mut r = ranks(&[("src/x.rs", 0.2)]);
         r.insert("src/nan.rs".into(), (f64::NAN, f64::INFINITY));
-        let out = format_blast_radius(
+        let out = fmt_blast(
             &impact(
                 &["src/s.rs", "src/t.rs", "src/s.rs"],
                 &["src/s.rs", "src/nan.rs", "src/t.rs", "src/x.rs"],
@@ -2487,7 +2685,7 @@ mod tests {
 
     #[test]
     fn blast_format_emits_the_compact_shape() {
-        let out = format_blast_radius(
+        let out = fmt_blast(
             &impact(&["src/s.rs"], &["src/s.rs", "src/x.rs"], &[]),
             &ranks(&[("src/x.rs", 0.123456789)]),
             BlastRadiusMode::parse("not-a-mode"),
@@ -2504,7 +2702,11 @@ mod tests {
         for gone in ["qualified_name", "distance", "relation"] {
             assert!(dep.get(gone).is_none(), "dependent row must not carry {gone}: {dep}");
         }
+        assert_eq!(dep["depth"], 1);
+        assert_eq!(dep["via"], "Calls caller -> src/s.rs::target L5");
+        assert_eq!(v["direction"], "dependents");
         assert_eq!(v["nodes"][0]["relation"], "changed");
+        assert!(v["nodes"][0].get("depth").is_none() && v["nodes"][0].get("via").is_none());
     }
 
     /// A workspace where `src/core.rs` has `callers` dependents.
@@ -2537,6 +2739,7 @@ mod tests {
                     depth: Some(1),
                     mode: Some("callers".into()),
                     limit,
+                    direction: None,
                 }))
                 .await
                 .unwrap()
@@ -2551,11 +2754,11 @@ mod tests {
         let all = call(Some(200)).await;
         assert_eq!(dependent_paths(&all).len(), 45);
         assert!(!all.truncated);
-        // The description's "~20-30 per row" hint: rows here use short
+        // The description's "~30-40 per row" hint: rows here use short
         // paths, so they must come in under the top of that band.
         let bytes = serde_json::to_string(&all).unwrap().len();
         let per_row = bytes.div_ceil(4) / all.nodes.len();
-        assert!(per_row <= 30, "{per_row} estimated tokens per row");
+        assert!(per_row <= 40, "{per_row} estimated tokens per row");
         assert_eq!(
             dependent_paths(&default),
             dependent_paths(&all)[..40].to_vec(),
@@ -2565,6 +2768,164 @@ mod tests {
         assert!(dependent_paths(&none).is_empty());
         assert_eq!(none.not_shown, 45);
         assert_eq!(none.nodes[0].path, "src/core.rs");
+    }
+
+    /// `src/top.rs::top` calls `src/mid.rs::mid`, which calls
+    /// `src/core.rs::target`.
+    fn chain_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "mod core;\nmod mid;\nmod top;\n").unwrap();
+        std::fs::write(src.join("core.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(src.join("mid.rs"), "use crate::core::target;\npub fn mid() { target(); }\n").unwrap();
+        std::fs::write(src.join("top.rs"), "use crate::mid::mid;\npub fn top() { mid(); }\n").unwrap();
+        dir
+    }
+
+    async fn blast(
+        s: &GavieroMcpServer,
+        path: &str,
+        direction: Option<&str>,
+    ) -> Result<BlastRadiusOutput, ErrorData> {
+        s.blast_radius(Parameters(BlastRadiusInput {
+            paths: vec![path.into()],
+            depth: Some(2),
+            direction: direction.map(str::to_string),
+            ..Default::default()
+        }))
+        .await
+        .map(|j| j.0)
+    }
+
+    fn row<'a>(out: &'a BlastRadiusOutput, path: &str) -> &'a BlastRadiusRelation {
+        out.nodes
+            .iter()
+            .find(|n| n.path == path && n.relation.is_none())
+            .unwrap_or_else(|| panic!("{path} not ranked: {:?}", out.nodes))
+    }
+
+    #[tokio::test]
+    async fn blast_radius_reports_depth_and_via() {
+        let dir = chain_workspace();
+        let s = refs_server(dir.path());
+        let out = blast(&s, "src/core.rs", None).await.unwrap();
+        assert_eq!(out.direction, "dependents");
+        let mid = row(&out, "src/mid.rs");
+        assert_eq!(mid.depth, Some(1));
+        let via = mid.via.as_deref().unwrap();
+        assert!(via.starts_with("Calls mid -> src/core.rs::target L"), "{via}");
+        assert_eq!(row(&out, "src/top.rs").depth, Some(2));
+    }
+
+    #[tokio::test]
+    async fn blast_radius_walks_dependencies() {
+        let dir = chain_workspace();
+        let s = refs_server(dir.path());
+        let out = blast(&s, "src/top.rs", Some("dependencies")).await.unwrap();
+        assert_eq!(out.direction, "dependencies");
+        assert_eq!(row(&out, "src/mid.rs").depth, Some(1));
+        assert_eq!(row(&out, "src/core.rs").depth, Some(2));
+    }
+
+    #[tokio::test]
+    async fn blast_radius_rejects_an_unknown_direction() {
+        let dir = chain_workspace();
+        let s = refs_server(dir.path());
+        let err = blast(&s, "src/core.rs", Some("sideways")).await.unwrap_err();
+        assert!(err.message.contains("dependencies"), "{}", err.message);
+    }
+
+    // ── symbol_refs ─────────────────────────────────────────────────
+
+    /// `src/caller.rs::calls_it` calls `src/core.rs::target`.
+    fn refs_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "mod core;\nmod caller;\n").unwrap();
+        std::fs::write(src.join("core.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(
+            src.join("caller.rs"),
+            "use crate::core::target;\npub fn calls_it() { target(); }\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn refs_server(dir: &std::path::Path) -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        GavieroMcpServer::with_defaults(stores, dir.to_path_buf())
+    }
+
+    async fn refs_of(
+        s: &GavieroMcpServer,
+        qn: &str,
+        direction: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<SymbolRefsOutput, ErrorData> {
+        s.symbol_refs(Parameters(SymbolRefsInput {
+            qualified_name: qn.into(),
+            direction: direction.map(str::to_string),
+            limit,
+        }))
+        .await
+        .map(|j| j.0)
+    }
+
+    #[tokio::test]
+    async fn symbol_refs_lists_callers_and_callees() {
+        let dir = refs_workspace();
+        let s = refs_server(dir.path());
+        let callers = refs_of(&s, "src/core.rs::target", Some("callers"), None).await.unwrap();
+        assert!(
+            callers.refs.iter().any(|r| r.role == "caller"
+                && r.qualified_name == "src/caller.rs::calls_it"
+                && r.path == "src/caller.rs"
+                && r.kind == "Calls"
+                && r.line == Some(2)),
+            "{:?}",
+            callers.refs
+        );
+        assert!(callers.refs.iter().all(|r| r.role == "caller"));
+
+        let callees = refs_of(&s, "src/caller.rs::calls_it", None, None).await.unwrap();
+        assert!(
+            callees.refs.iter().any(|r| r.role == "callee"
+                && r.qualified_name == "src/core.rs::target"
+                && r.path == "src/core.rs"
+                && r.line == Some(1)),
+            "{:?}",
+            callees.refs
+        );
+        assert_eq!(callees.qualified_name, "src/caller.rs::calls_it");
+    }
+
+    #[tokio::test]
+    async fn symbol_refs_rejects_a_bare_path_and_unknown_symbols() {
+        let dir = refs_workspace();
+        let s = refs_server(dir.path());
+        let bare = refs_of(&s, "src/core.rs", None, None).await.unwrap_err();
+        assert!(bare.message.contains("blast_radius"), "{}", bare.message);
+        let unknown = refs_of(&s, "src/core.rs::nope", None, None).await.unwrap_err();
+        assert!(unknown.message.contains("node_doc"), "{}", unknown.message);
+        let sideways = refs_of(&s, "src/core.rs::target", Some("sideways"), None)
+            .await
+            .unwrap_err();
+        assert!(sideways.message.contains("direction"), "{}", sideways.message);
+    }
+
+    #[tokio::test]
+    async fn symbol_refs_respects_limit() {
+        let dir = refs_workspace();
+        let s = refs_server(dir.path());
+        let out = refs_of(&s, "src/core.rs::target", None, Some(0)).await.unwrap();
+        assert!(out.refs.is_empty());
+        assert!(out.not_shown >= 1);
+        assert!(out.truncated);
     }
 
     // ── observation ownership (X4) ──────────────────────────────────
@@ -4087,7 +4448,7 @@ mod tests {
     }
 
     #[test]
-    fn default_lists_all_nine_tools() {
+    fn default_lists_all_ten_tools() {
         let s = fixture().with_symbol_enrichment(true);
         let names = s.listed_tool_names();
         for tool in super::super::tools::ALL_MCP_TOOLS {
@@ -4096,7 +4457,7 @@ mod tests {
                 "missing {tool} in {names:?}"
             );
         }
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
     }
 
     // ── in-process dispatch (Route A: the API-provider tool path) ──────
@@ -4112,7 +4473,7 @@ mod tests {
     async fn every_advertised_tool_is_dispatchable_in_process() {
         let s = fixture().with_symbol_enrichment(true);
         let specs = s.in_process_tool_specs();
-        assert_eq!(specs.len(), 9, "expected the full advertised surface");
+        assert_eq!(specs.len(), 10, "expected the full advertised surface");
 
         for spec in specs {
             // Empty args are not universally invalid (`repo_outline`'s inputs are
