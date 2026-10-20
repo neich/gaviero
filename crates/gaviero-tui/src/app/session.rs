@@ -160,86 +160,66 @@ pub(crate) async fn get_or_build_topology_cached(
     }
 }
 
-pub(crate) async fn get_or_build_repo_map_cached(
-    repo_map_cache: std::sync::Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<
-                std::path::PathBuf,
-                std::sync::Arc<gaviero_core::repo_map::RepoMap>,
-            >,
-        >,
-    >,
-    workspace_root: std::path::PathBuf,
-    excludes: Vec<String>,
+/// The live `RepoMap` of the workspace folder at `root`: waits for the
+/// folder's pending graph updates (and, on first use, its startup scan),
+/// then returns the shared snapshot. `None` for a root that is not a
+/// workspace folder or whose graph failed to build.
+pub(crate) async fn repo_map_for(
+    services: &gaviero_core::repo_map::GraphServices,
+    root: &std::path::Path,
 ) -> Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>> {
-    // Cache hit on the per-folder slot.
-    {
-        let guard = repo_map_cache.read().await;
-        if let Some(rm) = guard.get(&workspace_root) {
-            return Some(rm.clone());
-        }
-    }
-    let root = workspace_root.clone();
-    match tokio::task::spawn_blocking(move || {
-        gaviero_core::repo_map::RepoMap::build(&root, &excludes)
-    })
-    .await
-    {
-        Ok(Ok(map)) => {
-            let arc = std::sync::Arc::new(map);
-            let mut guard = repo_map_cache.write().await;
-            guard.insert(workspace_root, arc.clone());
-            Some(arc)
-        }
-        _ => None,
-    }
+    services.for_root(root)?.snapshot().await
 }
 
 /// Compute the prompt-formatted impact-radius text for the given seeds.
 ///
-/// Returns `None` when seeds are empty, the GraphStore can't be built, or
-/// no affected files were found. M2 carries this through the planner via
-/// `PlannerInput::pre_fetched_impact_text` because `GraphStore` is `!Send`
-/// and lives in `spawn_blocking`; M3 will wire `graph_store` into the
-/// planner directly per V9 §4 and remove this carrier.
+/// Reads the folder's live graph (after its pending updates) on a fresh
+/// connection. Returns `None` when seeds are empty, the graph can't be
+/// read, or no affected files were found. M2 carries this through the
+/// planner via `PlannerInput::pre_fetched_impact_text` because `GraphStore`
+/// is `!Send` and lives in `spawn_blocking`; M3 will wire `graph_store` into
+/// the planner directly per V9 §4 and remove this carrier.
 pub(crate) async fn compute_impact_text(
-    workspace_root: std::path::PathBuf,
+    service: gaviero_core::repo_map::GraphService,
     seeds: Vec<String>,
-    excludes: Vec<String>,
 ) -> Option<String> {
     if seeds.is_empty() {
         return None;
     }
+    service.flush().await;
     tokio::task::spawn_blocking(move || {
-        let (store, _) =
-            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &excludes).ok()?;
-        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
-        let impact = store.impact_radius(&seed_refs, 2).ok()?;
-        if impact.affected_files.is_empty() {
-            return None;
-        }
-        // C3: rank the affected set with HippoRAG specificity and the
-        // default `mode=All` weights, then render with `[sp 0.92]`
-        // badges so the chat injection visibly carries the score.
-        let mut to_rank: Vec<String> = impact.changed_files.clone();
-        for f in &impact.affected_files {
-            if !to_rank.contains(f) {
-                to_rank.push(f.clone());
-            }
-        }
-        let ranks = gaviero_core::repo_map::rank_files_with_mode(
-            &store,
-            &seed_refs,
-            &to_rank,
-            gaviero_core::repo_map::store::BlastRadiusMode::All,
-            gaviero_core::repo_map::SpecificityConfig::default(),
-        )
-        .unwrap_or_default();
-        Some(
-            gaviero_core::repo_map::store::GraphStore::format_impact_for_prompt_ranked(
-                &impact, &ranks,
-            ),
-        )
+        service
+            .with_reader(|store| {
+                let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+                let impact = store.impact_radius(&seed_refs, 2)?;
+                if impact.affected_files.is_empty() {
+                    return Ok(None);
+                }
+                // C3: rank the affected set with HippoRAG specificity and the
+                // default `mode=All` weights, then render with `[sp 0.92]`
+                // badges so the chat injection visibly carries the score.
+                let mut to_rank: Vec<String> = impact.changed_files.clone();
+                for f in &impact.affected_files {
+                    if !to_rank.contains(f) {
+                        to_rank.push(f.clone());
+                    }
+                }
+                let ranks = gaviero_core::repo_map::rank_files_with_mode(
+                    store,
+                    &seed_refs,
+                    &to_rank,
+                    gaviero_core::repo_map::store::BlastRadiusMode::All,
+                    gaviero_core::repo_map::SpecificityConfig::default(),
+                )
+                .unwrap_or_default();
+                Ok(Some(
+                    gaviero_core::repo_map::store::GraphStore::format_impact_for_prompt_ranked(
+                        &impact, &ranks,
+                    ),
+                ))
+            })
+            .ok()
+            .flatten()
     })
     .await
     .ok()
@@ -250,27 +230,27 @@ pub(crate) async fn compute_impact_text(
 /// chat first turn. Mirrors [`compute_impact_text`] but returns the ~150-token
 /// count summary (naming `blast_radius(path)`) instead of the full ranked
 /// render, so the model pulls the detail on demand. Returns `None` when seeds
-/// are empty (empty buffer → inject nothing), the GraphStore can't be built,
-/// or there is nothing to report.
+/// are empty (empty buffer → inject nothing), the graph can't be read, or
+/// there is nothing to report.
 pub(crate) async fn compute_impact_summary(
-    workspace_root: std::path::PathBuf,
+    service: gaviero_core::repo_map::GraphService,
     seeds: Vec<String>,
-    excludes: Vec<String>,
 ) -> Option<String> {
     if seeds.is_empty() {
         return None;
     }
+    service.flush().await;
     tokio::task::spawn_blocking(move || {
-        let (store, _) =
-            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &excludes).ok()?;
-        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
-        let impact = store.impact_radius(&seed_refs, 2).ok()?;
-        let summary = gaviero_core::repo_map::store::GraphStore::format_impact_summary(&impact);
-        if summary.is_empty() {
-            None
-        } else {
-            Some(summary)
-        }
+        service
+            .with_reader(|store| {
+                let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+                let impact = store.impact_radius(&seed_refs, 2)?;
+                let summary =
+                    gaviero_core::repo_map::store::GraphStore::format_impact_summary(&impact);
+                Ok((!summary.is_empty()).then_some(summary))
+            })
+            .ok()
+            .flatten()
     })
     .await
     .ok()
@@ -303,39 +283,6 @@ pub(crate) fn render_chat_selections(
     }
 
     parts.join("\n\n")
-}
-
-/// Spawn a background task that (re)builds `RepoMap` and writes it into
-/// `app.repo_map` under the primary workspace folder key. Safe to call
-/// multiple times — each invocation replaces that folder's cached map.
-/// Other folders are warmed up lazily on first use via
-/// [`get_or_build_repo_map_cached`].
-pub(crate) fn warm_up_repo_map(app: &App) {
-    let Some(root) = app.graph_workspace_root.clone() else {
-        return;
-    };
-    let cache = app.repo_map.clone();
-    let excludes = super::parse_exclude_patterns(&app.workspace, Some(&root));
-    let key = root.clone();
-    tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || {
-            gaviero_core::repo_map::RepoMap::build(&root, &excludes)
-        })
-        .await
-        {
-            Ok(Ok(map)) => {
-                let mut guard = cache.write().await;
-                guard.insert(key, std::sync::Arc::new(map));
-                tracing::info!("repo_map warmed up");
-            }
-            Ok(Err(e)) => {
-                tracing::debug!("repo_map build skipped: {}", e);
-            }
-            Err(e) => {
-                tracing::warn!("repo_map build panicked: {}", e);
-            }
-        }
-    });
 }
 
 pub(super) fn try_quit(app: &mut App) {
@@ -936,5 +883,40 @@ mod tests {
         handle_settings_error_key(&mut app, &key(crossterm::event::KeyCode::Char('q')));
         assert!(app.should_quit);
         assert_eq!(app.buffers.len(), buffers_before, "quitting opens nothing");
+    }
+
+    /// A folder whose `src/seed.rs` calls `src/zz_target.rs` (a resolvable
+    /// bare call), served by a one-folder registry.
+    fn linked_services(dir: &std::path::Path) -> gaviero_core::repo_map::GraphServices {
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed.rs"), "pub fn gv_seed_fn() { gv_target_fn(); }\n").unwrap();
+        std::fs::write(src.join("zz_target.rs"), "pub fn gv_target_fn() {}\n").unwrap();
+        gaviero_core::repo_map::GraphServices::new(vec![gaviero_core::repo_map::GraphFolder {
+            root: dir.to_path_buf(),
+            db_path: dir.join(".gaviero").join("code_graph.db"),
+            excludes: Vec::new(),
+            specificity: gaviero_core::repo_map::SpecificityConfig::default(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn repo_map_for_returns_the_live_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = linked_services(dir.path());
+        let map = repo_map_for(&services, dir.path()).await.expect("live map");
+        assert!(map.edge_count() >= 2, "edges: {}", map.edge_count());
+        assert!(dir.path().join(".gaviero").join("code_graph.db").exists());
+    }
+
+    #[tokio::test]
+    async fn compute_impact_summary_uses_the_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = linked_services(dir.path());
+        let service = services.primary().cloned().unwrap();
+        let text = compute_impact_summary(service, vec!["src/zz_target.rs".to_string()])
+            .await
+            .expect("an impact summary");
+        assert!(text.contains("blast_radius"), "{text}");
     }
 }

@@ -248,6 +248,20 @@ pub struct FileExtraction {
     pub symbol_count: i64,
 }
 
+/// One non-file node as the repo outline sees it
+/// ([`GraphStore::outline_symbols`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineSymbol {
+    pub file_path: String,
+    pub name: String,
+    /// [`NodeKind::as_str`].
+    pub kind: String,
+    /// 0-based start line, when recorded.
+    pub line: Option<i64>,
+    /// `impl:Type`, `impl:Type:Trait`, `trait:Name`, or `None`.
+    pub owner: Option<String>,
+}
+
 /// C4: one-shot migration applied at every `open*` call.
 ///
 /// Pre-C4 databases stored edges with either NULL `kind` (very old
@@ -1533,6 +1547,39 @@ impl GraphStore {
             }
         }
         Ok(out)
+    }
+
+    /// Every indexed file (one with a stored content hash) and its size in
+    /// bytes, sorted by path. The file nodes of the repo outline.
+    pub fn outline_files(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT h.file_path, COALESCE(x.content_bytes, 0)
+             FROM file_hashes h
+             LEFT JOIN file_extraction x ON x.file_path = h.file_path
+             ORDER BY h.file_path",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every non-file node, sorted by file and start line. The symbol lists
+    /// of the repo outline.
+    pub fn outline_symbols(&self) -> Result<Vec<OutlineSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, name, kind, line_start, owner FROM nodes
+             WHERE kind != 'File'
+             ORDER BY file_path, line_start, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OutlineSymbol {
+                file_path: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                owner: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// All distinct file paths known to the graph (from both `nodes`

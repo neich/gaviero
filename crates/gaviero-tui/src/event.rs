@@ -22,8 +22,10 @@ pub enum Event {
 
     // Filesystem
     FileChanged(PathBuf),
-    /// A file or directory was created, deleted, or renamed — refresh the tree.
-    FileTreeChanged,
+    /// Files or directories were created, deleted, or renamed — refresh the
+    /// tree and update the code graph. Carries the non-excluded paths (both
+    /// sides of a rename when the platform reports them).
+    FileTreeChanged(Vec<PathBuf>),
     /// Terminal event from the bounded PTY channel.
     Terminal(TerminalEvent),
 
@@ -1121,14 +1123,15 @@ impl EventLoop {
                                 let _ = tx.send(Event::FileChanged(path.clone()));
                             }
                         }
-                        // FileTreeChanged carries no path, so coalesce: drop the
-                        // event entirely if every reported path is excluded.
-                        let any_visible = event
+                        // Forward the visible paths; drop the event entirely
+                        // if every reported path is excluded.
+                        let visible: Vec<PathBuf> = event
                             .paths
-                            .iter()
-                            .any(|p| !path_is_excluded(p, &roots, &exclude_patterns));
-                        if any_visible {
-                            let _ = tx.send(Event::FileTreeChanged);
+                            .into_iter()
+                            .filter(|p| !path_is_excluded(p, &roots, &exclude_patterns))
+                            .collect();
+                        if !visible.is_empty() {
+                            let _ = tx.send(Event::FileTreeChanged(visible));
                         }
                     }
                     _ => {}

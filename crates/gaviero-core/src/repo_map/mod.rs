@@ -1,9 +1,11 @@
 //! Repo-map: context budget planning for multi-agent swarm runs.
 //!
-//! Builds a reference graph of source files using tree-sitter symbol
-//! extraction, then uses personalized PageRank to rank files by relevance to
-//! an agent's owned paths. The resulting `ContextPlan` tells the runner which
-//! files to include as full content vs. signatures-only vs. just a path list.
+//! Builds a reference graph of source files: nodes from tree-sitter symbol
+//! extraction, file references (edges) from the code graph
+//! ([`store::GraphStore::file_edges`]). Personalized PageRank then ranks
+//! files by relevance to an agent's owned paths. The resulting `ContextPlan`
+//! tells the runner which files to include as full content vs.
+//! signatures-only vs. just a path list.
 //!
 //! ## Usage
 //! ```ignore
@@ -11,8 +13,6 @@
 //! let plan = repo_map.rank_for_agent(&["src/auth/"], 32_000);
 //! // Inject plan.repo_outline into the agent's system prompt
 //! ```
-//!
-//! See Phase 5 of the implementation plan.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,12 +26,14 @@ pub mod graph_builder;
 pub mod page_rank;
 pub mod resolve;
 pub mod rust_walk;
+pub mod service;
 pub mod store;
 pub mod symbol_enrichment;
 pub mod symbol_search;
 pub mod topology;
 pub mod types;
 
+pub use service::{GraphFolder, GraphService, GraphServiceStats, GraphServices};
 pub use topology::{TopologyConfig, build_folder_topology};
 
 /// Normalize a workspace-relative path to `/` separators (Tier W1 /
@@ -73,15 +75,45 @@ pub struct Symbol {
     pub owner: Option<String>,
 }
 
+/// Reverse-edge damping: a seed's rank flows to the files it references at
+/// full edge weight and back to the files that reference it at this
+/// fraction.
+pub const REVERSE_EDGE_FACTOR: f64 = 0.5;
+
 /// A typed edge between two file nodes.
 #[derive(Debug, Clone)]
 pub struct ReferenceEdge {
     pub kind: store::EdgeKind,
+    /// True for the mirror of a code-graph edge (referenced file →
+    /// referencing file), weighted by [`REVERSE_EDGE_FACTOR`].
+    pub reverse: bool,
 }
 
 impl ReferenceEdge {
     pub fn new(kind: store::EdgeKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            reverse: false,
+        }
+    }
+
+    /// The mirror edge: from the referenced file back to the referencing one.
+    pub fn reversed(kind: store::EdgeKind) -> Self {
+        Self {
+            kind,
+            reverse: true,
+        }
+    }
+
+    /// PageRank transition weight under `mode`: the mode's preset for this
+    /// kind, times [`REVERSE_EDGE_FACTOR`] for a reverse edge.
+    pub fn weight(&self, mode: store::BlastRadiusMode) -> f64 {
+        let w = mode.edge_weight(self.kind);
+        if self.reverse {
+            w * REVERSE_EDGE_FACTOR
+        } else {
+            w
+        }
     }
 }
 
@@ -225,6 +257,12 @@ const OUTLINE_MAX_FILES: usize = 300;
 /// `ctx:` readout) above what is actually sent.
 fn outline_line_cost(line: &str) -> usize {
     (line.len() / 4).max(1)
+}
+
+/// A whole-workspace seed (`.`, `./`, empty) carries no personalization, so
+/// the ranking is global and no file is `OWN`.
+fn is_match_all_seed(seed: &str) -> bool {
+    matches!(seed.trim(), "" | "." | "./")
 }
 
 /// M3 per-selection tracing (V9 §11 M3 acceptance: "planner logs show ...
@@ -478,12 +516,57 @@ impl RepoMap {
     /// [`SpecificityConfig`]. Used by the workspace settings layer to
     /// honor `repoMap.specificity.enabled` and
     /// `repoMap.specificity.stopSymbolThreshold` without rebuilding.
+    ///
+    /// Builds a throwaway in-memory code graph for `workspace`, projects it
+    /// with [`Self::from_store`], and writes nothing to disk. Callers that
+    /// already maintain a persisted graph should project it directly.
     pub fn build_with_config(
         workspace: &Path,
         excludes: &[String],
         config: SpecificityConfig,
     ) -> anyhow::Result<Self> {
-        let graph = builder::build(workspace, excludes)?;
+        let store = store::GraphStore::open_memory()?;
+        graph_builder::build_graph_into(&store, workspace, excludes)?;
+        Self::from_store(&store, config)
+    }
+
+    /// Project a code graph into a `RepoMap`. RepoMap is a pure projection
+    /// of the store: one file node per indexed file
+    /// ([`store::GraphStore::outline_files`]), its symbols from the graph's
+    /// nodes ([`store::GraphStore::outline_symbols`]) — two same-named
+    /// symbols in one file appear once, as the graph keys nodes by
+    /// `file::name` — and each [`store::GraphStore::file_edges`] row as a
+    /// forward edge (referencing → referenced file) plus a reverse edge
+    /// damped by [`REVERSE_EDGE_FACTOR`].
+    pub fn from_store(store: &store::GraphStore, config: SpecificityConfig) -> anyhow::Result<Self> {
+        let mut symbols_by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for s in store.outline_symbols()? {
+            symbols_by_file.entry(s.file_path).or_default().push(Symbol {
+                name: s.name,
+                kind: s.kind,
+                line: s.line.unwrap_or(0).max(0) as usize,
+                owner: s.owner,
+            });
+        }
+        let mut graph: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
+        let mut idx_for: HashMap<String, NodeIndex> = HashMap::new();
+        for (path, bytes) in store.outline_files()? {
+            let symbols = symbols_by_file.remove(&path).unwrap_or_default();
+            let idx = graph.add_node(FileNode {
+                path: PathBuf::from(&path),
+                token_estimate: (bytes.max(0) as usize) / 4,
+                symbols,
+            });
+            idx_for.insert(path, idx);
+        }
+        // Parallel edges are kept: multiplicity is weight, as in
+        // `rank_files_with_weights_cancellable`.
+        for (src, tgt, kind) in store.file_edges()? {
+            if let (Some(&s), Some(&t)) = (idx_for.get(&src), idx_for.get(&tgt)) {
+                graph.add_edge(s, t, ReferenceEdge::new(kind));
+                graph.add_edge(t, s, ReferenceEdge::reversed(kind));
+            }
+        }
         let specificity_map = if config.enabled {
             compute_specificity_map(&graph, config.stop_symbol_threshold)
         } else {
@@ -493,6 +576,12 @@ impl RepoMap {
             graph,
             specificity_map,
         })
+    }
+
+    /// Number of edges in the reference graph, both directions counted
+    /// (each code-graph edge contributes a forward and a reverse edge).
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
     }
 
     /// V9 §11 M3: structured per-file ranking for the planner.
@@ -506,6 +595,9 @@ impl RepoMap {
     ///
     /// The legacy [`Self::rank_for_agent`] remains as a thin wrapper for
     /// the M0 baseline trace and any non-planner consumers; M10 deletes it.
+    ///
+    /// A match-all seed (`.`, `./`, empty) personalizes nothing: the ranking
+    /// is global and no file is `OWN`.
     pub fn rank_for_agent_structured(
         &self,
         owned: &[String],
@@ -521,7 +613,7 @@ impl RepoMap {
     /// `mode=tests` by `TestOf` only, `mode=impact` by the recommended
     /// blend (Calls=1.0, Implements=0.9, Defines=0.8, Imports=0.5,
     /// TestOf=0.3, others=0.2), and `mode=all` reproduces the legacy
-    /// uniform weighting.
+    /// uniform weighting. Match-all seeds (`.`, `./`, empty) are ignored.
     pub fn rank_for_agent_structured_with_mode(
         &self,
         owned: &[String],
@@ -543,6 +635,7 @@ impl RepoMap {
     /// even the path-only line of the next-ranked file no longer fits, the
     /// selection stops there (the same rule as the injector), so the result
     /// is always a rank-ordered prefix. No tracing: the units are not tokens.
+    /// With only match-all seeds (`.`, `./`, empty) the ranking is global.
     pub fn rank_with_line_cost(
         &self,
         owned: &[String],
@@ -560,14 +653,15 @@ impl RepoMap {
         mode: store::BlastRadiusMode,
         line_cost: &dyn Fn(&str) -> usize,
     ) -> Vec<GraphCandidate> {
+        // Filter match-all seeds first: `path_pattern::matches(".", _)` is
+        // always true.
+        let seeds: Vec<&String> = owned.iter().filter(|o| !is_match_all_seed(o)).collect();
         let owned_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
             .filter(|&idx| {
                 let p = self.graph[idx].path.to_string_lossy();
-                owned
-                    .iter()
-                    .any(|o| o == "." || o == "./" || crate::path_pattern::matches(o, &p))
+                seeds.iter().any(|o| crate::path_pattern::matches(o, &p))
             })
             .collect();
 
@@ -577,7 +671,7 @@ impl RepoMap {
             0.85,
             15,
             Some(&self.specificity_map),
-            |edge: &ReferenceEdge| mode.edge_weight(edge.kind),
+            |edge: &ReferenceEdge| edge.weight(mode),
         );
 
         let mut sorted: Vec<NodeIndex> = self.graph.node_indices().collect();
@@ -1157,5 +1251,133 @@ mod tests {
         };
         let plan = map.rank_for_agent(&["main.rs".to_string()], 10_000);
         assert_eq!(plan.repo_outline, expected_outline);
+    }
+
+    // ── code-graph edges ─────────────────────────────────────────
+
+    /// `src/seed.rs` calls `src/zz_callee.rs` and is called by
+    /// `src/yy_caller.rs`; `src/aa_unrelated.rs` links to nothing. The
+    /// unique bare-call names resolve across files. Plus three files with
+    /// no tree-sitter grammar.
+    fn linked_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed.rs"), "pub fn gv_seed_fn() { gv_callee_fn(); }\n").unwrap();
+        std::fs::write(src.join("zz_callee.rs"), "pub fn gv_callee_fn() {}\n").unwrap();
+        std::fs::write(src.join("yy_caller.rs"), "pub fn gv_caller_fn() { gv_seed_fn(); }\n")
+            .unwrap();
+        std::fs::write(src.join("aa_unrelated.rs"), "pub fn gv_unrelated_fn() {}\n").unwrap();
+        std::fs::write(src.join("notes.md"), "# notes\n").unwrap();
+        std::fs::write(src.join("build.log"), "log line\n").unwrap();
+        std::fs::write(src.join("Cargo.lock"), "# lock\n").unwrap();
+        dir
+    }
+
+    fn node_index(map: &RepoMap, path: &str) -> NodeIndex {
+        map.graph
+            .node_indices()
+            .find(|&i| map.graph[i].path.to_string_lossy() == path)
+            .unwrap_or_else(|| panic!("no node for {path}"))
+    }
+
+    fn position(cands: &[GraphCandidate], path: &str) -> usize {
+        cands
+            .iter()
+            .position(|c| c.path.to_string_lossy() == path)
+            .unwrap_or_else(|| panic!("{path} not in candidates"))
+    }
+
+    fn score(cands: &[GraphCandidate], path: &str) -> f64 {
+        cands[position(cands, path)].rank_score
+    }
+
+    #[test]
+    fn build_lists_only_code_graph_files() {
+        let dir = linked_workspace();
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
+        let mut paths: Vec<String> = map
+            .graph
+            .node_indices()
+            .map(|i| map.graph[i].path.to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "src/aa_unrelated.rs",
+                "src/seed.rs",
+                "src/yy_caller.rs",
+                "src/zz_callee.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_adds_forward_and_reverse_edges() {
+        let dir = linked_workspace();
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
+        assert!(map.edge_count() >= 4, "edges: {}", map.edge_count());
+        let seed = node_index(&map, "src/seed.rs");
+        let callee = node_index(&map, "src/zz_callee.rs");
+        let forward = map.graph.edges_connecting(seed, callee).collect::<Vec<_>>();
+        assert!(
+            forward.iter().any(|e| !e.weight().reverse),
+            "expected a forward seed → callee edge"
+        );
+        let back = map.graph.edges_connecting(callee, seed).collect::<Vec<_>>();
+        assert!(
+            back.iter().any(|e| e.weight().reverse),
+            "expected a reverse callee → seed edge"
+        );
+    }
+
+    #[test]
+    fn from_store_matches_in_memory_build() {
+        let dir = linked_workspace();
+        let store = store::GraphStore::open_memory().unwrap();
+        graph_builder::build_graph_into(&store, dir.path(), &[]).unwrap();
+        let from_store =
+            RepoMap::from_store(&store, SpecificityConfig::default()).expect("from_store");
+        let in_memory = RepoMap::build(dir.path(), &[]).expect("build");
+        assert!(from_store.edge_count() > 0);
+        assert_eq!(from_store.edge_count(), in_memory.edge_count());
+    }
+
+    #[test]
+    fn seeded_rank_prefers_callee_then_caller_then_unrelated() {
+        let dir = linked_workspace();
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
+        let cands = map.rank_for_agent_structured(&["src/seed.rs".into()], 100_000);
+        let callee = score(&cands, "src/zz_callee.rs");
+        let caller = score(&cands, "src/yy_caller.rs");
+        let unrelated = score(&cands, "src/aa_unrelated.rs");
+        assert!(callee > caller, "callee {callee} vs caller {caller}");
+        assert!(caller > unrelated, "caller {caller} vs unrelated {unrelated}");
+    }
+
+    #[test]
+    fn linked_file_listed_before_unlinked() {
+        let dir = linked_workspace();
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
+        let cands = map.rank_for_agent_structured(&["src/seed.rs".into()], 100_000);
+        assert!(
+            position(&cands, "src/zz_callee.rs") < position(&cands, "src/aa_unrelated.rs"),
+            "walk order would list aa_ first"
+        );
+    }
+
+    #[test]
+    fn match_all_seed_is_unseeded() {
+        let dir = linked_workspace();
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
+        let dot = map.rank_for_agent_structured(&[".".into()], 100_000);
+        assert!(!dot.is_empty());
+        assert!(dot.iter().all(|c| c.decision != GraphDecision::FullAttach));
+        assert!(dot.iter().all(|c| !c.rendered_line.contains("OWN ")));
+        assert!(dot.iter().any(|c| c.rendered_line.contains("(gv_")));
+        let none = map.rank_for_agent_structured(&[], 100_000);
+        let paths = |cs: &[GraphCandidate]| cs.iter().map(|c| c.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&dot), paths(&none));
     }
 }

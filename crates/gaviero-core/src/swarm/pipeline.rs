@@ -2405,11 +2405,15 @@ impl WorkspaceAnalysis {
     async fn build(config: &SwarmConfig, units: &[WorkUnit]) -> Self {
         let repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
             let workspace = config.workspace_root.clone();
+            let graph_db = config.graph_db();
             let excludes = config.excludes.clone();
             let specificity = config.specificity;
             Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
+                    crate::repo_map::graph_builder::build_graph_at(&workspace, &graph_db, &excludes)
+                        .and_then(|(store, _)| {
+                            crate::repo_map::RepoMap::from_store(&store, specificity)
+                        })
                         .map_err(|e| {
                             tracing::debug!("repo_map build skipped: {}", e);
                             e

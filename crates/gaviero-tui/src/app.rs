@@ -22,7 +22,6 @@ use crate::theme::{self, Theme};
 use crate::widgets::tabs::TabBar;
 
 use gaviero_core::memory::WriterHandle;
-use gaviero_core::repo_map::RepoMap;
 use gaviero_core::session_state::{self, SessionState, TabState};
 use gaviero_core::types::WriteProposal;
 use gaviero_core::workspace::Workspace;
@@ -228,15 +227,11 @@ pub struct App {
     /// task; held here only so a clean shutdown can join it.
     pub memory_sleeptime_scheduler: Option<gaviero_core::memory::SleeptimeScheduler>,
 
-    // Code graph cache — lazy build per workspace folder, invalidated on
-    // file changes. Keyed by canonical folder root path so workspace-wide
-    // chat (`/workspace`) can fetch a map per folder. The previous Option
-    // shape was a single workspace-primary cell — promoted to HashMap to
-    // support per-folder caches while keeping today's path (single-folder
-    // chat dispatch) working: callers still ask for the focused folder's
-    // map and get a one-entry cache miss on first use.
-    pub repo_map:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<RepoMap>>>>,
+    /// The live code graph of every workspace folder, one writer each
+    /// (`<folder>/.gaviero/code_graph.db`). Fed by the file watcher, read
+    /// by chat injection and shared with the MCP server, so both see the
+    /// same graph. Lazy until `start_all` at startup.
+    pub graph_services: gaviero_core::repo_map::GraphServices,
     /// Shallow directory topology cache (per folder root).
     pub topology_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, String>>>,
@@ -398,6 +393,19 @@ impl App {
 
         // Primary workspace root for code-graph context (first root).
         let graph_workspace_root = workspace.roots().first().map(|p| p.to_path_buf());
+        // One live graph per folder, in folder order (the first is primary).
+        let graph_services = gaviero_core::repo_map::GraphServices::new(
+            workspace
+                .roots()
+                .iter()
+                .map(|root| gaviero_core::repo_map::GraphFolder {
+                    root: root.to_path_buf(),
+                    db_path: gaviero_core::repo_map::graph_builder::graph_db_path(root),
+                    excludes: parse_exclude_patterns(&workspace, Some(root)),
+                    specificity: workspace.resolve_specificity_config(Some(root)),
+                })
+                .collect(),
+        );
         // History lives beside the MCP telemetry sink, under the same root the
         // prompt dispatch uses. Constructing the recorder touches no disk.
         let history = gaviero_core::history::HistoryRecorder::for_workspace(
@@ -509,7 +517,7 @@ impl App {
             memory_reranker: None,
             memory_rerank_cfg: None,
             memory_sleeptime_scheduler: None,
-            repo_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            graph_services,
             topology_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
@@ -673,8 +681,10 @@ impl App {
         {
             hints.topology_chars = Some(body.len());
         }
-        if let Ok(guard) = self.repo_map.try_read()
-            && let Some(map) = guard.get(&graph_root)
+        if let Some(map) = self
+            .graph_services
+            .for_root(&graph_root)
+            .and_then(|s| s.current())
         {
             let budget = self.chat_state.agent_settings.graph_budget_tokens;
             if budget > 0 {

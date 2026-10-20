@@ -122,17 +122,14 @@ fn incremental_build(
     collect_source_files(workspace, workspace, &mut source_files, excludes)?;
     result.files_scanned = source_files.len();
 
-    // 2. Get existing file hashes
-    let existing_hashes: std::collections::HashMap<String, String> =
-        store.all_file_hashes()?.into_iter().collect();
-
-    // 3. Detect deleted files (in store but not on disk). A path that was
+    // 2. Detect deleted files (in store but not on disk). A path that was
     //    unreadable has a status row but no hash, so check both.
     let current_files: std::collections::HashSet<String> = source_files
         .iter()
         .map(|(_, rel)| rel.to_string_lossy().to_string())
         .collect();
-    let mut stored: std::collections::BTreeSet<String> = existing_hashes.keys().cloned().collect();
+    let mut stored: std::collections::BTreeSet<String> =
+        store.all_file_hashes()?.into_iter().map(|(path, _)| path).collect();
     stored.extend(store.all_extraction_paths()?);
     for stored_file in &stored {
         if !current_files.contains(stored_file) {
@@ -141,6 +138,117 @@ fn incremental_build(
         }
     }
 
+    // 3. Index every file (unchanged ones are skipped by hash).
+    index_files(store, workspace, &source_files, &source_files, policy_current, &mut result)?;
+
+    // Publish the policy with the completed graph, never a partial build.
+    store.set_graph_meta(EXTRACTION_POLICY_META_KEY, EXTRACTION_POLICY_VERSION)?;
+
+    let (total_nodes, total_edges) = store.stats()?;
+    result.total_nodes = total_nodes;
+    result.total_edges = total_edges;
+    transaction.commit()?;
+
+    Ok(result)
+}
+
+/// Re-index `paths` (workspace-relative, `/`-separated) with the same
+/// per-file rules as a full build, then re-resolve unchanged
+/// structured-language files when definitions changed, all in one
+/// transaction. A path may name a file, a directory (walked), or something
+/// that no longer exists (its stored files, and those under it, are
+/// removed). Paths the code graph does not index (dot directories,
+/// [`SKIP_DIRS`], `excludes`, no tree-sitter grammar) are ignored. Falls back
+/// to a full incremental build when the stored extraction policy is stale.
+pub fn update_paths(
+    store: &GraphStore,
+    workspace: &Path,
+    excludes: &[String],
+    paths: &[String],
+) -> Result<BuildResult> {
+    if store.graph_meta(EXTRACTION_POLICY_META_KEY)?.as_deref() != Some(EXTRACTION_POLICY_VERSION) {
+        return incremental_build(store, workspace, excludes);
+    }
+    let mut result = BuildResult::default();
+    let transaction = store.build_transaction()?;
+
+    let mut stored: std::collections::BTreeSet<String> =
+        store.all_file_hashes()?.into_iter().map(|(path, _)| path).collect();
+    stored.extend(store.all_extraction_paths()?);
+
+    let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut removed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for p in paths {
+        let rel = p.trim_end_matches('/');
+        if rel.is_empty() || !passes_filters(Path::new(rel), excludes) {
+            continue;
+        }
+        let abs = workspace.join(rel);
+        let prefix = format!("{rel}/");
+        let mark_gone = |removed: &mut std::collections::BTreeSet<String>| {
+            for s in &stored {
+                if (s == rel || s.starts_with(&prefix)) && !workspace.join(s).is_file() {
+                    removed.insert(s.clone());
+                }
+            }
+        };
+        if abs.is_dir() {
+            collect_source_files(&abs, workspace, &mut candidates, excludes)?;
+            mark_gone(&mut removed);
+        } else if abs.is_file() {
+            if is_indexable(Path::new(rel), excludes) {
+                candidates.push((abs, PathBuf::from(rel)));
+            }
+        } else {
+            mark_gone(&mut removed);
+        }
+    }
+
+    for path in &removed {
+        store.delete_file(path)?;
+        result.files_removed += 1;
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    // Every file still in the graph plus the candidates: the set the
+    // staleness pass may re-resolve.
+    let mut all: std::collections::BTreeMap<String, (PathBuf, PathBuf)> = stored
+        .iter()
+        .filter(|s| !removed.contains(*s))
+        .map(|s| (s.clone(), (workspace.join(s), PathBuf::from(s))))
+        .collect();
+    for c in &candidates {
+        all.insert(c.1.to_string_lossy().into_owned(), c.clone());
+    }
+    let all_files: Vec<(PathBuf, PathBuf)> = all.into_values().collect();
+
+    result.files_scanned = candidates.len();
+    index_files(store, workspace, &candidates, &all_files, true, &mut result)?;
+
+    let (total_nodes, total_edges) = store.stats()?;
+    result.total_nodes = total_nodes;
+    result.total_edges = total_edges;
+    transaction.commit()?;
+
+    Ok(result)
+}
+
+/// Phase 1 (nodes) and phase 2 (edges) for `candidates`, inside the
+/// caller's transaction. `all_files` is every source file the staleness pass
+/// may re-resolve; a removal recorded in `result.files_removed` counts as a
+/// definition change.
+fn index_files(
+    store: &GraphStore,
+    workspace: &Path,
+    candidates: &[(PathBuf, PathBuf)],
+    all_files: &[(PathBuf, PathBuf)],
+    policy_current: bool,
+    result: &mut BuildResult,
+) -> Result<()> {
+    let existing_hashes: std::collections::HashMap<String, String> =
+        store.all_file_hashes()?.into_iter().collect();
+
     // 4. Phase 1: Index nodes for changed files
     let mut changed_files: Vec<(PathBuf, PathBuf, String)> = Vec::new(); // (abs, rel, content)
     // What each re-indexed file offered other files before this build
@@ -148,7 +256,7 @@ fn incremental_build(
     let mut old_signatures: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut signature_changed = result.files_removed > 0;
-    for (abs_path, rel_path) in &source_files {
+    for (abs_path, rel_path) in candidates {
         let rel_str = rel_path.to_string_lossy().to_string();
 
         // Read and hash file. An unreadable or oversized file must not leave
@@ -297,7 +405,7 @@ fn incremental_build(
         }
     }
     if signature_changed {
-        for (abs_path, rel_path) in &source_files {
+        for (abs_path, rel_path) in all_files {
             let rel_str = rel_path.to_string_lossy().to_string();
             let Some(lang) = lang_of(&rel_str).filter(|l| structured(*l)) else {
                 continue;
@@ -353,15 +461,7 @@ fn incremental_build(
         );
     }
 
-    // Publish the policy with the completed graph, never a partial build.
-    store.set_graph_meta(EXTRACTION_POLICY_META_KEY, EXTRACTION_POLICY_VERSION)?;
-
-    let (total_nodes, total_edges) = store.stats()?;
-    result.total_nodes = total_nodes;
-    result.total_edges = total_edges;
-    transaction.commit()?;
-
-    Ok(result)
+    Ok(())
 }
 
 /// Languages whose references go through [`super::resolve`] (the rest
@@ -384,13 +484,8 @@ fn collect_source_files(
     for entry in entries.flatten() {
         let path = entry.path();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        if file_name.starts_with('.') || SKIP_DIRS.contains(&file_name) {
-            continue;
-        }
-
         let rel = path.strip_prefix(workspace).unwrap_or(&path);
-        if is_excluded(file_name, rel, excludes) {
+        if entry_skipped(file_name, rel, excludes) {
             continue;
         }
 
@@ -398,8 +493,7 @@ fn collect_source_files(
             collect_source_files(&path, workspace, out, excludes)?;
         } else if path.is_file() {
             // Only index files with known extensions
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if language_for_extension(ext).is_some() {
+            if has_grammar(&path) {
                 // Store keys and LLM-facing outputs (blast_radius,
                 // impact texts) use `/`-separated rel paths on all
                 // hosts; abs_path stays native for I/O.
@@ -409,6 +503,43 @@ fn collect_source_files(
     }
 
     Ok(())
+}
+
+/// The walk's per-entry skip rule: dot entries, [`SKIP_DIRS`], and
+/// `excludes` (`rel` is the entry's workspace-relative path).
+fn entry_skipped(file_name: &str, rel: &Path, excludes: &[String]) -> bool {
+    file_name.starts_with('.')
+        || SKIP_DIRS.contains(&file_name)
+        || is_excluded(file_name, rel, excludes)
+}
+
+/// Whether the walk from the workspace root would descend to `rel`: no
+/// ancestor (or `rel` itself) is skipped by [`entry_skipped`].
+fn passes_filters(rel: &Path, excludes: &[String]) -> bool {
+    let mut prefix = PathBuf::new();
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        prefix.push(name);
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if entry_skipped(name, &prefix, excludes) {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_grammar(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    language_for_extension(ext).is_some()
+}
+
+/// Whether a full build would index the file at `rel`.
+fn is_indexable(rel: &Path, excludes: &[String]) -> bool {
+    passes_filters(rel, excludes) && has_grammar(rel)
 }
 
 fn hash_content(content: &str) -> String {
@@ -967,5 +1098,125 @@ mod tests {
             impact.affected_files.contains(&"big.rs".to_string()),
             "reference extraction still parses files over the symbol cap"
         );
+    }
+
+    // ── targeted updates (update_paths) ─────────────────────────────
+
+    type GraphShape = (Vec<(String, String, String)>, Vec<(String, String)>);
+
+    /// File edges (as a sorted multiset) and `(file, symbol)` pairs.
+    fn shape(store: &GraphStore) -> GraphShape {
+        let mut edges: Vec<_> = store
+            .file_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(s, t, k)| (s, t, k.as_str().to_string()))
+            .collect();
+        edges.sort();
+        let mut symbols: Vec<_> = store
+            .outline_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.file_path, s.name))
+            .collect();
+        symbols.sort();
+        (edges, symbols)
+    }
+
+    /// `store` (updated in place) must equal a fresh full build of `dir`.
+    fn assert_matches_full_build(store: &GraphStore, dir: &Path) {
+        let fresh = GraphStore::open_memory().unwrap();
+        build_graph_into(&fresh, dir, &[]).unwrap();
+        assert_eq!(shape(store), shape(&fresh));
+    }
+
+    fn write(dir: &Path, rel: &str, body: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn built(dir: &Path) -> GraphStore {
+        let store = GraphStore::open_memory().unwrap();
+        build_graph_into(&store, dir, &[]).unwrap();
+        store
+    }
+
+    fn paths(list: &[&str]) -> Vec<String> {
+        list.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn update_paths_matches_a_full_build_after_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn gv_a() {}\n");
+        write(dir.path(), "src/b.rs", "pub fn gv_b() { gv_a(); }\n");
+        write(dir.path(), "src/d.rs", "pub fn gv_d() { gv_c(); }\n");
+        let store = built(dir.path());
+
+        // A body edit, a new definition an unchanged file calls, a new caller.
+        write(dir.path(), "src/a.rs", "pub fn gv_a() { 1; }\n");
+        write(dir.path(), "src/c.rs", "pub fn gv_c() {}\n");
+        write(dir.path(), "src/e.rs", "pub fn gv_e() { gv_b(); }\n");
+        let r = update_paths(&store, dir.path(), &[], &paths(&["src/a.rs", "src/c.rs", "src/e.rs"]))
+            .unwrap();
+        assert_eq!(r.files_changed, 3);
+        // A definition changed, so every unchanged structured file (b.rs,
+        // d.rs) is re-resolved — d.rs now resolves gv_c.
+        assert_eq!(r.files_reresolved, 2);
+        assert_matches_full_build(&store, dir.path());
+    }
+
+    #[test]
+    fn update_paths_handles_file_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn gv_a() {}\n");
+        write(dir.path(), "src/b.rs", "pub fn gv_b() { gv_a(); }\n");
+        let store = built(dir.path());
+
+        std::fs::remove_file(dir.path().join("src/a.rs")).unwrap();
+        let r = update_paths(&store, dir.path(), &[], &paths(&["src/a.rs"])).unwrap();
+        assert_eq!(r.files_removed, 1);
+        assert_matches_full_build(&store, dir.path());
+    }
+
+    #[test]
+    fn update_paths_handles_directory_delete_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/sub/x.rs", "pub fn gv_x() {}\n");
+        write(dir.path(), "src/sub/y.rs", "pub fn gv_y() { gv_x(); }\n");
+        write(dir.path(), "src/user.rs", "pub fn gv_u() { gv_y(); }\n");
+        let store = built(dir.path());
+
+        std::fs::rename(dir.path().join("src/sub"), dir.path().join("src/moved")).unwrap();
+        let r = update_paths(&store, dir.path(), &[], &paths(&["src/sub", "src/moved"])).unwrap();
+        assert_eq!(r.files_removed, 2);
+        assert_eq!(r.files_changed, 2);
+        assert_matches_full_build(&store, dir.path());
+
+        std::fs::remove_dir_all(dir.path().join("src/moved")).unwrap();
+        let r = update_paths(&store, dir.path(), &[], &paths(&["src/moved"])).unwrap();
+        assert_eq!(r.files_removed, 2);
+        assert_matches_full_build(&store, dir.path());
+    }
+
+    #[test]
+    fn update_paths_ignores_non_indexable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn gv_a() {}\n");
+        let store = built(dir.path());
+
+        write(dir.path(), ".gaviero/code_graph.db-wal", "x");
+        write(dir.path(), "target/x.rs", "pub fn gv_t() {}\n");
+        write(dir.path(), "notes.md", "# notes\n");
+        let r = update_paths(
+            &store,
+            dir.path(),
+            &[],
+            &paths(&[".gaviero/code_graph.db-wal", "target/x.rs", "notes.md"]),
+        )
+        .unwrap();
+        assert_eq!((r.files_changed, r.files_removed), (0, 0));
+        assert_matches_full_build(&store, dir.path());
     }
 }

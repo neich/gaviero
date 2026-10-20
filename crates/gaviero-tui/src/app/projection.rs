@@ -527,7 +527,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::Resize(_, _)
         | Event::TerminalFocus(_)
         | Event::FileChanged(_)
-        | Event::FileTreeChanged
+        | Event::FileTreeChanged(_)
         | Event::Terminal(_)
         | Event::ClaudeSessionStarted { .. }
         | Event::CursorSessionStarted { .. }
