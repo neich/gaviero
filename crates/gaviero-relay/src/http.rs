@@ -259,7 +259,7 @@ async fn phone_stream(
     );
     Response::builder()
         .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CACHE_CONTROL, "no-store, no-transform")
         .header("X-Accel-Buffering", "no")
         .body(body)
         .expect("valid response")
