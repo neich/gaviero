@@ -1,5 +1,6 @@
 pub mod agent_chat;
 pub mod chat_markdown;
+pub mod code_graph_panel;
 pub mod file_tree;
 pub mod git_panel;
 pub mod history_panel;
