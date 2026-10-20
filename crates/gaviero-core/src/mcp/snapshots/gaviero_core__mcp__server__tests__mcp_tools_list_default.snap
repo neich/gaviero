@@ -4,7 +4,7 @@ expression: "&default_pretty"
 ---
 [
   {
-    "description": "Ranked dependents (impact, callers, tests) of file paths, best first; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~20-30 per row.",
+    "description": "Ranked dependents (or dependencies) of file paths with hop depth and the edge that reached each; limit rows (default 40), not_shown counts the rest. Read-only. Token cost: ~30-40 per row.",
     "name": "blast_radius"
   },
   {
@@ -30,5 +30,9 @@ expression: "&default_pretty"
   {
     "description": "PageRank-ranked code outline lines for mid-run orientation. Read-only. Token cost: compact JSON payload ≤ token_cap (default 2000).",
     "name": "repo_outline"
+  },
+  {
+    "description": "Function-level callers and callees of one qualified_name from node_doc, with file and line. Read-only. Token cost: ~20-30 per row.",
+    "name": "symbol_refs"
   }
 ]

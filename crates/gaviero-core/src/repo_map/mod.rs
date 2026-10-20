@@ -27,6 +27,7 @@ pub mod page_rank;
 pub mod resolve;
 pub mod rust_walk;
 pub mod service;
+pub mod spans;
 pub mod store;
 pub mod symbol_enrichment;
 pub mod symbol_search;
@@ -68,11 +69,20 @@ pub struct Symbol {
     pub kind: String,
     /// 0-based line number.
     pub line: usize,
+    /// 0-based line of the definition's last character (tree-sitter end
+    /// row).
+    pub end_line: usize,
     /// Enclosing container, for methods: `impl:Type`, `impl:Type:Trait`
     /// (an `impl Trait for Type` block) or `trait:Name`. `None` at top
     /// level. Used by edge resolution to tell `Widget::new` from
     /// `Gadget::new`; not part of the symbol's `qualified_name`.
     pub owner: Option<String>,
+    /// Rust test code: a function with a test attribute (`#[test]`,
+    /// `#[tokio::test]`, any attribute path ending in `test`) or any
+    /// function inside a `#[cfg(test)]` module. Always false for other
+    /// languages and for non-function items; test *files* are classified
+    /// by path ([`edges::is_test_file`]).
+    pub test: bool,
 }
 
 /// Reverse-edge damping: a seed's rank flows to the files it references at
@@ -299,21 +309,102 @@ fn trace_graph_selection(out: &[GraphCandidate], budget_tokens: usize) {
     );
 }
 
+/// One file reached by [`walk_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkStep {
+    pub file: String,
+    /// Hops from the nearest seed (1 = a direct neighbour).
+    pub depth: usize,
+    /// The edge that first reached `file`.
+    pub via: store::FileEdgeWitness,
+}
+
+/// Breadth-first walk of the file graph from `seeds`, up to `max_depth`
+/// hops, over the edges `mode` includes, in `direction`.
+///
+/// Level by level, each frontier file in ascending order visits its
+/// neighbours in `edges` order: for `Dependents` the files that reference
+/// it, for `Dependencies` the files it references, for `Both` the former
+/// then the latter. The first edge that reaches a file is its witness.
+/// Seeds are never steps. For `Dependents` the reached set equals
+/// [`store::GraphStore::impact_radius_with_mode`]'s affected files minus
+/// the seeds.
+pub fn walk_files(
+    edges: &[store::FileEdgeWitness],
+    seeds: &[&str],
+    max_depth: usize,
+    mode: store::BlastRadiusMode,
+    direction: store::WalkDirection,
+) -> Vec<WalkStep> {
+    let mut forward: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut backward: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in edges.iter().enumerate() {
+        if mode.includes(e.kind) {
+            forward.entry(e.source_file.as_str()).or_default().push(i);
+            backward.entry(e.target_file.as_str()).or_default().push(i);
+        }
+    }
+    let back = matches!(direction, store::WalkDirection::Dependents | store::WalkDirection::Both);
+    let fwd = matches!(direction, store::WalkDirection::Dependencies | store::WalkDirection::Both);
+    let mut visited: HashSet<&str> = seeds.iter().copied().collect();
+    let mut frontier: Vec<&str> = Vec::new();
+    for s in seeds {
+        if !frontier.contains(s) {
+            frontier.push(s);
+        }
+    }
+    let mut steps = Vec::new();
+    for depth in 1..=max_depth {
+        frontier.sort_unstable();
+        let mut next: Vec<&str> = Vec::new();
+        for f in &frontier {
+            let mut candidates: Vec<(usize, &str)> = Vec::new();
+            if back {
+                for &i in backward.get(f).map(Vec::as_slice).unwrap_or_default() {
+                    candidates.push((i, edges[i].source_file.as_str()));
+                }
+            }
+            if fwd {
+                for &i in forward.get(f).map(Vec::as_slice).unwrap_or_default() {
+                    candidates.push((i, edges[i].target_file.as_str()));
+                }
+            }
+            for (i, nbr) in candidates {
+                if visited.insert(nbr) {
+                    steps.push(WalkStep {
+                        file: nbr.to_string(),
+                        depth,
+                        via: edges[i].clone(),
+                    });
+                    next.push(nbr);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    steps
+}
+
 /// C3 + C4: rank a set of files using mode-weighted PageRank +
 /// specificity, sourced from the persisted [`store::GraphStore`].
 ///
-/// Used by the MCP `blast_radius` handler: the SQL CTE picks which
+/// Used by the MCP `blast_radius` handler: [`walk_files`] picks which
 /// files are reachable in the chosen mode, this function then orders
 /// them by per-intent edge weights with HippoRAG-style stop-symbol
-/// damping. Returns one `(score, specificity)` pair per file in
-/// `affected`. Files absent from the graph (e.g. seed paths that don't
-/// appear as edge endpoints) get `(0.0, 1.0)` so they don't get
-/// silently dropped from the output.
+/// damping. The rank flows the way the walk goes (`direction`): from the
+/// seeds to the files that use them for `Dependents`. Returns one
+/// `(score, specificity)` pair per file in `affected`. Files absent from
+/// the graph (e.g. seed paths that don't appear as edge endpoints) get
+/// `(0.0, 1.0)` so they don't get silently dropped from the output.
 pub fn rank_files_with_mode(
     store: &store::GraphStore,
     seeds: &[&str],
     affected: &[String],
     mode: store::BlastRadiusMode,
+    direction: store::WalkDirection,
     config: SpecificityConfig,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
     rank_files_with_weights(
@@ -321,6 +412,7 @@ pub fn rank_files_with_mode(
         seeds,
         affected,
         store::EdgeWeights::default_for(mode),
+        direction,
         config,
     )
 }
@@ -334,9 +426,10 @@ pub fn rank_files_with_weights(
     seeds: &[&str],
     affected: &[String],
     weights: store::EdgeWeights,
+    direction: store::WalkDirection,
     config: SpecificityConfig,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
-    rank_files_with_weights_cancellable(store, seeds, affected, weights, config, &|| false)
+    rank_files_with_weights_cancellable(store, seeds, affected, weights, direction, config, &|| false)
 }
 
 /// [`rank_files_with_weights`] that gives up with an error as soon as
@@ -348,6 +441,7 @@ pub fn rank_files_with_weights_cancellable(
     seeds: &[&str],
     affected: &[String],
     weights: store::EdgeWeights,
+    direction: store::WalkDirection,
     config: SpecificityConfig,
     cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
@@ -375,7 +469,10 @@ pub fn rank_files_with_weights_cancellable(
         }
     }
 
-    // 2. Build the DiGraph keyed by file path.
+    // 2. Build the DiGraph keyed by file path, oriented the way the walk
+    //    goes so rank flows from the seeds to what the walk reaches:
+    //    referenced -> referencing for dependents, the stored direction
+    //    for dependencies, both for both.
     let mut g: DiGraph<String, store::EdgeKind> = DiGraph::new();
     let mut idx_for: HashMap<String, NodeIndex> = HashMap::new();
     for p in &paths {
@@ -384,7 +481,18 @@ pub fn rank_files_with_weights_cancellable(
     }
     for (src, tgt, kind) in edges {
         if let (Some(&s_i), Some(&t_i)) = (idx_for.get(&src), idx_for.get(&tgt)) {
-            g.add_edge(s_i, t_i, kind);
+            match direction {
+                store::WalkDirection::Dependents => {
+                    g.add_edge(t_i, s_i, kind);
+                }
+                store::WalkDirection::Dependencies => {
+                    g.add_edge(s_i, t_i, kind);
+                }
+                store::WalkDirection::Both => {
+                    g.add_edge(s_i, t_i, kind);
+                    g.add_edge(t_i, s_i, kind);
+                }
+            }
         }
     }
 
@@ -541,10 +649,13 @@ impl RepoMap {
     pub fn from_store(store: &store::GraphStore, config: SpecificityConfig) -> anyhow::Result<Self> {
         let mut symbols_by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
         for s in store.outline_symbols()? {
+            let test = s.kind == "Test";
             symbols_by_file.entry(s.file_path).or_default().push(Symbol {
                 name: s.name,
                 kind: s.kind,
                 line: s.line.unwrap_or(0).max(0) as usize,
+                end_line: s.line_end.unwrap_or(0).max(0) as usize,
+                test,
                 owner: s.owner,
             });
         }
@@ -889,7 +1000,7 @@ mod tests {
         // dependents: caller.rs via `Calls` and tester.rs via `TestOf`.
         // mode=Callers should rank caller.rs above tester.rs;
         // mode=Tests should invert.
-        use crate::repo_map::store::{BlastRadiusMode, EdgeKind, GraphStore, NodeKind};
+        use crate::repo_map::store::{BlastRadiusMode, EdgeKind, GraphStore, NodeKind, WalkDirection};
         let store = GraphStore::open_memory().unwrap();
         store
             .upsert_node(
@@ -956,6 +1067,7 @@ mod tests {
             &["seed.rs"],
             &affected,
             BlastRadiusMode::Callers,
+            WalkDirection::Dependents,
             SpecificityConfig::default(),
         )
         .unwrap();
@@ -964,21 +1076,130 @@ mod tests {
             &["seed.rs"],
             &affected,
             BlastRadiusMode::Tests,
+            WalkDirection::Dependents,
             SpecificityConfig::default(),
         )
         .unwrap();
         assert!(
-            callers["caller.rs"].0 >= callers["tester.rs"].0,
-            "Callers mode must rank Calls-reached at least as high: {callers:?}"
+            callers["caller.rs"].0 > callers["tester.rs"].0,
+            "Callers mode must rank the Calls-reached dependent higher: {callers:?}"
         );
         assert!(
-            tests["tester.rs"].0 >= tests["caller.rs"].0,
-            "Tests mode must rank TestOf-reached at least as high: {tests:?}"
+            tests["tester.rs"].0 > tests["caller.rs"].0,
+            "Tests mode must rank the TestOf-reached dependent higher: {tests:?}"
         );
         // specificity in [0, 1] for every affected file.
         for (_, sp) in callers.values() {
             assert!((0.0..=1.0).contains(sp));
         }
+    }
+
+    /// One `Function` node `<file>::<file>_fn` per file (distinct names,
+    /// so specificity does not zero the edges), and `(kind, from, to)`
+    /// edges between them (sourced from `from`'s function).
+    fn walk_fixture(files: &[&str], edges: &[(store::EdgeKind, &str, &str)]) -> store::GraphStore {
+        use crate::repo_map::store::{GraphStore, NodeKind};
+        let store = GraphStore::open_memory().unwrap();
+        for f in files {
+            let name = format!("{f}_fn");
+            let qn = format!("{f}::{name}");
+            store
+                .upsert_node(NodeKind::Function, &name, &qn, f, Some(0), Some(0), Some("rust"), None)
+                .unwrap();
+        }
+        for (kind, from, to) in edges {
+            store
+                .insert_edge(*kind, &format!("{from}::{from}_fn"), &format!("{to}::{to}_fn"), from, 0)
+                .unwrap();
+        }
+        store
+    }
+
+    /// `d -> c -> b -> a` by `Calls`, plus `t -TestOf-> a`.
+    fn chain_fixture() -> store::GraphStore {
+        use crate::repo_map::store::EdgeKind;
+        walk_fixture(
+            &["a", "b", "c", "d", "t"],
+            &[
+                (EdgeKind::Calls, "b", "a"),
+                (EdgeKind::Calls, "c", "b"),
+                (EdgeKind::Calls, "d", "c"),
+                (EdgeKind::TestOf, "t", "a"),
+                (EdgeKind::Calls, "t", "a"),
+            ],
+        )
+    }
+
+    #[test]
+    fn walk_matches_impact_radius() {
+        use crate::repo_map::store::{BlastRadiusMode, WalkDirection};
+        let store = chain_fixture();
+        let edges = store.file_edge_witnesses().unwrap();
+        for mode in [BlastRadiusMode::All, BlastRadiusMode::Callers, BlastRadiusMode::Tests] {
+            for depth in 1..=3 {
+                let mut walked: Vec<String> = walk_files(&edges, &["a"], depth, mode, WalkDirection::Dependents)
+                    .into_iter()
+                    .map(|s| s.file)
+                    .collect();
+                walked.sort();
+                let mut cte: Vec<String> = store
+                    .impact_radius_with_mode(&["a"], depth, mode)
+                    .unwrap()
+                    .affected_files
+                    .into_iter()
+                    .filter(|f| f != "a")
+                    .collect();
+                cte.sort();
+                assert_eq!(walked, cte, "{mode:?} depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn walk_records_depth_and_witness() {
+        use crate::repo_map::store::{BlastRadiusMode, EdgeKind, WalkDirection};
+        let store = chain_fixture();
+        let edges = store.file_edge_witnesses().unwrap();
+        let steps = walk_files(&edges, &["a"], 2, BlastRadiusMode::Callers, WalkDirection::Dependents);
+        let got: Vec<(&str, usize, &str, &str)> = steps
+            .iter()
+            .map(|s| (s.file.as_str(), s.depth, s.via.source_file.as_str(), s.via.target_file.as_str()))
+            .collect();
+        assert_eq!(got, vec![("b", 1, "b", "a"), ("t", 1, "t", "a"), ("c", 2, "c", "b")]);
+        assert_eq!(steps[0].via.kind, EdgeKind::Calls);
+        assert_eq!(steps[0].via.source_qn, "b::b_fn");
+
+        let deps = walk_files(&edges, &["d"], 3, BlastRadiusMode::All, WalkDirection::Dependencies);
+        let got: Vec<(&str, usize)> = deps.iter().map(|s| (s.file.as_str(), s.depth)).collect();
+        assert_eq!(got, vec![("c", 1), ("b", 2), ("a", 3)]);
+
+        let both = walk_files(&edges, &["b"], 1, BlastRadiusMode::Callers, WalkDirection::Both);
+        let got: Vec<&str> = both.iter().map(|s| s.file.as_str()).collect();
+        assert_eq!(got, vec!["c", "a"], "dependents first, then dependencies");
+    }
+
+    #[test]
+    fn dependents_rank_flows_from_the_seed() {
+        use crate::repo_map::store::{BlastRadiusMode, EdgeKind, WalkDirection};
+        let files = ["s", "d", "y"];
+        let with_edge = walk_fixture(&files, &[(EdgeKind::Calls, "d", "s"), (EdgeKind::Calls, "y", "d")]);
+        let without = walk_fixture(&files, &[(EdgeKind::Calls, "y", "d")]);
+        let affected: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        let rank = |store: &store::GraphStore, dir: WalkDirection| {
+            rank_files_with_mode(store, &["s"], &affected, BlastRadiusMode::All, dir, SpecificityConfig::default())
+                .unwrap()["d"]
+                .0
+        };
+        let (a, b) = (
+            rank(&with_edge, WalkDirection::Dependents),
+            rank(&without, WalkDirection::Dependents),
+        );
+        assert!(a > b * 1.5, "a dependent of the seed must gain rank from it: {a} vs {b}");
+        let (a, b) = (
+            rank(&with_edge, WalkDirection::Dependencies),
+            rank(&without, WalkDirection::Dependencies),
+        );
+        assert!(a <= b + 1e-9, "the old orientation sends the seed's rank away from d: {a} vs {b}");
     }
 
     #[test]
@@ -998,7 +1219,9 @@ mod tests {
                 name: "seed".into(),
                 kind: "function_item".into(),
                 line: 0,
+                end_line: 0,
                 owner: None,
+                test: false,
             }],
         });
         let by_call = g.add_node(FileNode {
@@ -1008,7 +1231,9 @@ mod tests {
                 name: "by_call".into(),
                 kind: "function_item".into(),
                 line: 0,
+                end_line: 0,
                 owner: None,
+                test: false,
             }],
         });
         let by_test = g.add_node(FileNode {
@@ -1018,7 +1243,9 @@ mod tests {
                 name: "by_test".into(),
                 kind: "function_item".into(),
                 line: 0,
+                end_line: 0,
                 owner: None,
+                test: false,
             }],
         });
         g.add_edge(seed, by_call, ReferenceEdge::new(EdgeKind::Calls));
@@ -1106,7 +1333,9 @@ mod tests {
                 name: format!("a_long_symbol_name_number_{i}"),
                 kind: "function_item".into(),
                 line: 0,
+                end_line: 0,
                 owner: None,
+                test: false,
             })
             .collect();
         let b = g.add_node(FileNode {
@@ -1159,17 +1388,19 @@ mod tests {
         let affected = vec!["a.rs".to_string()];
         let weights = store::EdgeWeights::default_for(store::BlastRadiusMode::All);
         let config = SpecificityConfig::default();
+        let dir = store::WalkDirection::Dependents;
         let err = rank_files_with_weights_cancellable(
             &store,
             &["a.rs"],
             &affected,
             weights,
+            dir,
             config,
             &|| true,
         )
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
-        let ok = rank_files_with_weights(&store, &["a.rs"], &affected, weights, config).unwrap();
+        let ok = rank_files_with_weights(&store, &["a.rs"], &affected, weights, dir, config).unwrap();
         assert!(ok.contains_key("a.rs"));
     }
 
@@ -1189,7 +1420,9 @@ mod tests {
                 name: format!("a_long_symbol_name_number_{i}"),
                 kind: "function_item".into(),
                 line: 0,
+                end_line: 0,
                 owner: None,
+                test: false,
             })
             .collect();
         let b = g.add_node(FileNode {

@@ -108,6 +108,49 @@ pub(super) fn container_owner(node: tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
+/// The outer attributes of a Rust item (`attribute_item` siblings right
+/// before it, comments skipped), whitespace removed: `#[tokio::test]`.
+fn outer_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                if let Ok(text) = p.utf8_text(source) {
+                    out.push(text.chars().filter(|c| !c.is_whitespace()).collect());
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = p.prev_sibling();
+    }
+    out
+}
+
+/// An attribute's text between `#[` and `]`.
+fn attribute_inner(attr: &str) -> &str {
+    attr.strip_prefix("#[")
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(attr)
+}
+
+/// A test attribute: its path (before any `(`) is `test` or ends in
+/// `::test` (`#[test]`, `#[tokio::test(flavor = "…")]`).
+fn has_test_attr(node: tree_sitter::Node, source: &[u8]) -> bool {
+    outer_attributes(node, source).iter().any(|a| {
+        let path = attribute_inner(a).split('(').next().unwrap_or("");
+        path == "test" || path.ends_with("::test")
+    })
+}
+
+/// Exactly `#[cfg(test)]` (not `cfg(all(test, …))`).
+fn has_cfg_test(node: tree_sitter::Node, source: &[u8]) -> bool {
+    outer_attributes(node, source)
+        .iter()
+        .any(|a| attribute_inner(a) == "cfg(test)")
+}
+
 /// `crate::a::Foo<T>` / `&mut Foo` / `dyn Foo + Send` → `Foo`.
 pub(super) fn type_base_name(text: &str) -> String {
     let t = text.trim();
@@ -126,24 +169,37 @@ pub(super) fn collect_symbols(root: tree_sitter::Node, source: &[u8], out: &mut 
     // last. Pre-order visits a container before its contents, so a block is
     // popped once the walk reaches a node starting at or after its end.
     let mut owners: Vec<(usize, String)> = Vec::new();
+    // End bytes of the enclosing Rust `#[cfg(test)]` modules, innermost
+    // last, popped the same way.
+    let mut test_mods: Vec<usize> = Vec::new();
     loop {
         let node = cursor.node();
         while owners.last().is_some_and(|(end, _)| node.start_byte() >= *end) {
             owners.pop();
         }
+        while test_mods.last().is_some_and(|end| node.start_byte() >= *end) {
+            test_mods.pop();
+        }
         if DEF_KINDS.contains(&node.kind())
             && let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source)
         {
+            let test = node.kind() == "function_item"
+                && (!test_mods.is_empty() || has_test_attr(node, source));
             out.push(Symbol {
                 name: name.to_string(),
                 kind: node.kind().to_string(),
                 line: node.start_position().row,
+                end_line: node.end_position().row,
                 owner: owners.last().map(|(_, o)| o.clone()),
+                test,
             });
         }
         if let Some(owner) = container_owner(node, source) {
             owners.push((node.end_byte(), owner));
+        }
+        if node.kind() == "mod_item" && has_cfg_test(node, source) {
+            test_mods.push(node.end_byte());
         }
         if cursor.goto_first_child() {
             continue;
@@ -174,6 +230,37 @@ pub trait Baz {}
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"foo"), "{:?}", names);
         assert!(names.contains(&"Bar"), "{:?}", names);
+    }
+
+    #[test]
+    fn symbols_record_their_end_lines() {
+        let syms = extract_symbols("rs", "fn a() {\n    1;\n}\nstruct B;\n");
+        let span = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.line, s.end_line))
+                .unwrap_or_else(|| panic!("{name} missing: {syms:?}"))
+        };
+        assert_eq!(span("a"), (0, 2));
+        assert_eq!(span("B"), (3, 3));
+    }
+
+    #[test]
+    fn inline_rust_tests_are_marked() {
+        let src = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    struct Fixture;\n    fn helper() {}\n    #[test]\n    fn checks() { prod(); }\n}\n#[tokio::test]\nasync fn t2() {}\nfn after() {}\n";
+        let syms = extract_symbols("rs", src);
+        let test = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .map(|s| s.test)
+                .unwrap_or_else(|| panic!("{name} missing: {syms:?}"))
+        };
+        for name in ["helper", "checks", "t2"] {
+            assert!(test(name), "{name} is test code");
+        }
+        for name in ["prod", "Fixture", "after"] {
+            assert!(!test(name), "{name} is not test code");
+        }
     }
 
     #[test]

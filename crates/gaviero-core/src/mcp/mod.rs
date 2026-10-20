@@ -1,6 +1,6 @@
 //! Gaviero as an MCP server (Tier A / A5).
 //!
-//! Nine tools for subprocess coding agents — eight read-only:
+//! Ten tools for subprocess coding agents — nine read-only:
 //! * `memory_search` — merged multi-scope hybrid search over memories
 //!   (repo + workspace + global; `module` / `run` need per-file / per-run
 //!   identity that does not cross the shim)
@@ -10,6 +10,7 @@
 //! * `blast_radius` — graph impact / callers / tests for file paths
 //! * `node_doc` — per-file symbol signatures (+ `qualified_name` for chaining)
 //! * `repo_outline` — PageRank-ranked code outline (mid-run `<repo_outline>` pull)
+//! * `symbol_refs` — function-level callers and callees of one symbol
 //! * `symbol_search` / `symbol_doc` — semantic symbol retrieval (when enrichment on)
 //!
 //! …plus one that is write-adjacent:
@@ -133,9 +134,10 @@ pub use tools::{
     MemoryFlagInput, MemoryFlagOutput, MemoryGetInput, MemoryGetOutput, MemoryGetRow,
     MemoryPingInput, MemoryPingOutput, MemorySearchInput, MemorySearchOutput, MemorySearchResult,
     NodeDoc, NodeDocInput, NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
-    SymbolDocInput, SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS,
-    TOOL_MEMORY_FLAG, TOOL_MEMORY_GET, TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC,
-    TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
+    SymbolDocInput, SymbolDocOutput, SymbolRef, SymbolRefsInput, SymbolRefsOutput,
+    SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS, TOOL_MEMORY_FLAG, TOOL_MEMORY_GET,
+    TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC, TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC,
+    TOOL_SYMBOL_REFS, TOOL_SYMBOL_SEARCH,
 };
 pub use transport::McpEndpoint;
 pub use user_scope::{

@@ -936,6 +936,14 @@ pub fn take_by_key<T>(mut items: Vec<(u64, T)>, n: usize) -> Vec<T> {
 
 /// Resolve every reference of `file` and insert its edges. Returns the
 /// number of edges inserted.
+///
+/// An edge's `source_qn` is the innermost symbol of `file` containing the
+/// reference, or `file` itself at top level ([`super::spans`]). A
+/// reference that resolves only to `file`'s own definition
+/// ([`Outcome::Local`]) gets one same-file edge to it. Test code — a test
+/// file, or a Rust test function ([`super::Symbol::test`]) in any file —
+/// also gets a `TestOf` edge to each target that is not test code (not in
+/// a test file, not a `Test` node).
 pub fn resolve_and_insert(
     store: &GraphStore,
     ctx: &ResolveContext,
@@ -946,34 +954,48 @@ pub fn resolve_and_insert(
 ) -> anyhow::Result<usize> {
     let scope = FileScope::build(lang, refs);
     let source_is_test = is_test_file(file);
+    let spans = super::spans::SymbolSpans::load(store, file)?;
     let mut edges = 0;
     for r in refs {
         let outcome = ctx.resolve(file, lang, &scope, r);
         stats.record(&outcome, r);
-        let Outcome::Files { targets, .. } = outcome else {
-            continue;
-        };
         let kind = match r.kind {
             RefKind::Import => EdgeKind::Imports,
             RefKind::Call => EdgeKind::Calls,
             RefKind::Implements => EdgeKind::Implements,
         };
-        // `import a.b` has no item name; the module stands in for it.
-        let name = match (&r.module, r.target_name.is_empty()) {
-            (Some(m), true) => m.as_str(),
-            _ => r.target_name.as_str(),
+        let (source_qn, source_test) = spans.source_for(file, r.line as i64);
+        let targets = match outcome {
+            Outcome::Files { targets, .. } => targets,
+            Outcome::Local => {
+                if ctx.defines(file, &r.target_name) {
+                    let def = &ctx.defs_by_file[file][&r.target_name][0];
+                    let target_qn = &def.qualified_name;
+                    // A recursive call is not an edge.
+                    if *target_qn != source_qn {
+                        store.insert_edge(kind, &source_qn, target_qn, file, r.line as i64)?;
+                        edges += 1;
+                        // An inline test exercising its own file's code.
+                        if source_test && !source_is_test && def.kind != "Test" {
+                            store.insert_edge(EdgeKind::TestOf, &source_qn, target_qn, file, r.line as i64)?;
+                            edges += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => continue,
         };
-        let source_qn = format!("{file}::{name}");
         for (target_file, name) in targets {
-            let target_qn = match &name {
-                Some(n) if ctx.defines(&target_file, n) => ctx.defs_by_file[&target_file][n][0]
-                    .qualified_name
-                    .clone(),
-                _ => target_file.clone(),
+            let def = match &name {
+                Some(n) if ctx.defines(&target_file, n) => Some(&ctx.defs_by_file[&target_file][n][0]),
+                _ => None,
             };
+            let target_qn = def.map_or_else(|| target_file.clone(), |d| d.qualified_name.clone());
             store.insert_edge(kind, &source_qn, &target_qn, file, r.line as i64)?;
             edges += 1;
-            if source_is_test && !is_test_file(&target_file) {
+            let target_is_test_code = is_test_file(&target_file) || def.is_some_and(|d| d.kind == "Test");
+            if (source_is_test || source_test) && !target_is_test_code {
                 store.insert_edge(EdgeKind::TestOf, &source_qn, &target_qn, file, r.line as i64)?;
                 edges += 1;
             }

@@ -86,7 +86,7 @@ gaviero-core/src/
 ├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
 │  ├─ signal.rs           MemorySignalSink — the one write-adjacent seam
-│  ├─ tools.rs            Nine tools (see MCP below)
+│  ├─ tools.rs            Ten tools (see MCP below)
 │  ├─ probe.rs            ProbeLedger + memory_ping receipts
 │  ├─ transport.rs        McpEndpoint (Unix socket / Windows named pipe)
 │  ├─ http.rs             Loopback streamable-HTTP listener
@@ -168,7 +168,7 @@ Writes, TUI chat: every provider writes during the turn (`AgentOptions::host_cap
 ### Memory / MCP / observers
 
 - [`MemoryStores`](src/memory/stores.rs) + [`WriterHandle`](src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](src/mcp/server.rs) — nine tools (eight read-only including `memory_ping` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs). Loopback HTTP: [`mcp/http.rs`](src/mcp/http.rs). Shim lookup: [`mcp/endpoint_file.rs`](src/mcp/endpoint_file.rs). Lean surface: `mcp.gavieroServer.exposedTools` (default all nine; lean preset `memory_search`/`memory_get`/`memory_ping`).
+- [`GavieroMcpServer`](src/mcp/server.rs) — ten tools (nine read-only including `memory_ping` and `symbol_refs` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs). Loopback HTTP: [`mcp/http.rs`](src/mcp/http.rs). Shim lookup: [`mcp/endpoint_file.rs`](src/mcp/endpoint_file.rs). Lean surface: `mcp.gavieroServer.exposedTools` (default all ten; lean preset `memory_search`/`memory_get`/`memory_ping`).
 - Observers in [`observer.rs`](src/observer.rs) / [`memory/observer.rs`](src/memory/observer.rs) / [`mcp/observer.rs`](src/mcp/observer.rs).
 
 ---
@@ -226,10 +226,20 @@ DBs: global `~/.config/gaviero/memory.db`; workspace+run `<workspace>/.gaviero/m
 
 ### MCP
 
-[`spawn_mcp_server`](src/mcp/server.rs) binds [`McpEndpoint`](src/mcp/transport.rs). Subprocess agents use `gaviero-mcp-shim`. Tools ([`tools.rs`](src/mcp/tools.rs)): `memory_search`, `memory_get`, `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`, `symbol_search`, `symbol_doc` (last two gated by `repoMap.symbolEnrichment.enabled`).
+[`spawn_mcp_server`](src/mcp/server.rs) binds [`McpEndpoint`](src/mcp/transport.rs). Subprocess agents use `gaviero-mcp-shim`. Tools ([`tools.rs`](src/mcp/tools.rs)): `memory_search`, `memory_get`, `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`, `symbol_refs`, `symbol_search`, `symbol_doc` (last two gated by `repoMap.symbolEnrichment.enabled`).
 
 Graph-tool output contracts:
-- **`blast_radius`** returns `{mode, nodes, not_shown, truncated}`. The nodes are `changed` rows, then up to `limit` ranked dependents (default 40, max 200, 0 allowed), then `test_gap` rows. Dependents are ordered by full-precision score with path as tie-break, and their scores are rounded to 3 decimals after ranking. `relation` appears only on changed and test-gap rows. Rows carry no `qualified_name` or `distance`.
+- **`blast_radius`** returns `{mode, direction, nodes, not_shown, truncated}`.
+  - `direction` is `dependents` (default: files that use the seeds), `dependencies` (files the seeds use) or `both`; anything else is `invalid_params`.
+  - The files come from a breadth-first walk of the cross-file edges the mode includes ([`walk_files`](src/repo_map/mod.rs)). For `dependents` this is the same set as the impact CTE.
+  - The nodes are `changed` rows, then up to `limit` ranked rows (default 40, max 200, 0 allowed), then `test_gap` rows.
+  - Ranked rows are ordered by full-precision score with path as tie-break; scores are rounded to 3 decimals after ranking. The score is mode-weighted personalized PageRank on the graph oriented the way the walk goes, so the seeds' rank flows to what the walk reaches.
+  - Each ranked row carries `depth` (hops from the nearest seed) and `via`, the edge that first reached it: `"<Kind> <source> -> <target> L<line>"`. The line is 1-based in the referencing file. The side in the row's own file is a bare symbol name, the other side a folder-relative qualified name.
+  - `relation` appears only on changed and test-gap rows, which carry no `depth` or `via`. No row carries `qualified_name`.
+- **`symbol_refs`** returns `{qualified_name, refs, not_shown, truncated}` for one symbol `qualified_name` (`<path>::<name>`, as `node_doc` gives it). A bare path is `invalid_params` (use `blast_radius`), and so is an unknown symbol.
+  - `direction`: `callers`, `callees` or `both` (default).
+  - Each ref has `role` (`caller` / `callee`), the other end's `qualified_name` (a file path for a top-level reference), `path`, a 1-based `line` (the call site for callers, the definition for callees), `kind` (`Calls` / `Imports` / `Implements`), and `test: true` when a caller is test code.
+  - Callers come first, then callees. `limit` defaults to 40 (max 200, 0 allowed) and applies to the combined list. An absolute path selects its workspace folder. Paths of a non-primary folder are shown absolute.
 - **`node_doc`** symbols carry `qualified_name`, a 1-based `line` (null when unknown) and `signature` only when it differs from the name. There is no legacy `signatures` list. An empty result carries `status` (an extraction outcome, `unknown` or `not_indexed`) and `note`.
 - **`repo_outline`** entries are `{rendered}` in rank order. `token_estimate` is the estimate (`ceil(bytes/4)`, [`payload.rs`](src/mcp/payload.rs)) of the whole compact response and never exceeds the clamped `token_cap`.
 - **`repo_outline` `seed_paths`** omitted, empty or `.` means no personalization: an unseeded global ranking with no `OWN` lines.
@@ -271,7 +281,7 @@ Graph-tool output contracts:
   - **External type:** no edge, unless a workspace extension trait in scope is implemented for it.
   - **Unknown:** the name-based steps above.
 - **Fallback.** The last fallback everywhere is the name: definitions in files of the same language, free functions only for `foo()` and methods only for `.foo()`. A `.foo()` whose receiver is unknown and whose name std also defines (`ok`, `send`, `elapsed`, … — [`std_methods.txt`](src/repo_map/std_methods.txt), generated from the toolchain's rustdoc HTML by `python -I research/gen_std_methods.py`; regenerate after a toolchain update, `--check` verifies) gets no edge.
-- **Filters.** Production files never target test files. Same-file targets need no edge.
+- **Filters.** Production files never target test files. A reference that resolves only to its own file's definition (`Outcome::Local`) gets one same-file edge, unless it is a recursive call. File-level consumers (`file_edges`, the impact walk, ranking) skip same-file edges.
 - **Ambiguity is dropped, not fanned out.** When candidates span more than `RESOLVE_MAX_TARGET_FILES` files (1, chosen on labelled samples), the reference gets no edge. `BuildResult.resolve` counts:
   - resolution by step;
   - local, unresolved and dropped references;
@@ -283,7 +293,13 @@ Graph-tool output contracts:
   - Two methods of one name in one file share a node (the `qualified_name` format); method lookups use the `type_methods` facts instead, but the edge's target node is the shared one.
   - Macros are not expanded, and `#[path]` is not modelled. Inline `mod x { }` items stay in their file.
   - A function-scoped `use` counts as file-wide.
-  - `source_qn` stays `{file}::{called name}`. `blast_radius` is file-level, and its meaning is unchanged.
+  - Same-named symbols in one file share one node, which keeps the range of the last one stored. A reference inside an earlier same-named method falls outside that range, so it is attributed to an enclosing symbol or to the file. An inline test helper never replaces a same-named production node.
+
+**Symbol-level edges** ([`repo_map/spans.rs`](src/repo_map/spans.rs)):
+- Nodes store `line_start` and `line_end`.
+- A reference edge's `source_qn` is the innermost stored symbol whose range contains the reference, or the file (its File node) at top level. Ranges come from the stored nodes, so full builds and `update_paths` agree.
+- `file_edges` counts each (file, target, kind) once, so per-caller rows do not change file-level weights. `symbol_refs` reads callers and callees from these rows.
+- Rust inline test code is stored as `Test` nodes and emits `TestOf` to the non-test code it references, same-file included, so a file covered only by its own `#[cfg(test)]` tests is no longer a test gap. Inline test code is a function with a test attribute (`#[test]`, `#[tokio::test]`, …) or any function in a `#[cfg(test)]` module. A file's own non-`TestOf` edges never count as test coverage by path.
 
 ### Two-layer graph context
 

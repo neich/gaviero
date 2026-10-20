@@ -98,7 +98,7 @@ impl McpCallRecord {
 /// output JSON. Inspects the first known result-bearing array field
 /// across the read-only tools (`results` for `memory_search` /
 /// `symbol_search`, `nodes` for `blast_radius`, `symbols` for `node_doc`,
-/// `entries` for `repo_outline`). `signatures` and `impls` stay last so
+/// `entries` for `repo_outline`, `refs` for `symbol_refs`). `signatures` and `impls` stay last so
 /// records written before `node_doc` dropped its legacy `signatures`
 /// list keep their verdict. A non-object output, or one with no
 /// recognised array, counts as non-empty.
@@ -109,7 +109,7 @@ pub fn output_is_empty(output: &serde_json::Value) -> bool {
     let Some(obj) = output.as_object() else {
         return false;
     };
-    for key in ["results", "nodes", "symbols", "entries", "signatures", "impls"] {
+    for key in ["results", "nodes", "symbols", "entries", "refs", "signatures", "impls"] {
         if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
             return arr.is_empty();
         }
@@ -334,6 +334,8 @@ mod tests {
         assert!(!output_is_empty(&serde_json::json!({"results": [1]})));
         assert!(output_is_empty(&serde_json::json!({"nodes": []})));
         assert!(!output_is_empty(&serde_json::json!({"nodes": [{}]})));
+        assert!(output_is_empty(&serde_json::json!({"refs": []})));
+        assert!(!output_is_empty(&serde_json::json!({"refs": [{}]})));
         // No recognised array → treated as non-empty.
         assert!(!output_is_empty(&serde_json::json!({"path": "src/lib.rs"})));
         assert!(!output_is_empty(&serde_json::json!("scalar")));

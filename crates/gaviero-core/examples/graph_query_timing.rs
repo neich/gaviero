@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use gaviero_core::repo_map::store::{BlastRadiusMode, EdgeWeights, GraphStore};
+use gaviero_core::repo_map::store::{BlastRadiusMode, EdgeWeights, GraphStore, WalkDirection};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         &seeds,
         &to_rank,
         EdgeWeights::default_for(mode),
+        WalkDirection::Dependents,
         gaviero_core::repo_map::SpecificityConfig::default(),
     )?;
     let rank_ms = t.elapsed().as_secs_f64() * 1000.0;

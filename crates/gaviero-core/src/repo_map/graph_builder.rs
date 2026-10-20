@@ -320,12 +320,20 @@ fn index_files(
             Some(&hash),
         )?;
 
-        // Insert symbol nodes
+        // Insert symbol nodes. Same-named symbols share one node (keyed
+        // `file::name`); inline test code never replaces a production
+        // definition's kind and span (a `mod tests` mock named like the
+        // function it stands in for).
+        let mut production: std::collections::HashSet<String> = std::collections::HashSet::new();
         for sym in symbols {
             let qn = format!("{}::{}", rel_str, sym.name);
-            let kind = if is_test {
+            if sym.test && !is_test && production.contains(&qn) {
+                continue;
+            }
+            let kind = if is_test || sym.test {
                 NodeKind::Test
             } else {
+                production.insert(qn.clone());
                 node_kind_from_ts(&sym.kind, &rel_str)
             };
             store.upsert_node(
@@ -334,7 +342,7 @@ fn index_files(
                 &qn,
                 &rel_str,
                 Some(sym.line as i64),
-                None,
+                Some(sym.end_line as i64),
                 language,
                 Some(&hash),
             )?;
@@ -770,6 +778,83 @@ mod tests {
         assert_eq!(edges_from(&store, "src/b.rs"), vec![]);
     }
 
+    #[test]
+    fn edges_are_sourced_from_the_enclosing_function() {
+        let dir = demo_crate(&[
+            ("lib.rs", "mod util;\nmod app;\n"),
+            ("util.rs", "pub fn helper() {}\n"),
+            (
+                "app.rs",
+                "use crate::util::helper;\npub fn run() {\n    helper();\n    local();\n}\nfn local() {}\n",
+            ),
+        ]);
+        let (store, _) = build_graph(dir.path(), &[]).unwrap();
+        let rows = store.edge_rows().unwrap();
+        let has = |kind: &str, src: &str, tgt: &str, file: &str| {
+            rows.iter()
+                .any(|(k, s, t, f)| k == kind && s == src && t == tgt && f == file)
+        };
+        assert!(has("Calls", "src/app.rs::run", "src/util.rs::helper", "src/app.rs"), "{rows:#?}");
+        assert!(has("Calls", "src/app.rs::run", "src/app.rs::local", "src/app.rs"), "{rows:#?}");
+        assert!(has("Imports", "src/app.rs", "src/util.rs::helper", "src/app.rs"), "{rows:#?}");
+        let run = store
+            .nodes_for_file("src/app.rs")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.qualified_name == "src/app.rs::run")
+            .unwrap();
+        assert_eq!((run.line_start, run.line_end), (Some(1), Some(4)));
+    }
+
+    #[test]
+    fn inline_tests_cover_their_file() {
+        let dir = demo_crate(&[
+            (
+                "lib.rs",
+                "mod other;\npub fn prod() {}\npub fn send() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    fn helper() {}\n    fn send() {}\n    #[test]\n    fn checks() { prod(); helper(); }\n}\n",
+            ),
+            ("other.rs", "pub fn lonely() {}\n"),
+        ]);
+        let (store, _) = build_graph(dir.path(), &[]).unwrap();
+        let kind = |qn: &str| {
+            store
+                .nodes_for_file("src/lib.rs")
+                .unwrap()
+                .into_iter()
+                .find(|n| n.qualified_name == qn)
+                .map(|n| n.kind)
+                .unwrap_or_else(|| panic!("{qn} missing"))
+        };
+        assert_eq!(kind("src/lib.rs::checks"), "Test");
+        assert_eq!(kind("src/lib.rs::prod"), "Function");
+        assert_eq!(kind("src/lib.rs::helper"), "Test");
+        let send = store
+            .nodes_for_file("src/lib.rs")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.qualified_name == "src/lib.rs::send")
+            .unwrap();
+        assert_eq!(
+            (send.kind.as_str(), send.line_start),
+            ("Function", Some(2)),
+            "a same-named mock in the tests keeps the production kind and span"
+        );
+        let rows = store.edge_rows().unwrap();
+        assert!(
+            rows.iter().any(|(k, s, t, f)| k == "TestOf"
+                && s == "src/lib.rs::checks"
+                && t == "src/lib.rs::prod"
+                && f == "src/lib.rs"),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|(k, _, t, _)| k == "TestOf" && t == "src/lib.rs::helper"),
+            "a test calling a test helper is not a test of it: {rows:#?}"
+        );
+        let impact = store.impact_radius(&["src/lib.rs", "src/other.rs"], 1).unwrap();
+        assert_eq!(impact.test_gaps, vec!["src/other.rs".to_string()]);
+    }
+
     // ── staleness through type facts (receiver-typing R6) ──────────
 
     fn demo_crate(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -1128,6 +1213,8 @@ mod tests {
         let fresh = GraphStore::open_memory().unwrap();
         build_graph_into(&fresh, dir, &[]).unwrap();
         assert_eq!(shape(store), shape(&fresh));
+        // Symbol-level too: every edge's source symbol agrees.
+        assert_eq!(store.edge_rows().unwrap(), fresh.edge_rows().unwrap());
     }
 
     fn write(dir: &Path, rel: &str, body: &str) {

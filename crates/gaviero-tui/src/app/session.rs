@@ -209,6 +209,7 @@ pub(crate) async fn compute_impact_text(
                     &seed_refs,
                     &to_rank,
                     gaviero_core::repo_map::store::BlastRadiusMode::All,
+                    gaviero_core::repo_map::store::WalkDirection::Dependents,
                     gaviero_core::repo_map::SpecificityConfig::default(),
                 )
                 .unwrap_or_default();

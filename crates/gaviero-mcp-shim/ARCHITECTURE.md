@@ -71,7 +71,8 @@ Fixed 8192-byte buffers. Byte-faithful — no framing or JSON parsing.
 Agent JSON-RPC request line
   → stdin → buffer → endpoint write + flush
   → GavieroMcpServer executes tool (memory_search | memory_get |
-       blast_radius | node_doc | repo_outline | symbol_search | symbol_doc)
+       blast_radius | node_doc | repo_outline | symbol_refs |
+       symbol_search | symbol_doc)
   → response line → stdout + flush
   → Agent
 ```

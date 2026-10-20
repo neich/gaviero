@@ -257,9 +257,10 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
 fn retrieval_protocol_clause(retrieval: &RetrievalToolset) -> String {
     let node = retrieval.names("node_doc");
     let blast = retrieval.names("blast_radius");
+    let refs = retrieval.names("symbol_refs");
     let memory = retrieval.names("memory_search");
     let symbols = retrieval.names("symbol_search") || retrieval.names("symbol_doc");
-    if !node && !blast && !memory && !symbols {
+    if !node && !blast && !refs && !memory && !symbols {
         return String::new();
     }
 
@@ -275,33 +276,17 @@ fn retrieval_protocol_clause(retrieval: &RetrievalToolset) -> String {
     if blast {
         parts.push("use blast_radius(path) for callers, affected files, and missing tests");
     }
+    if refs {
+        parts.push("use symbol_refs(qualified_name) for a function's callers and callees");
+    }
     if memory {
         parts.push("use memory_search for prior decisions");
     }
     if parts.is_empty() && symbols {
         s.push_str("use the symbol tools below.");
-    } else {
-        match parts.len() {
-            0 => {}
-            1 => {
-                s.push_str(parts[0]);
-                s.push('.');
-            }
-            2 => {
-                s.push_str(parts[0]);
-                s.push_str("; ");
-                s.push_str(parts[1]);
-                s.push('.');
-            }
-            _ => {
-                s.push_str(parts[0]);
-                s.push_str("; ");
-                s.push_str(parts[1]);
-                s.push_str("; ");
-                s.push_str(parts[2]);
-                s.push('.');
-            }
-        }
+    } else if !parts.is_empty() {
+        s.push_str(&parts.join("; "));
+        s.push('.');
     }
     s.push_str(" Do not ask the user to paste code you can retrieve.");
     if symbols {
@@ -851,6 +836,7 @@ mod tests {
         assert!(graph.contains("node_doc(path)"));
         assert!(graph.contains("blast_radius(path)"));
         assert!(graph.contains("memory_search"));
+        assert!(graph.contains("symbol_refs(qualified_name)"));
         assert!(!graph.contains("symbol_search"));
 
         // symbols live → the symbol-tool sentence is appended.
@@ -872,6 +858,7 @@ mod tests {
         assert!(lean.contains("memory_search"));
         assert!(!lean.contains("node_doc"));
         assert!(!lean.contains("blast_radius"));
+        assert!(!lean.contains("symbol_refs"));
     }
 
     #[test]

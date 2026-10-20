@@ -46,8 +46,11 @@ pub const PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
 /// `"3"`: symbol owners, bodiless trait methods, re-export rows and
 /// qualified, import-aware edge resolution ([`super::resolve`]).
 /// `"4"`: receiver typing — type facts, per-file imports, receiver
-/// expressions ([`super::rust_walk`], `resolve::receiver`).
-pub const EXTRACTION_POLICY_VERSION: &str = "5";
+/// expressions ([`super::rust_walk`], `resolve::receiver`). `"5"`: the
+/// version before symbol end lines. `"6"`: symbol end lines, reference
+/// edges sourced from the enclosing symbol ([`super::spans`]) and
+/// same-file edges. `"7"`: Rust inline test functions stored as `Test`.
+pub const EXTRACTION_POLICY_VERSION: &str = "7";
 
 /// `graph_meta` key holding the policy version the stored graph was
 /// completely extracted with.
