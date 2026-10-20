@@ -462,7 +462,7 @@ async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(
                 writer,
                 json!({
                     "sessionUpdate": "usage_update",
-                    "used": { "inputTokens": 11, "outputTokens": 7 }
+                    "used": 11, "size": 1000000
                 }),
             )
             .await?;

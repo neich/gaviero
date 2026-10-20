@@ -330,7 +330,7 @@ async fn session_new_uses_enclosing_cwd_for_sibling_folders() {
     assert!(
         texts.iter().any(|t| t.contains("<workspace_folders>")
             && t.contains("gaviero-flutter")
-            && t.contains("Do not assume the primary folder is cwd")),
+            && t.contains("relative to session_root")),
         "{texts:?}"
     );
     let status = status.lock().unwrap().clone();

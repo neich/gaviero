@@ -781,8 +781,9 @@ fn rel_under(root: &Path, path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Prompt hint listing sibling folders. When `session_cwd` is an enclosing
-/// parent, tools resolve relative paths against that parent, not the primary.
+/// Prompt hint listing sibling folders relative to the session root (the ACP
+/// session/new cwd and dsh's sandbox write root). dsh's working_directory tool
+/// can move the live cwd, so the hint never calls the root "cwd".
 fn workspace_folders_hint(
     workspace_root: &Path,
     additional_roots: &[PathBuf],
@@ -792,7 +793,7 @@ fn workspace_folders_hint(
         return None;
     }
     let mut hint = String::from("<workspace_folders>\n");
-    hint.push_str(&format!("cwd: {}\n", session_cwd.display()));
+    hint.push_str(&format!("session_root: {}\n", session_cwd.display()));
     hint.push_str(&format!("primary: {}\n", workspace_root.display()));
     if let Some(rel) = rel_under(session_cwd, workspace_root) {
         hint.push_str(&format!("primary_rel: {}\n", rel.display()));
@@ -809,7 +810,7 @@ fn workspace_folders_hint(
     hint.push_str("</workspace_folders>\n");
     if paths_eq(session_cwd, workspace_root) {
         hint.push_str(
-            "Read freely from any folder above. File edits land in the primary cwd by default.",
+            "Read freely from any folder above. File writes are confined to session_root. dsh reports your current working directory separately; it can change, session_root does not.",
         );
     } else {
         let primary_rel = rel_under(session_cwd, workspace_root)
@@ -822,9 +823,10 @@ fn workspace_folders_hint(
                     .into_owned()
             });
         hint.push_str(&format!(
-            "The ACP working directory is {} so tools can reach every folder above. \
-             Use paths relative to that cwd (for example `{primary_rel}/src/lib.rs`). \
-             Do not assume the primary folder is cwd.",
+            "session_root is {}, the folder enclosing every folder above, and file writes are confined to it. \
+             The *_rel paths are relative to session_root (for example `{primary_rel}/src/lib.rs`). \
+             dsh reports your current working directory separately and it can change, \
+             so prefer absolute paths or paths under session_root.",
             session_cwd.display()
         ));
     }
@@ -1443,6 +1445,10 @@ impl AgentSession for AcpClientSession {
         live.gate_written.clear();
 
         self.running = Some(tokio::spawn(async move {
+            // dsh >= 0.2.1-rc.2 settles session/prompt only after the root agent, its
+            // managed subagents, and the root turns their results trigger finish, so a
+            // delegating turn can run long with only root updates streamed. No timeout
+            // here by design; cancellation kills the child below.
             let prompt_fut = handle.request_indefinite(
                 "session/prompt",
                 json!({
@@ -1939,10 +1945,9 @@ mod tests {
             .expect("workspace_folders block");
         assert!(hint.contains("gaviero-flutter"), "{hint}");
         assert!(hint.contains("primary_rel:"), "{hint}");
-        assert!(
-            hint.contains("Do not assume the primary folder is cwd"),
-            "{hint}"
-        );
+        assert!(hint.contains("session_root:"), "{hint}");
+        assert!(hint.contains("relative to session_root"), "{hint}");
+        assert!(!hint.contains("\ncwd: "), "{hint}");
         assert_eq!(*texts.last().unwrap(), "now");
     }
 }

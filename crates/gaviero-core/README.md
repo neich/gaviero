@@ -81,7 +81,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `providers.deepseek.baseUrl` | `https://api.deepseek.com` | DeepSeek chat API base URL (legacy `base_url` still read) |
 | `providers.deepseek.pricing` | list prices | `{ "cache_hit_in", "cache_miss_in", "out" }` USD / 1M tokens, overriding the per-model table |
 
-**API key** (`deepseek:` and `dsh:`), first match wins: `DEEPSEEK_API_KEY`, then `[deepseek] api_key = "sk-…"` in `<workspace>/.gaviero/secrets.toml`, then the same in `~/.gaviero/secrets.toml`.
+**API key** (`deepseek:` and `dsh:`), first match wins: `DEEPSEEK_API_KEY`, then `[deepseek] api_key = "sk-…"` in `<workspace>/.gaviero/secrets.toml`, then the same in `~/.gaviero/secrets.toml`. For `dsh:`, gaviero launches dsh with `--patch ~/.gaviero/dsh/gaviero-acp.patch.yml`, which disables dsh's own credential store so this key is the one dsh uses. Set `providers.dsh.credentialSource` to `"dsh"` to let a key saved in `~/.dsh/.credentials.yaml` win instead (dsh ≥ 0.2.1-alpha.2 prefers it over the environment).
 
 `deepseek:` always runs in thinking mode. The effort maps onto DeepSeek's `low | high | max`, and an unset, `off`, or `auto` effort becomes `high`. `max_tokens` is left to the API's thinking default (64K, or 128K at `max`). The agent reaches `mcp.extraServers` (stdio and URL) through gaviero's in-process MCP client, and a TUI conversation names any `agent.availableTools` entry it cannot serve.
 
