@@ -1801,6 +1801,64 @@ impl Buffer {
         len
     }
 
+    /// The line's text without its trailing newline.
+    pub fn line_text(&self, line: usize) -> String {
+        if line >= self.text.len_lines() {
+            return String::new();
+        }
+        let mut text: String = self.text.line(line).into();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        if text.ends_with('\r') {
+            text.pop();
+        }
+        text
+    }
+
+    /// The identifier under the cursor. Uses the buffer's tree-sitter node
+    /// when it is an identifier-kind node, otherwise a word scan of the
+    /// cursor line.
+    ///
+    /// Never panics: an empty buffer, a cursor past the line, and a missing
+    /// tree all fall back to the word scan.
+    pub fn identifier_at_cursor(&self) -> Option<String> {
+        let line = self.cursor.line;
+        if line >= self.text.len_lines() {
+            return None;
+        }
+        let col = self.cursor.col.min(self.line_len(line));
+        let char_pos = self.text.line_to_char(line) + col;
+        if char_pos > self.text.len_chars() {
+            return None;
+        }
+        let byte = self.text.char_to_byte(char_pos);
+        // Retry one byte left: the cursor is often just past the identifier.
+        let node = self.identifier_node_at(byte).or_else(|| {
+            byte.checked_sub(1).and_then(|b| self.identifier_node_at(b))
+        });
+        if let Some(node) = node {
+            return Some(
+                self.text
+                    .byte_slice(node.start_byte()..node.end_byte())
+                    .to_string(),
+            );
+        }
+        let text = self.line_text(line);
+        let (start, end) = gaviero_core::repo_map::word_span_at(&text, col)?;
+        Some(text.chars().skip(start).take(end - start).collect())
+    }
+
+    fn identifier_node_at(&self, byte: usize) -> Option<gaviero_core::Node<'_>> {
+        let tree = self.tree.as_ref()?;
+        let node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+        if node.kind().contains("identifier") {
+            Some(node)
+        } else {
+            None
+        }
+    }
+
     /// Set anchor at current cursor position if not already set.
     fn ensure_anchor(&mut self) {
         if self.cursor.anchor.is_none() {
@@ -3934,5 +3992,56 @@ mod tests {
         assert_eq!(buf.text.to_string(), src);
         assert!(buf.text.to_string().contains("\\\n"));
         assert!(!buf.text.to_string().ends_with('\\'));
+    }
+
+    // ── Go-to-definition identifier lookup ───────────────────────
+
+    fn rust_buffer(source: &str) -> (tempfile::TempDir, Buffer) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.rs");
+        std::fs::write(&path, source).unwrap();
+        let buf = Buffer::open(&path).unwrap();
+        (dir, buf)
+    }
+
+    #[test]
+    fn nav_identifier_tree_node() {
+        let (_dir, mut buf) = rust_buffer("fn main() { helper(); }\n");
+        buf.cursor.line = 0;
+        buf.cursor.col = 13; // inside `helper`
+        assert_eq!(buf.identifier_at_cursor().as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn nav_identifier_falls_back_to_word_scan() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("let helper = 1;\n");
+        assert!(buf.tree.is_none());
+        buf.cursor.col = 4;
+        assert_eq!(buf.identifier_at_cursor().as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn nav_identifier_at_line_end() {
+        let (_dir, mut buf) = rust_buffer("value\n");
+        buf.cursor.col = 5;
+        assert_eq!(buf.identifier_at_cursor().as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn nav_identifier_on_punctuation_is_none() {
+        let (_dir, mut buf) = rust_buffer("fn main() {}\n");
+        buf.cursor.col = 9; // on `(`
+        assert_eq!(buf.identifier_at_cursor(), None);
+        assert!(Buffer::empty().identifier_at_cursor().is_none());
+    }
+
+    #[test]
+    fn nav_line_text_strips_the_newline() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("first\r\nsecond\r\n");
+        assert_eq!(buf.line_text(0), "first");
+        assert_eq!(buf.line_text(1), "second");
+        assert_eq!(buf.line_text(9), "");
     }
 }

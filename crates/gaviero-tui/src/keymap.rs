@@ -22,13 +22,14 @@ pub enum Action {
     SetLeftModeFind,
     SetLeftModeChanges,
 
-    // Side panel modes (Alt+A/H/G/M)
+    // Side panel modes (Alt+A/H/G/M/R)
     SetSideModeChat,
     /// Per-turn history panel.
     SetSideModeHistory,
     SetSideModeGit,
     /// Tier A / A4: memory inspection panel.
     SetSideModeMemory,
+
 
     // Editor actions
     InsertChar(char),
@@ -68,6 +69,8 @@ pub enum Action {
     ToggleWordWrap,
     /// Collapse/expand the innermost foldable block around the cursor.
     ToggleFold,
+    /// Jump to the graph definition of the identifier under the cursor.
+    GoToDefinition,
     /// Collapse every block, or expand all of them when any is collapsed.
     ToggleAllFolds,
     FindInBuffer,
@@ -171,6 +174,7 @@ impl Keymap {
             KeyCode::Char('h') if alt => Action::SetSideModeHistory,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
+
             // Alt+Y: toggle auto-approve permissions for next prompt
             KeyCode::Char('y') if alt => Action::ToggleAutoApprove,
 
@@ -212,6 +216,10 @@ impl Keymap {
             KeyCode::F(10) if shift => Action::ToggleAllFolds,
             KeyCode::F(10) => Action::ToggleFold,
             KeyCode::F(11) => Action::ToggleFullscreen,
+            // Go-to-definition. F12 has a dedicated CSI encoding that survives
+            // host layers; Alt+. is the muscle-memory shortcut.
+            KeyCode::F(12) => Action::GoToDefinition,
+            KeyCode::Char('.') if alt => Action::GoToDefinition,
 
             // ── Tab character ────────────────────────────────────
             KeyCode::Tab => Action::Tab,
@@ -515,6 +523,23 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Left, KeyModifiers::ALT)),
             Action::CursorLeft
+        );
+    }
+
+    #[test]
+    fn test_go_to_definition_bindings() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(12), KeyModifiers::NONE)),
+            Action::GoToDefinition
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('.'), KeyModifiers::ALT)),
+            Action::GoToDefinition
+        );
+        // A bare '.' is still text.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('.'), KeyModifiers::NONE)),
+            Action::InsertChar('.')
         );
     }
 }

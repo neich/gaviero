@@ -50,6 +50,42 @@ pub(crate) fn normalize_rel_path(rel: &Path) -> PathBuf {
 
 // ── Graph types ──────────────────────────────────────────────
 
+/// Char-index span `(start, end_exclusive)` of the identifier at `char_col`.
+/// Identifier chars are alphanumeric or `_` (Unicode alphanumerics count).
+/// A column one past the last char still resolves to the last identifier.
+pub fn word_span_at(line: &str, char_col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut col = if char_col < chars.len() {
+        char_col
+    } else if char_col == chars.len() {
+        chars.len() - 1
+    } else {
+        return None;
+    };
+    if !is_ident(chars[col]) {
+        // A caret one past the identifier (on trailing punctuation or
+        // whitespace) still belongs to the word it just left.
+        if col > 0 && is_ident(chars[col - 1]) {
+            col -= 1;
+        } else {
+            return None;
+        }
+    }
+    let mut start = col;
+    while start > 0 && is_ident(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && is_ident(chars[end]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 /// A source file node in the repo reference graph.
 #[derive(Debug, Clone)]
 pub struct FileNode {
@@ -695,6 +731,7 @@ impl RepoMap {
         self.graph.edge_count()
     }
 
+
     /// V9 §11 M3: structured per-file ranking for the planner.
     ///
     /// Same algorithm as [`Self::rank_for_agent`] but returns structured
@@ -934,6 +971,27 @@ impl RepoMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nav_word_span_at_middle() {
+        assert_eq!(word_span_at("let value = 42;", 5), Some((4, 9)));
+        assert_eq!(word_span_at("let value = 42;", 4), Some((4, 9)));
+    }
+
+    #[test]
+    fn nav_word_span_at_end_boundary() {
+        assert_eq!(word_span_at("value", 5), Some((0, 5)));
+        assert_eq!(word_span_at("value ", 5), Some((0, 5)));
+        assert_eq!(word_span_at("a b_c", 4), Some((2, 5)));
+    }
+
+    #[test]
+    fn nav_word_span_at_non_identifier() {
+        assert_eq!(word_span_at("()", 0), None);
+        assert_eq!(word_span_at("", 0), None);
+        assert_eq!(word_span_at("value", 99), None);
+    }
+
 
     #[test]
     fn empty_workspace_builds() {

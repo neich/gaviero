@@ -180,6 +180,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 return;
             }
 
+            // The definition picker is modal: it consumes every key while open.
+            if app.definition_picker.is_some() {
+                super::nav::handle_picker_key(app, &key);
+                return;
+            }
+
             if app.move_state.is_some()
                 && app.focus == Focus::FileTree
                 && app.left_panel == LeftPanelMode::FileTree
@@ -2009,6 +2015,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.focus = Focus::SidePanel;
             app.refresh_memory_panel();
         }
+
         Action::ToggleTerminal => {
             if app.focus == Focus::SidePanel && matches!(app.side_panel, SidePanelMode::AgentChat) {
                 if !app.chat_state.active_conv_busy() {
@@ -2219,6 +2226,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::ToggleFold => super::editing::toggle_fold_at_cursor(app),
         Action::ToggleAllFolds => super::editing::toggle_all_folds(app),
+        Action::GoToDefinition => super::nav::goto_definition(app),
         Action::ToggleFullscreen => app.toggle_fullscreen(),
         Action::SwitchLayout(n) => app.switch_layout(n),
         Action::FindInBuffer => {
@@ -2273,6 +2281,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             SidePanelMode::HistoryPanel => app.handle_history_panel_action(action),
             SidePanelMode::GitPanel => app.handle_git_panel_action(action),
             SidePanelMode::MemoryPanel => app.handle_memory_panel_action(action),
+
         },
         _ => {}
     }
