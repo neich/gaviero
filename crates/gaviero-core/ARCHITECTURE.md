@@ -232,6 +232,7 @@ Graph-tool output contracts:
 - **`blast_radius`** returns `{mode, nodes, not_shown, truncated}`. The nodes are `changed` rows, then up to `limit` ranked dependents (default 40, max 200, 0 allowed), then `test_gap` rows. Dependents are ordered by full-precision score with path as tie-break, and their scores are rounded to 3 decimals after ranking. `relation` appears only on changed and test-gap rows. Rows carry no `qualified_name` or `distance`.
 - **`node_doc`** symbols carry `qualified_name`, a 1-based `line` (null when unknown) and `signature` only when it differs from the name. There is no legacy `signatures` list. An empty result carries `status` (an extraction outcome, `unknown` or `not_indexed`) and `note`.
 - **`repo_outline`** entries are `{rendered}` in rank order. `token_estimate` is the estimate (`ceil(bytes/4)`, [`payload.rs`](src/mcp/payload.rs)) of the whole compact response and never exceeds the clamped `token_cap`.
+- **`repo_outline` `seed_paths`** omitted, empty or `.` means no personalization: an unseeded global ranking with no `OWN` lines.
 
 **Telemetry:** `ServerHandler::call_tool` and `call_tool_in_process` each emit exactly one entry per invocation, failures included (error set, null output). The `*_impl` cores never emit.
 
@@ -286,7 +287,15 @@ Graph-tool output contracts:
 
 ### Two-layer graph context
 
-First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/topology.rs)) + `<repo_outline>` (PageRank). `/lite` keeps topology only.
+First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/topology.rs)) + `<repo_outline>`. `/lite` keeps topology only.
+
+`<repo_outline>` is PageRank over the code graph's file edges ([`RepoMap::from_store`](src/repo_map/mod.rs) projects the code graph, edges from `GraphStore::file_edges`). Each edge counts forward (referencing → referenced file) at full weight and in reverse at `REVERSE_EDGE_FACTOR` (0.5). It lists only files the code graph indexes, i.e. those with a tree-sitter grammar. A `.` or empty seed is an unseeded global ranking.
+
+**Live graph** ([`repo_map/service.rs`](src/repo_map/service.rs)). Each workspace folder has one `GraphService`, whose writer thread is the only writer of `<folder>/.gaviero/code_graph.db` in the process.
+- **Updates.** File-watcher paths are coalesced (300 ms of quiet, 2 s cap) and applied with `graph_builder::update_paths` in one transaction. More than 1000 dirty paths, a `rescan`, or the startup pass trigger a full incremental scan instead.
+- **Publishing.** Every batch commits to disk, then publishes a new `RepoMap` snapshot.
+- **Readers.** Chat injection (TUI `App::graph_services`) and every MCP graph tool read the same services. Readers open fresh WAL connections and wait (`flush`) for the pending batch. Paths under dot directories, such as gaviero's own `.gaviero/` writes, never trigger a batch.
+- **CLI.** gaviero-cli has no watcher: its MCP graph is scanned once per process.
 
 ---
 

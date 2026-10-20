@@ -95,7 +95,8 @@ pub struct MemorySearchOutput {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct BlastRadiusInput {
     /// One or more seed paths (repo-relative). Empty inputs are an
-    /// error.
+    /// error. An absolute path selects the workspace folder that contains
+    /// it; all paths must come from one folder.
     pub paths: Vec<String>,
     /// Graph traversal depth. Clamped to [1, 5]. Defaults to 2 —
     /// matches the chat-path default.
@@ -259,8 +260,10 @@ pub fn one_based_line(line_start: Option<i64>) -> Option<u32> {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct RepoOutlineInput {
     /// Seed paths for personalized PageRank (repo-relative, glob-aware
-    /// — same matching as agent `owned_paths`). Omitted or empty →
-    /// `["."]`, i.e. match-all: rank the whole workspace.
+    /// — same matching as agent `owned_paths`). Omitted, empty, or `.`
+    /// means no personalization: a global ranking of the whole workspace
+    /// in which no file is `OWN`. An absolute path selects the workspace
+    /// folder that contains it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_paths: Option<Vec<String>>,
     /// Token budget for the outline. Server clamps to [100, 8000];

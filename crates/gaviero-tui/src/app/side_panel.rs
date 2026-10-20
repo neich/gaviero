@@ -2388,7 +2388,7 @@ pub(crate) fn dispatch_prompt_core(
         .agent_settings
         .bootstrap_tier_override
         .clone();
-    let repo_map_cache = app.repo_map.clone();
+    let graph_services = app.graph_services.clone();
     // In workspace mode (multi-folder), every sibling folder is forwarded to
     // the agent CLI as a `--add-dir`. The primary cwd is `root`; siblings are
     // every other folder. Empty in single-folder mode.
@@ -2549,12 +2549,7 @@ pub(crate) fn dispatch_prompt_core(
         //
         let repo_map_fut = async {
             if bootstrap_outline {
-                crate::app::session::get_or_build_repo_map_cached(
-                    repo_map_cache.clone(),
-                    graph_root.clone(),
-                    graph_excludes.clone(),
-                )
-                .await
+                crate::app::session::repo_map_for(&graph_services, &graph_root).await
             } else {
                 None
             }
@@ -2574,20 +2569,14 @@ pub(crate) fn dispatch_prompt_core(
         };
         let (repo_map_arc, primary_topology) = tokio::join!(repo_map_fut, topology_fut);
 
-        // Workspace-wide extras: build / fetch a repo map per sibling
-        // folder. Only on first turn (planner skips bootstrap context
-        // on follow-ups) AND when `/workspace` was armed (otherwise the
-        // list is empty). Each lookup is a HashMap hit on warm cache.
+        // Workspace-wide extras: each sibling folder's live repo map. Only
+        // on first turn (planner skips bootstrap context on follow-ups) AND
+        // when `/workspace` was armed (otherwise the list is empty).
         let extra_repo_map_arcs: Vec<std::sync::Arc<gaviero_core::repo_map::RepoMap>> =
             if bootstrap_outline && !extra_workspace_folders.is_empty() {
                 let mut out = Vec::with_capacity(extra_workspace_folders.len());
-                for (i, folder) in extra_workspace_folders.iter().enumerate() {
-                    if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
-                        repo_map_cache.clone(),
-                        folder.clone(),
-                        extra_workspace_excludes.get(i).cloned().unwrap_or_default(),
-                    )
-                    .await
+                for folder in extra_workspace_folders.iter() {
+                    if let Some(rm) = crate::app::session::repo_map_for(&graph_services, folder).await
                     {
                         out.push(rm);
                     }
@@ -2628,24 +2617,19 @@ pub(crate) fn dispatch_prompt_core(
         //   - strong, tool-capable     → thin count summary (pull via blast_radius)
         //   - small-local              → full push (kept until proven non-inferior)
         // An empty change buffer yields no seeds, so both paths return None.
-        let impact_text = if !bootstrap_impact {
-            None
-        } else if bootstrap_arms.explicit
-            || resolved_tier != gaviero_core::context_planner::BootstrapTier::Strong
-        {
-            crate::app::session::compute_impact_text(
-                graph_root.clone(),
-                graph_seeds.clone(),
-                graph_excludes.clone(),
-            )
-            .await
-        } else {
-            crate::app::session::compute_impact_summary(
-                graph_root.clone(),
-                graph_seeds.clone(),
-                graph_excludes.clone(),
-            )
-            .await
+        let impact_service = graph_services.for_root(&graph_root).cloned();
+        let impact_text = match impact_service {
+            _ if !bootstrap_impact => None,
+            None => None,
+            Some(service)
+                if bootstrap_arms.explicit
+                    || resolved_tier != gaviero_core::context_planner::BootstrapTier::Strong =>
+            {
+                crate::app::session::compute_impact_text(service, graph_seeds.clone()).await
+            }
+            Some(service) => {
+                crate::app::session::compute_impact_summary(service, graph_seeds.clone()).await
+            }
         };
 
         let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_outline || bootstrap_impact {

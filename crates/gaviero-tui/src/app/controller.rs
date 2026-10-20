@@ -1,17 +1,5 @@
 use super::*;
 
-/// Mark every cached per-folder `RepoMap` as stale; the next chat send
-/// will rebuild whichever folder it actually queries. Conservative —
-/// invalidates all entries because the saved file might belong to any
-/// folder. Cheap: acquires the lock briefly and clears the HashMap.
-fn invalidate_repo_map(app: &App) {
-    let cache = app.repo_map.clone();
-    tokio::spawn(async move {
-        let mut guard = cache.write().await;
-        guard.clear();
-    });
-}
-
 /// Phone notifications (ntfy and/or gaviero-relay) do not honour terminal
 /// focus — the phone is the point. Still requires
 /// `notifications.agentFinished.enabled` / `agentWaiting.enabled`
@@ -276,7 +264,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
         }
         Event::FileChanged(path) => {
-            invalidate_repo_map(app);
+            // Queue the path for the folder's graph writer (never blocks).
+            app.graph_services.notify_changed(std::slice::from_ref(&path));
             if app.skill_catalog.needs_rebuild_for(&path) {
                 app.rebuild_skill_catalog();
             }
@@ -285,8 +274,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             app.handle_file_changed(&path);
         }
-        Event::FileTreeChanged => {
-            invalidate_repo_map(app);
+        Event::FileTreeChanged(paths) => {
+            app.graph_services.notify_changed(&paths);
             app.refresh_file_tree();
             app.refresh_git_panel();
         }
@@ -1598,7 +1587,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .with_graph_excludes(crate::app::parse_exclude_patterns(
                         &app.workspace,
                         Some(&workspace_root_for_mcp),
-                    ));
+                    ))
+                    // The same live graphs chat injection reads (last: it
+                    // supersedes the fallback the builders above configure).
+                    .with_graph_services(app.graph_services.clone());
                     // D3: memory_flag ships enabled. The sink is the only
                     // seam through which a tool call can cause a write, and
                     // it goes through the S2 writer task like everything else.
@@ -1616,10 +1608,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         }
                         _ => server,
                     };
-                    // Phase 1: warm the graph cache + reranker in the
-                    // background so the first user query never pays the cold
-                    // start. The cache is shared via Arc with every spawned
-                    // connection clone.
+                    // Phase 1: wait for the primary folder's live graph
+                    // (already started at launch) and warm the reranker in
+                    // the background so the first user query never pays the
+                    // cold start. Every connection clone shares both.
                     let warm = server.clone();
                     tokio::spawn(async move { warm.warmup().await });
                     let http_server = server.clone();

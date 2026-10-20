@@ -425,8 +425,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Warm up the code graph in the background (non-blocking).
-    crate::app::session::warm_up_repo_map(&app);
+    // Start every folder's live code graph (a background writer thread per
+    // folder; its first job is the startup scan). Non-blocking.
+    app.graph_services.start_all();
 
     // Remote sidecar (Plan A A6, Plan C §2.2). Enabled by default; host
     // detection, certificate provisioning, and binding run in a background

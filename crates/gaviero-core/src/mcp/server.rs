@@ -96,28 +96,17 @@ pub struct GavieroMcpServer {
         crate::repo_map::store::BlastRadiusMode,
         crate::repo_map::store::EdgeWeights,
     >,
-    /// Cached `GraphStore` for the workspace, lazily populated by the
-    /// first graph tool (or [`Self::warmup`]) so we don't re-run
-    /// `graph_builder::build_graph` (a workspace-wide scan + tree-sitter
-    /// parse) on every invocation. The cached connection is a *build
-    /// sentinel* only: query handlers open a fresh WAL connection via
-    /// [`with_graph_store`] so `blast_radius` PageRank cannot serialize
-    /// `node_doc` / `symbol_*` for minutes. Call
-    /// [`Self::invalidate_graph_cache`] from the embedding app after a
-    /// large workspace change to force the next call to rescan.
-    ///
-    /// `GraphStore` wraps a `rusqlite::Connection` which is `Send` but
-    /// not `Sync`, so the sentinel lives behind a `Mutex`.
-    graph_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>>,
-    /// Cached in-memory `RepoMap` backing the `repo_outline` tool,
-    /// mirroring `graph_cache`'s lifecycle: lazily built on first use,
-    /// shared across per-connection clones via `Arc`, and cleared by
-    /// [`Self::invalidate_graph_cache`]. Stored as `Arc<RepoMap>` so
-    /// ranking can run without holding the mutex (same convoy as
-    /// `blast_radius` / `node_doc`).
-    repo_map_cache: Arc<tokio::sync::Mutex<Option<Arc<crate::repo_map::RepoMap>>>>,
-    /// Extra exclude patterns (from `files.exclude`) applied when this
-    /// process first builds the graph. Scratch dir names in
+    /// The live code graphs this server reads: one
+    /// [`crate::repo_map::GraphService`] per workspace folder, shared with
+    /// the host's prompt injection when the host installs them
+    /// ([`Self::with_graph_services`]). Without that, a single-folder
+    /// registry for `workspace_root` / `graph_db_path` / `graph_excludes` /
+    /// `specificity` is created on first use; nothing watches it, so it is
+    /// scanned once per process and refreshed only by
+    /// [`Self::invalidate_graph_cache`]. Shared by per-connection clones.
+    graph_services: Arc<std::sync::OnceLock<crate::repo_map::GraphServices>>,
+    /// Extra exclude patterns (from `files.exclude`) for the fallback
+    /// graph registry ([`Self::graph_services`]). Scratch dir names in
     /// `repo_map::builder::SKIP_DIRS` always apply; this list is the
     /// host's additional skip set.
     graph_excludes: Vec<String>,
@@ -327,51 +316,14 @@ fn format_blast_radius(
     }
 }
 
-/// Ensure the on-disk graph exists (first call in this process builds
-/// it under `graph_cache`), then open a *fresh* WAL connection for `f`.
-///
-/// Do not run `f` while holding `graph_cache`: `blast_radius` PageRank
-/// used to serialize every other graph tool for minutes.
-fn with_graph_store<T, F>(
-    cache: &tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>,
-    workspace_root: &Path,
-    graph_db: &Path,
-    excludes: &[String],
-    f: F,
-) -> anyhow::Result<T>
-where
-    F: FnOnce(&crate::repo_map::store::GraphStore) -> anyhow::Result<T>,
-{
-    {
-        let mut guard = cache.blocking_lock();
-        if guard.is_none() {
-            let (store, _) =
-                crate::repo_map::graph_builder::build_graph_at(workspace_root, graph_db, excludes)?;
-            *guard = Some(store);
-        }
-    }
-    let store = crate::repo_map::store::GraphStore::open(graph_db)?;
-    f(&store)
-}
-
-fn with_repo_map<T, F>(
-    cache: &tokio::sync::Mutex<Option<Arc<crate::repo_map::RepoMap>>>,
-    workspace_root: &Path,
-    excludes: &[String],
-    f: F,
-) -> anyhow::Result<T>
-where
-    F: FnOnce(&crate::repo_map::RepoMap) -> anyhow::Result<T>,
-{
-    let map = {
-        let mut guard = cache.blocking_lock();
-        if guard.is_none() {
-            let built = crate::repo_map::RepoMap::build(workspace_root, excludes)?;
-            *guard = Some(Arc::new(built));
-        }
-        Arc::clone(guard.as_ref().expect("repo map populated above"))
-    };
-    f(&map)
+/// A folder root as shown in tool output: `/`-separated, no trailing `/`.
+fn display_root(service: &crate::repo_map::GraphService) -> String {
+    service
+        .root()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[tool_router]
@@ -395,8 +347,7 @@ impl GavieroMcpServer {
             reranker,
             specificity: crate::repo_map::SpecificityConfig::default(),
             edge_weights: std::collections::HashMap::new(),
-            graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            repo_map_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            graph_services: Arc::new(std::sync::OnceLock::new()),
             graph_excludes: Vec::new(),
             symbol_enrichment_enabled: false,
             symbol_embedder_name: None,
@@ -423,7 +374,7 @@ impl GavieroMcpServer {
     }
 
     /// Clone the server for a freshly accepted connection, giving it its own
-    /// first-tool-call latch while sharing the warm caches (`graph_cache`,
+    /// first-tool-call latch while sharing the warm state (`graph_services`,
     /// reranker) via `Arc`. Each shim connection is one MCP session, so the
     /// latch is per-session rather than process-global.
     pub(crate) fn clone_for_connection(&self) -> Self {
@@ -646,68 +597,97 @@ impl GavieroMcpServer {
         self
     }
 
-    /// Drop the cached `GraphStore` and `RepoMap` so the next
-    /// `blast_radius` / `repo_outline` call rebuilds them from the
-    /// current workspace state. Embedding apps (TUI / CLI) should call
-    /// this after a bulk workspace change (large checkout, large file
-    /// deletion) — small per-file edits don't require it because the
-    /// next builder run is incremental.
-    pub async fn invalidate_graph_cache(&self) {
-        let mut guard = self.graph_cache.lock().await;
-        *guard = None;
-        drop(guard);
-        let mut rm = self.repo_map_cache.lock().await;
-        *rm = None;
+    /// Read the host's live graphs instead of building a private one. Call
+    /// it after the other graph builders (`with_graph_db_path`,
+    /// `with_graph_excludes`, `with_specificity`), which only shape the
+    /// fallback registry.
+    pub fn with_graph_services(mut self, services: crate::repo_map::GraphServices) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(services);
+        self.graph_services = Arc::new(cell);
+        self
     }
 
-    /// Phase 1 warmup: pay the `blast_radius` graph-build cost and (when
-    /// a reranker is configured) the cold-ONNX session/tokenizer load at
-    /// workspace-open time, in the background, so the first real user
-    /// query never lands on a cold start. Best-effort: build/warm errors
-    /// are logged and swallowed — a warmup failure must never block
-    /// workspace open. The graph cache is shared via `Arc` with every
-    /// per-connection server clone, so warming here warms all of them.
-    pub async fn warmup(&self) {
-        let cache = Arc::clone(&self.graph_cache);
-        let repo_map_cache = Arc::clone(&self.repo_map_cache);
-        let workspace_root = self.workspace_root.clone();
-        let graph_db = self.graph_db_path.clone();
-        let excludes = self.graph_excludes.clone();
-        // build_graph is blocking + potentially heavy on a large repo;
-        // run it off the async runtime and hold the cache lock only for
-        // this build (matching the `blast_radius` pattern).
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                match crate::repo_map::graph_builder::build_graph_at(
-                    &workspace_root,
-                    &graph_db,
-                    &excludes,
-                ) {
-                    Ok((store, _)) => *guard = Some(store),
-                    Err(e) => tracing::warn!(
-                        target: "mcp_server",
-                        error = %e,
-                        "graph cache warmup build failed"
-                    ),
-                }
-            }
-            drop(guard);
-            // Also pre-build the `repo_outline` RepoMap so a mid-run
-            // outline pull never pays the cold workspace scan.
-            let mut rm = repo_map_cache.blocking_lock();
-            if rm.is_none() {
-                match crate::repo_map::RepoMap::build(&workspace_root, &excludes) {
-                    Ok(map) => *rm = Some(Arc::new(map)),
-                    Err(e) => tracing::warn!(
-                        target: "mcp_server",
-                        error = %e,
-                        "repo map warmup build failed"
-                    ),
-                }
-            }
+    /// The graph registry; created on first use when the host installed
+    /// none (see the field doc).
+    pub(crate) fn graph_services(&self) -> &crate::repo_map::GraphServices {
+        self.graph_services.get_or_init(|| {
+            crate::repo_map::GraphServices::new(vec![crate::repo_map::GraphFolder {
+                root: self.workspace_root.clone(),
+                db_path: self.graph_db_path.clone(),
+                excludes: self.graph_excludes.clone(),
+                specificity: self.specificity,
+            }])
         })
-        .await;
+    }
+
+    /// The primary (first) folder's graph.
+    fn primary_graph(&self) -> Result<crate::repo_map::GraphService, ErrorData> {
+        self.graph_services()
+            .primary()
+            .cloned()
+            .ok_or_else(|| ErrorData::internal_error("no workspace folder", None))
+    }
+
+    /// Resolve a tool path to its folder: an absolute path goes to the
+    /// workspace folder that contains it (returned folder-relative,
+    /// `/`-separated); a relative path to the primary folder.
+    fn resolve_graph_path(
+        &self,
+        path: &str,
+    ) -> Result<(usize, crate::repo_map::GraphService, String), ErrorData> {
+        let services = self.graph_services();
+        let p = Path::new(path);
+        if p.is_absolute() {
+            let (idx, service) = services.containing(p).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("path is outside every workspace folder: {path}"),
+                    None,
+                )
+            })?;
+            let rel = p
+                .strip_prefix(service.root())
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if rel.is_empty() {
+                return Err(ErrorData::invalid_params(
+                    format!("path is a workspace folder root, not a file: {path}"),
+                    None,
+                ));
+            }
+            Ok((idx, service.clone(), rel))
+        } else {
+            Ok((0, self.primary_graph()?, path.replace('\\', "/")))
+        }
+    }
+
+    /// How a folder-relative path is shown: as is for the primary folder,
+    /// absolute (`/`-separated) for any other.
+    fn display_path(folder: usize, service: &crate::repo_map::GraphService, rel: &str) -> String {
+        if folder == 0 {
+            rel.to_string()
+        } else {
+            format!("{}/{rel}", display_root(service))
+        }
+    }
+
+    /// Force a full rescan of every folder's graph. Watched hosts (the TUI)
+    /// never need it; others call it after a bulk workspace change.
+    pub async fn invalidate_graph_cache(&self) {
+        self.graph_services().rescan_all();
+    }
+
+    /// Phase 1 warmup: start every folder's graph writer (its first job is
+    /// the full scan) and wait for the primary folder's, then warm the
+    /// reranker's cold ONNX session when one is configured, so the first
+    /// real query never lands on a cold start. Best-effort: errors are
+    /// logged by the writer and here, never surfaced.
+    pub async fn warmup(&self) {
+        let services = self.graph_services();
+        services.start_all();
+        if let Some(primary) = services.primary() {
+            primary.flush().await;
+        }
 
         if let Some(reranker) = self.reranker.as_ref()
             && let Err(e) = reranker.warmup().await
@@ -921,55 +901,68 @@ impl GavieroMcpServer {
         }
         let depth = clamp_blast_depth(input.depth);
         let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
-        let paths = input.paths.clone();
-        let workspace_root = self.workspace_root.clone();
-        let graph_db = self.graph_db_path.clone();
+        // Every path must resolve to the same workspace folder's graph.
+        let mut resolved = Vec::with_capacity(input.paths.len());
+        for p in &input.paths {
+            resolved.push(self.resolve_graph_path(p)?);
+        }
+        let folder = resolved[0].0;
+        if resolved.iter().any(|(f, _, _)| *f != folder) {
+            return Err(ErrorData::invalid_params(
+                "blast_radius paths span workspace folders; pass paths from one folder",
+                None,
+            ));
+        }
+        let service = resolved[0].1.clone();
+        let paths: Vec<String> = resolved.into_iter().map(|(_, _, rel)| rel).collect();
         let specificity = self.specificity;
         let weights = self
             .edge_weights
             .get(&mode)
             .copied()
             .unwrap_or_else(|| crate::repo_map::store::EdgeWeights::default_for(mode));
-        let cache = Arc::clone(&self.graph_cache);
-        let excludes = self.graph_excludes.clone();
 
-        // Build (if needed) under the sentinel mutex, then rank on a
-        // fresh connection so this call cannot block `node_doc`. On timeout
-        // the query is cancelled, not merely abandoned: the in-flight SQL
-        // statement is interrupted and ranking stops at its next check.
-        // (A first-call graph *build* is not cancelled: it is cached work.)
+        // Wait for pending graph updates, then rank on a fresh read
+        // connection; both run under the timeout. On timeout the query is
+        // cancelled, not merely abandoned: the in-flight SQL statement is
+        // interrupted and ranking stops at its next check.
         let cancel = crate::repo_map::store::GraphCancel::new();
         let job = Arc::clone(&cancel);
         #[cfg(test)]
         let (test_delay, completed) = (self.blast_test_delay, Arc::clone(&self.blast_completed));
-        let compute = tokio::task::spawn_blocking(move || {
-            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
-                job.attach(store)?;
-                #[cfg(test)]
-                std::thread::sleep(test_delay);
-                job.check()?;
-                let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-                let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
-                job.check()?;
-                let mut to_rank: Vec<String> = impact.changed_files.to_vec();
-                for f in &impact.affected_files {
-                    if !to_rank.contains(f) {
-                        to_rank.push(f.clone());
+        let reader = service.clone();
+        let compute = async move {
+            reader.flush().await;
+            tokio::task::spawn_blocking(move || {
+                reader.with_reader(|store| {
+                    job.attach(store)?;
+                    #[cfg(test)]
+                    std::thread::sleep(test_delay);
+                    job.check()?;
+                    let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                    let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
+                    job.check()?;
+                    let mut to_rank: Vec<String> = impact.changed_files.to_vec();
+                    for f in &impact.affected_files {
+                        if !to_rank.contains(f) {
+                            to_rank.push(f.clone());
+                        }
                     }
-                }
-                let ranks = crate::repo_map::rank_files_with_weights_cancellable(
-                    store,
-                    &seed_refs,
-                    &to_rank,
-                    weights,
-                    specificity,
-                    &|| job.is_cancelled(),
-                )?;
-                #[cfg(test)]
-                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok((impact, ranks))
+                    let ranks = crate::repo_map::rank_files_with_weights_cancellable(
+                        store,
+                        &seed_refs,
+                        &to_rank,
+                        weights,
+                        specificity,
+                        &|| job.is_cancelled(),
+                    )?;
+                    #[cfg(test)]
+                    completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok((impact, ranks))
+                })
             })
-        });
+            .await
+        };
         let (impact, ranks) = match tokio::time::timeout(self.graph_query_timeout, compute).await
         {
             Ok(join) => join
@@ -987,12 +980,13 @@ impl GavieroMcpServer {
             }
         };
 
-        Ok(Json(format_blast_radius(
-            &impact,
-            &ranks,
-            mode,
-            clamp_blast_limit(input.limit),
-        )))
+        let mut out = format_blast_radius(&impact, &ranks, mode, clamp_blast_limit(input.limit));
+        if folder != 0 {
+            for node in &mut out.nodes {
+                node.path = Self::display_path(folder, &service, &node.path);
+            }
+        }
+        Ok(Json(out))
     }
 
     // ── node_doc ────────────────────────────────────────────────────
@@ -1013,14 +1007,11 @@ impl GavieroMcpServer {
         self.ensure_tool_allowed("node_doc")?;
         let path = input.path.clone();
         let qualified_name = path.clone();
-        let cache = Arc::clone(&self.graph_cache);
-        let workspace_root = self.workspace_root.clone();
-        let graph_db = self.graph_db_path.clone();
-        let excludes = self.graph_excludes.clone();
-        let path_for_graph = path.clone();
+        let (_, service, path_for_graph) = self.resolve_graph_path(&path)?;
+        service.flush().await;
 
         let (symbols, empty_status) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
+            service.with_reader(|store| {
                 let nodes = store.nodes_for_file(&path_for_graph)?;
                 let has_file_node = nodes.iter().any(|n| n.kind == "File");
                 let mut symbols = Vec::new();
@@ -1290,34 +1281,60 @@ impl GavieroMcpServer {
         self.ensure_tool_allowed("repo_outline")?;
         let cap = clamp_repo_outline_token_cap(input.token_cap);
         let mode = BlastRadiusMode::parse(input.mode.as_deref().unwrap_or("all"));
-        // Empty / omitted seeds → "." which the ranker treats as
-        // match-all (every file is owned; whole-workspace outline).
-        let seeds: Vec<String> = match &input.seed_paths {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => vec![".".to_string()],
+        // Seeds pick the folder (all from one); none → the primary folder,
+        // ranked unseeded (no file is `OWN`).
+        let seed_paths = input.seed_paths.clone().unwrap_or_default();
+        let (folder, service, seeds) = if seed_paths.is_empty() {
+            (0, self.primary_graph()?, Vec::new())
+        } else {
+            let mut resolved = Vec::with_capacity(seed_paths.len());
+            for seed in &seed_paths {
+                resolved.push(self.resolve_graph_path(seed)?);
+            }
+            let folder = resolved[0].0;
+            if resolved.iter().any(|(f, _, _)| *f != folder) {
+                return Err(ErrorData::invalid_params(
+                    "repo_outline seed_paths span workspace folders; pass seeds from one folder",
+                    None,
+                ));
+            }
+            let service = resolved[0].1.clone();
+            let seeds: Vec<String> = resolved.into_iter().map(|(_, _, rel)| rel).collect();
+            (folder, service, seeds)
         };
-        let cache = Arc::clone(&self.repo_map_cache);
-        let workspace_root = self.workspace_root.clone();
-        let excludes = self.graph_excludes.clone();
 
-        let candidates = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            with_repo_map(&cache, &workspace_root, &excludes, |map| {
-                Ok(map.rank_with_line_cost(
-                    &seeds,
-                    outline_entry_budget_bytes(cap),
-                    mode,
-                    &outline_entry_cost_bytes,
-                ))
-            })
+        let Some(map) = service.snapshot().await else {
+            return Ok(Json(finish_outline(Vec::new())));
+        };
+        // A non-primary folder's lines carry absolute paths; charge the
+        // longer prefix against the budget.
+        let prefix_bytes = if folder == 0 {
+            0
+        } else {
+            display_root(&service).len() + 1
+        };
+        let candidates = tokio::task::spawn_blocking(move || {
+            map.rank_with_line_cost(
+                &seeds,
+                outline_entry_budget_bytes(cap),
+                mode,
+                &|line: &str| outline_entry_cost_bytes(line) + prefix_bytes,
+            )
         })
         .await
-        .map_err(|e| ErrorData::internal_error(format!("repo_outline join: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(format!("repo_outline: {e}"), None))?;
+        .map_err(|e| ErrorData::internal_error(format!("repo_outline join: {e}"), None))?;
 
         let entries = candidates
             .into_iter()
-            .map(|c| RepoOutlineEntry {
-                rendered: c.rendered_line,
+            .map(|c| {
+                let rendered = if folder == 0 {
+                    c.rendered_line
+                } else {
+                    let rel = c.path.to_string_lossy().into_owned();
+                    c.rendered_line
+                        .replacen(&rel, &Self::display_path(folder, &service, &rel), 1)
+                };
+                RepoOutlineEntry { rendered }
             })
             .collect();
         let out = finish_outline(entries);
@@ -1362,12 +1379,12 @@ impl GavieroMcpServer {
         let query_name = query_embedder.name().to_string();
         let memory_name = self.stores.embedder().name().to_string();
 
-        let cache = Arc::clone(&self.graph_cache);
-        let workspace_root = self.workspace_root.clone();
-        let graph_db = self.graph_db_path.clone();
-        let excludes = self.graph_excludes.clone();
+        // Symbol tools serve the primary folder (the enrichment sidecar is
+        // per graph DB).
+        let service = self.primary_graph()?;
+        service.flush().await;
         let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
+            service.with_reader(|store| {
                 // G2 / OD-2: cross-model cosine is noise — verify the
                 // sidecar's vectors were built by the query embedder.
                 let stamp = store.graph_meta("symbol_embedder")?;
@@ -1436,12 +1453,10 @@ impl GavieroMcpServer {
         }
 
         let qn = input.qualified_name.clone();
-        let cache = Arc::clone(&self.graph_cache);
-        let workspace_root = self.workspace_root.clone();
-        let graph_db = self.graph_db_path.clone();
-        let excludes = self.graph_excludes.clone();
+        let service = self.primary_graph()?;
+        service.flush().await;
         let out = tokio::task::spawn_blocking(move || -> anyhow::Result<SymbolDocOutput> {
-            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
+            service.with_reader(|store| {
                 let Some(doc) = store.symbol_doc(&qn)? else {
                     anyhow::bail!("no symbol_docs row for qualified_name `{qn}`");
                 };
@@ -3676,6 +3691,160 @@ mod tests {
         );
         for e in &out.0.entries {
             assert!(!e.rendered.is_empty());
+        }
+    }
+
+    /// `src/seed.rs` calls into `src/zz_target.rs`; `src/aa_unrelated.rs`
+    /// links to nothing. Walk order alone would list `aa_` first.
+    fn linked_outline_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed.rs"), "pub fn gv_seed_fn() { gv_target_fn(); }\n").unwrap();
+        std::fs::write(src.join("zz_target.rs"), "pub fn gv_target_fn() {}\n").unwrap();
+        std::fs::write(src.join("aa_unrelated.rs"), "pub fn gv_unrelated_fn() {}\n").unwrap();
+        dir
+    }
+
+    async fn outline_of(dir: &std::path::Path, seed_paths: Option<Vec<String>>) -> Vec<String> {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, dir.to_path_buf());
+        s.repo_outline(Parameters(RepoOutlineInput {
+            seed_paths,
+            token_cap: Some(2000),
+            mode: None,
+        }))
+        .await
+        .unwrap()
+        .0
+        .entries
+        .into_iter()
+        .map(|e| e.rendered)
+        .collect()
+    }
+
+    /// The outline ranks over code-graph edges: a file the seed calls is
+    /// listed before an unlinked one.
+    #[tokio::test]
+    async fn repo_outline_ranks_linked_files_first() {
+        let dir = linked_outline_workspace();
+        let lines = outline_of(dir.path(), Some(vec!["src/seed.rs".into()])).await;
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {lines:?}"))
+        };
+        assert!(at("zz_target.rs") < at("aa_unrelated.rs"), "{lines:?}");
+    }
+
+    /// Omitted seeds are an unseeded whole-workspace ranking: no `OWN`
+    /// lines, and files show their symbol names.
+    #[tokio::test]
+    async fn repo_outline_default_seed_lists_symbols_without_own() {
+        let dir = linked_outline_workspace();
+        let lines = outline_of(dir.path(), None).await;
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|l| !l.contains("OWN ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("(gv_")), "{lines:?}");
+    }
+
+    /// A change notified to the server's graph shows up in the next outline
+    /// (the live graph, not a cache built once).
+    #[tokio::test]
+    async fn repo_outline_sees_file_changes_after_notify() {
+        let dir = linked_outline_workspace();
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, dir.path().to_path_buf());
+        let outline = |s: GavieroMcpServer| async move {
+            s.repo_outline(Parameters(RepoOutlineInput {
+                seed_paths: Some(vec!["src/seed.rs".into()]),
+                token_cap: Some(2000),
+                mode: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .entries
+            .into_iter()
+            .map(|e| e.rendered)
+            .collect::<Vec<_>>()
+        };
+        let before = outline(s.clone()).await;
+        assert!(!before.iter().any(|l| l.contains("bb_new.rs")), "{before:?}");
+
+        let new_file = dir.path().join("src").join("bb_new.rs");
+        std::fs::write(&new_file, "pub fn gv_new_fn() { gv_seed_fn(); }\n").unwrap();
+        s.graph_services().notify_changed(std::slice::from_ref(&new_file));
+        let after = outline(s.clone()).await;
+        assert!(after.iter().any(|l| l.contains("bb_new.rs")), "{after:?}");
+    }
+
+    fn graph_folder(root: &std::path::Path) -> crate::repo_map::GraphFolder {
+        crate::repo_map::GraphFolder {
+            root: root.to_path_buf(),
+            db_path: root.join(".gaviero").join("code_graph.db"),
+            excludes: Vec::new(),
+            specificity: crate::repo_map::SpecificityConfig::default(),
+        }
+    }
+
+    /// A server over two folders: the linked outline workspace (primary)
+    /// and a second folder where `src/caller.rs` calls `src/core.rs`.
+    fn two_folder_server() -> (tempfile::TempDir, tempfile::TempDir, GavieroMcpServer) {
+        let primary = linked_outline_workspace();
+        let second = tempfile::tempdir().unwrap();
+        let src = second.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("core.rs"), "pub fn gv_b_core() {}\n").unwrap();
+        std::fs::write(src.join("caller.rs"), "pub fn gv_b_caller() { gv_b_core(); }\n").unwrap();
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, primary.path().to_path_buf()).with_graph_services(
+            crate::repo_map::GraphServices::new(vec![graph_folder(primary.path()), graph_folder(second.path())]),
+        );
+        (primary, second, s)
+    }
+
+    /// An absolute path is served by the folder that contains it, and that
+    /// folder's rows come back as absolute paths.
+    #[tokio::test]
+    async fn blast_radius_serves_the_folder_that_contains_an_absolute_path() {
+        let (_primary, second, s) = two_folder_server();
+        let core = second.path().join("src").join("core.rs");
+        let out = s
+            .blast_radius(Parameters(BlastRadiusInput {
+                paths: vec![core.to_string_lossy().into_owned()],
+                depth: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .0;
+        let root = second.path().to_string_lossy().replace('\\', "/");
+        assert_eq!(out.nodes[0].path, format!("{root}/src/core.rs"));
+        assert!(
+            out.nodes.iter().any(|n| n.path == format!("{root}/src/caller.rs")),
+            "{:?}",
+            out.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn blast_radius_rejects_paths_from_two_folders() {
+        let (_primary, second, s) = two_folder_server();
+        let core = second.path().join("src").join("core.rs");
+        let result = s
+            .blast_radius(Parameters(BlastRadiusInput {
+                paths: vec!["src/seed.rs".into(), core.to_string_lossy().into_owned()],
+                ..Default::default()
+            }))
+            .await;
+        match result {
+            Err(e) => assert!(e.message.contains("span workspace folders"), "{}", e.message),
+            Ok(_) => panic!("expected invalid_params for paths from two folders"),
         }
     }
 

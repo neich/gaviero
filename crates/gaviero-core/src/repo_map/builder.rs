@@ -1,72 +1,12 @@
-//! Build a file reference graph from a workspace using tree-sitter.
+//! Tree-sitter symbol extraction helpers and the shared skip / exclude
+//! rules used by the code graph ([`super::graph_builder`]).
 //!
-//! For each source file in the workspace:
-//! 1. Parse it with tree-sitter (if the extension is supported)
-//! 2. Extract top-level definition names (functions, structs, traits, etc.)
-//! 3. Record token count estimate (characters / 4, a rough proxy)
-//!
-//! Edges (file-to-file references) are future work; the initial graph has
-//! nodes only. PageRank will rank files by their proximity to owned nodes.
+//! The repo outline no longer walks the workspace itself: [`super::RepoMap`]
+//! is a projection of the code graph ([`super::RepoMap::from_store`]).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use petgraph::graph::DiGraph;
-
-use super::{FileNode, ReferenceEdge, Symbol};
-
-/// Walk `workspace` and build a `DiGraph<FileNode, ReferenceEdge>`.
-///
-/// Skips hidden directories (`.git`, `.cargo`, `target`, `node_modules`) plus
-/// any caller-supplied `excludes` (see [`is_excluded`]).
-/// Unknown file extensions produce a node with an empty symbol list.
-pub fn build(
-    workspace: &Path,
-    excludes: &[String],
-) -> anyhow::Result<DiGraph<FileNode, ReferenceEdge>> {
-    let mut graph: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
-    walk_dir(workspace, workspace, &mut graph, excludes)?;
-    Ok(graph)
-}
-
-fn walk_dir(
-    dir: &Path,
-    workspace: &Path,
-    graph: &mut DiGraph<FileNode, ReferenceEdge>,
-    excludes: &[String],
-) -> anyhow::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("repo_map: cannot read dir {}: {}", dir.display(), e);
-            return Ok(());
-        }
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        // Skip hidden dirs and common build/vendor dirs
-        if file_name.starts_with('.') || SKIP_DIRS.contains(&file_name) {
-            continue;
-        }
-
-        let rel = path.strip_prefix(workspace).unwrap_or(&path);
-        if is_excluded(file_name, rel, excludes) {
-            continue;
-        }
-
-        if path.is_dir() {
-            walk_dir(&path, workspace, graph, excludes)?;
-        } else if path.is_file()
-            && let Some(node) = build_node(&path, super::normalize_rel_path(rel))
-        {
-            graph.add_node(node);
-        }
-    }
-
-    Ok(())
-}
+use super::Symbol;
 
 /// Returns `true` if `rel_path` (or its basename) matches any exclude pattern.
 ///
@@ -112,40 +52,6 @@ pub const SKIP_DIRS: &[&str] = &[
 ];
 
 pub use super::extraction::{MAX_FILE_BYTES, MAX_PARSE_BYTES};
-
-const BINARY_EXTENSIONS: &[&str] = &[
-    "so", "a", "dylib", "dll", "exe", "o", "wasm", "pdf", "png", "jpg", "jpeg", "gif", "ico",
-    "zip", "tar", "gz", "xz", "bz2", "db", "sqlite", "sqlite3", "bin", "dat",
-];
-
-/// Build a `FileNode` for a single file, or `None` if it is binary, over
-/// the read limit, or unreadable. Symbols follow the shared extraction
-/// policy ([`super::extraction::extract`]).
-fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
-    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if BINARY_EXTENSIONS.contains(&ext) {
-        return None;
-    }
-    let content = match super::extraction::read_source(abs_path) {
-        Ok(c) => c,
-        Err(outcome) => {
-            tracing::debug!(
-                "repo_map: skipping {} ({})",
-                abs_path.display(),
-                outcome.as_str()
-            );
-            return None;
-        }
-    };
-    let token_estimate = content.len() / 4;
-    let symbols = super::extraction::extract(ext, &content).symbols;
-
-    Some(FileNode {
-        path: rel_path,
-        token_estimate,
-        symbols,
-    })
-}
 
 /// Extract top-level definition names from source content via tree-sitter,
 /// with the 2 s deadline but **no** size cap. Compatibility wrapper for
