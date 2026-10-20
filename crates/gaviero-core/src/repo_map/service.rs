@@ -181,6 +181,17 @@ impl GraphService {
         f(&store)
     }
 
+    /// Run `f` on a query-only connection to the on-disk graph. Blocking; the
+    /// caller keeps it on one thread. Never runs migrations and never creates
+    /// the database: `f` is not called when it does not exist.
+    pub fn with_query_reader<T>(
+        &self,
+        f: impl FnOnce(&GraphStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let store = GraphStore::open_query_only(self.db_path())?;
+        f(&store)
+    }
+
     /// Writer counters.
     pub fn stats(&self) -> GraphServiceStats {
         *self.inner.shared.stats.read().unwrap_or_else(|e| e.into_inner())
@@ -563,5 +574,32 @@ mod tests {
         let map_a = services.all()[0].snapshot().await.expect("snapshot a");
         assert!(has_node(&map_b, "src/only_in_b.rs"));
         assert!(!has_node(&map_a, "src/only_in_b.rs"));
+    }
+
+    /// `with_query_reader` answers from the on-disk graph without starting the
+    /// writer thread or running a migration.
+    #[test]
+    fn nav_query_reader_reads_a_built_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn helper() {}\n").unwrap();
+        graph_builder::build_graph(dir.path(), &[]).unwrap();
+
+        let root = dir.path().to_path_buf();
+        let service = GraphService::new(GraphFolder {
+            db_path: graph_builder::graph_db_path(&root),
+            root,
+            excludes: Vec::new(),
+            specificity: SpecificityConfig::default(),
+        });
+        assert!(service.current().is_none(), "the writer must not have started");
+
+        let hits = service
+            .with_query_reader(|store| store.definitions_by_name("helper", "src/lib.rs"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].qualified_name, "src/lib.rs::helper");
+        assert!(service.current().is_none(), "a read must not start the writer");
     }
 }
