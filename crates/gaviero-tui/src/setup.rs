@@ -801,14 +801,16 @@ fn profile_settings(profile: Profile, codex_trust_granted: bool) -> serde_json::
     ]);
 
     let agent = match profile {
+        // No `mcp__gaviero` entry: gaviero's own MCP server is approved for
+        // every provider by default (`mcp.gavieroServer.enabled` turns it off).
         Profile::Full => serde_json::json!({
             "availableTools": [
                 "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash",
-                "AskUserQuestion", "mcp__gaviero"
+                "AskUserQuestion"
             ],
             "approvedTools": [
                 "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash",
-                "AskUserQuestion", "mcp__gaviero"
+                "AskUserQuestion"
             ],
             "permissions": {
                 "bash": {
@@ -825,11 +827,11 @@ fn profile_settings(profile: Profile, codex_trust_granted: bool) -> serde_json::
         Profile::Restricted => serde_json::json!({
             "availableTools": [
                 "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
-                "AskUserQuestion", "mcp__gaviero"
+                "AskUserQuestion"
             ],
             "approvedTools": [
                 "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
-                "AskUserQuestion", "mcp__gaviero"
+                "AskUserQuestion"
             ],
             "permissions": {
                 "bash": { "denylist": denylist }

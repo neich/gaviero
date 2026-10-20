@@ -88,7 +88,7 @@ pub use config_synth::{
     ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
     TrustConsent, claude_mcp_config_json, claude_settings_permissions, codex_mcp_config_toml,
     codex_mcp_overrides_from_config_file, codex_synth_has_any_mcp, codex_synth_has_remote_mcp,
-    host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
+    codex_synth_trusted, host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
     synthesize_for_worktree, worktree_has_remote_mcp_urls,
 };
 pub use endpoint_file::{

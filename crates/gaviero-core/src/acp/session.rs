@@ -189,6 +189,23 @@ pub fn ensure_ask_user_question(tools: &mut Vec<String>) {
     }
 }
 
+/// Claude permission rule covering every tool of gaviero's own MCP server.
+/// Always auto-approved ([`allowed_tools_arg`]): the server is gaviero's,
+/// and it is switched off with `mcp.gavieroServer.enabled = false`, not by
+/// leaving it out of `agent.approvedTools`. `mcp.permissions` denies still
+/// win — the server drops denied tools and Claude's deny rules beat allows.
+pub const GAVIERO_MCP_RULE: &str = "mcp__gaviero";
+
+/// The `--allowedTools` value: the approved tools plus [`GAVIERO_MCP_RULE`].
+/// An allow rule for a server that is not registered is inert.
+pub fn allowed_tools_arg(approved: &[&str]) -> String {
+    let mut rules: Vec<&str> = approved.to_vec();
+    if !rules.contains(&GAVIERO_MCP_RULE) {
+        rules.push(GAVIERO_MCP_RULE);
+    }
+    rules.join(",")
+}
+
 /// True for `agent.availableTools` entries naming an MCP server or tool
 /// (`mcp__gaviero`, `mcp__context7__query_docs`) rather than a built-in.
 ///
@@ -449,8 +466,9 @@ impl AcpSession {
 
         if options.auto_approve {
             cmd.arg("--dangerously-skip-permissions");
-        } else if !approved_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(approved_tools.join(","));
+        } else {
+            cmd.arg("--allowedTools")
+                .arg(allowed_tools_arg(approved_tools));
         }
 
         if !system_prompt.is_empty() {
@@ -976,6 +994,17 @@ mod tests {
         assert_eq!(
             crate::mcp::filter_claude_tools(built.clone(), &policy),
             built
+        );
+    }
+
+    #[test]
+    fn allowed_tools_always_approve_the_gaviero_server() {
+        assert_eq!(allowed_tools_arg(&[]), "mcp__gaviero");
+        assert_eq!(allowed_tools_arg(&["Read", "Grep"]), "Read,Grep,mcp__gaviero");
+        assert_eq!(
+            allowed_tools_arg(&["Read", "mcp__gaviero"]),
+            "Read,mcp__gaviero",
+            "an explicit rule is not repeated"
         );
     }
 

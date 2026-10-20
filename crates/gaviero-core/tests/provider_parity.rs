@@ -53,6 +53,9 @@ fn synth_for(dir: &std::path::Path) -> McpConfigSynth {
     synth.enabled = true;
     synth.gaviero_enabled = true;
     synth.context7.enabled = true;
+    // Codex declares third-party servers only under its trust grant; without
+    // it the codex config would omit context7 for want of input.
+    synth.codex_trust = gaviero_core::mcp::TrustConsent::Granted;
     assert!(
         synth.context7.enabled && synth.permissions.server_allowed("context7"),
         "fixture precondition: context7 must survive the permission gate, \

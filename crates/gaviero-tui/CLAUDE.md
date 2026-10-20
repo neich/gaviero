@@ -17,7 +17,7 @@ cargo run -p gaviero-tui -- --workspace path/to/dir   # multi-folder from a dire
 
 Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspace` → `Workspace::load`; `--workspace <dir>` → the `*.gaviero-workspace` already in `<dir>`, else one the setup wizard writes ([src/main.rs](src/main.rs)).
 
-**First-run setup** ([src/setup.rs](src/setup.rs)) runs *before* the editor, owning its own raw-mode session so the C1 consent prompt after it still reads plain stdin. Triggers when the target has no `.gaviero/settings.json` (folder mode) or no `*.gaviero-workspace` (`--workspace`), and never without a TTY. Steps: agent profile (full / restricted — restricted drops `Bash` from `agent.availableTools`), workspace members (`--workspace` only), provider configs (yes grants `mcp.gavieroServer.codexTrust` so `.codex/config.toml` is written), confirm. Existing files are never overwritten.
+**First-run setup** ([src/setup.rs](src/setup.rs)) runs *before* the editor, owning its own raw-mode session so the C1 consent prompt after it still reads plain stdin. Triggers when the target has no `.gaviero/settings.json` (folder mode) or no `*.gaviero-workspace` (`--workspace`), and never without a TTY. Steps: agent profile (full / restricted — restricted drops `Bash` from `agent.availableTools`), workspace members (`--workspace` only), provider configs (yes grants `mcp.gavieroServer.codexTrust`, which adds context7 / `mcp.extraServers` to `.codex/config.toml` — gaviero's own server is declared and pre-approved for every provider without it), confirm. Existing files are never overwritten.
 
 ## Architecture
 
