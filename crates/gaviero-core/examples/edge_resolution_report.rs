@@ -59,14 +59,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
     // One `Calls` reference = (source file, called name). Its fan-out is the
-    // number of distinct target files it was linked to.
+    // number of distinct target files it was linked to. Edges are sourced
+    // from the calling symbol, so the called name is the target node's name
+    // and each distinct target counts once.
     let mut fanout: Vec<(String, String, i64, i64)> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT e.file_path, e.source_qn, COUNT(DISTINCT n.file_path), COUNT(*)
+            "SELECT e.file_path, n.name, COUNT(DISTINCT n.file_path), COUNT(DISTINCT e.target_qn)
              FROM edges e JOIN nodes n ON n.qualified_name = e.target_qn
              WHERE e.kind = 'Calls' AND n.file_path != e.file_path
-             GROUP BY e.file_path, e.source_qn",
+             GROUP BY e.file_path, n.name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -82,8 +84,8 @@ fn main() -> anyhow::Result<()> {
     let call_edges: i64 = fanout.iter().map(|f| f.3).sum();
     let ambiguous_edges: i64 = fanout.iter().filter(|f| f.2 > 1).map(|f| f.3).sum();
     let mut by_name: HashMap<String, i64> = HashMap::new();
-    for (_, qn, files, _) in &fanout {
-        let name = qn.rsplit("::").next().unwrap_or(qn).to_string();
+    for (_, name, files, _) in &fanout {
+        let name = name.clone();
         let e = by_name.entry(name).or_default();
         *e = (*e).max(*files);
     }

@@ -258,8 +258,37 @@ pub struct OutlineSymbol {
     pub kind: String,
     /// 0-based start line, when recorded.
     pub line: Option<i64>,
+    /// 0-based end line, when recorded.
+    pub line_end: Option<i64>,
     /// `impl:Type`, `impl:Type:Trait`, `trait:Name`, or `None`.
     pub owner: Option<String>,
+}
+
+/// One stored symbol's line range ([`GraphStore::symbol_spans`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSpan {
+    pub qualified_name: String,
+    /// [`NodeKind::as_str`].
+    pub kind: String,
+    /// 0-based first line.
+    pub line_start: i64,
+    /// 0-based last line.
+    pub line_end: i64,
+}
+
+/// One row of [`GraphStore::symbol_callers`] / [`GraphStore::symbol_callees`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRefRow {
+    pub kind: EdgeKind,
+    /// The other end: the caller (`source_qn`) or the callee (`target_qn`).
+    pub qualified_name: String,
+    /// File of `qualified_name`.
+    pub file_path: String,
+    /// 0-based: the call site in the caller's file for callers, the
+    /// callee's definition for callees.
+    pub line: Option<i64>,
+    /// `nodes.kind` of `qualified_name`, when it is a stored node.
+    pub node_kind: Option<String>,
 }
 
 /// C4: one-shot migration applied at every `open*` call.
@@ -479,6 +508,17 @@ impl BlastRadiusMode {
         }
     }
 
+    /// Whether this mode walks edges of `kind`; the same kinds as the
+    /// impact CTE's filter.
+    pub fn includes(&self, kind: EdgeKind) -> bool {
+        match self {
+            Self::Impact | Self::All => true,
+            Self::Callers => kind == EdgeKind::Calls,
+            Self::Tests => kind == EdgeKind::TestOf,
+            Self::Implementations => kind == EdgeKind::Implements,
+        }
+    }
+
     fn edge_kind_sql_list(&self) -> &'static str {
         match self {
             Self::Impact => {
@@ -506,6 +546,52 @@ impl BlastRadiusMode {
     pub fn edge_weight(&self, kind: EdgeKind) -> f64 {
         EdgeWeights::default_for(*self).weight(kind)
     }
+}
+
+/// Which way a blast-radius walk follows reference edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WalkDirection {
+    /// Files that reference the seeds (the impact direction).
+    #[default]
+    Dependents,
+    /// Files the seeds reference.
+    Dependencies,
+    /// Both.
+    Both,
+}
+
+impl WalkDirection {
+    /// `dependents` / `dependencies` / `both` (trimmed, any case);
+    /// anything else is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dependents" => Some(Self::Dependents),
+            "dependencies" => Some(Self::Dependencies),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dependents => "dependents",
+            Self::Dependencies => "dependencies",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// One cross-file reference edge with its endpoints' files
+/// ([`GraphStore::file_edge_witnesses`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdgeWitness {
+    pub source_file: String,
+    pub target_file: String,
+    pub kind: EdgeKind,
+    pub source_qn: String,
+    pub target_qn: String,
+    /// 0-based line of the reference in `source_file`.
+    pub line: i64,
 }
 
 /// Per-intent edge weight map for PageRank propagation.
@@ -817,6 +903,89 @@ impl GraphStore {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every edge as `(kind, source_qn, target_qn, file_path)`, sorted.
+    #[cfg(test)]
+    pub(crate) fn edge_rows(&self) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, source_qn, target_qn, file_path FROM edges ORDER BY 1, 2, 3, 4",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The line ranges of a file's symbols (nodes with both lines
+    /// recorded), ordered by start line, end line, then qualified name.
+    pub fn symbol_spans(&self, file_path: &str) -> Result<Vec<SymbolSpan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT qualified_name, kind, line_start, line_end FROM nodes
+             WHERE file_path = ?1 AND kind != 'File'
+               AND line_start IS NOT NULL AND line_end IS NOT NULL
+             ORDER BY line_start, line_end, qualified_name",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| {
+            Ok(SymbolSpan {
+                qualified_name: row.get(0)?,
+                kind: row.get(1)?,
+                line_start: row.get(2)?,
+                line_end: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Symbols referencing `qualified_name` (`Calls`, `Imports`,
+    /// `Implements`), one row per referencing symbol and kind, with the
+    /// first call site. Ordered by file, line, symbol, kind.
+    pub fn symbol_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRefRow>> {
+        self.symbol_ref_rows(
+            "SELECT e.kind, e.source_qn, e.file_path, e.line, n.kind
+             FROM edges e LEFT JOIN nodes n ON n.qualified_name = e.source_qn
+             WHERE e.target_qn = ?1 AND e.kind IN ('Calls','Imports','Implements')
+             ORDER BY e.file_path, e.line, e.source_qn, e.kind",
+            qualified_name,
+        )
+    }
+
+    /// Symbols `qualified_name` references (`Calls`, `Imports`,
+    /// `Implements`), with their definition line. Ordered by file, line,
+    /// symbol, kind.
+    pub fn symbol_callees(&self, qualified_name: &str) -> Result<Vec<SymbolRefRow>> {
+        self.symbol_ref_rows(
+            "SELECT e.kind, e.target_qn, n.file_path, n.line_start, n.kind
+             FROM edges e JOIN nodes n ON n.qualified_name = e.target_qn
+             WHERE e.source_qn = ?1 AND e.kind IN ('Calls','Imports','Implements')
+             ORDER BY n.file_path, n.line_start, e.target_qn, e.kind",
+            qualified_name,
+        )
+    }
+
+    fn symbol_ref_rows(&self, sql: &str, qualified_name: &str) -> Result<Vec<SymbolRefRow>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![qualified_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (kind, qualified_name, file_path, line, node_kind) = r?;
+            if let Some(kind) = EdgeKind::parse(&kind) {
+                out.push(SymbolRefRow {
+                    kind,
+                    qualified_name,
+                    file_path,
+                    line,
+                    node_kind,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Whether a node with this `qualified_name` exists.
@@ -1341,23 +1510,8 @@ impl GraphStore {
             }
         }
 
-        // 4. Find test gaps: changed files that have no edge from any test file
-        let mut test_gaps = Vec::new();
-        for cf in changed_files {
-            let has_test: bool = self.conn.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM edges e
-                    JOIN nodes n ON n.qualified_name = e.target_qn
-                    WHERE n.file_path = ?1
-                      AND (e.kind IN ('TestOf','TestedBy') OR e.file_path LIKE '%test%')
-                )",
-                params![cf],
-                |row| row.get(0),
-            )?;
-            if !has_test {
-                test_gaps.push(cf.to_string());
-            }
-        }
+        // 4. Find test gaps.
+        let test_gaps = self.test_gaps(changed_files)?;
 
         Ok(ImpactSummary {
             changed_files: changed_files.iter().map(|s| s.to_string()).collect(),
@@ -1366,6 +1520,70 @@ impl GraphStore {
             test_gaps,
             truncated: false,
         })
+    }
+
+    /// The files among `files` with no test reaching them: no `TestOf`
+    /// edge into their symbols, and no edge from another file whose path
+    /// contains `test`. A file's own edges never count by path (a
+    /// same-file call in `src/attest.rs` is not a test).
+    pub fn test_gaps(&self, files: &[&str]) -> Result<Vec<String>> {
+        let mut test_gaps = Vec::new();
+        for cf in files {
+            let has_test: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM edges e
+                    JOIN nodes n ON n.qualified_name = e.target_qn
+                    WHERE n.file_path = ?1
+                      AND (e.kind IN ('TestOf','TestedBy')
+                           OR (e.file_path LIKE '%test%' AND e.file_path != ?1))
+                )",
+                params![cf],
+                |row| row.get(0),
+            )?;
+            if !has_test {
+                test_gaps.push(cf.to_string());
+            }
+        }
+        Ok(test_gaps)
+    }
+
+    /// Every cross-file reference edge (`Defines` and same-file rows
+    /// excluded) with both endpoint files, ordered by source file, target
+    /// file, kind, source and target symbol. [`crate::repo_map::walk_files`]
+    /// walks these and keeps the first edge that reached each file as its
+    /// witness.
+    pub fn file_edge_witnesses(&self) -> Result<Vec<FileEdgeWitness>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.file_path, n.file_path, e.kind, e.source_qn, e.target_qn, e.line
+             FROM edges e JOIN nodes n ON n.qualified_name = e.target_qn
+             WHERE e.kind != 'Defines' AND e.file_path != n.file_path
+             ORDER BY e.file_path, n.file_path, e.kind, e.source_qn, e.target_qn",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (source_file, target_file, kind, source_qn, target_qn, line) = r?;
+            if let Some(kind) = EdgeKind::parse(&kind) {
+                out.push(FileEdgeWitness {
+                    source_file,
+                    target_file,
+                    kind,
+                    source_qn,
+                    target_qn,
+                    line: line.unwrap_or(0),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// C3: format impact result with per-file rank/specificity badges.
@@ -1524,10 +1742,15 @@ impl GraphStore {
     /// `target_qn`. Self-edges are filtered. Used by the MCP
     /// `blast_radius` handler to apply per-intent edge weights via
     /// `BlastRadiusMode::edge_weight`.
+    ///
+    /// One row per distinct referencing file, target and kind: edges are
+    /// sourced from the calling symbol, so two functions of one file
+    /// calling the same target are two edges, but the file-level weight
+    /// stays one.
     pub fn file_edges(&self) -> Result<Vec<(String, String, EdgeKind)>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.file_path, n.file_path, e.kind
-             FROM edges e
+             FROM (SELECT DISTINCT file_path, target_qn, kind FROM edges) e
              JOIN nodes n ON n.qualified_name = e.target_qn",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1566,7 +1789,7 @@ impl GraphStore {
     /// of the repo outline.
     pub fn outline_symbols(&self) -> Result<Vec<OutlineSymbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file_path, name, kind, line_start, owner FROM nodes
+            "SELECT file_path, name, kind, line_start, owner, line_end FROM nodes
              WHERE kind != 'File'
              ORDER BY file_path, line_start, name",
         )?;
@@ -1576,6 +1799,7 @@ impl GraphStore {
                 name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                line_end: row.get(5)?,
                 owner: row.get(4)?,
             })
         })?;
@@ -2114,6 +2338,77 @@ mod tests {
         // No TestOf edge for src/lib.rs
         let result = store.impact_radius(&["src/lib.rs"], 3).unwrap();
         assert!(result.test_gaps.contains(&"src/lib.rs".to_string()));
+    }
+
+    fn function(store: &GraphStore, qn: &str) {
+        let (file, name) = qn.split_once("::").unwrap();
+        store
+            .upsert_node(NodeKind::Function, name, qn, file, Some(0), Some(0), Some("rust"), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn file_edges_counts_each_target_once_per_file() {
+        let store = GraphStore::open_memory().unwrap();
+        for qn in ["a.rs::one", "a.rs::two", "b.rs::f"] {
+            function(&store, qn);
+        }
+        store.insert_edge(EdgeKind::Calls, "a.rs::one", "b.rs::f", "a.rs", 0).unwrap();
+        store.insert_edge(EdgeKind::Calls, "a.rs::two", "b.rs::f", "a.rs", 1).unwrap();
+        assert_eq!(
+            store.file_edges().unwrap(),
+            vec![("a.rs".to_string(), "b.rs".to_string(), EdgeKind::Calls)]
+        );
+    }
+
+    #[test]
+    fn test_gaps_ignore_a_files_own_edges() {
+        let store = GraphStore::open_memory().unwrap();
+        for qn in ["src/attest.rs::run", "src/attest.rs::helper"] {
+            function(&store, qn);
+        }
+        store
+            .insert_edge(EdgeKind::Calls, "src/attest.rs::run", "src/attest.rs::helper", "src/attest.rs", 0)
+            .unwrap();
+        let result = store.impact_radius(&["src/attest.rs"], 1).unwrap();
+        assert_eq!(result.test_gaps, vec!["src/attest.rs".to_string()]);
+    }
+
+    #[test]
+    fn symbol_callers_and_callees_round_trip() {
+        let store = GraphStore::open_memory().unwrap();
+        for qn in ["a.rs::run", "b.rs::helper"] {
+            function(&store, qn);
+        }
+        store
+            .upsert_node(NodeKind::Test, "checks", "a.rs::checks", "a.rs", Some(5), Some(7), None, None)
+            .unwrap();
+        store.insert_edge(EdgeKind::Calls, "a.rs::run", "b.rs::helper", "a.rs", 2).unwrap();
+        store.insert_edge(EdgeKind::Calls, "a.rs::checks", "b.rs::helper", "a.rs", 6).unwrap();
+        store.insert_edge(EdgeKind::TestOf, "a.rs::checks", "b.rs::helper", "a.rs", 6).unwrap();
+        store.insert_edge(EdgeKind::Imports, "a.rs", "b.rs::helper", "a.rs", 0).unwrap();
+
+        let callers = store.symbol_callers("b.rs::helper").unwrap();
+        let got: Vec<_> = callers
+            .iter()
+            .map(|r| (r.qualified_name.as_str(), r.kind, r.line, r.node_kind.as_deref()))
+            .collect();
+        // TestOf rows are not callers; `a.rs` has no File node here.
+        assert_eq!(
+            got,
+            vec![
+                ("a.rs", EdgeKind::Imports, Some(0), None),
+                ("a.rs::run", EdgeKind::Calls, Some(2), Some("Function")),
+                ("a.rs::checks", EdgeKind::Calls, Some(6), Some("Test")),
+            ]
+        );
+
+        let callees = store.symbol_callees("a.rs::run").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].qualified_name, "b.rs::helper");
+        assert_eq!(callees[0].file_path, "b.rs");
+        assert_eq!(callees[0].line, Some(0));
+        assert!(store.symbol_callees("b.rs::helper").unwrap().is_empty());
     }
 
     #[test]

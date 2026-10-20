@@ -137,7 +137,8 @@ impl RetrievalToolset {
                 || has("blast_radius")
                 || has("node_doc")
                 || has("memory_get")
-                || has("repo_outline"),
+                || has("repo_outline")
+                || has("symbol_refs"),
             symbols: has("symbol_search") || has("symbol_doc"),
             exposed: tools.to_vec(),
         }
@@ -148,7 +149,9 @@ impl RetrievalToolset {
             return self.exposed.iter().any(|t| t == tool);
         }
         match tool {
-            "node_doc" | "blast_radius" | "memory_search" => self.graph_and_memory,
+            "node_doc" | "blast_radius" | "memory_search" | "symbol_refs" => {
+                self.graph_and_memory
+            }
             "symbol_search" | "symbol_doc" => self.symbols,
             _ => false,
         }

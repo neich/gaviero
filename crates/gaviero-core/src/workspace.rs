@@ -1536,6 +1536,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
             "blast_radius",
             "node_doc",
             "repo_outline",
+            "symbol_refs",
             "symbol_search",
             "symbol_doc",
             "memory_flag"

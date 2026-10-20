@@ -942,13 +942,17 @@ fn is_noise_call(name: &str) -> bool {
 ///
 /// For each reference in `file_path`, looks up the `target_name` in the graph
 /// to find which file defines that symbol. If found (and it's a different file),
-/// inserts an edge.
+/// inserts an edge. The edge's `source_qn` is the innermost symbol of
+/// `file_path` containing the reference, or `file_qn_prefix` (the File
+/// node; the graph builder passes `file_path`) at top level
+/// ([`super::spans`]).
 pub fn resolve_and_insert_edges(
     store: &GraphStore,
     file_path: &str,
     file_qn_prefix: &str,
     refs: &[RawReference],
 ) -> anyhow::Result<usize> {
+    let spans = super::spans::SymbolSpans::load(store, file_path)?;
     let mut edges_added = 0;
     let source_is_test = is_test_file(file_path);
     // Memoize `is_test_file` per unique target path. `resolve_symbol`
@@ -975,7 +979,7 @@ pub fn resolve_and_insert_edges(
                 continue;
             }
 
-            let source_qn = format!("{}::{}", file_qn_prefix, r.target_name);
+            let source_qn = spans.source_for(file_qn_prefix, r.line as i64).0;
             store.insert_edge(edge_kind, &source_qn, target_qn, file_path, r.line as i64)?;
             edges_added += 1;
 
