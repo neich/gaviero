@@ -303,12 +303,13 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             }
             ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
-            // 1.3 `file_browser` dispatch lands in the next milestone; until
-            // then the frames are known to the protocol but not served.
-            ClientFrame::ListDirectory(_) | ClientFrame::ReadFile(_) => Err(CommandFailure::new(
-                ErrorCode::InvalidPayload,
-                "file_browser is not implemented in this build",
-            )),
+            // 1.3 (`file_browser`): read-only workspace browsing.
+            ClientFrame::ListDirectory(r) => {
+                crate::app::remote_files::list_directory(app, r.path.as_deref())
+                    .map(|result| (CommandStatus::Completed, Some(result)))
+            }
+            ClientFrame::ReadFile(r) => crate::app::remote_files::read_file(app, &r.path)
+                .map(|result| (CommandStatus::Completed, Some(result))),
             ClientFrame::TurnReviewAction(a) => {
                 apply_turn_review_action(app, &a).map(|()| (CommandStatus::Completed, None))
             }
@@ -1022,5 +1023,46 @@ mod tests {
         assert_eq!(app.chat_state.active_conv, active_before);
         assert_eq!(app.chat_state.conversations[0].id, bg);
         let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    #[test]
+    fn remote_list_directory_and_read_file_dispatch() {
+        use gaviero_remote::envelope::{ListDirectory, ReadFile};
+        let (dir, mut app) = two_tab_app();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut send = |frame: ClientFrame| {
+            handle_remote_command(
+                &mut app,
+                ClientEnvelope {
+                    version: gaviero_remote::version::PROTOCOL_VERSION,
+                    instance_id: Some("test".into()),
+                    command_id: "file-browser".into(),
+                    frame,
+                },
+                131072,
+            );
+            app.remote.pending_frames.pop()
+        };
+
+        let Some(ServerFrame::CommandResult(listing)) =
+            send(ClientFrame::ListDirectory(ListDirectory { path: None }))
+        else {
+            panic!("expected command_result for list_directory");
+        };
+        let listing = listing.result.unwrap();
+        let roots = listing["roots"].as_array().unwrap();
+        assert!(!roots.is_empty(), "workspace roots must be listed");
+        let label = roots[0]["path"].as_str().unwrap().to_string();
+
+        let Some(ServerFrame::CommandResult(read)) = send(ClientFrame::ReadFile(ReadFile {
+            path: format!("{label}/src/main.rs"),
+        })) else {
+            panic!("expected command_result for read_file");
+        };
+        let read = read.result.unwrap();
+        assert_eq!(read["viewable"], true);
+        assert_eq!(read["language"], "rust");
     }
 }

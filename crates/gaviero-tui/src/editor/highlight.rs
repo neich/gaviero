@@ -138,6 +138,91 @@ pub fn run_highlights(
     spans
 }
 
+/// One highlight run as a semantic capture name (the wire form), not a color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub class: String,
+}
+
+/// Every non-overlapping highlight run in `source`, most-specific capture
+/// winning, sorted by `start_byte`. `lang_name` selects the query file;
+/// `language` is the parsed grammar.
+pub fn class_spans(
+    source: &str,
+    lang_name: &str,
+    language: gaviero_core::Language,
+) -> anyhow::Result<Vec<ClassSpan>> {
+    let config = load_highlight_config(language.clone(), lang_name)?;
+    let mut parser = gaviero_core::Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|e| anyhow::anyhow!("set_language failed: {e}"))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+
+    // Per-byte class id; u32::MAX = no highlight.
+    let mut ids = vec![u32::MAX; source.len()];
+    let mut names: Vec<String> = Vec::new();
+    let mut packed: Vec<(usize, usize, u32, usize)> = Vec::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        for capture in m.captures {
+            let group = &config.group_names[capture.index as usize];
+            let node = capture.node;
+            if node.start_byte() == node.end_byte() {
+                continue;
+            }
+            let id = match names.iter().position(|n| n == group) {
+                Some(i) => i as u32,
+                None => {
+                    names.push(group.clone());
+                    (names.len() - 1) as u32
+                }
+            };
+            let priority = group.chars().filter(|c| *c == '.').count();
+            packed.push((node.start_byte(), node.end_byte(), id, priority));
+        }
+    }
+
+    // Same order as `run_highlights`: start asc, width desc, priority asc, so
+    // the last (most specific) span wins when the ids are painted.
+    packed.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| (b.1 - b.0).cmp(&(a.1 - a.0)))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    for (start, end, id, _) in packed {
+        ids[start..end].fill(id);
+    }
+
+    let mut spans = Vec::new();
+    let mut run_start = 0;
+    while run_start < ids.len() {
+        let id = ids[run_start];
+        let mut run_end = run_start + 1;
+        while run_end < ids.len() && ids[run_end] == id {
+            run_end += 1;
+        }
+        if id != u32::MAX {
+            spans.push(ClassSpan {
+                start_byte: run_start,
+                end_byte: run_end,
+                class: names[id as usize].clone(),
+            });
+        }
+        run_start = run_end;
+    }
+    Ok(spans)
+}
+
 /// Recursively collect byte ranges of ERROR and MISSING nodes within the
 /// visible range and push a styled span for each into `out`.
 fn collect_error_spans(
@@ -450,5 +535,32 @@ mod tests {
             !number_spans.is_empty(),
             "should produce orange spans for JSON numbers"
         );
+    }
+
+    #[test]
+    fn class_spans_are_sorted_and_non_overlapping() {
+        let source = "fn main() { let s = \"x\"; }";
+        let language = gaviero_core::tree_sitter::language_for_extension("rs")
+            .expect("should have rust language");
+        let spans = class_spans(source, "rust", language).expect("class spans");
+
+        assert!(!spans.is_empty(), "rust source must produce spans");
+        assert!(
+            spans.iter().any(|s| s.class == "keyword"),
+            "expected a keyword capture, got {:?}",
+            spans.iter().map(|s| &s.class).collect::<Vec<_>>()
+        );
+        let mut previous_end = 0;
+        for span in &spans {
+            assert!(span.start_byte >= previous_end, "spans must not overlap");
+            assert!(span.end_byte <= source.len(), "span past the source");
+            assert!(span.start_byte < span.end_byte, "empty span");
+            assert!(
+                source.is_char_boundary(span.start_byte)
+                    && source.is_char_boundary(span.end_byte),
+                "span not on a char boundary"
+            );
+            previous_end = span.end_byte;
+        }
     }
 }

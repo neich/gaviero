@@ -10,7 +10,7 @@ use crate::panels::code_graph_panel::{
 /// or more roots share that label, disambiguates by appending the parent dir
 /// name, then by appending the absolute path. Empty label only if the root
 /// has no usable name at all (single-folder fallback case).
-fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
+pub(crate) fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
     let mut labels: Vec<String> = roots.iter().map(|(n, _)| n.clone()).collect();
     loop {
         let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -1716,7 +1716,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
 /// Roots `@` completion and `@path` resolution share with the explorer:
 /// workspace-level config dirs (`.gaviero`, `.claude` beside the workspace
 /// file) first, then member folders. Single-folder mode has no config dirs.
-fn completion_named_roots(
+pub(crate) fn completion_named_roots(
     workspace: &gaviero_core::workspace::Workspace,
 ) -> Vec<(String, std::path::PathBuf)> {
     let mut roots: Vec<(String, std::path::PathBuf)> = workspace
