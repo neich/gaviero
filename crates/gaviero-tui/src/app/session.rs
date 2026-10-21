@@ -340,15 +340,40 @@ pub(super) fn restore_session(app: &mut App) {
             crate::editor::buffer::Buffer::resolve_editor_path(std::path::Path::new(&tab.path));
         if path.exists() {
             app.open_file(&path);
-            if let Some(buf) = app.buffers.last_mut() {
-                let max_line = buf.text.len_lines().saturating_sub(1);
-                buf.cursor.line = tab.cursor_line.min(max_line);
-                buf.cursor.col = tab.cursor_col;
+            // `open_file` leaves the requested tab active on success, but
+            // leaves the previous buffer active when the open fails — guard
+            // on the path so a failed restore can't overwrite that buffer.
+            let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+                continue;
+            };
+            if !buf
+                .path
+                .as_deref()
+                .is_some_and(|p| Buffer::paths_refer_to_same_file(p, &path))
+            {
+                continue;
+            }
+            // Wrap first: `scroll_top` counts visual rows when it is on, and
+            // the bounds differ from the logical-line clamp below.
+            if let Some(word_wrap) = tab.word_wrap {
+                buf.word_wrap = word_wrap;
+            }
+            let max_line = buf.text.len_lines().saturating_sub(1);
+            buf.cursor.line = tab.cursor_line.min(max_line);
+            buf.cursor.col = tab.cursor_col.min(buf.line_len(buf.cursor.line));
+            if buf.word_wrap {
+                // A wrapped offset may legitimately exceed the logical line
+                // count; it is clamped against the real wrap layout on the
+                // first render, when the content width is known.
+                buf.scroll.top_line = tab.scroll_top;
+                buf.request_scroll_clamp();
+            } else {
                 buf.scroll.top_line = tab.scroll_top.min(max_line);
-                if buf.lang_name.as_deref() == Some("markdown") {
-                    buf.preview_mode =
-                        MarkdownPreviewMode::from_session_key(tab.preview_mode.as_deref());
-                }
+            }
+            if buf.lang_name.as_deref() == Some("markdown") {
+                buf.preview_mode =
+                    MarkdownPreviewMode::from_session_key(tab.preview_mode.as_deref());
+                buf.preview_scroll = tab.preview_scroll;
             }
         }
     }
@@ -432,7 +457,9 @@ fn session_state_from_app(app: &App) -> SessionState {
                 cursor_line: buf.cursor.line,
                 cursor_col: buf.cursor.col,
                 scroll_top: buf.scroll.top_line,
+                word_wrap: Some(buf.word_wrap),
                 preview_mode: buf.preview_mode.session_key().map(str::to_owned),
+                preview_scroll: buf.preview_scroll,
             })
         })
         .collect();
@@ -742,6 +769,111 @@ mod tests {
         assert!(!app.panel_visible.side_panel);
 
         cleanup_session(key);
+    }
+
+    #[test]
+    fn editor_tab_state_survives_a_restart() {
+        // The point of the feature: a tab comes back exactly as it was left —
+        // caret, scroll, word wrap, and the markdown preview's mode/scroll.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(
+            &file,
+            "# Title\n\nalpha\nbravo\ncharlie\ndelta\n\n# Two\ntail\n",
+        )
+        .unwrap();
+
+        let mut app = session_app(dir.path());
+        app.open_file(&file);
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.cursor.line = 4;
+            buf.cursor.col = 3;
+            buf.scroll.top_line = 2;
+            buf.word_wrap = true;
+            buf.preview_mode = MarkdownPreviewMode::Split;
+            buf.preview_scroll = 6;
+        }
+        save_session(&app);
+
+        let mut restarted = session_app(dir.path());
+        restore_session(&mut restarted);
+
+        let buf = &restarted.buffers[restarted.active_buffer];
+        assert_eq!(buf.cursor.line, 4);
+        assert_eq!(buf.cursor.col, 3);
+        assert_eq!(buf.scroll.top_line, 2);
+        assert!(buf.word_wrap, "word wrap must survive a restart");
+        assert_eq!(buf.preview_mode, MarkdownPreviewMode::Split);
+        assert_eq!(buf.preview_scroll, 6);
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn a_restored_cursor_is_clamped_to_the_shorter_file() {
+        // A file edited outside the editor may be shorter than when the
+        // session was saved; a stale caret/pane must land inside it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("short.rs");
+        // No trailing newline: a single logical line, so the stale caret both
+        // exceeds the line count and the line length.
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let mut app = session_app(dir.path());
+        app.open_file(&file);
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.cursor.line = 2;
+            buf.cursor.col = 99;
+            buf.scroll.top_line = 2;
+        }
+        save_session(&app);
+
+        let mut restarted = session_app(dir.path());
+        restore_session(&mut restarted);
+
+        let buf = &restarted.buffers[restarted.active_buffer];
+        assert_eq!(buf.cursor.line, 0);
+        assert_eq!(buf.cursor.col, "fn main() {}".chars().count());
+        assert_eq!(buf.scroll.top_line, 0);
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn a_wrapped_scroll_offset_is_not_clamped_to_the_logical_line_count() {
+        // With wrap on, `scroll_top` counts visual rows and can exceed the
+        // logical line count. Restoring must keep it and defer the bound to
+        // the first render, which knows the wrap width.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("long.txt");
+        std::fs::write(&file, "word ".repeat(400)).unwrap();
+
+        let mut app = session_app(dir.path());
+        app.open_file(&file);
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.word_wrap = true;
+            buf.scroll.top_line = 12;
+        }
+        save_session(&app);
+
+        let mut restarted = session_app(dir.path());
+        restore_session(&mut restarted);
+
+        let buf = &mut restarted.buffers[restarted.active_buffer];
+        assert!(buf.word_wrap);
+        assert_eq!(
+            buf.scroll.top_line, 12,
+            "a visual row offset must not be clamped to the single logical line"
+        );
+        assert!(
+            buf.take_scroll_clamp_request(),
+            "the first render must still bound the offset"
+        );
+
+        cleanup_session(dir.path());
     }
 
     #[test]
