@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.2 (1.0 frozen; 1.1 and 1.2 additive)
+# Gaviero Remote Protocol — v1.3 (1.0 frozen; 1.1, 1.2 and 1.3 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 2 }
+PROTOCOL_VERSION  = { major: 1, minor: 3 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1)
@@ -181,6 +181,8 @@ holds the current token.
 | `request_terminals` | `{ terminal_id? }` — requires `shell_sessions`; lists tabs and reads the selected screen |
 | `terminal_input` | `{ terminal_id, text }` — requires `shell_sessions`; writes UTF-8 input and control keys to the named PTY |
 | `request_file_completions` | `{ query, limit? }` — requires `file_completions`; workspace paths for an `@` reference |
+| `list_directory` | `{ path? }` — requires `file_browser`; absent/empty ⇒ the workspace roots. `path` is an explorer display path `<root-label>/<rel>`. |
+| `read_file` | `{ path }` — requires `file_browser`; reads one regular UTF-8 file, read-only. |
 | `turn_review_action` | `{ turn_id, action, path? }` — requires `turn_review` (1.2); see §1.2 additions |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
@@ -429,9 +431,58 @@ sits in an `@` token that starts the text or follows whitespace, debounces
 typing, keeps one request in flight, and on tap replaces the token with
 `@<path> `. Older servers receive no completion requests.
 
+## File browser (`file_browser` capability)
+
+Servers advertising `hello.capabilities: ["file_browser", ...]` implement the read-only workspace
+browser used by the phone's Explorer screen. There is **no** write, create, rename, delete, or save
+command — view-only is enforced by the absence of commands.
+
+**Roots.** `list_directory` with an absent or empty `path` returns the same labelled roots the desktop
+explorer and `@` completion use, each `{ name, path, is_dir: true }` where `path` is the label. Every
+path in a listing is the label plus `/` plus the relative path (one namespace for single- and
+multi-root workspaces; the client never joins paths itself).
+
+`list_directory` result:
+
+```json
+{ "path": "gaviero/src", "roots": [],
+  "entries": [ { "name": "main.rs", "path": "gaviero/src/main.rs", "is_dir": false, "size": 1024 },
+               { "name": "app", "path": "gaviero/src/app", "is_dir": true } ],
+  "truncated": false }
+```
+
+For an absent/empty `path` the result is
+`{ "path": "", "roots": [ { "name": "gaviero", "path": "gaviero", "is_dir": true } ],
+"entries": [], "truncated": false }`.
+`entries` is sorted directories-first, then case-insensitively by name. `.git` is not listed.
+More than 1000 entries ⇒ the first 1000 and `truncated: true`.
+
+`read_file` result:
+
+```json
+{ "path": "gaviero/src/main.rs", "viewable": true, "language": "rust",
+  "bytes": 1500, "truncated": false, "content": "fn main() {}\n",
+  "classes": ["keyword", "function"],
+  "spans": [[0, 2, 0], [3, 7, 1]], "spans_truncated": false }
+```
+
+Unviewable: `{ "path": "logo.png", "viewable": false, "reason": "binary", "bytes": 4096 }`,
+`reason ∈ binary | not_utf8 | not_a_file`.
+
+- Content is capped at 48 KiB (head, cut at a UTF-8 boundary); `truncated: true` means spans are
+  empty. `bytes` is always the full on-disk size.
+- `spans` offsets are UTF-8 byte offsets into the returned `content`, exclusive end, sorted and
+  non-overlapping; `classes` is the string table, `spans[i][2]` indexes it. At most 4000 spans;
+  `spans_truncated` is true when the cap dropped the tail.
+- A file is binary when a NUL byte appears in its first 8192 bytes, or more than 5% of those bytes
+  are C0 control characters other than `\t`, `\n`, `\r`.
+- The browser is read-only: there is no write, create, rename, delete, or save command.
+- Path rules: only `<root-label>/<rel>` strings inside a workspace root are accepted; `..`,
+  absolute paths, and symlinks resolving outside the root are `invalid_payload`.
+
 ## Fixtures
 
-One example per frame type under `fixtures/client/` (16) and `fixtures/server/` (20),
+One example per frame type under `fixtures/client/` (19) and `fixtures/server/` (23),
 named `<type>.json`, each a complete envelope, plus `fixtures/http/instances.json` for the
 1.1 directory body. `fixtures/server/hello.json` shows the 1.1 shape (`machine`, capabilities);
 the test suite also asserts the 1.0 shape (no `machine`) still decodes. `fixtures/server/message_complete.json`

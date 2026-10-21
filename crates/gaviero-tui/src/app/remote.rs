@@ -303,6 +303,12 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             }
             ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
+            // 1.3 `file_browser` dispatch lands in the next milestone; until
+            // then the frames are known to the protocol but not served.
+            ClientFrame::ListDirectory(_) | ClientFrame::ReadFile(_) => Err(CommandFailure::new(
+                ErrorCode::InvalidPayload,
+                "file_browser is not implemented in this build",
+            )),
             ClientFrame::TurnReviewAction(a) => {
                 apply_turn_review_action(app, &a).map(|()| (CommandStatus::Completed, None))
             }

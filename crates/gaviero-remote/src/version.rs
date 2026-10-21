@@ -7,14 +7,15 @@ use serde::{Deserialize, Serialize};
 /// `hello.machine`, capability strings, optional
 /// `request_messages.before_seq`, and the `GET /v1/instances` resource.
 /// Minor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,
-/// and two error codes.
+/// and two error codes. Minor 3 is additive: the `file_browser` capability
+/// with the `list_directory` / `read_file` client frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -26,6 +27,8 @@ pub mod capability {
     pub const FILE_COMPLETIONS: &str = "file_completions";
     /// 1.2: turn-review frames and `turn_review_action`.
     pub const TURN_REVIEW: &str = "turn_review";
+    /// 1.3: `list_directory` / `read_file` browse the workspace read-only.
+    pub const FILE_BROWSER: &str = "file_browser";
 }
 
 /// Why a peer's version is unacceptable.
