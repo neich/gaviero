@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS file_hashes (
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
 CREATE INDEX IF NOT EXISTS idx_nodes_qn   ON nodes(qualified_name);
+-- Name lookup for go-to-definition. `GraphStore::open` executes this schema on
+-- every startup, so an existing database gains the index the next time the TUI
+-- (or any other writer) opens it. No separate migration.
+CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_edges_src  ON edges(source_qn);
 CREATE INDEX IF NOT EXISTS idx_edges_tgt  ON edges(target_qn);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
@@ -233,6 +237,35 @@ pub struct Definition {
     pub kind: String,
     /// `impl:Type`, `impl:Type:Trait`, `trait:Name`, or `None`.
     pub owner: Option<String>,
+}
+
+/// How a [`DefinitionHit`] was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionVia {
+    /// A `Calls` / `Imports` / `Implements` edge at the queried line.
+    Edge,
+    /// A name match with no edge evidence.
+    Name,
+}
+
+/// One go-to-definition candidate ([`GraphStore::definitions_at_line`] /
+/// [`GraphStore::definitions_by_name`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionHit {
+    /// `nodes.kind`.
+    pub kind: String,
+    /// `nodes.name`.
+    pub name: String,
+    pub qualified_name: String,
+    /// Workspace-relative, `/`-separated.
+    pub file_path: String,
+    /// 0-based first line.
+    pub line_start: Option<i64>,
+    /// 0-based last line, inclusive.
+    pub line_end: Option<i64>,
+    /// 0-based reference site; `None` for name hits.
+    pub edge_line: Option<i64>,
+    pub via: DefinitionVia,
 }
 
 /// One `file_extraction` row: the persisted extraction outcome of a path.
@@ -800,6 +833,23 @@ impl GraphStore {
         migrate_typed_edges(&conn)?;
         migrate_unique_edges(&conn)?;
         migrate_node_owner(&conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Open an existing graph database without creating it, running schema
+    /// migrations, or taking a write lock. `query_only` rejects every write at
+    /// the SQLite level; the connection may still create WAL side files.
+    pub fn open_query_only(db_path: &Path) -> Result<Self> {
+        if !db_path.is_file() {
+            anyhow::bail!("graph database not found: {}", db_path.display());
+        }
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening graph db (query only): {}", db_path.display()))?;
+        conn.execute_batch("PRAGMA query_only=1; PRAGMA busy_timeout=1000;")?;
         Ok(Self { conn })
     }
 
@@ -1860,6 +1910,77 @@ impl GraphStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ── Go-to-definition ─────────────────────────────────────────
+
+    /// Definition candidates referenced at `line` (0-based) of `file_path`.
+    /// Excludes `Defines` edges; joins to the target node.
+    pub fn definitions_at_line(&self, file_path: &str, line: i64) -> Result<Vec<DefinitionHit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.kind, n.name, n.qualified_name, n.file_path, n.line_start, n.line_end, e.line
+             FROM edges e JOIN nodes n ON n.qualified_name = e.target_qn
+             WHERE e.file_path = ?1 AND e.line = ?2
+               AND e.kind IN ('Calls','Imports','Implements')
+             ORDER BY CASE e.kind WHEN 'Calls' THEN 0 WHEN 'Implements' THEN 1 ELSE 2 END,
+                      n.file_path, n.line_start",
+        )?;
+        let rows = stmt.query_map(params![file_path, line], |row| {
+            Ok(DefinitionHit {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                qualified_name: row.get(2)?,
+                file_path: row.get(3)?,
+                line_start: row.get(4)?,
+                line_end: row.get(5)?,
+                edge_line: row.get(6)?,
+                via: DefinitionVia::Edge,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Definitions named exactly `name`, ranked same-file, same-directory,
+    /// then line. Excludes `File` nodes. At most 50 rows.
+    pub fn definitions_by_name(&self, name: &str, prefer_file: &str) -> Result<Vec<DefinitionHit>> {
+        let dir = prefer_file
+            .rfind('/')
+            .map(|i| &prefer_file[..i])
+            .filter(|d| !d.is_empty());
+        // A directory miss must never match: `\u{0}` cannot appear in a path.
+        let dir_prefix = match dir {
+            Some(dir) => format!("{}/%", escape_like(dir)),
+            None => "\u{0}".to_string(),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, name, qualified_name, file_path, line_start, line_end
+             FROM nodes
+             WHERE name = ?1 AND kind != 'File'
+             ORDER BY (file_path = ?2) DESC,
+                      (file_path LIKE ?3 ESCAPE '\\') DESC,
+                      line_start, qualified_name
+             LIMIT 50",
+        )?;
+        let rows = stmt.query_map(params![name, prefer_file, dir_prefix], |row| {
+            Ok(DefinitionHit {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                qualified_name: row.get(2)?,
+                file_path: row.get(3)?,
+                line_start: row.get(4)?,
+                line_end: row.get(5)?,
+                edge_line: None,
+                via: DefinitionVia::Name,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+/// Escape the `LIKE` metacharacters (and the escape char itself) in `s`.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -2768,5 +2889,248 @@ mod tests {
             "interrupt took {:?}",
             started.elapsed()
         );
+    }
+
+    // ── Go-to-definition ─────────────────────────────────────────
+
+    fn function_at(store: &GraphStore, name: &str, file: &str, line: i64) -> String {
+        let qn = format!("{file}::{name}");
+        store
+            .upsert_node(
+                NodeKind::Function,
+                name,
+                &qn,
+                file,
+                Some(line),
+                Some(line),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        qn
+    }
+
+    #[test]
+    fn nav_query_only_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".gaviero").join("code_graph.db");
+        {
+            let store = GraphStore::open(&db).unwrap();
+            function_at(&store, "helper", "src/lib.rs", 0);
+        }
+
+        let ro = GraphStore::open_query_only(&db).unwrap();
+        let nodes = ro.nodes_for_file("src/lib.rs").unwrap();
+        assert_eq!(nodes.len(), 1);
+        let write = ro.conn.execute(
+            "INSERT INTO nodes (kind, name, qualified_name, file_path) VALUES ('Function','x','x::x','x')",
+            [],
+        );
+        assert!(write.is_err(), "a query-only connection must reject INSERT");
+
+        assert!(
+            GraphStore::open_query_only(&dir.path().join("missing.db")).is_err(),
+            "a missing database is an error, never created"
+        );
+    }
+
+    #[test]
+    fn nav_definition_at_line_finds_call_target() {
+        let store = GraphStore::open_memory().unwrap();
+        let caller = function_at(&store, "caller", "a.rs", 0);
+        let helper = function_at(&store, "helper", "b.rs", 40);
+        store
+            .insert_edge(EdgeKind::Calls, &caller, &helper, "a.rs", 7)
+            .unwrap();
+
+        let hits = store.definitions_at_line("a.rs", 7).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].qualified_name, "b.rs::helper");
+        assert_eq!(hits[0].edge_line, Some(7));
+        assert_eq!(hits[0].via, DefinitionVia::Edge);
+    }
+
+    #[test]
+    fn nav_definition_at_line_ignores_defines_edges() {
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(NodeKind::File, "a.rs", "a.rs", "a.rs", None, None, Some("rust"), None)
+            .unwrap();
+        let helper = function_at(&store, "helper", "a.rs", 3);
+        store
+            .insert_edge(EdgeKind::Defines, "a.rs", &helper, "a.rs", 3)
+            .unwrap();
+
+        assert!(store.definitions_at_line("a.rs", 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nav_definition_at_line_misses_a_second_call_site() {
+        let store = GraphStore::open_memory().unwrap();
+        let caller = function_at(&store, "caller", "a.rs", 0);
+        let helper = function_at(&store, "helper", "b.rs", 40);
+        store
+            .insert_edge(EdgeKind::Calls, &caller, &helper, "a.rs", 7)
+            .unwrap();
+        // `idx_edges_unique` keeps the first site for a (kind, source, target,
+        // file) tuple; the second insert is ignored. Known limitation.
+        store
+            .insert_edge(EdgeKind::Calls, &caller, &helper, "a.rs", 9)
+            .unwrap();
+
+        assert_eq!(store.definitions_at_line("a.rs", 7).unwrap().len(), 1);
+        assert!(
+            store.definitions_at_line("a.rs", 9).unwrap().is_empty(),
+            "the unique edge index keeps only the first call site"
+        );
+    }
+
+    #[test]
+    fn nav_definitions_by_name_prefers_same_file_then_directory() {
+        let store = GraphStore::open_memory().unwrap();
+        function_at(&store, "a", "src/a.rs", 1);
+        function_at(&store, "a", "src/sub/a.rs", 2);
+        function_at(&store, "a", "other/a.rs", 3);
+
+        let order: Vec<String> = store
+            .definitions_by_name("a", "src/a.rs")
+            .unwrap()
+            .into_iter()
+            .map(|h| h.file_path)
+            .collect();
+        assert_eq!(order, vec!["src/a.rs", "src/sub/a.rs", "other/a.rs"]);
+    }
+
+    #[test]
+    fn nav_definitions_by_name_excludes_file_nodes() {
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(NodeKind::File, "helper", "src/helper", "src/helper", None, None, None, None)
+            .unwrap();
+        function_at(&store, "helper", "src/lib.rs", 4);
+
+        let hits = store.definitions_by_name("helper", "src/lib.rs").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].qualified_name, "src/lib.rs::helper");
+        assert_eq!(hits[0].via, DefinitionVia::Name);
+        assert_eq!(hits[0].edge_line, None);
+    }
+
+    #[test]
+    fn nav_name_index_is_used() {
+        let store = GraphStore::open_memory().unwrap();
+        store.begin_transaction().unwrap();
+        for i in 0..10_000 {
+            let name = format!("sym_{i:05}");
+            let file = format!("src/f{:04}.rs", i % 200);
+            let qn = format!("{file}::{name}");
+            let line = i as i64;
+            store
+                .upsert_node(
+                    NodeKind::Function,
+                    &name,
+                    &qn,
+                    &file,
+                    Some(line),
+                    Some(line),
+                    Some("rust"),
+                    None,
+                )
+                .unwrap();
+        }
+        store.commit().unwrap();
+
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT kind, name, qualified_name, file_path, line_start, line_end
+                 FROM nodes
+                 WHERE name = ?1 AND kind != 'File'
+                 ORDER BY (file_path = ?2) DESC,
+                          (file_path LIKE ?3 ESCAPE '\\') DESC,
+                          line_start, qualified_name
+                 LIMIT 50",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["sym_05000", "src/f0100.rs", "src/%"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|d| d.contains("USING INDEX idx_nodes_name")),
+            "name lookup must use the index; plan: {plan:?}"
+        );
+    }
+
+    /// Budget benchmark for the definition path: a fresh query-only connection
+    /// plus one query per iteration, 10k nodes / 15k edges.
+    #[test]
+    fn nav_definition_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".gaviero").join("code_graph.db");
+        let store = GraphStore::open(&db).unwrap();
+        store.begin_transaction().unwrap();
+        for i in 0..10_000usize {
+            let name = format!("sym_{i:05}");
+            let file = format!("src/f{:04}.rs", i % 200);
+            let qn = format!("{file}::{name}");
+            let line = i as i64;
+            store
+                .upsert_node(
+                    NodeKind::Function,
+                    &name,
+                    &qn,
+                    &file,
+                    Some(line),
+                    Some(line),
+                    Some("rust"),
+                    None,
+                )
+                .unwrap();
+        }
+        for i in 0..15_000usize {
+            let src_file = format!("src/f{:04}.rs", i % 200);
+            let tgt_idx = (i % 10_000 + i / 10_000) % 10_000;
+            let src = format!("src/f{:04}.rs::sym_{:05}", i % 200, i % 10_000);
+            let tgt = format!("src/f{:04}.rs::sym_{tgt_idx:05}", (i + 7) % 200);
+            store
+                .insert_edge(EdgeKind::Calls, &src, &tgt, &src_file, (i % 50) as i64)
+                .unwrap();
+        }
+        store.commit().unwrap();
+        // Keep the writer connection open, as production does: the TUI's
+        // `GraphService` writer thread holds one for the process lifetime. With
+        // no other connection, every `open_query_only`/drop pair would recreate
+        // and checkpoint-delete the `-wal`/`-shm` files, measuring file churn
+        // rather than the query.
+        let _writer = store;
+
+        for _ in 0..10 {
+            let s = GraphStore::open_query_only(&db).unwrap();
+            let _ = s.definitions_by_name("sym_05000", "src/f0100.rs").unwrap();
+            let _ = s.definitions_at_line("src/f0100.rs", 7).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let s = GraphStore::open_query_only(&db).unwrap();
+            let _ = s.definitions_by_name("sym_05000", "src/f0100.rs").unwrap();
+        }
+        let name_total = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let s = GraphStore::open_query_only(&db).unwrap();
+            let _ = s.definitions_at_line("src/f0100.rs", 7).unwrap();
+        }
+        let line_total = started.elapsed().as_millis();
+
+        println!("nav_definition_budget: name_total={name_total}ms line_total={line_total}ms");
+        assert!(name_total < 1_500, "definitions_by_name x1000 took {name_total}ms");
+        assert!(line_total < 1_000, "definitions_at_line x1000 took {line_total}ms");
     }
 }

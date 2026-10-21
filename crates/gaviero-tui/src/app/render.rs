@@ -56,6 +56,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if app.settings_error_dialog.is_some() {
             app.render_settings_error_dialog(frame, size);
         }
+        if app.definition_picker.is_some() {
+            super::nav::render_picker(app, frame, size);
+        }
         return;
     }
 
@@ -209,6 +212,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.settings_error_dialog.is_some() {
         app.render_settings_error_dialog(frame, size);
     }
+    if app.definition_picker.is_some() {
+        super::nav::render_picker(app, frame, size);
+    }
 }
 
 pub(super) fn render_fullscreen(app: &mut App, frame: &mut Frame, area: Rect, panel: Focus) {
@@ -269,6 +275,8 @@ pub(super) fn side_panel_title(app: &App, fullscreen: bool) -> &'static str {
         (SidePanelMode::GitPanel, true) => "GIT (fullscreen)",
         (SidePanelMode::MemoryPanel, false) => "MEMORY",
         (SidePanelMode::MemoryPanel, true) => "MEMORY (fullscreen)",
+        (SidePanelMode::CodeGraph, false) => "CODE GRAPH",
+        (SidePanelMode::CodeGraph, true) => "CODE GRAPH (fullscreen)",
     }
 }
 
@@ -1244,6 +1252,10 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         SidePanelMode::HistoryPanel => {
             app.history_panel
                 .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
+        }
+        SidePanelMode::CodeGraph => {
+            let base = app.theme.default_style();
+            app.code_graph_panel.render(area, frame.buffer_mut(), base);
         }
     }
 }

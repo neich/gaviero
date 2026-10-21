@@ -714,6 +714,19 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     return;
                 }
 
+                // Ctrl+click: go to the definition of the word under the
+                // pointer. Gutter, scrollbar, and fold-column clicks returned
+                // above, so this only sees real text.
+                if app.diff_review.is_none()
+                    && mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    app.set_cursor_from_mouse(col, row);
+                    super::nav::goto_definition(app);
+                    return;
+                }
+
                 if app.diff_review.is_none() {
                     let is_double_click = app
                         .last_click
@@ -742,6 +755,23 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 && area.contains((col, row).into())
             {
                 app.focus = Focus::SidePanel;
+
+                // Must run before the chat scrollbar branch below, or a click
+                // in the panel's rightmost column is routed to the chat.
+                if app.side_panel == SidePanelMode::CodeGraph
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                {
+                    let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+                    if col == body.x + body.width.saturating_sub(1)
+                        && body.contains((col, row).into())
+                    {
+                        app.scrollbar_dragging = Some(ScrollbarTarget::CodeGraph);
+                        app.scroll_panel_to_row(ScrollbarTarget::CodeGraph, row);
+                        return;
+                    }
+                    super::side_panel::click_code_graph(app, area, col, row);
+                    return;
+                }
 
                 if app.side_panel == SidePanelMode::AgentChat && row == area.y {
                     let tab_area_x = area.x + 1;
@@ -1285,6 +1315,18 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             app.history_panel
                 .scroll_section(if up { -delta } else { delta });
         }
+        SidePanelMode::CodeGraph => {
+            // Must not fall through to the chat arm: this panel has its own
+            // scroll state and no chat transcript.
+            let delta = theme::MOUSE_SCROLL_DELTA;
+            if up {
+                app.code_graph_panel.scroll.scroll_up(delta);
+            } else {
+                app.code_graph_panel
+                    .scroll
+                    .scroll_down(delta, app.code_graph_panel.lines.len());
+            }
+        }
         _ => {
             // Wheel while chat is focused: prefer the overflowing prompt unless
             // the pointer is explicitly over the transcript. Focus-first routing
@@ -1539,6 +1581,28 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .min(area.height.saturating_sub(1)) as usize;
             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
             app.chat_state.scroll_offset = (fraction * max_scroll as f64)
+                .round()
+                .min(max_scroll as f64) as usize;
+        }
+        ScrollbarTarget::CodeGraph => {
+            let Some(area) = app.layout.side_panel_area else {
+                return;
+            };
+            let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+            let track_height = body.height as usize;
+            if track_height == 0 {
+                return;
+            }
+            let panel = &mut app.code_graph_panel;
+            let max_scroll = panel.max_scroll(track_height);
+            if max_scroll == 0 {
+                return;
+            }
+            let row_in_track = row
+                .saturating_sub(body.y)
+                .min(body.height.saturating_sub(1)) as usize;
+            let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+            panel.scroll.offset = (fraction * max_scroll as f64)
                 .round()
                 .min(max_scroll as f64) as usize;
         }
@@ -2681,5 +2745,69 @@ mod tests {
             wheel_target(Focus::SidePanel, &v, Some(Focus::FileTree)),
             WheelTarget::FileTree
         );
+    }
+
+    // ── Ctrl+click go-to-definition ──────────────────────────────
+
+    /// `src/a.rs` calls `helper` defined in `src/b.rs`; the editor is 120
+    /// columns wide with the default gutter.
+    fn ctrl_click_fixture(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "pub fn caller() { helper(); }\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "pub fn helper() {}\n").unwrap();
+        gaviero_core::repo_map::graph_builder::build_graph(dir, &[]).unwrap();
+
+        let mut app = agent_edit_app(dir);
+        app.layout.editor_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        crate::app::editing::open_file(&mut app, &dir.join("src/a.rs"));
+        app.focus = Focus::Editor;
+        app
+    }
+
+    fn callee_screen_pos(app: &App, line: usize, char_col: usize) -> (u16, u16) {
+        let area = app.layout.editor_area;
+        let gutter = crate::editor::view::gutter_width(app.buffers[app.active_buffer].line_count());
+        (area.x + gutter + char_col as u16, area.y + line as u16)
+    }
+
+    #[test]
+    fn nav_ctrl_click_opens_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ctrl_click_fixture(dir.path());
+        let (column, row) = callee_screen_pos(&app, 0, 18);
+
+        app.handle_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::CONTROL,
+        }));
+
+        let path = app.buffers[app.active_buffer]
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        assert!(path.ends_with("/src/b.rs"), "opened {path}");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn nav_plain_click_only_moves_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ctrl_click_fixture(dir.path());
+        let (column, row) = callee_screen_pos(&app, 0, 18);
+        let opened = app.buffers.len();
+
+        app.handle_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+
+        assert_eq!(app.buffers.len(), opened, "a plain click must not navigate");
+        assert_eq!(app.buffers[app.active_buffer].cursor.col, 18);
+        cleanup_session(dir.path());
     }
 }
