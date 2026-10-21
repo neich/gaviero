@@ -26,6 +26,7 @@ pub mod dsh;
 #[cfg(test)]
 pub mod fake;
 pub mod map;
+mod permission;
 pub mod rpc;
 
 use std::collections::{HashMap, HashSet};
@@ -58,8 +59,10 @@ use crate::write_gate::WriteGatePipeline;
 
 use super::registry::SessionConstruction;
 use super::replay_compaction::compact_turn_replay;
+use super::tool_surface::AgentToolSurface;
 use super::{AgentSession, Turn};
 use dsh::{DshLaunchSpec, mcp_servers_for_session, registers_gaviero};
+use permission::{PermissionPlan, ToolCallLog, plan_permission};
 use rpc::{IncomingRequest, JsonRpcChild, JsonRpcHandle};
 
 pub struct AcpClientSession {
@@ -971,6 +974,19 @@ fn resolve_acp_path(session_cwd: &Path, workspace_root: &Path, raw: &str) -> Pat
     from_session
 }
 
+/// Stream one `session/update` and record it for permission lookups.
+async fn forward_update(
+    notification: &Value,
+    workspace_root: &Path,
+    tx: &mpsc::Sender<Result<UnifiedStreamEvent>>,
+    tool_calls: &mut ToolCallLog,
+) {
+    tool_calls.observe(notification);
+    for ev in map::map_session_update(notification, workspace_root) {
+        let _ = tx.send(Ok(ev)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     req: IncomingRequest,
@@ -983,6 +999,8 @@ async fn handle_incoming(
     conv_id: Option<&str>,
     file_scope: &FileScope,
     auto_approve: bool,
+    tool_surface: &AgentToolSurface,
+    tool_calls: &ToolCallLog,
     gate_written: &mut HashSet<PathBuf>,
 ) {
     match req.method.as_str() {
@@ -1095,20 +1113,30 @@ async fn handle_incoming(
                         .to_string()
                 })
             });
-            let allowed = if auto_approve {
-                true
-            } else {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                observer.on_permission_request(
-                    "acp",
-                    req.params
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ACP permission"),
-                    &req.params,
-                    tx,
-                );
-                matches!(rx.await, Ok(PermissionDecision::Allow { .. }))
+            // Shell escalations follow the workspace tool policy, like Codex
+            // command approvals; only what the policy leaves open reaches the
+            // user (see `permission.rs`).
+            let allowed = match plan_permission(
+                &req.params,
+                tool_calls,
+                tool_surface,
+                auto_approve,
+                workspace_root,
+            ) {
+                PermissionPlan::Allow => true,
+                PermissionPlan::Reject => {
+                    tracing::debug!(params = %req.params, "dsh: permission rejected by tool policy");
+                    false
+                }
+                PermissionPlan::Ask {
+                    tool_name,
+                    description,
+                    input,
+                } => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    observer.on_permission_request(&tool_name, &description, &input, tx);
+                    matches!(rx.await, Ok(PermissionDecision::Allow { .. }))
+                }
             };
             let option_id = if allowed {
                 allow_id.unwrap_or_else(|| "allow-once".into())
@@ -1439,6 +1467,7 @@ impl AgentSession for AcpClientSession {
         let cancel = self.cancel_token.clone();
         let agent_id = self.agent_id.clone();
         let conv_id = self.conv_id.clone();
+        let tool_surface = AgentToolSurface::from_agent_options(&self.options, &self.workspace_root);
 
         // Take the live session so the task can own the RPC child.
         let mut live = self.inner.take().expect("ensure_running");
@@ -1458,6 +1487,7 @@ impl AgentSession for AcpClientSession {
             );
             tokio::pin!(prompt_fut);
             let mut prompt_result: Option<Result<Value>> = None;
+            let mut tool_calls = ToolCallLog::default();
             loop {
                 tokio::select! {
                     biased;
@@ -1466,6 +1496,13 @@ impl AgentSession for AcpClientSession {
                         break;
                     }
                     Some(req) = live.rpc.incoming.recv() => {
+                        // The reader dispatches in wire order, and dsh flushes a
+                        // call's `tool_call` update before asking permission for
+                        // it — drain what is already queued so the permission
+                        // policy can see that call.
+                        while let Ok(n) = live.rpc.notifications.try_recv() {
+                            forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                        }
                         handle_incoming(
                             req,
                             &handle,
@@ -1477,14 +1514,14 @@ impl AgentSession for AcpClientSession {
                             conv_id.as_deref(),
                             &file_scope,
                             auto_approve,
+                            &tool_surface,
+                            &tool_calls,
                             &mut live.gate_written,
                         )
                         .await;
                     }
                     Some(n) = live.rpc.notifications.recv() => {
-                        for ev in map::map_session_update(&n, &workspace_root) {
-                            let _ = tx.send(Ok(ev)).await;
-                        }
+                        forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
                     }
                     result = &mut prompt_fut, if prompt_result.is_none() => {
                         prompt_result = Some(result);
@@ -1499,6 +1536,9 @@ impl AgentSession for AcpClientSession {
             }
             // Drain leftovers that raced with prompt completion.
             while let Ok(req) = live.rpc.incoming.try_recv() {
+                while let Ok(n) = live.rpc.notifications.try_recv() {
+                    forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                }
                 handle_incoming(
                     req,
                     &handle,
@@ -1510,14 +1550,14 @@ impl AgentSession for AcpClientSession {
                     conv_id.as_deref(),
                     &file_scope,
                     auto_approve,
+                    &tool_surface,
+                    &tool_calls,
                     &mut live.gate_written,
                 )
                 .await;
             }
             while let Ok(n) = live.rpc.notifications.try_recv() {
-                for ev in map::map_session_update(&n, &workspace_root) {
-                    let _ = tx.send(Ok(ev)).await;
-                }
+                forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
             }
             let reusable = matches!(&prompt_result, Some(Ok(_)));
             match prompt_result {
