@@ -60,22 +60,24 @@ fn resolve_targets(
     let (_, rel) = rel_for(app, abs)
         .ok_or_else(|| anyhow::anyhow!("file is outside its workspace folder"))?;
 
+    // Only a hit named `ident` answers the click. An edge on the line that
+    // targets another name is evidence for a different identifier
+    // (`self.count = compute();` clicked on `count`), so it is never a
+    // fallback: a miss is reported, never guessed.
     let mut hits = service.with_query_reader(|store| {
-        let mut hits = store.definitions_at_line(&rel, line as i64)?;
-        if hits.len() > 1 {
-            let named: Vec<DefinitionHit> =
-                hits.iter().filter(|h| h.name == ident).cloned().collect();
-            if !named.is_empty() {
-                hits = named;
-            }
-        }
+        let hits: Vec<DefinitionHit> = store
+            .definitions_at_line(&rel, line as i64)?
+            .into_iter()
+            .filter(|h| h.name == ident)
+            .collect();
         if hits.is_empty() {
-            hits = store.definitions_by_name(ident, &rel)?;
+            return store.definitions_by_name(ident, &rel);
         }
         Ok(hits)
     })?;
 
-    hits.dedup_by(|a, b| a.qualified_name == b.qualified_name);
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|h| seen.insert(h.qualified_name.clone()));
     hits.sort_by(|a, b| {
         (a.file_path != rel)
             .cmp(&(b.file_path != rel))
@@ -167,7 +169,7 @@ pub(super) fn goto_definition(app: &mut App) {
         let hit = &hits[0];
         let target = root.join(&hit.file_path);
         let (line, name) = (hit.line_start.unwrap_or(0).max(0) as usize, hit.name.clone());
-        open_file_at(app, &target, line, 0, Some(&name));
+        jump_to(app, &target, line, &name);
         return;
     }
     app.definition_picker = Some(DefinitionPicker {
@@ -178,16 +180,40 @@ pub(super) fn goto_definition(app: &mut App) {
     });
 }
 
+/// Go-to-definition's jump: open the definition, then let a visible CODE
+/// GRAPH panel follow it, so the panel shows the symbol just reached (its
+/// callers and callees). A hidden panel stays hidden.
+fn jump_to(app: &mut App, target: &std::path::Path, line: usize, name: &str) {
+    if open_file_at(app, target, line, 0, Some(name)) {
+        super::side_panel::show_symbol_graph(app, false);
+    }
+}
+
+/// Open `path` and place the cursor. Returns false (with a status) when the
+/// file could not be opened; the current buffer is then left untouched.
 pub(super) fn open_file_at(
     app: &mut App,
     path: &std::path::Path,
     line: usize,
     col: usize,
     ident: Option<&str>,
-) {
+) -> bool {
     super::editing::open_file(app, path);
+    // `open_file` only logs a failure and keeps the old buffer active; moving
+    // the cursor then would jump the wrong file (a stale graph row pointing
+    // at a deleted or renamed file).
+    let target = crate::editor::buffer::Buffer::resolve_editor_path(path);
+    let opened = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.as_deref())
+        .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &target));
+    if !opened {
+        status(app, format!("Cannot open {}", path.display()));
+        return false;
+    }
     let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
-        return;
+        return false;
     };
     let line = line.min(buf.line_count().saturating_sub(1));
     buf.cursor.line = line;
@@ -203,6 +229,7 @@ pub(super) fn open_file_at(
     buf.scroll.top_line = line.saturating_sub(10);
     app.ensure_editor_cursor_visible();
     app.focus = Focus::Editor;
+    true
 }
 
 /// Consume every key while the picker is open. Returns false when it is closed.
@@ -228,7 +255,7 @@ pub(super) fn handle_picker_key(app: &mut App, key: &KeyEvent) -> bool {
                 let target = p.root.join(&hit.file_path);
                 let line = hit.line_start.unwrap_or(0).max(0) as usize;
                 let name = hit.name.clone();
-                open_file_at(app, &target, line, 0, Some(&name));
+                jump_to(app, &target, line, &name);
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => app.definition_picker = None,
@@ -431,6 +458,83 @@ mod tests {
             .map(|(m, _)| m.clone())
             .unwrap_or_default();
         assert!(message.contains("No graph definition"), "{message}");
+        cleanup_session(dir.path());
+    }
+
+    /// The only edge on the line targets `helper`; a click on the local
+    /// `count` must report a miss, not jump to `helper`.
+    #[test]
+    fn nav_goto_definition_does_not_guess_another_symbol_on_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "pub fn helper() -> i32 { 1 }\npub fn caller() { let count = helper(); }\n",
+        );
+        gaviero_core::repo_map::graph_builder::build_graph(dir.path(), &[]).unwrap();
+        let mut app = graph_app(dir.path());
+        super::super::editing::open_file(&mut app, &dir.path().join("src/lib.rs"));
+        app.focus = Focus::Editor;
+        app.buffers[app.active_buffer].cursor.line = 1;
+        app.buffers[app.active_buffer].cursor.col = 24; // inside `count`
+
+        goto_definition(&mut app);
+
+        assert!(app.definition_picker.is_none());
+        assert_eq!(app.buffers[app.active_buffer].cursor.line, 1, "the cursor must not move");
+        let message = app
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(message.contains("No graph definition for 'count'"), "{message}");
+        cleanup_session(dir.path());
+    }
+
+    /// A name on a line whose edge targets another symbol still resolves by
+    /// name: `Widget` goes to the struct, not to the `make` call.
+    #[test]
+    fn nav_goto_definition_falls_back_to_the_name_when_the_edge_is_another_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "pub struct Widget;\npub fn make() -> Widget { Widget }\npub fn caller() { let _w: Widget = make(); }\n",
+        );
+        gaviero_core::repo_map::graph_builder::build_graph(dir.path(), &[]).unwrap();
+        let mut app = graph_app(dir.path());
+        super::super::editing::open_file(&mut app, &dir.path().join("src/lib.rs"));
+        app.focus = Focus::Editor;
+        app.buffers[app.active_buffer].cursor.line = 2;
+        app.buffers[app.active_buffer].cursor.col = 28; // inside `Widget`
+
+        goto_definition(&mut app);
+
+        assert!(app.definition_picker.is_none());
+        assert_eq!(app.buffers[app.active_buffer].cursor.line, 0);
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn nav_open_file_at_a_missing_file_leaves_the_buffer_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "one\ntwo\nthree\n");
+        let mut app = graph_app(dir.path());
+        super::super::editing::open_file(&mut app, &dir.path().join("src/a.rs"));
+        let before = (app.active_buffer, app.buffers.len());
+
+        let opened = open_file_at(&mut app, &dir.path().join("src/gone.rs"), 2, 0, None);
+
+        assert!(!opened);
+        assert_eq!((app.active_buffer, app.buffers.len()), before);
+        assert!(active_rel(&app).ends_with("/src/a.rs"), "{}", active_rel(&app));
+        assert_eq!(app.buffers[app.active_buffer].cursor.line, 0, "the cursor must not move");
+        let message = app
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(message.contains("Cannot open"), "{message}");
         cleanup_session(dir.path());
     }
 

@@ -761,6 +761,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 if app.side_panel == SidePanelMode::CodeGraph
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 {
+                    let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+                    if col == body.x + body.width.saturating_sub(1)
+                        && body.contains((col, row).into())
+                    {
+                        app.scrollbar_dragging = Some(ScrollbarTarget::CodeGraph);
+                        app.scroll_panel_to_row(ScrollbarTarget::CodeGraph, row);
+                        return;
+                    }
                     super::side_panel::click_code_graph(app, area, col, row);
                     return;
                 }
@@ -1573,6 +1581,28 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .min(area.height.saturating_sub(1)) as usize;
             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
             app.chat_state.scroll_offset = (fraction * max_scroll as f64)
+                .round()
+                .min(max_scroll as f64) as usize;
+        }
+        ScrollbarTarget::CodeGraph => {
+            let Some(area) = app.layout.side_panel_area else {
+                return;
+            };
+            let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+            let track_height = body.height as usize;
+            if track_height == 0 {
+                return;
+            }
+            let panel = &mut app.code_graph_panel;
+            let max_scroll = panel.max_scroll(track_height);
+            if max_scroll == 0 {
+                return;
+            }
+            let row_in_track = row
+                .saturating_sub(body.y)
+                .min(body.height.saturating_sub(1)) as usize;
+            let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+            panel.scroll.offset = (fraction * max_scroll as f64)
                 .round()
                 .min(max_scroll as f64) as usize;
         }

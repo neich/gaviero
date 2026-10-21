@@ -3260,6 +3260,49 @@ fn graph_symbol_row(symbol: &gaviero_core::repo_map::Symbol) -> SymbolRow {
     }
 }
 
+/// Point the panel at `(root, rel)` with no rows and no rendered document.
+/// Recording the file is what stops `maybe_refresh_code_graph_panel` from
+/// retrying it on every event.
+fn reset_code_graph_rows(app: &mut App, root: PathBuf, rel: String, depth: usize) {
+    let panel = &mut app.code_graph_panel;
+    panel.graph_ready = false;
+    panel.source_file = rel;
+    panel.root = root;
+    panel.depth = depth;
+    panel.status.clear();
+    panel.symbols.clear();
+    panel.total_symbols = 0;
+    panel.dependencies.clear();
+    panel.total_dependencies = 0;
+    panel.dependents.clear();
+    panel.total_dependents = 0;
+    panel.referenced_by.clear();
+    panel.references.clear();
+    panel.symbol_name = None;
+    panel.rendered_width = 0;
+    panel.lines.clear();
+    panel.links.clear();
+    panel.selected_link = None;
+}
+
+/// Replace the document with the query error. The previous file's document
+/// must not stay on screen under the new file's name, and the failed file is
+/// recorded so the per-event hook does not re-run the failing query; `r`
+/// retries explicitly.
+fn show_code_graph_error(
+    app: &mut App,
+    root: PathBuf,
+    rel: String,
+    depth: usize,
+    error: &anyhow::Error,
+) {
+    let markdown = format!("# {rel}\n\nGraph query failed: {error}\n\nPress r to retry.\n");
+    reset_code_graph_rows(app, root, rel, depth);
+    let panel = &mut app.code_graph_panel;
+    panel.markdown = markdown;
+    panel.status = "graph query failed".to_string();
+}
+
 fn graph_edge_via(witness: &gaviero_core::repo_map::store::FileEdgeWitness) -> String {
     format!(
         "{}:{} → {}",
@@ -3302,25 +3345,7 @@ pub(super) fn refresh_code_graph_panel(app: &mut App) -> anyhow::Result<()> {
     // The graph was never built for this folder: say so and stop. Setting
     // `source_file` matters, or `maybe_refresh` retries on every event.
     if !service.db_path().is_file() {
-        let panel = &mut app.code_graph_panel;
-        panel.graph_ready = false;
-        panel.source_file = rel.clone();
-        panel.root = root;
-        panel.depth = depth;
-        panel.status.clear();
-        panel.symbols.clear();
-        panel.total_symbols = 0;
-        panel.dependencies.clear();
-        panel.total_dependencies = 0;
-        panel.dependents.clear();
-        panel.total_dependents = 0;
-        panel.referenced_by.clear();
-        panel.references.clear();
-        panel.symbol_name = None;
-        panel.rendered_width = 0;
-        panel.lines.clear();
-        panel.links.clear();
-        panel.selected_link = None;
+        reset_code_graph_rows(app, root, rel.clone(), depth);
         let markdown = {
             let doc = GraphDoc {
                 rel: &rel,
@@ -3377,7 +3402,7 @@ pub(super) fn refresh_code_graph_panel(app: &mut App) -> anyhow::Result<()> {
         witnesses: Option<Vec<gaviero_core::repo_map::store::FileEdgeWitness>>,
     }
 
-    let out = service.with_query_reader(|store| {
+    let queried = service.with_query_reader(|store| {
         let mut out = QueryOut {
             symbols: Vec::new(),
             total_symbols: 0,
@@ -3414,6 +3439,9 @@ pub(super) fn refresh_code_graph_panel(app: &mut App) -> anyhow::Result<()> {
                 .find(|hit| hit.name == ident)
                 .map(|hit| hit.qualified_name);
             if qn.is_none() {
+                // A definition line has no reference edge; the name lookup
+                // ranks the same file first, so the symbol under the cursor
+                // wins over same-named symbols elsewhere.
                 qn = store
                     .definitions_by_name(ident, &rel)?
                     .into_iter()
@@ -3438,7 +3466,14 @@ pub(super) fn refresh_code_graph_panel(app: &mut App) -> anyhow::Result<()> {
             out.witnesses = Some(store.file_edge_witnesses()?);
         }
         Ok(out)
-    })?;
+    });
+    let out = match queried {
+        Ok(out) => out,
+        Err(e) => {
+            show_code_graph_error(app, root, rel, depth, &e);
+            return Err(e);
+        }
+    };
 
     if snapshot.is_none() {
         symbols = out.symbols;
@@ -3563,6 +3598,39 @@ pub(super) fn refresh_code_graph_panel(app: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Show the CODE GRAPH document for the symbol under the editor cursor.
+///
+/// `open` shows the panel when it is hidden or in another mode (`Alt+S`);
+/// otherwise only an already-visible CODE GRAPH panel follows (after
+/// go-to-definition). Focus never moves, so the editor keeps the keyboard;
+/// the scroll returns to the top, where the symbol's references are.
+pub(super) fn show_symbol_graph(app: &mut App, open: bool) {
+    let visible = app.panel_visible.side_panel && app.side_panel == SidePanelMode::CodeGraph;
+    if !visible && !open {
+        return;
+    }
+    app.panel_visible.side_panel = true;
+    app.side_panel = SidePanelMode::CodeGraph;
+    let ident = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.identifier_at_cursor());
+    if !refresh_with_status(app) {
+        return;
+    }
+    let panel = &mut app.code_graph_panel;
+    panel.scroll.reset();
+    panel.selected_link = None;
+    if !panel.graph_ready {
+        return;
+    }
+    match (ident, panel.symbol_name.is_some()) {
+        (None, _) => panel.status = "No identifier under the cursor".to_string(),
+        (Some(ident), false) => panel.status = format!("No graph symbol for '{ident}'"),
+        (Some(_), true) => {}
+    }
+}
+
 /// Cheap per-event check: refresh only when the visible panel's source file
 /// no longer matches the active buffer.
 pub(super) fn maybe_refresh_code_graph_panel(app: &mut App) {
@@ -3575,7 +3643,13 @@ pub(super) fn maybe_refresh_code_graph_panel(app: &mut App) {
     let Some((_, rel)) = super::nav::rel_for(app, &abs) else {
         return;
     };
-    if rel == app.code_graph_panel.source_file {
+    // Compare the folder too: two workspace folders can both hold
+    // `src/lib.rs`, and the panel's links resolve against its `root`.
+    let same_root = app
+        .graph_services
+        .containing(&abs)
+        .is_some_and(|(_, service)| service.root() == app.code_graph_panel.root.as_path());
+    if same_root && rel == app.code_graph_panel.source_file {
         return;
     }
     if let Err(e) = refresh_code_graph_panel(app) {
@@ -3616,8 +3690,7 @@ pub(super) fn follow_graph_link(app: &mut App, href: &str) -> bool {
                     }
                 },
             };
-            super::nav::open_file_at(app, &abs, line, 0, None);
-            true
+            super::nav::open_file_at(app, &abs, line, 0, None)
         }
         Some(MarkdownLinkTarget::External(url)) => {
             match crate::platform::open_external(&url) {
@@ -3646,8 +3719,8 @@ pub(super) fn click_code_graph(app: &mut App, area: Rect, col: u16, row: u16) ->
     let href = crate::panels::chat_markdown::preview_link_at(
         &app.code_graph_panel.lines,
         app.code_graph_panel.scroll.offset,
-        geo.body.x + 1,
-        geo.body,
+        geo.text.x + 1,
+        geo.text,
         col,
         row,
     )
@@ -3689,8 +3762,8 @@ fn select_graph_link(app: &mut App, delta: isize) {
     };
     panel.selected_link = Some(next);
     let line = panel.links[next].line;
-    panel.scroll.selected = line;
-    panel.scroll.ensure_visible();
+    // `select` flags the next render to scroll the link into view.
+    panel.scroll.select(line, panel.lines.len());
     panel.status = format!("link {}/{}: {}", next + 1, count, panel.links[next].href);
 }
 
@@ -3751,6 +3824,10 @@ pub(super) fn handle_code_graph_action(app: &mut App, action: Action) {
 pub(super) fn export_code_graph_document(app: &mut App) -> anyhow::Result<PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // No rows to export: the graph is not built, or the last query failed.
+    if !app.code_graph_panel.graph_ready {
+        anyhow::bail!("no graph document to export");
+    }
     let root = app.code_graph_panel.root.clone();
     let source_file = app.code_graph_panel.source_file.clone();
     let sanitized: String = source_file
@@ -4189,7 +4266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut markdown = String::new();
         for i in 0..60 {
-            markdown.push_str(&format!("line {i}\n"));
+            markdown.push_str(&format!("line {i}\n\n"));
         }
         let (mut app, area) = link_fixture(dir.path(), &markdown);
         let chat_before = app.chat_state.scroll_offset;
@@ -4203,6 +4280,88 @@ mod tests {
 
         assert!(app.code_graph_panel.scroll.offset > 0);
         assert_eq!(app.chat_state.scroll_offset, chat_before);
+
+        // The next frame must keep the wheel position, not snap back to the
+        // (unchanged) selection at line 0.
+        let scrolled = app.code_graph_panel.scroll.offset;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.code_graph_panel
+            .render(area, &mut buf, ratatui::style::Style::default());
+        assert_eq!(app.code_graph_panel.scroll.offset, scrolled);
+        cleanup_session(dir.path());
+    }
+
+    fn drag(app: &mut crate::app::App, column: u16, row: u16) {
+        app.handle_event(crate::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn code_graph_scrollbar_click_and_drag_scroll_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut markdown = String::new();
+        for i in 0..60 {
+            markdown.push_str(&format!("line {i}\n"));
+        }
+        let markdown = markdown.replace('\n', "\n\n");
+        let (mut app, area) = link_fixture(dir.path(), &markdown);
+        let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+        let bar_x = body.right() - 1;
+        let max = app.code_graph_panel.max_scroll(body.height as usize);
+        assert!(max > 0);
+
+        // Bottom of the track: last page, last line on the bottom row.
+        click(&mut app, bar_x, body.bottom() - 1);
+        assert_eq!(app.code_graph_panel.scroll.offset, max);
+        assert_eq!(app.focus, crate::app::state::Focus::SidePanel);
+
+        // Dragging back to the top follows the pointer.
+        drag(&mut app, bar_x, body.y);
+        assert_eq!(app.code_graph_panel.scroll.offset, 0);
+
+        // The position survives a render.
+        drag(&mut app, bar_x, body.y + body.height / 2);
+        let mid = app.code_graph_panel.scroll.offset;
+        assert!(mid > 0 && mid < max, "{mid} of {max}");
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.code_graph_panel
+            .render(area, &mut buf, ratatui::style::Style::default());
+        assert_eq!(app.code_graph_panel.scroll.offset, mid);
+        let bar: Vec<&str> = (body.y..body.bottom())
+            .map(|y| buf[(bar_x, y)].symbol())
+            .collect();
+        assert!(bar.contains(&"█") && bar.contains(&"│"), "{bar:?}");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn code_graph_next_link_scrolls_it_into_view() {
+        use crate::keymap::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut markdown = String::new();
+        for i in 0..40 {
+            markdown.push_str(&format!("line {i}\n\n"));
+        }
+        markdown.push_str("[src/b.rs:2](src/b.rs#L2)\n");
+        let (mut app, area) = link_fixture(dir.path(), &markdown);
+        assert_eq!(app.code_graph_panel.scroll.offset, 0);
+
+        super::handle_code_graph_action(&mut app, Action::InsertChar('n'));
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.code_graph_panel
+            .render(area, &mut buf, ratatui::style::Style::default());
+
+        let line = app.code_graph_panel.links[0].line;
+        let body = crate::panels::code_graph_panel::CodeGraphPanel::geometry(area).body;
+        let offset = app.code_graph_panel.scroll.offset;
+        assert!(
+            (offset..offset + body.height as usize).contains(&line),
+            "link line {line} not visible from offset {offset}"
+        );
         cleanup_session(dir.path());
     }
 
@@ -4227,6 +4386,166 @@ mod tests {
         assert!(text.contains("file://"), "{text}");
         assert!(text.contains("#L"), "{text}");
         assert!(app.code_graph_panel.status.contains("Wrote"));
+        cleanup_session(dir.path());
+    }
+
+    /// Two folders that both hold `src/lib.rs`: switching between them must
+    /// refresh, or the panel shows (and links into) the other folder.
+    #[test]
+    fn code_graph_maybe_refresh_tracks_the_folder_not_just_the_path() {
+        use crate::app::state::{Focus, SidePanelMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        write_graph_file(&one, "src/lib.rs", "pub fn one_fn() {}\n");
+        write_graph_file(&two, "src/lib.rs", "pub fn two_fn() {}\n");
+        gaviero_core::repo_map::graph_builder::build_graph(&one, &[]).unwrap();
+        gaviero_core::repo_map::graph_builder::build_graph(&two, &[]).unwrap();
+        let ws_path = tmp.path().join("demo.gaviero-workspace");
+        std::fs::write(
+            &ws_path,
+            serde_json::to_string(&serde_json::json!({
+                "folders": [{ "path": one, "name": "one" }, { "path": two, "name": "two" }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            gaviero_core::workspace::Workspace::load(&ws_path).unwrap(),
+            tx,
+        );
+        app.panel_visible.side_panel = true;
+        app.side_panel = SidePanelMode::CodeGraph;
+        app.focus = Focus::SidePanel;
+
+        crate::app::editing::open_file(&mut app, &one.join("src/lib.rs"));
+        super::refresh_code_graph_panel(&mut app).unwrap();
+        assert!(app.code_graph_panel.markdown.contains("one_fn"));
+
+        crate::app::editing::open_file(&mut app, &two.join("src/lib.rs"));
+        super::maybe_refresh_code_graph_panel(&mut app);
+        assert_eq!(app.code_graph_panel.source_file, "src/lib.rs");
+        assert!(app.code_graph_panel.root.ends_with("two"), "{:?}", app.code_graph_panel.root);
+        let markdown = &app.code_graph_panel.markdown;
+        assert!(markdown.contains("two_fn") && !markdown.contains("one_fn"), "{markdown}");
+        cleanup_session(&app.workspace_key());
+    }
+
+    /// A failing query replaces the document and records the file, so the
+    /// per-event hook does not re-run it on every key, tick, or mouse move.
+    #[test]
+    fn code_graph_query_error_is_shown_once_not_retried_per_event() {
+        let dir = tempfile::tempdir().unwrap();
+        write_graph_file(dir.path(), "src/lib.rs", "pub fn helper() {}\n");
+        let mut app = graph_app(dir.path());
+        // Present (so the panel tries to read it) but not a database.
+        std::fs::write(
+            gaviero_core::repo_map::graph_builder::graph_db_path(dir.path()),
+            "this is not a sqlite database, just text that is long enough to have a header",
+        )
+        .unwrap();
+        crate::app::editing::open_file(&mut app, &dir.path().join("src/lib.rs"));
+
+        assert!(super::refresh_code_graph_panel(&mut app).is_err());
+        assert_eq!(app.code_graph_panel.source_file, "src/lib.rs");
+        assert!(
+            app.code_graph_panel.markdown.contains("Graph query failed"),
+            "{}",
+            app.code_graph_panel.markdown
+        );
+        assert!(!app.code_graph_panel.graph_ready);
+        assert!(super::export_code_graph_document(&mut app).is_err());
+
+        app.status_message = None;
+        super::maybe_refresh_code_graph_panel(&mut app);
+        assert!(app.status_message.is_none(), "the hook must not retry the failing query");
+        cleanup_session(dir.path());
+    }
+
+    fn helper_caller_app(dir: &std::path::Path) -> crate::app::App {
+        write_graph_file(
+            dir,
+            "src/lib.rs",
+            "pub fn helper() {}\npub fn caller() { helper(); }\n",
+        );
+        gaviero_core::repo_map::graph_builder::build_graph(dir, &[]).unwrap();
+        let mut app = graph_app(dir);
+        crate::app::editing::open_file(&mut app, &dir.join("src/lib.rs"));
+        app.focus = crate::app::state::Focus::Editor;
+        app
+    }
+
+    #[test]
+    fn code_graph_alt_s_shows_the_symbol_and_keeps_editor_focus() {
+        use crate::app::state::{Focus, SidePanelMode};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = helper_caller_app(dir.path());
+        app.panel_visible.side_panel = false;
+        app.side_panel = SidePanelMode::AgentChat;
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.cursor.line = 1;
+            buf.cursor.col = 22; // inside the `helper` call
+        }
+
+        app.handle_event(crate::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::ALT,
+        )));
+
+        assert!(app.panel_visible.side_panel);
+        assert_eq!(app.side_panel, SidePanelMode::CodeGraph);
+        assert_eq!(app.focus, Focus::Editor, "Alt+S must not steal the keyboard");
+        let markdown = &app.code_graph_panel.markdown;
+        let refs = markdown.find("## References for `helper`").expect(markdown);
+        let symbols = markdown.find("## Symbols").expect(markdown);
+        assert!(refs < symbols, "references come first: {markdown}");
+        assert!(section(markdown, "### Referenced by", "### References\n").contains("caller"));
+        cleanup_session(dir.path());
+    }
+
+    /// A same-file jump does not change the active file, so only the explicit
+    /// follow can update the panel.
+    #[test]
+    fn code_graph_follows_go_to_definition_in_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = helper_caller_app(dir.path());
+        super::refresh_code_graph_panel(&mut app).unwrap();
+        assert!(!app.code_graph_panel.markdown.contains("References for `helper`"));
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.cursor.line = 1;
+            buf.cursor.col = 22;
+        }
+
+        crate::app::nav::goto_definition(&mut app);
+
+        assert_eq!(app.buffers[app.active_buffer].cursor.line, 0);
+        assert!(
+            app.code_graph_panel.markdown.contains("## References for `helper`"),
+            "{}",
+            app.code_graph_panel.markdown
+        );
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn code_graph_go_to_definition_leaves_a_hidden_panel_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = helper_caller_app(dir.path());
+        app.panel_visible.side_panel = false;
+        {
+            let buf = &mut app.buffers[app.active_buffer];
+            buf.cursor.line = 1;
+            buf.cursor.col = 22;
+        }
+
+        crate::app::nav::goto_definition(&mut app);
+
+        assert_eq!(app.buffers[app.active_buffer].cursor.line, 0);
+        assert!(!app.panel_visible.side_panel);
+        assert!(app.code_graph_panel.markdown.is_empty());
         cleanup_session(dir.path());
     }
 

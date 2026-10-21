@@ -2024,6 +2024,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     Some((format!("Graph panel: {e}"), std::time::Instant::now()));
             }
         }
+        Action::ShowSymbolGraph => super::side_panel::show_symbol_graph(app, true),
         Action::ToggleTerminal => {
             if app.focus == Focus::SidePanel && matches!(app.side_panel, SidePanelMode::AgentChat) {
                 if !app.chat_state.active_conv_busy() {

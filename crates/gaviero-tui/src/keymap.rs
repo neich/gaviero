@@ -31,6 +31,9 @@ pub enum Action {
     SetSideModeMemory,
     /// Code graph document for the active file.
     SetSideModeGraph,
+    /// Show the CODE GRAPH panel for the symbol under the editor cursor,
+    /// keeping focus where it is.
+    ShowSymbolGraph,
 
     // Editor actions
     InsertChar(char),
@@ -177,6 +180,9 @@ impl Keymap {
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
             // Alt+R: open / refresh the code graph panel (Alt+R was unbound).
             KeyCode::Char('r') | KeyCode::Char('R') if alt => Action::SetSideModeGraph,
+            // Alt+S: code graph for the symbol under the cursor (Alt+I is
+            // previous tab, Alt+F is Find).
+            KeyCode::Char('s') | KeyCode::Char('S') if alt => Action::ShowSymbolGraph,
             // Alt+Y: toggle auto-approve permissions for next prompt
             KeyCode::Char('y') if alt => Action::ToggleAutoApprove,
 
@@ -559,6 +565,23 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('r'), KeyModifiers::NONE)),
             Action::InsertChar('r')
+        );
+    }
+
+    #[test]
+    fn alt_s_shows_the_symbol_graph() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('s'), KeyModifiers::ALT)),
+            Action::ShowSymbolGraph
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('S'), KeyModifiers::ALT)),
+            Action::ShowSymbolGraph
+        );
+        // Ctrl+S stays Save.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Action::Save
         );
     }
 }

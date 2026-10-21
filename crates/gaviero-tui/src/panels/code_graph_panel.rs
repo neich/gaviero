@@ -91,12 +91,19 @@ pub struct GraphLink {
 }
 
 /// A code-graph link's destination for `path` and a 0-based `line`.
+///
+/// Both styles percent-encode the path: the inline parser closes a
+/// destination at its first `)`, so `app/(auth)/page.tsx` would otherwise
+/// break, and `classify_markdown_link` percent-decodes local paths.
 fn link_dest(style: &LinkStyle, path: &str, line: Option<usize>) -> String {
     match style {
-        LinkStyle::Repo => match line {
-            Some(line) => format!("{path}#L{}", line + 1),
-            None => path.to_string(),
-        },
+        LinkStyle::Repo => {
+            let mut href = percent_encode_path(path);
+            if let Some(line) = line {
+                href.push_str(&format!("#L{}", line + 1));
+            }
+            href
+        }
         LinkStyle::Absolute(root) => {
             let abs = root.join(path).to_string_lossy().replace('\\', "/");
             let mut href = format!("file:///{}", percent_encode_path(abs.trim_start_matches('/')));
@@ -138,6 +145,21 @@ fn escape_label(text: &str) -> String {
     text.replace(']', "\\]")
 }
 
+/// A symbol's container for display. `Symbol::owner` is `impl:Type`,
+/// `impl:Type:Trait`, or `trait:Name`; anything else is shown as-is.
+fn owner_label(owner: &str) -> String {
+    if let Some(rest) = owner.strip_prefix("impl:") {
+        return match rest.split_once(':') {
+            Some((ty, tr)) => format!("impl `{tr}` for `{ty}`"),
+            None => format!("impl `{rest}`"),
+        };
+    }
+    if let Some(name) = owner.strip_prefix("trait:") {
+        return format!("trait `{name}`");
+    }
+    format!("in `{owner}`")
+}
+
 fn link(style: &LinkStyle, path: &str, line: Option<usize>) -> String {
     format!(
         "[{}]({})",
@@ -153,7 +175,7 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
 
     if !doc.graph_ready {
         out.push_str(
-            "_The code graph for this folder is not built yet. Open the folder in gaviero, or run gaviero-cli --graph._\n",
+            "*The code graph for this folder is not built yet. Open the folder in gaviero, or run gaviero-cli --graph.*\n",
         );
         return out;
     }
@@ -163,44 +185,16 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
         doc.total_symbols, doc.total_dependencies, doc.total_dependents, doc.depth
     ));
 
-    // ── Symbols ─────────────────────────────────────────────────
-    out.push_str("## Symbols\n\n");
-    if doc.symbols.is_empty() {
-        out.push_str("_No indexed symbols for this file._\n\n");
-    } else {
-        for symbol in doc.symbols {
-            out.push_str(&format!(
-                "- [L{}]({}) — `{}` `{}`",
-                symbol.line + 1,
-                link_dest(&style, doc.rel, Some(symbol.line)),
-                symbol.kind,
-                symbol.name
-            ));
-            if let Some(owner) = &symbol.owner {
-                out.push_str(&format!(" · impl `{owner}`"));
-            }
-            if symbol.test {
-                out.push_str(" · test");
-            }
-            out.push('\n');
-        }
-        if doc.symbols.len() < doc.total_symbols {
-            out.push_str(&format!(
-                "\n_(showing {} of {})_\n",
-                doc.symbols.len(),
-                doc.total_symbols
-            ));
-        }
-        out.push('\n');
-    }
-
     // ── References ──────────────────────────────────────────────
+    // First: the symbol under the cursor is the most specific question the
+    // panel answers (`Alt+S`, go-to-definition), and the symbol list can be
+    // hundreds of rows long.
     if let Some(name) = doc.symbol_name {
         out.push_str(&format!("## References for `{name}`\n\n"));
 
         out.push_str("### Referenced by\n\n");
         if doc.referenced_by.is_empty() {
-            out.push_str("_None indexed._\n\n");
+            out.push_str("*None indexed.*\n\n");
         } else {
             for row in doc.referenced_by {
                 out.push_str(&format!(
@@ -215,7 +209,7 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
 
         out.push_str("### References\n\n");
         if doc.references.is_empty() {
-            out.push_str("_None indexed._\n\n");
+            out.push_str("*None indexed.*\n\n");
         } else {
             for row in doc.references {
                 out.push_str(&format!(
@@ -229,10 +223,41 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
         }
     }
 
+    // ── Symbols ─────────────────────────────────────────────────
+    out.push_str("## Symbols\n\n");
+    if doc.symbols.is_empty() {
+        out.push_str("*No indexed symbols for this file.*\n\n");
+    } else {
+        for symbol in doc.symbols {
+            out.push_str(&format!(
+                "- [L{}]({}) — `{}` `{}`",
+                symbol.line + 1,
+                link_dest(&style, doc.rel, Some(symbol.line)),
+                symbol.kind,
+                symbol.name
+            ));
+            if let Some(owner) = &symbol.owner {
+                out.push_str(&format!(" · {}", owner_label(owner)));
+            }
+            if symbol.test {
+                out.push_str(" · test");
+            }
+            out.push('\n');
+        }
+        if doc.symbols.len() < doc.total_symbols {
+            out.push_str(&format!(
+                "\n*(showing {} of {})*\n",
+                doc.symbols.len(),
+                doc.total_symbols
+            ));
+        }
+        out.push('\n');
+    }
+
     // ── Depends on / Used by ────────────────────────────────────
     out.push_str(&format!("## Depends on (depth {})\n\n", doc.depth));
     if doc.dependencies.is_empty() {
-        out.push_str(&format!("_None at depth {}._\n\n", doc.depth));
+        out.push_str(&format!("*None at depth {}.*\n\n", doc.depth));
     } else {
         for row in doc.dependencies {
             out.push_str(&format!(
@@ -244,7 +269,7 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
         }
         if doc.dependencies.len() < doc.total_dependencies {
             out.push_str(&format!(
-                "\n_(showing {} of {})_\n",
+                "\n*(showing {} of {})*\n",
                 doc.dependencies.len(),
                 doc.total_dependencies
             ));
@@ -254,7 +279,7 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
 
     out.push_str(&format!("## Used by (depth {})\n\n", doc.depth));
     if doc.dependents.is_empty() {
-        out.push_str(&format!("_None at depth {}._\n", doc.depth));
+        out.push_str(&format!("*None at depth {}.*\n", doc.depth));
     } else {
         for row in doc.dependents {
             out.push_str(&format!(
@@ -266,7 +291,7 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
         }
         if doc.dependents.len() < doc.total_dependents {
             out.push_str(&format!(
-                "\n_(showing {} of {})_\n",
+                "\n*(showing {} of {})*\n",
                 doc.dependents.len(),
                 doc.total_dependents
             ));
@@ -279,7 +304,10 @@ pub fn markdown_doc(doc: &GraphDoc<'_>, style: LinkStyle) -> String {
 /// The panel rects, derived from its outer area once so render and click
 /// hit-testing cannot drift.
 pub struct PanelGeometry {
+    /// Text plus the scrollbar column.
     pub body: Rect,
+    /// `body` without its rightmost column, which holds the scrollbar.
+    pub text: Rect,
     pub footer: Rect,
 }
 
@@ -352,30 +380,39 @@ impl CodeGraphPanel {
     /// The only place that derives body/footer from the outer rect; render
     /// and click hit-testing both call it so they cannot drift.
     pub fn geometry(area: Rect) -> PanelGeometry {
-        if area.height <= 1 {
-            return PanelGeometry {
-                body: area,
-                footer: Rect::default(),
-            };
-        }
-        PanelGeometry {
-            body: Rect {
-                height: area.height - 1,
-                ..area
-            },
-            footer: Rect {
-                y: area.y + area.height - 1,
-                height: 1,
-                ..area
-            },
-        }
+        let (body, footer) = if area.height <= 1 {
+            (area, Rect::default())
+        } else {
+            (
+                Rect {
+                    height: area.height - 1,
+                    ..area
+                },
+                Rect {
+                    y: area.y + area.height - 1,
+                    height: 1,
+                    ..area
+                },
+            )
+        };
+        let text = Rect {
+            width: body.width.saturating_sub(1),
+            ..body
+        };
+        PanelGeometry { body, text, footer }
     }
 
-    /// Re-wrap `markdown` at `width` and rebuild `links`.
+    /// Largest scroll offset that still fills the body: the last line sits
+    /// on the bottom row, as in the editor and the markdown preview.
+    pub fn max_scroll(&self, viewport: usize) -> usize {
+        self.lines.len().saturating_sub(viewport)
+    }
+
+    /// Re-wrap `markdown` for a body `width` columns wide and rebuild `links`.
     pub fn rebuild_cache(&mut self, width: u16, base: Style) {
-        // `render_lines_to_buffer` writes at `body.x + 1`, so the usable text
-        // width is one column narrower than the area.
-        let text_width = width.saturating_sub(1).max(1) as usize;
+        // `render_lines_to_buffer` writes at `text.x + 1` and the rightmost
+        // column is the scrollbar, so text gets two columns less than the body.
+        let text_width = width.saturating_sub(2).max(1) as usize;
         self.lines = chat_markdown::format_chat_markdown(&self.markdown, text_width, base);
         self.links.clear();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -401,15 +438,26 @@ impl CodeGraphPanel {
         if geo.body.width != self.rendered_width {
             self.rebuild_cache(geo.body.width, base);
         }
-        self.scroll.set_viewport(geo.body.height as usize);
-        self.scroll.clamp(self.lines.len());
+        let viewport = geo.body.height as usize;
+        self.scroll.set_viewport(viewport);
+        // Pin to the selected link only after a selection change (`n`/`p`);
+        // `clamp` would re-pin every frame and undo wheel and scrollbar moves.
+        self.scroll.ensure_visible_on_render();
+        self.scroll.offset = self.scroll.offset.min(self.max_scroll(viewport));
         chat_markdown::render_lines_to_buffer(
             &self.lines,
-            geo.body,
+            geo.text,
             buf,
             self.scroll.offset,
             base,
             None,
+        );
+        crate::widgets::scrollbar::render_scrollbar(
+            geo.body,
+            buf,
+            self.lines.len(),
+            viewport,
+            self.scroll.offset,
         );
 
         if geo.footer.height == 0 || geo.footer.width == 0 {
@@ -485,7 +533,7 @@ mod tests {
                 line: 239,
                 kind: "function_item".into(),
                 name: "open_file_at".into(),
-                owner: Some("App".into()),
+                owner: Some("impl:App".into()),
                 test: false,
             },
         ];
@@ -494,7 +542,59 @@ mod tests {
             out.contains("- [L120](src/app.rs#L120) — `function_item` `open_file`"),
             "{out}"
         );
-        assert!(out.contains("impl `App`"), "{out}");
+        assert!(out.contains("· impl `App`"), "{out}");
+        assert!(!out.contains("impl:"), "the raw owner prefix must not leak: {out}");
+    }
+
+    #[test]
+    fn code_graph_markdown_owner_labels() {
+        assert_eq!(owner_label("impl:App"), "impl `App`");
+        assert_eq!(owner_label("impl:Widget:Display"), "impl `Display` for `Widget`");
+        assert_eq!(owner_label("trait:Shape"), "trait `Shape`");
+        assert_eq!(owner_label("Module"), "in `Module`");
+    }
+
+    #[test]
+    fn code_graph_markdown_repo_links_survive_parens() {
+        use crate::editor::markdown::{MarkdownLinkTarget, classify_markdown_link};
+        let symbols = vec![symbol(0, "function_declaration", "Page")];
+        let mut panel = CodeGraphPanel {
+            markdown: markdown_doc(
+                &doc("app/(auth) x/page.tsx", &symbols, &[], &[]),
+                LinkStyle::Repo,
+            ),
+            ..CodeGraphPanel::default()
+        };
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        panel.render(area, &mut buf, Style::default());
+
+        let href = &panel.links.first().expect("the symbol row is a link").href;
+        assert_eq!(href, "app/%28auth%29%20x/page.tsx#L1");
+        assert_eq!(
+            classify_markdown_link(href),
+            Some(MarkdownLinkTarget::Local {
+                path: PathBuf::from("app/(auth) x/page.tsx"),
+                fragment: Some("L1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn code_graph_markdown_notes_render_as_italics() {
+        let mut d = doc("src/app.rs", &[], &[], &[]);
+        d.total_symbols = 0;
+        let mut panel = CodeGraphPanel {
+            markdown: markdown_doc(&d, LinkStyle::Repo),
+            ..CodeGraphPanel::default()
+        };
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        panel.render(area, &mut buf, Style::default());
+        let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("None at depth 1."), "{rendered}");
+        assert!(!rendered.contains("_None"), "markers must not show: {rendered}");
+        assert!(!rendered.contains("*None"), "markers must not show: {rendered}");
     }
 
     #[test]
@@ -506,7 +606,7 @@ mod tests {
         let mut d = doc("src/app.rs", &symbols, &[], &[]);
         d.total_symbols = 250;
         let out = markdown_doc(&d, LinkStyle::Repo);
-        assert!(out.contains("_(showing 2 of 250)_"), "{out}");
+        assert!(out.contains("*(showing 2 of 250)*"), "{out}");
     }
 
     #[test]

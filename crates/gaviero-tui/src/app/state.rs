@@ -161,6 +161,8 @@ pub(super) enum ScrollbarTarget {
     /// scrolls `scroll_top`) or batch file-set (`batch_review`, scrolls
     /// `diff_scroll`). The active one is resolved at scroll time.
     ReviewDiff,
+    /// CODE GRAPH side panel body.
+    CodeGraph,
 }
 
 #[derive(Default, Clone)]

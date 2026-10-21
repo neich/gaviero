@@ -452,7 +452,8 @@ fn action_escapes_terminal(action: &Action) -> bool {
             | SetSideModeGit
             | SetSideModeMemory
             | SetSideModeGraph
-            | GoToDefinition
+            // GoToDefinition / ShowSymbolGraph act on the editor cursor and
+            // stay with the PTY: Alt+. is the shell's "last argument".
             | ToggleAutoApprove
             | SwitchLayout(_)
             | CycleTabForward
@@ -617,5 +618,9 @@ mod tests {
         assert!(!escapes(KeyCode::PageUp, KeyModifiers::NONE));
         assert!(!escapes(KeyCode::Tab, KeyModifiers::NONE));
         assert!(!escapes(KeyCode::Enter, KeyModifiers::NONE));
+        // Editor-cursor graph actions stay with the shell too.
+        assert!(!escapes(KeyCode::Char('.'), KeyModifiers::ALT)); // last argument
+        assert!(!escapes(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(!escapes(KeyCode::F(12), KeyModifiers::NONE));
     }
 }
