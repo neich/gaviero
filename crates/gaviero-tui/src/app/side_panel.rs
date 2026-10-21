@@ -2020,6 +2020,28 @@ pub(crate) fn dispatch_prompt_core(
     });
 
     app.chat_state.add_user_message_at(conv_idx, &prompt);
+    // Remote projection: the prompt itself is a message the mirror must see.
+    // The observer-driven `MessageComplete` path only covers the agent's
+    // reply (and projects `messages.last()`, which by then is the assistant),
+    // so a desktop-typed prompt used to reach the phone only through a later
+    // full snapshot — the phone showed the reply streaming with no prompt
+    // above it. Both desktop Enter and remote `send_prompt` funnel through
+    // this function, so one push here covers both.
+    if let Some(message) = app.chat_state.conversations[conv_idx]
+        .messages
+        .last()
+        .map(crate::app::projection::message_dto)
+    {
+        app.remote.push_frame(
+            gaviero_remote::envelope::ServerFrame::MessageComplete(
+                gaviero_remote::envelope::MessageComplete {
+                    conv_id: conv_id.clone(),
+                    message,
+                },
+            ),
+        );
+        app.remote.bump_global();
+    }
     // Crash durability: conversations only reach disk on a clean quit
     // (`main.rs` calls `save_session` once, after the event loop breaks), so
     // a panic or a killed terminal would otherwise lose every prompt typed

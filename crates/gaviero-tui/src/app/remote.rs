@@ -1025,6 +1025,39 @@ mod tests {
         let _ = apply_interrupt(&mut app, &bg, None);
     }
 
+    /// A prompt typed on the desktop must reach the mirror as its own
+    /// `message_complete`: the observer path only projects the assistant
+    /// reply, so without this the phone shows the answer with no prompt.
+    #[tokio::test]
+    async fn desktop_prompt_projects_the_user_message_to_the_mirror() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let turn_id = crate::app::side_panel::dispatch_prompt_core(
+            &mut app,
+            &bg,
+            "typed on the desktop".into(),
+            Vec::new(),
+            false,
+        )
+        .expect("prompt must dispatch");
+        assert!(!turn_id.is_empty());
+
+        let projected = app
+            .remote
+            .pending_frames
+            .iter()
+            .find_map(|frame| match frame {
+                ServerFrame::MessageComplete(m) if m.conv_id == bg => Some(m),
+                _ => None,
+            })
+            .expect("the prompt itself must be projected as message_complete");
+        assert_eq!(projected.message.role, gaviero_remote::dto::Role::User);
+        assert_eq!(projected.message.content, "typed on the desktop");
+        assert!(!projected.message.truncated);
+
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
     #[test]
     fn remote_list_directory_and_read_file_dispatch() {
         use gaviero_remote::envelope::{ListDirectory, ReadFile};
