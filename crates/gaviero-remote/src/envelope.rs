@@ -31,6 +31,10 @@ pub enum ClientFrame {
     RequestTerminals(RequestTerminals),
     TerminalInput(TerminalInput),
     RequestFileCompletions(RequestFileCompletions),
+    /// 1.3 (`file_browser`): list one workspace directory.
+    ListDirectory(ListDirectory),
+    /// 1.3 (`file_browser`): read one workspace file as UTF-8.
+    ReadFile(ReadFile),
     /// 1.2 (`turn_review`).
     TurnReviewAction(TurnReviewAction),
 }
@@ -54,6 +58,8 @@ impl ClientFrame {
         "request_terminals",
         "terminal_input",
         "request_file_completions",
+        "list_directory",
+        "read_file",
         "turn_review_action",
     ];
 }
@@ -168,6 +174,20 @@ pub struct RequestFileCompletions {
     /// Clamped server-side to 1–50; absent ⇒ 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ListDirectory {
+    /// Explorer display path (`<root-label>/<rel>`). Omitted or empty lists
+    /// the workspace roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFile {
+    /// Explorer display path of a regular file.
+    pub path: String,
 }
 
 // ── Server frames ────────────────────────────────────────────────

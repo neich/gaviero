@@ -38,6 +38,18 @@
         ],
         "type": "object"
       },
+      "ListDirectory": {
+        "properties": {
+          "path": {
+            "description": "Explorer display path (`<root-label>/<rel>`). Omitted or empty lists\nthe workspace roots.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PermissionDecision": {
         "properties": {
           "allow": {
@@ -76,7 +88,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -94,6 +106,18 @@
         "required": [
           "major",
           "minor"
+        ],
+        "type": "object"
+      },
+      "ReadFile": {
+        "properties": {
+          "path": {
+            "description": "Explorer display path of a regular file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
         ],
         "type": "object"
       },
@@ -608,6 +632,40 @@
         "type": "object"
       },
       {
+        "description": "1.3 (`file_browser`): list one workspace directory.",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ListDirectory"
+          },
+          "type": {
+            "const": "list_directory",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "1.3 (`file_browser`): read one workspace file as UTF-8.",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ReadFile"
+          },
+          "type": {
+            "const": "read_file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
         "description": "1.2 (`turn_review`).",
         "properties": {
           "payload": {
@@ -693,7 +751,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -763,7 +821,7 @@
   "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 2
+    "minor": 3
   },
   "server_envelope": {
     "$defs": {
@@ -1670,7 +1728,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
         "properties": {
           "major": {
             "format": "uint16",

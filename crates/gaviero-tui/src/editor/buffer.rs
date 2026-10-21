@@ -112,6 +112,11 @@ pub struct Buffer {
     pub modified: bool,
     pub cursor: Cursor,
     pub scroll: Scroll,
+    /// Set when a restored wrapped tab's `scroll.top_line` came from the
+    /// session. That offset counts visual rows, which cannot be bounded until
+    /// the first render knows the content width; the render path consumes this
+    /// once via [`Buffer::take_scroll_clamp_request`].
+    restored_scroll_pending: bool,
     /// Horizontal position vertical movement tries to keep. See [`GoalCol`].
     goal_col: Option<GoalCol>,
     pub undo_stack: Vec<Transaction>,
@@ -182,6 +187,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            restored_scroll_pending: false,
             goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -298,6 +304,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            restored_scroll_pending: false,
             goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -372,6 +379,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            restored_scroll_pending: false,
             goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1457,6 +1465,19 @@ impl Buffer {
         let total = self.scroll_line_count(content_width);
         let max_scroll = total.saturating_sub(viewport_height.max(1));
         self.scroll.top_line = self.scroll.top_line.min(max_scroll);
+    }
+
+    /// Mark a restored wrapped scroll offset for a one-shot clamp. A restored
+    /// `scroll.top_line` counts *visual* rows, so it can only be bounded once
+    /// the first render supplies the content width.
+    pub fn request_scroll_clamp(&mut self) {
+        self.restored_scroll_pending = true;
+    }
+
+    /// Consume the one-shot clamp request. `true` means the caller should call
+    /// [`clamp_scroll_top`](Self::clamp_scroll_top) with the current viewport.
+    pub fn take_scroll_clamp_request(&mut self) -> bool {
+        std::mem::take(&mut self.restored_scroll_pending)
     }
 
     /// Clamp cursor and scroll positions to be within the current content bounds.

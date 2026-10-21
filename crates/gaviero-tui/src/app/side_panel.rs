@@ -10,7 +10,7 @@ use crate::panels::code_graph_panel::{
 /// or more roots share that label, disambiguates by appending the parent dir
 /// name, then by appending the absolute path. Empty label only if the root
 /// has no usable name at all (single-folder fallback case).
-fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
+pub(crate) fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
     let mut labels: Vec<String> = roots.iter().map(|(n, _)| n.clone()).collect();
     loop {
         let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -1716,7 +1716,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
 /// Roots `@` completion and `@path` resolution share with the explorer:
 /// workspace-level config dirs (`.gaviero`, `.claude` beside the workspace
 /// file) first, then member folders. Single-folder mode has no config dirs.
-fn completion_named_roots(
+pub(crate) fn completion_named_roots(
     workspace: &gaviero_core::workspace::Workspace,
 ) -> Vec<(String, std::path::PathBuf)> {
     let mut roots: Vec<(String, std::path::PathBuf)> = workspace
@@ -2020,6 +2020,28 @@ pub(crate) fn dispatch_prompt_core(
     });
 
     app.chat_state.add_user_message_at(conv_idx, &prompt);
+    // Remote projection: the prompt itself is a message the mirror must see.
+    // The observer-driven `MessageComplete` path only covers the agent's
+    // reply (and projects `messages.last()`, which by then is the assistant),
+    // so a desktop-typed prompt used to reach the phone only through a later
+    // full snapshot — the phone showed the reply streaming with no prompt
+    // above it. Both desktop Enter and remote `send_prompt` funnel through
+    // this function, so one push here covers both.
+    if let Some(message) = app.chat_state.conversations[conv_idx]
+        .messages
+        .last()
+        .map(crate::app::projection::message_dto)
+    {
+        app.remote.push_frame(
+            gaviero_remote::envelope::ServerFrame::MessageComplete(
+                gaviero_remote::envelope::MessageComplete {
+                    conv_id: conv_id.clone(),
+                    message,
+                },
+            ),
+        );
+        app.remote.bump_global();
+    }
     // Crash durability: conversations only reach disk on a clean quit
     // (`main.rs` calls `save_session` once, after the event loop breaks), so
     // a panic or a killed terminal would otherwise lose every prompt typed
