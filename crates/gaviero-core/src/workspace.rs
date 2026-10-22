@@ -565,13 +565,20 @@ impl Workspace {
     /// Authoritative settings location: beside the workspace file in workspace
     /// mode, or inside the opened folder in single-folder mode.
     pub fn settings_path(&self) -> PathBuf {
+        self.gaviero_dir().join("settings.json")
+    }
+
+    /// The main `.gaviero/` directory: beside the workspace file in
+    /// workspace mode, inside the opened folder in single-folder mode.
+    /// Workspace settings and workspace-level skills live here and take
+    /// priority over the user-wide [`user_gaviero_dir`].
+    pub fn gaviero_dir(&self) -> PathBuf {
         self.workspace_path
             .as_deref()
             .and_then(Path::parent)
             .or_else(|| self.folders.first().map(|folder| folder.path.as_path()))
             .unwrap_or_else(|| Path::new("."))
             .join(".gaviero")
-            .join("settings.json")
     }
 
     /// Root directory for remote-sidecar state (Plan A §3.3): the bearer
@@ -1662,19 +1669,60 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
     }
 }
 
+/// Environment variable that relocates the user-wide `.gaviero/` directory
+/// to `$GAVIERO_ROOT/.gaviero`.
+pub const GAVIERO_ROOT_ENV: &str = "GAVIERO_ROOT";
+
+/// Folder holding the user-wide `.gaviero/` directory: `$GAVIERO_ROOT` when
+/// set and non-blank, otherwise the home directory (`$HOME` /
+/// `%USERPROFILE%`). `None` only when neither resolves.
+pub fn user_gaviero_root() -> Option<PathBuf> {
+    gaviero_root_from(std::env::var_os(GAVIERO_ROOT_ENV), dirs::home_dir())
+}
+
+fn gaviero_root_from(
+    env: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let from_env = env
+        .filter(|raw| !raw.to_string_lossy().trim().is_empty())
+        .map(|raw| match raw.to_str() {
+            Some(s) => expand_tilde_path(s),
+            None => PathBuf::from(raw),
+        })
+        .map(|p| std::path::absolute(&p).unwrap_or(p));
+    from_env.or(home)
+}
+
+/// User-wide gaviero directory: `<user_gaviero_root>/.gaviero`, holding
+/// what every gaviero instance shares — `settings.json`, `secrets.toml`,
+/// `skills/`. The workspace's own [`Workspace::gaviero_dir`] overrides it.
+/// Machine state stays in [`home_gaviero_dir`].
+pub fn user_gaviero_dir() -> Option<PathBuf> {
+    user_gaviero_root().map(|root| root.join(".gaviero"))
+}
+
+/// Per-machine gaviero directory, always `~/.gaviero` regardless of
+/// `GAVIERO_ROOT` (which may be shared between machines): remote token,
+/// TLS pair and instance registry, ntfy topic, dsh credential patch.
+pub fn home_gaviero_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gaviero"))
+}
+
 /// Machine-level remote state root (Plan C V1 §2.1): `~/.gaviero/remote/`,
 /// holding the machine bearer token, the shared TLS pair, and the instance
 /// registry. `None` only when no home directory can be determined; callers
 /// then fall back to the workspace root (Plan C invariant 17).
 pub fn remote_machine_state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".gaviero").join("remote"))
+    home_gaviero_dir().map(|dir| dir.join("remote"))
 }
 
 /// User-wide settings file: `~/.gaviero/settings.json` on every OS
-/// (`%USERPROFILE%\.gaviero\settings.json` on Windows). Same home-dir
-/// tree as `remote/` and `ntfy/`. `None` only when home cannot be resolved.
+/// (`%USERPROFILE%\.gaviero\settings.json` on Windows; see
+/// [`user_gaviero_root`] for `GAVIERO_ROOT`). Same tree as `remote/` and
+/// `ntfy/`. `None` only when the root cannot be resolved.
 pub fn user_settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".gaviero").join("settings.json"))
+    user_gaviero_dir().map(|dir| dir.join("settings.json"))
 }
 
 /// Former user-settings location (`dirs::config_dir()/gaviero/settings.json`):
@@ -1707,8 +1755,12 @@ fn load_user_settings_from(
         && path.is_file()
     {
         tracing::warn!(
-            "user settings loaded from legacy path {}; move them to ~/.gaviero/settings.json",
-            path.display()
+            "user settings loaded from legacy path {}; move them to {}",
+            path.display(),
+            canonical.map_or_else(
+                || "~/.gaviero/settings.json".to_string(),
+                |p| p.display().to_string()
+            )
         );
         return parse_user_settings_file(path);
     }
@@ -2000,6 +2052,40 @@ mod tests {
                 "user settings must not live under dirs::config_dir()"
             );
         }
+    }
+
+    #[test]
+    fn gaviero_root_defaults_to_home() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(gaviero_root_from(None, Some(home.clone())), Some(home.clone()));
+        assert_eq!(
+            gaviero_root_from(Some("   ".into()), Some(home.clone())),
+            Some(home),
+            "a blank GAVIERO_ROOT is ignored"
+        );
+        assert_eq!(gaviero_root_from(None, None), None);
+    }
+
+    #[test]
+    fn gaviero_root_env_wins_over_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = gaviero_root_from(
+            Some(dir.path().as_os_str().to_owned()),
+            Some(PathBuf::from("/home/someone")),
+        );
+        assert_eq!(root.as_deref(), Some(dir.path()));
+        assert_eq!(
+            gaviero_root_from(Some(dir.path().as_os_str().to_owned()), None).as_deref(),
+            Some(dir.path()),
+            "GAVIERO_ROOT works without a home directory"
+        );
+    }
+
+    #[test]
+    fn gaviero_root_env_relative_is_made_absolute() {
+        let root = gaviero_root_from(Some("relative/root".into()), None).unwrap();
+        assert!(root.is_absolute());
+        assert!(root.ends_with(Path::new("relative").join("root")));
     }
 
     #[test]

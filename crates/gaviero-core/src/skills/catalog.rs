@@ -29,9 +29,8 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     pub fn global_skills_dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gaviero")
+        crate::workspace::user_gaviero_dir()
+            .unwrap_or_else(|| PathBuf::from(".gaviero"))
             .join("skills")
     }
 
@@ -65,10 +64,15 @@ impl SkillCatalog {
             catalog.scan_dir(&skills_dir, SCOPE_REPO, &mut warnings);
         }
 
+        // Workspace-level skills live in the main `.gaviero/` beside the
+        // workspace file, the same directory as the workspace settings.
         if !single_folder {
-            let ws_skills = workspace_root.join(".gaviero").join("skills");
-            native_skills_dirs.push(canonicalize_path(&ws_skills));
-            catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
+            let ws_skills = workspace.gaviero_dir().join("skills");
+            let ws_canon = canonicalize_path(&ws_skills);
+            if !native_skills_dirs.contains(&ws_canon) {
+                native_skills_dirs.push(ws_canon);
+                catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
+            }
         }
 
         if global_dir.is_dir() {
@@ -494,6 +498,37 @@ mod tests {
         assert!(warnings.is_empty());
         let skill = catalog.resolve(None, "lint", None).unwrap();
         assert_eq!(skill.scope_level, SCOPE_REPO);
+    }
+
+    #[test]
+    fn workspace_skills_live_beside_the_workspace_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let file = tmp.path().join("ws.gaviero-workspace");
+        fs::write(
+            &file,
+            serde_json::json!({ "folders": [{ "path": a }, { "path": b }] }).to_string(),
+        )
+        .unwrap();
+        write_skill(&tmp.path().join(".gaviero").join("skills"), "shared", "Workspace skill");
+        write_skill(&a.join(".gaviero").join("skills"), "local", "First member skill");
+        write_skill(&tmp.path().join("global"), "shared", "Global skill");
+
+        let ws = Workspace::load(&file).unwrap();
+        let (catalog, warnings) = SkillCatalog::scan(&ws, &tmp.path().join("global"));
+        assert!(warnings.is_empty());
+        let shared = catalog.resolve(None, "shared", None).unwrap();
+        assert_eq!(shared.scope_level, SCOPE_WORKSPACE, "workspace beats global");
+        let local: Vec<_> = catalog
+            .all_skills()
+            .into_iter()
+            .filter(|s| s.name == "local")
+            .collect();
+        assert_eq!(local.len(), 1, "the first member is not also workspace scope");
+        assert_eq!(local[0].scope_level, SCOPE_REPO);
     }
 
     #[test]

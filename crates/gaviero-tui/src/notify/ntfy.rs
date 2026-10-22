@@ -44,7 +44,7 @@ impl Default for NtfyConfig {
 
 /// `~/.gaviero/ntfy/topic` — same home convention as `~/.gaviero/remote/token`.
 pub fn default_topic_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".gaviero").join("ntfy").join("topic"))
+    gaviero_core::workspace::home_gaviero_dir().map(|dir| dir.join("ntfy").join("topic"))
 }
 
 /// Master switch only — does not mint a topic. Safe for `/remote` status.
