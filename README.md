@@ -112,7 +112,7 @@ Settings cascade (highest priority first):
 
 1. `.gaviero/settings.json` — project-level
 2. `.gaviero-workspace` file — multi-folder workspace
-3. `~/.gaviero/settings.json` — user defaults (same home-dir path on Windows and Linux). If that file is missing, the previous location is still read (`~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json` on Windows).
+3. `~/.gaviero/settings.json` — user defaults (same home-dir path on Windows and Linux). If that file is missing, the previous location is still read (`~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json` on Windows). Set `GAVIERO_ROOT` to share one user directory between gaviero instances: `settings.json`, `secrets.toml` and `skills/` are then read from `$GAVIERO_ROOT/.gaviero` instead of `~/.gaviero`. The workspace/repo `.gaviero/` (beside the `.gaviero-workspace` file, or in the opened folder) is always loaded first and overrides it. Per-machine state (`remote/`, `ntfy/`, `dsh/`) stays in `~/.gaviero`.
 4. Built-in defaults
 
 ```json

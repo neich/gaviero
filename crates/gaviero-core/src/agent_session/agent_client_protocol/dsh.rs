@@ -191,9 +191,9 @@ impl DshLaunchSpec {
     }
 }
 
-/// `~/.gaviero/dsh/`, beside the user settings file.
+/// `~/.gaviero/dsh/` — per-machine, so it ignores `GAVIERO_ROOT`.
 fn acp_patch_dir() -> Option<std::path::PathBuf> {
-    crate::workspace::user_settings_path().and_then(|p| p.parent().map(|d| d.join("dsh")))
+    crate::workspace::home_gaviero_dir().map(|d| d.join("dsh"))
 }
 
 /// Write [`GAVIERO_ACP_PATCH`] to `<dir>/gaviero-acp.patch.yml` (tmp + rename)

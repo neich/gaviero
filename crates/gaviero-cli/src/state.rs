@@ -81,18 +81,28 @@ impl Discovered {
 }
 
 /// Search `start` and its parents for a gaviero workspace. The home
-/// directory is skipped: `~/.gaviero/` holds user-wide settings, not a
-/// workspace.
+/// directory and `$GAVIERO_ROOT` are skipped: their `.gaviero/` holds
+/// user-wide settings, not a workspace.
 pub fn discover(start: &Path) -> Result<Option<Discovered>> {
-    discover_with_home(start, dirs::home_dir().as_deref())
+    let skip: Vec<PathBuf> = dirs::home_dir()
+        .into_iter()
+        .chain(gaviero_core::workspace::user_gaviero_root())
+        .collect();
+    let skip: Vec<&Path> = skip.iter().map(PathBuf::as_path).collect();
+    discover_skipping(start, &skip)
 }
 
+#[cfg(test)]
 fn discover_with_home(start: &Path, home: Option<&Path>) -> Result<Option<Discovered>> {
+    discover_skipping(start, home.as_slice())
+}
+
+fn discover_skipping(start: &Path, skip: &[&Path]) -> Result<Option<Discovered>> {
     let start = canonical(start);
-    let home = home.map(canonical);
+    let skip: Vec<PathBuf> = skip.iter().map(|p| canonical(p)).collect();
     let Some(marker_root) = start
         .ancestors()
-        .find(|dir| Some(*dir) != home.as_deref() && has_workspace_marker(dir))
+        .find(|dir| !skip.iter().any(|s| s == dir) && has_workspace_marker(dir))
         .map(Path::to_path_buf)
     else {
         return Ok(None);
@@ -534,6 +544,20 @@ mod tests {
 
         let found = discover_with_home(&run, Some(&home)).unwrap();
         assert!(found.is_none_or(|d| d.marker_root != home));
+    }
+
+    #[test]
+    fn the_gaviero_root_is_skipped_as_well_as_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = canonical(tmp.path());
+        let gaviero_root = home.join("gaviero-root");
+        mark(&home, "settings.json");
+        mark(&gaviero_root, "settings.json");
+        let run = gaviero_root.join("project");
+        std::fs::create_dir_all(&run).unwrap();
+
+        let found = discover_skipping(&run, &[&home, &gaviero_root]).unwrap();
+        assert!(found.is_none_or(|d| d.marker_root != home && d.marker_root != gaviero_root));
     }
 
     #[test]

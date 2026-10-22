@@ -356,6 +356,12 @@ async fn main() -> Result<()> {
     if global_skills.is_dir() {
         watch_paths.push(global_skills);
     }
+    // Workspace-level skills sit beside the workspace file, outside the
+    // member folders in multi-folder mode.
+    let workspace_skills = workspace.gaviero_dir().join("skills");
+    if workspace_skills.is_dir() && !roots.iter().any(|r| workspace_skills.starts_with(r)) {
+        watch_paths.push(workspace_skills);
+    }
     let watch_refs: Vec<&std::path::Path> = watch_paths.iter().map(|p| p.as_path()).collect();
     let _file_watcher = event_loop
         .spawn_file_watcher(&watch_refs, watcher_excludes)
