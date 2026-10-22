@@ -392,6 +392,15 @@ pub(super) fn render_editor(app: &mut App, frame: &mut Frame, area: Rect) {
         area
     };
 
+    // A restored wrapped tab's scroll offset counts visual rows; now that the
+    // content width is known, bound it once against the real wrap layout.
+    let active = app.active_buffer;
+    if app.buffers[active].take_scroll_clamp_request() {
+        let (vp_h, content_w) =
+            super::editing::editor_viewport(app.buffers[active].line_count(), editor_area);
+        app.buffers[active].clamp_scroll_top(vp_h, content_w);
+    }
+
     let buf = &app.buffers[app.active_buffer];
     let highlight_config = buf
         .lang_name

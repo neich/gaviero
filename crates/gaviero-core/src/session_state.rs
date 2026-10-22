@@ -133,6 +133,10 @@ fn is_zero(v: &u16) -> bool {
     *v == 0
 }
 
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
 /// State for a single open tab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabState {
@@ -148,14 +152,30 @@ pub struct TabState {
     pub cursor_col: usize,
 
     /// Top visible line (scroll position).
+    ///
+    /// A logical line index normally, but a *visual* row index when the tab
+    /// was left with [`word_wrap`](Self::word_wrap) on and long lines were
+    /// wrapped — the UI clamps it against the real layout on the first render.
     #[serde(default)]
     pub scroll_top: usize,
+
+    /// Word wrap was active for this tab. `None` = not recorded (a session
+    /// written before wrap was persisted), in which case the workspace
+    /// `word_wrap` setting decides. Storing the effective value also keeps an
+    /// explicit toggle-off from being overridden by that setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_wrap: Option<bool>,
 
     /// Markdown preview layout this tab was left in: `"split"` or
     /// `"preview"`. Stored as an opaque string so core carries no UI type;
     /// absent or unrecognised restores as source-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_mode: Option<String>,
+
+    /// Scroll offset of this tab's rendered markdown preview, in preview
+    /// lines. Zero (the default) is omitted from the file.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub preview_scroll: usize,
 }
 
 /// Panel visibility state.
@@ -479,7 +499,9 @@ mod tests {
                 cursor_line: 10,
                 cursor_col: 5,
                 scroll_top: 3,
+                word_wrap: Some(true),
                 preview_mode: Some("split".to_string()),
+                preview_scroll: 4,
             }],
             active_tab: 0,
             panels: PanelState {
@@ -503,7 +525,9 @@ mod tests {
         assert_eq!(loaded.tabs.len(), 1);
         assert_eq!(loaded.tabs[0].path, "/tmp/file.rs");
         assert_eq!(loaded.tabs[0].cursor_line, 10);
+        assert_eq!(loaded.tabs[0].word_wrap, Some(true));
         assert_eq!(loaded.tabs[0].preview_mode.as_deref(), Some("split"));
+        assert_eq!(loaded.tabs[0].preview_scroll, 4);
         assert_eq!(loaded.active_tab, 0);
         assert!(loaded.panels.terminal);
         assert_eq!(loaded.tree_expanded.len(), 2);
@@ -512,6 +536,17 @@ mod tests {
         assert_eq!(loaded.chat_draft, "unsent prompt");
 
         let _ = std::fs::remove_dir_all(state_dir_for(key).unwrap());
+    }
+
+    #[test]
+    fn tab_state_written_before_wrap_and_preview_scroll_still_loads() {
+        // Sessions written before per-tab word wrap / preview scroll existed
+        // must still parse. `None` and 0 let the settings default and the top
+        // of the preview win, instead of restoring a value never recorded.
+        let json = r#"{ "tabs": [{ "path": "/tmp/a.rs", "cursor_line": 2 }], "active_tab": 0 }"#;
+        let state: SessionState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.tabs[0].word_wrap, None);
+        assert_eq!(state.tabs[0].preview_scroll, 0);
     }
 
     #[test]
