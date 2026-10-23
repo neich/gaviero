@@ -139,6 +139,10 @@ pub(crate) fn permission_request_dto(
         description: perm.description.clone(),
         input: perm.input.clone(),
         ask,
+        mcp_server: perm
+            .session_rule(true)
+            .and_then(|_| crate::panels::agent_chat::mcp_server_of(&perm.tool_name))
+            .map(str::to_string),
     }
 }
 

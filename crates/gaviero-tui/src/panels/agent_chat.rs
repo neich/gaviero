@@ -583,6 +583,10 @@ pub struct Conversation {
     /// Matching requests are answered without parking. In memory only, like
     /// `auto_approve`; kept across `/reset`, cleared by `/permissions clear`.
     pub session_allowed_tools: Vec<String>,
+    /// Same rule shape as `session_allowed_tools`, granted for the rest of
+    /// the current prompt only (the remote "allow this MCP server" answer).
+    /// Cleared when the next prompt is dispatched and by `/permissions clear`.
+    pub turn_allowed_tools: Vec<String>,
     /// Turn id assigned when the user message is dispatched. The same id
     /// ties prompt-time injection manifests to the completion extractor.
     pub pending_turn_id: Option<String>,
@@ -687,6 +691,7 @@ impl Conversation {
             auto_approve: false,
             pending_permission: None,
             session_allowed_tools: Vec::new(),
+            turn_allowed_tools: Vec::new(),
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -1125,6 +1130,7 @@ impl AgentChatState {
             auto_approve: false,
             pending_permission: None,
             session_allowed_tools: Vec::new(),
+            turn_allowed_tools: Vec::new(),
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -1271,8 +1277,9 @@ impl AgentChatState {
     }
 
     /// Whether conversation `idx` already granted `tool_name` for the
-    /// session. Never true for an `AskUserQuestion`-shaped input — a
-    /// question needs its answers, not a standing yes.
+    /// session or for the current prompt. Never true for an
+    /// `AskUserQuestion`-shaped input — a question needs its answers, not a
+    /// standing yes.
     pub fn session_allows_at(
         &self,
         idx: usize,
@@ -1281,8 +1288,29 @@ impl AgentChatState {
     ) -> bool {
         self.conversations.get(idx).is_some_and(|conv| {
             AskUserQuestionState::from_input(input).is_none()
-                && session_rules_allow(&conv.session_allowed_tools, tool_name)
+                && (session_rules_allow(&conv.session_allowed_tools, tool_name)
+                    || session_rules_allow(&conv.turn_allowed_tools, tool_name))
         })
+    }
+
+    /// The `mcp__<server>__*` rule a turn grant on conversation `idx`'s
+    /// pending request would add, or `None` when that request is not an
+    /// MCP tool call that can be granted server-wide.
+    pub fn turn_grant_rule_at(&self, idx: usize) -> Option<String> {
+        self.conversations
+            .get(idx)?
+            .pending_permission
+            .as_ref()?
+            .session_rule(true)
+    }
+
+    /// Record `rule` for the rest of conversation `idx`'s current prompt.
+    pub fn grant_for_turn_at(&mut self, idx: usize, rule: String) {
+        if let Some(conv) = self.conversations.get_mut(idx)
+            && !conv.turn_allowed_tools.contains(&rule)
+        {
+            conv.turn_allowed_tools.push(rule);
+        }
     }
 
     /// Record the `a` / `A` grant for the active conversation's pending
@@ -2496,23 +2524,41 @@ impl AgentChatState {
             }
             "/permissions" => {
                 let conv = &mut self.conversations[idx];
+                let list = |rules: &[String]| {
+                    rules
+                        .iter()
+                        .map(|rule| format!("  {rule}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 let msg = match arg {
-                    "" if conv.session_allowed_tools.is_empty() => {
+                    "" if conv.session_allowed_tools.is_empty()
+                        && conv.turn_allowed_tools.is_empty() =>
+                    {
                         "No tools allowed for this session. Press `a` on a permission \
                          prompt to allow that tool, or `A` to allow its whole MCP server."
                             .to_string()
                     }
-                    "" => format!(
-                        "Allowed for this session (no prompt):\n{}\n\n/permissions clear revokes them.",
-                        conv.session_allowed_tools
-                            .iter()
-                            .map(|rule| format!("  {rule}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ),
+                    "" => {
+                        let mut sections = Vec::new();
+                        if !conv.session_allowed_tools.is_empty() {
+                            sections.push(format!(
+                                "Allowed for this session (no prompt):\n{}",
+                                list(&conv.session_allowed_tools)
+                            ));
+                        }
+                        if !conv.turn_allowed_tools.is_empty() {
+                            sections.push(format!(
+                                "Allowed until the next prompt:\n{}",
+                                list(&conv.turn_allowed_tools)
+                            ));
+                        }
+                        format!("{}\n\n/permissions clear revokes them.", sections.join("\n\n"))
+                    }
                     "clear" => {
-                        let n = conv.session_allowed_tools.len();
+                        let n = conv.session_allowed_tools.len() + conv.turn_allowed_tools.len();
                         conv.session_allowed_tools.clear();
+                        conv.turn_allowed_tools.clear();
                         format!("Revoked {n} session permission(s); those tools will ask again.")
                     }
                     _ => "Usage: /permissions [clear]".to_string(),
@@ -4641,6 +4687,7 @@ impl AgentChatState {
                     auto_approve: false,
                     pending_permission: None,
                     session_allowed_tools: Vec::new(),
+                    turn_allowed_tools: Vec::new(),
                     pending_turn_id: None,
                     pending_module_path: None,
                     pending_focused_folder: None,

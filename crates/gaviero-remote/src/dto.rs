@@ -210,6 +210,19 @@ pub struct PermissionRequest {
     pub input: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<Ask>,
+    /// 1.4: MCP server the tool belongs to, present only when the request
+    /// can be answered with `grant: mcp_server_turn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<String>,
+}
+
+/// Standing grant attached to an allow (1.4, `permission_turn_grant`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionGrant {
+    /// Every tool of the request's `mcp_server`, until the conversation's
+    /// next prompt is dispatched.
+    McpServerTurn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

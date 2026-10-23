@@ -8,14 +8,16 @@ use serde::{Deserialize, Serialize};
 /// `request_messages.before_seq`, and the `GET /v1/instances` resource.
 /// Minor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,
 /// and two error codes. Minor 3 is additive: the `file_browser` capability
-/// with the `list_directory` / `read_file` client frames.
+/// with the `list_directory` / `read_file` client frames. Minor 4 is
+/// additive: the `permission_turn_grant` capability, optional
+/// `permission_request.mcp_server` and `permission_decision.grant`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -29,6 +31,9 @@ pub mod capability {
     pub const TURN_REVIEW: &str = "turn_review";
     /// 1.3: `list_directory` / `read_file` browse the workspace read-only.
     pub const FILE_BROWSER: &str = "file_browser";
+    /// 1.4: `permission_decision.grant = mcp_server_turn` allows every call
+    /// to the request's `mcp_server` for the rest of the current prompt.
+    pub const PERMISSION_TURN_GRANT: &str = "permission_turn_grant";
 }
 
 /// Why a peer's version is unacceptable.
