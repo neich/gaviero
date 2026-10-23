@@ -214,6 +214,9 @@ pub fn synthesize_provider_configs(workspace: &gaviero_core::workspace::Workspac
             ),
         }
     }
+    // Cursor's only bypass is `.cursorignore`. One decision per workspace, so
+    // a GAVIERO.md in one folder also covers the others.
+    written.extend(gaviero_core::instructions::sync_cursorignore_roots(&roots));
     written
 }
 

@@ -100,6 +100,16 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
             tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed")
         }
     }
+    // Cursor's bypass is the managed `.cursorignore` block, not a flag.
+    let roots: Vec<std::path::PathBuf> = app
+        .workspace
+        .roots()
+        .iter()
+        .map(|r| r.to_path_buf())
+        .collect();
+    for path in gaviero_core::instructions::sync_cursorignore_roots(&roots) {
+        super::turn_review::note_host_write(app, &path);
+    }
 }
 
 /// A2: resolve the scope a `/remember` invocation targets.

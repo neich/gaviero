@@ -1494,6 +1494,20 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                 "failed to synthesize workspace MCP config"
                             ),
                         }
+                        // Cursor has no instruction-file flag: its bypass is
+                        // the managed `.cursorignore` block. Rewrite it at
+                        // every startup so adding/removing GAVIERO.md takes
+                        // effect without a manual step.
+                        let cursor_roots: Vec<std::path::PathBuf> = app
+                            .workspace
+                            .roots()
+                            .iter()
+                            .map(|r| r.to_path_buf())
+                            .collect();
+                        for path in gaviero_core::instructions::sync_cursorignore_roots(&cursor_roots)
+                        {
+                            super::turn_review::note_host_write(app, &path);
+                        }
                     };
                 // Another gaviero process (typically a first TUI, or a
                 // headless CLI) may already own this workspace endpoint.

@@ -1,7 +1,7 @@
 //! `GAVIERO.md` — one provider-neutral agent instruction file.
 //!
-//! When a `GAVIERO.md` is in scope for an agent's workspace roots, gaviero
-//! owns project instructions for every provider:
+//! When a project `GAVIERO.md` is in scope for an agent's workspace roots,
+//! gaviero owns project instructions for every provider:
 //!
 //! * each provider's native discovery is switched off —
 //!   Claude Code: `claudeMdExcludes` passed through `--settings`
@@ -16,14 +16,23 @@
 //! With no `GAVIERO.md` in scope nothing changes: providers load their own
 //! `CLAUDE.md` / `AGENTS.md` as before.
 //!
-//! Scope, per workspace root:
-//! * inlined — `GAVIERO.md` in the root and each ancestor up to the git root
-//!   (the first directory holding `.git`; only the root itself when there is
-//!   none), plus the directory of an enclosing `*.gaviero-workspace` file;
-//!   outermost first, so closer files win when they disagree;
-//! * referenced — `GAVIERO.md` files further down the tree (honouring
-//!   `.gitignore`) are listed by path for the agent to read before working in
-//!   that folder, the way Claude lazily loads nested `CLAUDE.md` files.
+//! There is no file watcher. Discovery runs each time a session is
+//! constructed, and the TUI spawns a fresh provider session every turn, so an
+//! edited `GAVIERO.md` takes effect on the next turn — explicitly after
+//! `/reset` or `/compact`.
+//!
+//! Scope, per workspace root, broadest first (a later file wins):
+//! * `$GAVIERO_ROOT/.gaviero/GAVIERO.md` — the user-wide baseline, loaded even
+//!   when the repository has none (it takes over `~/.claude/CLAUDE.md`);
+//! * the directory holding an enclosing `*.gaviero-workspace` file;
+//! * the repository root down to the workspace root, stopping at the first
+//!   directory holding `.git` (only the root itself when there is none).
+//!
+//! Only the project/workspace layers above switch provider-native discovery
+//! off; the user-wide file alone does not. A `GAVIERO.md` further down the tree
+//! is folder-scoped, like a nested `CLAUDE.md`: it is listed by path (honouring
+//! `.gitignore`) for the agent to read before working in that folder, and on
+//! its own does not change how a provider loads its own files.
 
 use std::path::{Path, PathBuf};
 
@@ -71,50 +80,60 @@ const CURSORIGNORE_FILE: &str = ".cursorignore";
 const CURSORIGNORE_BEGIN: &str = "# >>> gaviero: GAVIERO.md replaces these (managed block)";
 const CURSORIGNORE_END: &str = "# <<< gaviero";
 /// Cursor reads `AGENTS.md` unconditionally and `CLAUDE.md` /
-/// `CLAUDE.local.md` with third-party extensibility on; its rule loader skips
-/// any file `.cursorignore` matches. Gitignore syntax: a bare name matches at
-/// every depth.
-const CURSOR_IGNORED: &[&str] = &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".cursorrules"];
+/// `CLAUDE.local.md` with third-party extensibility on. `.cursorignore`
+/// excludes them from file access; whether the rule loader honours it as well
+/// is not guaranteed, which is why the injected block says to ignore a native
+/// file if one still appears. Gitignore syntax: a bare name matches at every
+/// depth.
+const CURSOR_IGNORED: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".cursorrules",
+    ".cursor/rules/",
+];
 
 /// The `GAVIERO.md` files in scope for one agent session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectInstructions {
-    /// Inlined files, outermost first.
+    /// Inlined files, broadest first (a later file wins).
     pub inline: Vec<(PathBuf, String)>,
-    /// Files below a root, referenced by path.
+    /// Files below a root, referenced by path and scoped to their folder.
     pub nested: Vec<PathBuf>,
     /// Nested files beyond [`MAX_NESTED`].
     pub nested_overflow: usize,
+    /// A project- or workspace-level file was inlined, so the caller should
+    /// switch provider-native discovery off. The user-wide
+    /// `$GAVIERO_ROOT/.gaviero/GAVIERO.md` alone never sets this.
+    pub replaces_native: bool,
 }
 
 impl ProjectInstructions {
     /// Find every `GAVIERO.md` in scope for `primary` + `additional` roots.
     /// `None` when there is none — the caller leaves providers alone.
     pub fn discover(primary: &Path, additional: &[PathBuf]) -> Option<Self> {
+        Self::discover_with_global(primary, additional, global_file().as_deref())
+    }
+
+    /// [`Self::discover`] with an explicit user-wide file, so tests do not
+    /// depend on `$GAVIERO_ROOT`.
+    fn discover_with_global(
+        primary: &Path,
+        additional: &[PathBuf],
+        global: Option<&Path>,
+    ) -> Option<Self> {
         let roots = roots(primary, additional);
         let mut seen: Vec<PathBuf> = Vec::new();
         let mut out = Self::default();
 
+        // Broadest first: the user-wide baseline, then each root's workspace
+        // and repository layers from its outermost directory down.
+        if let Some(file) = global {
+            out.push_inline(file, &mut seen, false);
+        }
         for root in &roots {
-            for dir in inline_dirs(root) {
-                let file = dir.join(INSTRUCTIONS_FILE);
-                if !file.is_file() {
-                    continue;
-                }
-                let key = canonical(&file);
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
-                match std::fs::read_to_string(&file) {
-                    Ok(body) => out.inline.push((file, body)),
-                    Err(e) => tracing::warn!(
-                        target: "instructions",
-                        path = %file.display(),
-                        error = %e,
-                        "unreadable GAVIERO.md skipped"
-                    ),
-                }
+            for dir in project_dirs(root) {
+                out.push_inline(&dir.join(INSTRUCTIONS_FILE), &mut seen, true);
             }
         }
 
@@ -136,13 +155,50 @@ impl ProjectInstructions {
         (!out.inline.is_empty() || !out.nested.is_empty()).then_some(out)
     }
 
+    fn push_inline(&mut self, file: &Path, seen: &mut Vec<PathBuf>, project: bool) {
+        if !file.is_file() {
+            return;
+        }
+        let key = canonical(file);
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        if project {
+            self.replaces_native = true;
+        }
+        match std::fs::read_to_string(file) {
+            Ok(body) => self.inline.push((file.to_path_buf(), body)),
+            Err(e) => tracing::warn!(
+                target: "instructions",
+                path = %file.display(),
+                error = %e,
+                "unreadable GAVIERO.md skipped"
+            ),
+        }
+    }
+
     /// The `<project_instructions>` block appended to the system prompt.
     pub fn render(&self) -> String {
         let mut out = String::from(
             "<project_instructions source=\"GAVIERO.md\">\n\
-             These are this project's agent instructions. They replace CLAUDE.md, \
-             AGENTS.md and similar provider files, which are not loaded in this \
-             session; do not go looking for them.\n",
+             These are this project's agent instructions and take precedence over \
+             CLAUDE.md, AGENTS.md, .cursor/rules and similar provider files. ",
+        );
+        if self.replaces_native {
+            out.push_str(
+                "Gaviero disables those files where the provider supports it; if a \
+                 provider still loads one, ignore it in favour of this file. ",
+            );
+        } else {
+            out.push_str(
+                "Provider-native files are still loaded here; where they conflict, \
+                 this file wins. ",
+            );
+        }
+        out.push_str(
+            "Files below are ordered broadest first, so a later file wins where \
+             they disagree.\n",
         );
         let mut budget = MAX_INLINE_BYTES;
         for (path, body) in &self.inline {
@@ -185,20 +241,34 @@ impl ProjectInstructions {
     }
 }
 
-/// Whether any `GAVIERO.md` is in scope, i.e. whether provider-native
-/// instruction discovery should be switched off.
+/// Whether a project- or workspace-level `GAVIERO.md` is in scope, i.e.
+/// whether provider-native instruction discovery should be switched off. A
+/// user-wide file, or a nested folder file on its own, does not count.
 pub fn is_active(primary: &Path, additional: &[PathBuf]) -> bool {
-    ProjectInstructions::discover(primary, additional).is_some()
+    roots(primary, additional).iter().any(|root| {
+        project_dirs(root)
+            .iter()
+            .any(|dir| dir.join(INSTRUCTIONS_FILE).is_file())
+    })
 }
 
 /// `system_prompt` plus the `GAVIERO.md` block, or unchanged when none is in
 /// scope.
 pub fn append_to_system_prompt(
-    mut system_prompt: String,
+    system_prompt: String,
     primary: &Path,
     additional: &[PathBuf],
 ) -> String {
-    if let Some(found) = ProjectInstructions::discover(primary, additional) {
+    append_with_global(system_prompt, primary, additional, global_file().as_deref())
+}
+
+fn append_with_global(
+    mut system_prompt: String,
+    primary: &Path,
+    additional: &[PathBuf],
+    global: Option<&Path>,
+) -> String {
+    if let Some(found) = ProjectInstructions::discover_with_global(primary, additional, global) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&found.render());
     }
@@ -213,20 +283,48 @@ pub fn claude_settings_arg() -> String {
 }
 
 /// Add or remove gaviero's managed block in `<root>/.cursorignore` so Cursor
-/// skips `AGENTS.md` / `CLAUDE.md` exactly while `GAVIERO.md` is in scope for
-/// `root`. Lines outside the block are never touched; a file that held only
-/// the block is removed. Returns the path when the file changed.
+/// skips `AGENTS.md` / `CLAUDE.md` exactly while a project `GAVIERO.md` is in
+/// scope for `root`. Lines outside the block are never touched; a file that
+/// held only the block is removed. Returns the path when the file changed.
 ///
 /// Run for workspace roots, not swarm worktrees: a worktree inherits the
 /// block only if `.cursorignore` is committed.
 pub fn sync_cursorignore(root: &Path) -> Result<Option<PathBuf>> {
+    write_cursorignore(root, is_active(root, &[]))
+}
+
+/// Sync every workspace root with one decision, so a `GAVIERO.md` in a sibling
+/// folder also switches Cursor off in the others. Returns the changed paths;
+/// a failing root is logged and skipped (best-effort startup work).
+pub fn sync_cursorignore_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let Some((primary, rest)) = roots.split_first() else {
+        return Vec::new();
+    };
+    let active = is_active(primary, rest);
+    let mut changed = Vec::new();
+    for root in roots {
+        match write_cursorignore(root, active) {
+            Ok(Some(path)) => changed.push(path),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                target: "instructions",
+                path = %root.join(CURSORIGNORE_FILE).display(),
+                error = %e,
+                "could not sync .cursorignore"
+            ),
+        }
+    }
+    changed
+}
+
+fn write_cursorignore(root: &Path, active: bool) -> Result<Option<PathBuf>> {
     let path = root.join(CURSORIGNORE_FILE);
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let next = cursorignore_with_block(existing.as_deref(), is_active(root, &[]));
+    let next = cursorignore_with_block(existing.as_deref(), active);
     match (existing.as_deref(), next.as_deref()) {
         (old, new) if old == new => Ok(None),
         (_, None) => {
@@ -291,8 +389,10 @@ fn roots(primary: &Path, additional: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Directories whose `GAVIERO.md` is inlined for `root`, outermost first.
-fn inline_dirs(root: &Path) -> Vec<PathBuf> {
+/// Directories whose `GAVIERO.md` is inlined for `root`, outermost first: the
+/// enclosing workspace directory when there is one, then the repository root
+/// down to `root`.
+fn project_dirs(root: &Path) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = Vec::new();
     let mut git_root_found = false;
     for dir in root.ancestors() {
@@ -313,6 +413,12 @@ fn inline_dirs(root: &Path) -> Vec<PathBuf> {
     }
     chain.reverse();
     chain
+}
+
+/// User-wide instruction file: `$GAVIERO_ROOT/.gaviero/GAVIERO.md`, beside the
+/// user settings and skills.
+fn global_file() -> Option<PathBuf> {
+    crate::workspace::user_gaviero_dir().map(|dir| dir.join(INSTRUCTIONS_FILE))
 }
 
 fn holds_workspace_file(dir: &Path) -> bool {
@@ -384,14 +490,17 @@ mod tests {
         let dir = repo();
         write(&dir.path().join("CLAUDE.md"), "claude");
         assert!(!is_active(dir.path(), &[]));
-        assert_eq!(append_to_system_prompt("sys".into(), dir.path(), &[]), "sys");
+        assert_eq!(
+            append_with_global("sys".into(), dir.path(), &[], None),
+            "sys"
+        );
     }
 
     #[test]
     fn root_file_is_inlined() {
         let dir = repo();
         write(&dir.path().join(INSTRUCTIONS_FILE), "Use tabs.");
-        let out = append_to_system_prompt("sys".into(), dir.path(), &[]);
+        let out = append_with_global("sys".into(), dir.path(), &[], None);
         assert!(out.starts_with("sys\n\n<project_instructions"));
         assert!(out.contains("Use tabs."));
         assert!(out.ends_with("</project_instructions>"));
@@ -407,7 +516,7 @@ mod tests {
         let pkg = repo.join("pkg");
         write(&pkg.join(INSTRUCTIONS_FILE), "PKG");
 
-        let found = ProjectInstructions::discover(&pkg, &[]).unwrap();
+        let found = ProjectInstructions::discover_with_global(&pkg, &[], None).unwrap();
         let bodies: Vec<&str> = found.inline.iter().map(|(_, b)| b.as_str()).collect();
         assert_eq!(bodies, ["REPO", "PKG"]);
     }
@@ -420,7 +529,7 @@ mod tests {
         let member = ws.path().join("app");
         std::fs::create_dir_all(member.join(".git")).unwrap();
 
-        let found = ProjectInstructions::discover(&member, &[]).unwrap();
+        let found = ProjectInstructions::discover_with_global(&member, &[], None).unwrap();
         assert_eq!(found.inline.len(), 1);
         assert_eq!(found.inline[0].1, "WORKSPACE");
     }
@@ -431,7 +540,7 @@ mod tests {
         write(&outer.path().join(INSTRUCTIONS_FILE), "OUTSIDE");
         let root = outer.path().join("plain");
         std::fs::create_dir_all(&root).unwrap();
-        assert!(ProjectInstructions::discover(&root, &[]).is_none());
+        assert!(ProjectInstructions::discover_with_global(&root, &[], None).is_none());
     }
 
     #[test]
@@ -441,9 +550,12 @@ mod tests {
         write(&dir.path().join("target/x").join(INSTRUCTIONS_FILE), "IGNORED");
         write(&dir.path().join(".gitignore"), "target/\n");
 
-        let found = ProjectInstructions::discover(dir.path(), &[]).unwrap();
+        let found = ProjectInstructions::discover_with_global(dir.path(), &[], None).unwrap();
         assert!(found.inline.is_empty());
+        assert!(!found.replaces_native);
         assert_eq!(found.nested, [dir.path().join("crates/a").join(INSTRUCTIONS_FILE)]);
+        // A nested file alone is folder-scoped and leaves native files on.
+        assert!(!is_active(dir.path(), &[]));
         let rendered = found.render();
         assert!(rendered.contains("Folder-scoped instruction files"));
         assert!(!rendered.contains("\nA\n"));
@@ -454,19 +566,68 @@ mod tests {
         let a = repo();
         let b = repo();
         write(&b.path().join(INSTRUCTIONS_FILE), "B");
-        let found =
-            ProjectInstructions::discover(a.path(), &[b.path().to_path_buf(), b.path().to_path_buf()])
-                .unwrap();
+        let found = ProjectInstructions::discover_with_global(
+            a.path(),
+            &[b.path().to_path_buf(), b.path().to_path_buf()],
+            None,
+        )
+        .unwrap();
         assert_eq!(found.inline.len(), 1);
+        assert!(found.replaces_native);
     }
 
     #[test]
     fn oversized_body_is_truncated_with_pointer() {
         let dir = repo();
         write(&dir.path().join(INSTRUCTIONS_FILE), &"é".repeat(MAX_INLINE_BYTES));
-        let rendered = ProjectInstructions::discover(dir.path(), &[]).unwrap().render();
+        let rendered = ProjectInstructions::discover_with_global(dir.path(), &[], None)
+            .unwrap()
+            .render();
         assert!(rendered.contains("[truncated — read"));
         assert!(rendered.len() < MAX_INLINE_BYTES + 2048);
+    }
+
+    #[test]
+    fn project_file_switches_native_discovery_off() {
+        let dir = repo();
+        write(&dir.path().join(INSTRUCTIONS_FILE), "x");
+        let found = ProjectInstructions::discover_with_global(dir.path(), &[], None).unwrap();
+        assert!(found.replaces_native);
+        assert!(is_active(dir.path(), &[]));
+    }
+
+    #[test]
+    fn user_wide_file_is_a_baseline_and_does_not_switch_native_off() {
+        let dir = repo();
+        write(&dir.path().join("CLAUDE.md"), "claude");
+        let global = tempfile::tempdir().unwrap();
+        let global_file = global.path().join(INSTRUCTIONS_FILE);
+        write(&global_file, "GLOBAL");
+
+        let found =
+            ProjectInstructions::discover_with_global(dir.path(), &[], Some(&global_file))
+                .unwrap();
+        assert_eq!(found.inline.len(), 1);
+        assert_eq!(found.inline[0].1, "GLOBAL");
+        assert!(!found.replaces_native);
+        // A user-wide file alone never hides the project's CLAUDE.md.
+        assert!(!is_active(dir.path(), &[]));
+    }
+
+    #[test]
+    fn user_wide_file_is_read_before_the_repository() {
+        let dir = repo();
+        write(&dir.path().join(INSTRUCTIONS_FILE), "REPO");
+        let global = tempfile::tempdir().unwrap();
+        let global_file = global.path().join(INSTRUCTIONS_FILE);
+        write(&global_file, "GLOBAL");
+
+        let found =
+            ProjectInstructions::discover_with_global(dir.path(), &[], Some(&global_file))
+                .unwrap();
+        let bodies: Vec<&str> = found.inline.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(bodies, ["GLOBAL", "REPO"]);
+        assert!(found.replaces_native);
     }
 
     #[test]
@@ -499,5 +660,25 @@ mod tests {
         std::fs::remove_file(dir.path().join(INSTRUCTIONS_FILE)).unwrap();
         assert!(sync_cursorignore(dir.path()).unwrap().is_some());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn cursorignore_roots_share_one_decision() {
+        let a = repo();
+        let b = repo();
+        let roots = [a.path().to_path_buf(), b.path().to_path_buf()];
+        assert!(sync_cursorignore_roots(&roots).is_empty());
+
+        // A GAVIERO.md in a sibling root switches Cursor off in both.
+        write(&b.path().join(INSTRUCTIONS_FILE), "B");
+        assert_eq!(sync_cursorignore_roots(&roots).len(), 2);
+        assert!(a.path().join(CURSORIGNORE_FILE).exists());
+        assert!(b.path().join(CURSORIGNORE_FILE).exists());
+
+        // Removing it takes both blocks out again.
+        std::fs::remove_file(b.path().join(INSTRUCTIONS_FILE)).unwrap();
+        assert_eq!(sync_cursorignore_roots(&roots).len(), 2);
+        assert!(!a.path().join(CURSORIGNORE_FILE).exists());
+        assert!(!b.path().join(CURSORIGNORE_FILE).exists());
     }
 }
