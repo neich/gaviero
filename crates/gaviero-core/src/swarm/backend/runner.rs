@@ -386,7 +386,11 @@ async fn run_backend_inner(
 
         let request = CompletionRequest {
             prompt,
-            system_prompt: Some(default_editor_system_prompt(&capabilities)),
+            system_prompt: Some(crate::instructions::append_to_system_prompt(
+                default_editor_system_prompt(&capabilities),
+                workspace_root,
+                &[],
+            )),
             workspace_root: workspace_root.to_path_buf(),
             additional_roots: vec![],
             allowed_tools,

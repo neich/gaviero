@@ -379,6 +379,13 @@ fn codex_exec_args(
         args.push(pair);
     }
 
+    // GAVIERO.md in scope: no AGENTS.md discovery; the system prompt carries
+    // GAVIERO.md instead. Before `extra` so a DSL override still wins.
+    if crate::instructions::is_active(workspace_root, additional_roots) {
+        args.push("--config".to_string());
+        args.push(crate::instructions::CODEX_DISABLE_PROJECT_DOCS.to_string());
+    }
+
     // Forward every `extra { k v }` pair as a `-c k=v` override to codex.
     // Codex treats `--config` args as TOML-shaped overrides and silently
     // ignores unknown keys, so this is a safe pass-through: users opt in

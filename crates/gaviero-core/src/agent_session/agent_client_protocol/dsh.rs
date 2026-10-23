@@ -147,21 +147,27 @@ impl DshLaunchSpec {
     }
 
     /// Launcher arguments: the configured args, `--profile` unless the args
-    /// already set one, then `--patch <patch>` when given.
-    pub fn launch_args(&self, patch: Option<&Path>) -> Vec<std::ffi::OsString> {
+    /// already set one, then one `--patch <patch>` per overlay, in order.
+    pub fn launch_args(&self, patches: &[&Path]) -> Vec<std::ffi::OsString> {
         let mut out: Vec<std::ffi::OsString> = self.args.iter().map(Into::into).collect();
         if !self.profile.is_empty() && !args_already_set_profile(&self.args) {
             out.push("--profile".into());
             out.push(self.profile.as_str().into());
         }
-        if let Some(patch) = patch {
+        for patch in patches {
             out.push("--patch".into());
             out.push(patch.as_os_str().to_owned());
         }
         out
     }
 
-    pub fn build_command(&self, workspace_root: &Path) -> Result<tokio::process::Command> {
+    /// `additional_roots` only decide whether a `GAVIERO.md` is in scope
+    /// ([`crate::instructions`]); dsh's cwd stays `workspace_root`.
+    pub fn build_command(
+        &self,
+        workspace_root: &Path,
+        additional_roots: &[std::path::PathBuf],
+    ) -> Result<tokio::process::Command> {
         let mut cmd = agent_command(&self.command);
         if !self.skip_api_key {
             // The inner error names every file that was searched (workspace,
@@ -173,18 +179,32 @@ impl DshLaunchSpec {
         }
         // Resolved after the key so a missing key is reported before
         // anything is written under `~/.gaviero`.
-        let patch = if !self.skip_api_key && self.credential_source == DshCredentialSource::Gaviero
-        {
-            Some(ensure_acp_patch_file(&acp_patch_dir().ok_or_else(|| {
+        let mut patches: Vec<std::path::PathBuf> = Vec::new();
+        if !self.skip_api_key && self.credential_source == DshCredentialSource::Gaviero {
+            patches.push(ensure_acp_patch_file(&acp_patch_dir().ok_or_else(|| {
                 anyhow!(
                     "dsh: cannot locate ~/.gaviero for the credential patch; \
                      set providers.dsh.credentialSource to \"dsh\""
                 )
-            })?)?)
-        } else {
-            None
-        };
-        cmd.args(self.launch_args(patch.as_deref()));
+            })?)?);
+        }
+        // GAVIERO.md in scope: switch off dsh's AGENTS.md / CLAUDE.md
+        // discovery; the first prompt block carries GAVIERO.md instead.
+        // Real dsh only — the fake agent takes no patch overlays.
+        if !self.skip_api_key && crate::instructions::is_active(workspace_root, additional_roots) {
+            match acp_patch_dir() {
+                Some(dir) => patches.push(ensure_patch_file(
+                    &dir,
+                    crate::instructions::DSH_DISABLE_INSTRUCTIONS_PATCH_FILE,
+                    crate::instructions::DSH_DISABLE_INSTRUCTIONS_PATCH,
+                )?),
+                None => tracing::warn!(
+                    "dsh: cannot locate ~/.gaviero; AGENTS.md discovery stays on"
+                ),
+            }
+        }
+        let patch_refs: Vec<&Path> = patches.iter().map(|p| p.as_path()).collect();
+        cmd.args(self.launch_args(&patch_refs));
         cmd.current_dir(workspace_root);
         cmd.env("NO_COLOR", "1");
         Ok(cmd)
@@ -199,14 +219,20 @@ fn acp_patch_dir() -> Option<std::path::PathBuf> {
 /// Write [`GAVIERO_ACP_PATCH`] to `<dir>/gaviero-acp.patch.yml` (tmp + rename)
 /// unless it is already current, and return its path.
 pub fn ensure_acp_patch_file(dir: &Path) -> Result<std::path::PathBuf> {
+    ensure_patch_file(dir, GAVIERO_ACP_PATCH_FILE, GAVIERO_ACP_PATCH)
+}
+
+/// Write `body` to `<dir>/<name>` (tmp + rename) unless it is already
+/// current, and return its path.
+pub fn ensure_patch_file(dir: &Path, name: &str, body: &str) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("dsh: creating {}", dir.display()))?;
-    let path = dir.join(GAVIERO_ACP_PATCH_FILE);
-    if std::fs::read_to_string(&path).is_ok_and(|s| s == GAVIERO_ACP_PATCH) {
+    let path = dir.join(name);
+    if std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
         return Ok(path);
     }
-    let tmp = dir.join(format!("{GAVIERO_ACP_PATCH_FILE}.tmp"));
-    std::fs::write(&tmp, GAVIERO_ACP_PATCH)
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, body)
         .with_context(|| format!("dsh: writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("dsh: replacing {}", path.display()))?;

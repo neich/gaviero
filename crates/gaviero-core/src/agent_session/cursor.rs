@@ -215,7 +215,13 @@ impl CursorSession {
             },
         }
         .with_exposed_tools(self.exposed_tools.as_deref());
-        let system_prompt = shared::default_editor_system_prompt(&backend_caps);
+        // GAVIERO.md rides the prompt; `.cursorignore` keeps Cursor's own
+        // AGENTS.md / CLAUDE.md out (`instructions::sync_cursorignore`).
+        let system_prompt = crate::instructions::append_to_system_prompt(
+            shared::default_editor_system_prompt(&backend_caps),
+            &self.workspace_root,
+            &self.additional_roots,
+        );
         let user_prompt =
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");

@@ -6,6 +6,7 @@ pub mod git;
 pub mod git_conflict;
 pub mod history;
 pub mod indent;
+pub mod instructions;
 pub mod iteration;
 pub mod mcp;
 pub mod memory;
