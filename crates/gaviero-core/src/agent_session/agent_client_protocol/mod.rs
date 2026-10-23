@@ -891,7 +891,11 @@ fn build_prompt_blocks(
     session_cwd: &Path,
 ) -> Vec<Value> {
     let mut parts: Vec<String> = Vec::new();
-    parts.push(default_editor_system_prompt(&capabilities(exposed)));
+    parts.push(crate::instructions::append_to_system_prompt(
+        default_editor_system_prompt(&capabilities(exposed)),
+        workspace_root,
+        additional_roots,
+    ));
     if let Some(block) = render_graph_block(&turn.graph_selections) {
         parts.push(block);
     }

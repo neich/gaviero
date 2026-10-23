@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use gaviero_remote::dto::{
-    AnsweredBy, CommandStatus, ErrorCode, PermissionOutcome, ReviewActionKind,
+    AnsweredBy, CommandStatus, ErrorCode, PermissionGrant, PermissionOutcome, ReviewActionKind,
 };
 use gaviero_remote::envelope::{
     ClientEnvelope, ClientFrame, CommandError, CommandResult, PermissionClosed, ServerFrame,
@@ -248,6 +248,7 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 d.allow,
                 d.answers.as_deref(),
                 d.message.as_deref(),
+                d.grant,
                 AnsweredBy::Remote,
             )
             .map(|_| (CommandStatus::Completed, None)),
@@ -354,12 +355,17 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
 /// `permission_decision` land here; first valid writer wins, the loser
 /// finds no parked request (`stale_request`), and every close emits one
 /// `permission_closed` with `answered_by`.
+///
+/// `grant` (1.4) also allows the request's whole MCP server until the
+/// conversation's next prompt; it is checked before the request is consumed,
+/// so an invalid grant leaves the request parked.
 pub fn apply_permission_decision(
     app: &mut App,
     request_id: &str,
     allow: bool,
     answers: Option<&[Vec<u32>]>,
     message: Option<&str>,
+    grant: Option<PermissionGrant>,
     answered_by: AnsweredBy,
 ) -> Result<PermissionClosed, CommandFailure> {
     // Deny note hygiene (§5.3): size-limited, control-character filtered,
@@ -377,11 +383,33 @@ pub fn apply_permission_decision(
             "no pending permission with that id — the other side answered first",
         ));
     };
+    let turn_rule = match grant {
+        None => None,
+        Some(PermissionGrant::McpServerTurn) => {
+            if !allow {
+                return Err(CommandFailure::new(
+                    ErrorCode::InvalidPayload,
+                    "grant is only valid with allow",
+                ));
+            }
+            let Some(rule) = app.chat_state.turn_grant_rule_at(idx) else {
+                return Err(CommandFailure::new(
+                    ErrorCode::InvalidPayload,
+                    "this request is not an MCP tool call that can be granted server-wide",
+                ));
+            };
+            Some(rule)
+        }
+    };
     match app
         .chat_state
         .respond_permission_at(idx, allow, answers, message.as_deref())
     {
         Ok(info) => {
+            if let Some(rule) = turn_rule {
+                tracing::info!("Permission rule '{rule}' granted for the rest of the prompt");
+                app.chat_state.grant_for_turn_at(idx, rule);
+            }
             let closed = PermissionClosed {
                 conv_id: info.conv_id,
                 request_id: info.request_id,
@@ -420,7 +448,15 @@ pub fn desktop_answer_active_permission(app: &mut App, allow: bool) {
     else {
         return;
     };
-    let _ = apply_permission_decision(app, &request_id, allow, None, None, AnsweredBy::Desktop);
+    let _ = apply_permission_decision(
+        app,
+        &request_id,
+        allow,
+        None,
+        None,
+        None,
+        AnsweredBy::Desktop,
+    );
 }
 
 // ── Conversation commands (§4.4 / §4.8) ─────────────────────────────
@@ -1056,6 +1092,138 @@ mod tests {
         assert!(!projected.message.truncated);
 
         let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    fn park_permission(
+        app: &mut App,
+        conv_id: &str,
+        tool_name: &str,
+    ) -> tokio::sync::oneshot::Receiver<gaviero_core::observer::PermissionDecision> {
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        crate::app::controller::handle_event(
+            app,
+            Event::PermissionRequest {
+                conv_id: conv_id.to_string(),
+                tool_name: tool_name.to_string(),
+                description: "d".into(),
+                input: serde_json::json!({}),
+                respond,
+            },
+        );
+        rx
+    }
+
+    fn parked_request_id(app: &App, conv_id: &str) -> Option<String> {
+        let idx = app.chat_state.find_conv_idx(conv_id)?;
+        app.chat_state.conversations[idx]
+            .pending_permission
+            .as_ref()
+            .map(|p| p.request_id.clone())
+    }
+
+    /// The remote "allow this MCP server for the rest of the prompt" answer:
+    /// the request carries `mcp_server`, the grant answers the next call to
+    /// that server without parking, other servers still ask, and the next
+    /// dispatched prompt ends it.
+    #[tokio::test]
+    async fn remote_turn_grant_allows_the_server_until_the_next_prompt() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let mut first = park_permission(&mut app, &bg, "mcp__flutter__hot_reload");
+
+        let projected = app
+            .remote
+            .pending_frames
+            .iter()
+            .find_map(|frame| match frame {
+                ServerFrame::PermissionRequest(r) if r.conv_id == bg => Some(r.clone()),
+                _ => None,
+            })
+            .expect("the parked request is projected");
+        assert_eq!(projected.mcp_server.as_deref(), Some("flutter"));
+
+        let closed = apply_permission_decision(
+            &mut app,
+            &projected.request_id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::McpServerTurn),
+            AnsweredBy::Remote,
+        )
+        .expect("grant accepted");
+        assert_eq!(closed.outcome, PermissionOutcome::Allowed);
+        assert!(matches!(
+            first.try_recv(),
+            Ok(gaviero_core::observer::PermissionDecision::Allow { .. })
+        ));
+
+        // Same server, other tool: answered without parking.
+        let mut second = park_permission(&mut app, &bg, "mcp__flutter__screenshot");
+        assert!(parked_request_id(&app, &bg).is_none());
+        assert!(matches!(
+            second.try_recv(),
+            Ok(gaviero_core::observer::PermissionDecision::Allow { .. })
+        ));
+
+        // Another server still asks.
+        let _other = park_permission(&mut app, &bg, "mcp__context7__query-docs");
+        let other_id = parked_request_id(&app, &bg).expect("other server parks");
+        desktop_answer_active_permission_for(&mut app, &other_id);
+
+        // The next prompt ends the grant.
+        crate::app::side_panel::dispatch_prompt_core(
+            &mut app,
+            &bg,
+            "next prompt".into(),
+            Vec::new(),
+            false,
+        )
+        .expect("prompt must dispatch");
+        let _third = park_permission(&mut app, &bg, "mcp__flutter__hot_reload");
+        assert!(parked_request_id(&app, &bg).is_some(), "asks again");
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    fn desktop_answer_active_permission_for(app: &mut App, request_id: &str) {
+        apply_permission_decision(app, request_id, false, None, None, None, AnsweredBy::Desktop)
+            .expect("deny");
+    }
+
+    #[tokio::test]
+    async fn remote_turn_grant_is_refused_off_mcp_and_keeps_the_request() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let _rx = park_permission(&mut app, &bg, "Bash");
+        let id = parked_request_id(&app, &bg).expect("parked");
+        let err = apply_permission_decision(
+            &mut app,
+            &id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::McpServerTurn),
+            AnsweredBy::Remote,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPayload);
+        assert_eq!(parked_request_id(&app, &bg), Some(id.clone()), "still parked");
+
+        // A deny cannot carry a grant either.
+        let _rx2 = park_permission(&mut app, &bg, "mcp__flutter__hot_reload");
+        let id2 = parked_request_id(&app, &bg).unwrap();
+        let err = apply_permission_decision(
+            &mut app,
+            &id2,
+            false,
+            None,
+            None,
+            Some(PermissionGrant::McpServerTurn),
+            AnsweredBy::Remote,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPayload);
+        assert!(app.chat_state.conversations[0].turn_allowed_tools.is_empty());
     }
 
     #[test]

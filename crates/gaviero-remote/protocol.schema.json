@@ -70,6 +70,17 @@
               "null"
             ]
           },
+          "grant": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/PermissionGrant"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "1.4 (`permission_turn_grant`): with `allow`, also answer later\nrequests covered by the grant without asking. Only valid on a\nrequest that carries `mcp_server`."
+          },
           "message": {
             "description": "Free text on deny; size-limited, control-character filtered.",
             "type": [
@@ -87,8 +98,18 @@
         ],
         "type": "object"
       },
+      "PermissionGrant": {
+        "description": "Standing grant attached to an allow (1.4, `permission_turn_grant`).",
+        "oneOf": [
+          {
+            "const": "mcp_server_turn",
+            "description": "Every tool of the request's `mcp_server`, until the conversation's\nnext prompt is dispatched.",
+            "type": "string"
+          }
+        ]
+      },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -751,7 +772,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -821,7 +842,7 @@
   "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 3
+    "minor": 4
   },
   "server_envelope": {
     "$defs": {
@@ -1526,6 +1547,13 @@
           "input": {
             "description": "Display-only. The client never sends tool input back."
           },
+          "mcp_server": {
+            "description": "1.4: MCP server the tool belongs to, present only when the request\ncan be answered with `grant: mcp_server_turn`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "request_id": {
             "type": "string"
           },
@@ -1728,7 +1756,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`.",
         "properties": {
           "major": {
             "format": "uint16",

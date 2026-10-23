@@ -2062,6 +2062,8 @@ pub(crate) fn dispatch_prompt_core(
     {
         let conv = &mut app.chat_state.conversations[conv_idx];
         conv.pending_turn_id = Some(turn_id.clone());
+        // "Allow this MCP server for the rest of the prompt" ends here.
+        conv.turn_allowed_tools.clear();
         conv.pending_module_path = pending_module_path.clone();
         conv.pending_focused_folder = focused_folder.clone();
         conv.is_streaming = true;

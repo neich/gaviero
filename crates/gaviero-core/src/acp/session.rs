@@ -109,6 +109,10 @@ pub struct AgentOptions {
     /// Shell commands keep their own policy. Default `false`: swarm and CLI
     /// keep the Write Gate path.
     pub host_capture: bool,
+    /// A `GAVIERO.md` is in scope ([`crate::instructions`]): turn off
+    /// Claude's native `CLAUDE.md` / `AGENTS.md` discovery. The caller puts
+    /// the `GAVIERO.md` text in the system prompt.
+    pub skip_native_instructions: bool,
 }
 
 /// Edit tools approved without a prompt when the host reviews the turn's
@@ -139,6 +143,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("exposed_tools", &self.exposed_tools)
             .field("stdin_prompt", &self.stdin_prompt)
             .field("host_capture", &self.host_capture)
+            .field("skip_native_instructions", &self.skip_native_instructions)
             .finish()
     }
 }
@@ -163,6 +168,7 @@ impl Default for AgentOptions {
             exposed_tools: None,
             stdin_prompt: false,
             host_capture: false,
+            skip_native_instructions: false,
         }
     }
 }
@@ -473,6 +479,14 @@ impl AcpSession {
 
         if !system_prompt.is_empty() {
             cmd.arg("--append-system-prompt").arg(system_prompt);
+        }
+
+        // GAVIERO.md in scope: skip Claude's own CLAUDE.md / AGENTS.md
+        // discovery (the caller's system prompt carries GAVIERO.md). A
+        // flag-level settings layer, so project permissions still load.
+        if options.skip_native_instructions {
+            cmd.arg("--settings")
+                .arg(crate::instructions::claude_settings_arg());
         }
 
         // Interactive chat always exposes AskUserQuestion so clarifying

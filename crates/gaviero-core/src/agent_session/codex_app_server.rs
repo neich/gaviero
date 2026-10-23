@@ -112,10 +112,14 @@ fn codex_instructions_with_tools(
          Prefer the narrowest verification scope that validates the change.\n",
     );
 
-    if additional_roots.is_empty() {
-        return instructions;
+    if !additional_roots.is_empty() {
+        push_workspace_folders(&mut instructions, cwd, additional_roots);
     }
+    // GAVIERO.md replaces AGENTS.md (switched off in `codex_app_server_args`).
+    crate::instructions::append_to_system_prompt(instructions, cwd, additional_roots)
+}
 
+fn push_workspace_folders(instructions: &mut String, cwd: &Path, additional_roots: &[PathBuf]) {
     instructions.push_str("\nWorkspace folders (workspace-mode):\n");
     instructions.push_str(&format!("  primary: {}\n", cwd.to_string_lossy()));
     for root in additional_roots {
@@ -128,7 +132,6 @@ fn codex_instructions_with_tools(
         "Read from any folder above. Native edits inside those folders are captured \
          transactionally and routed through the same review queue.\n",
     );
-    instructions
 }
 
 fn thread_start_params(
@@ -361,12 +364,18 @@ pub struct CodexAppServerSession {
     review: ReviewContext,
 }
 
-fn codex_app_server_args(workspace_root: &Path) -> Vec<String> {
+fn codex_app_server_args(workspace_root: &Path, additional_roots: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
     let codex_config = workspace_root.join(".codex/config.toml");
     for pair in crate::mcp::codex_mcp_overrides_from_config_file(&codex_config) {
         args.push("--config".to_string());
         args.push(pair);
+    }
+    // GAVIERO.md in scope: no AGENTS.md discovery; `developerInstructions`
+    // carries GAVIERO.md instead.
+    if crate::instructions::is_active(workspace_root, additional_roots) {
+        args.push("--config".to_string());
+        args.push(crate::instructions::CODEX_DISABLE_PROJECT_DOCS.to_string());
     }
     crate::mcp::push_codex_multi_agent_override(
         &mut args,
@@ -445,7 +454,7 @@ impl CodexAppServerSession {
         }
 
         let mut cmd = crate::util::spawn::agent_command("codex");
-        for arg in codex_app_server_args(&self.workspace_root) {
+        for arg in codex_app_server_args(&self.workspace_root, &self.additional_roots) {
             cmd.arg(arg);
         }
         cmd.current_dir(&self.workspace_root).env("NO_COLOR", "1");
@@ -2250,7 +2259,7 @@ url = "https://example/mcp/"
         )
         .unwrap();
 
-        let args = codex_app_server_args(dir.path());
+        let args = codex_app_server_args(dir.path(), &[]);
         let app_server_index = args
             .iter()
             .position(|arg| arg == "app-server")
@@ -2277,13 +2286,27 @@ url = "https://example/mcp/"
     fn codex_app_server_args_emit_no_config_when_synth_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            codex_app_server_args(dir.path()),
+            codex_app_server_args(dir.path(), &[]),
             vec![
                 "app-server".to_string(),
                 "--listen".to_string(),
                 "stdio://".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn codex_app_server_args_disable_agents_md_when_gaviero_md_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("GAVIERO.md"), "rules").unwrap();
+        let args = codex_app_server_args(dir.path(), &[]);
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--config" && pair[1] == crate::instructions::CODEX_DISABLE_PROJECT_DOCS
+        }));
+        let instructions = codex_instructions_with_tools(dir.path(), &[], None);
+        assert!(instructions.contains("<project_instructions"));
+        assert!(instructions.contains("rules"));
     }
 
     #[test]

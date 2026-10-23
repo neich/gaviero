@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.3 (1.0 frozen; 1.1, 1.2 and 1.3 additive)
+# Gaviero Remote Protocol — v1.4 (1.0 frozen; 1.1, 1.2, 1.3 and 1.4 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 3 }
+PROTOCOL_VERSION  = { major: 1, minor: 4 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1)
@@ -168,7 +168,7 @@ holds the current token.
 | `client_hello` | `{ protocol_version, client_name, client_version }` |
 | `send_prompt` | `{ conv_id, text }` |
 | `slash` | `{ conv_id, line, confirmed }` — `confirmed: true` required for entries in `hello.confirm_required` |
-| `permission_decision` | `{ request_id, allow, answers?, message? }` — see Permission safety |
+| `permission_decision` | `{ request_id, allow, answers?, message?, grant? }` — see Permission safety; `grant` since 1.4 (`permission_turn_grant`) |
 | `review_action` | `{ proposal_id, proposal_revision, action, hunk_index? }` — `action ∈ accept_hunk \| reject_hunk \| accept_all \| reject_all \| finalize`; `hunk_index` required for the per-hunk actions |
 | `new_conversation` | `{ }` |
 | `switch_conversation` | `{ conv_id }` |
@@ -202,7 +202,7 @@ close 4006.
 | `streaming_ended` | `{ conv_id, turn_id, cancelled, error?, proposal_count }` |
 | `tool_call_started` | `{ conv_id, turn_id, tool_name }` |
 | `message_complete` | `{ conv_id, message: Message }` |
-| `permission_request` | `{ conv_id, request_id, tool_name, description, input, ask? }` — `input` is display-only |
+| `permission_request` | `{ conv_id, request_id, tool_name, description, input, ask?, mcp_server? }` — `input` is display-only; `mcp_server` since 1.4 |
 | `permission_closed` | `{ conv_id, request_id, outcome, answered_by }` — `outcome ∈ allowed \| denied \| superseded \| cancelled`; `answered_by ∈ desktop \| remote \| system` |
 | `proposal_created` | `{ proposal: Proposal }` |
 | `proposal_updated` | `{ proposal: Proposal }` |
@@ -217,7 +217,8 @@ close 4006.
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`. Clients ignore unknown entries.
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`. Clients ignore unknown
+entries.
 
 ## DTOs
 
@@ -249,7 +250,8 @@ Message              { seq, role, content, truncated, full_bytes?, tool_calls: [
 CodeBlock            { start_byte, end_byte, language?, truncated, spans: [Span] }
 Span                 { start_byte, end_byte, class }
 
-PermissionRequest    { conv_id, request_id, tool_name, description, input, ask? }
+PermissionRequest    { conv_id, request_id, tool_name, description, input, ask?, mcp_server? }
+PermissionGrant      "mcp_server_turn"                                        (1.4)
 Ask                  { questions: [AskQuestion] }
 AskQuestion          { question, header, multi_select, options: [AskOption] }
 AskOption            { label, description }
@@ -479,6 +481,23 @@ Unviewable: `{ "path": "logo.png", "viewable": false, "reason": "binary", "bytes
 - The browser is read-only: there is no write, create, rename, delete, or save command.
 - Path rules: only `<root-label>/<rel>` strings inside a workspace root are accepted; `..`,
   absolute paths, and symlinks resolving outside the root are `invalid_payload`.
+
+## Turn grants (`permission_turn_grant` capability, 1.4)
+
+Servers advertising `permission_turn_grant` let one answer allow a whole MCP server for the rest
+of the current prompt.
+
+- `permission_request.mcp_server` names the server (`flutter` for `mcp__flutter__hot_reload`). It
+  is present **only** when the request can be granted this way: an `mcp__<server>__<tool>` call
+  that is not an `AskUserQuestion` and not a shell/`acp` prompt. Clients show the option only
+  when the field is present.
+- `permission_decision { allow: true, grant: "mcp_server_turn" }` allows this request and, until
+  the conversation's next prompt is dispatched (from either side), answers every later request
+  for `mcp__<server>__*` on that conversation without parking it — no `permission_request`
+  frame is sent for those.
+- `grant` with `allow: false`, or on a request without `mcp_server`, is `invalid_payload` and
+  leaves the request parked. `permission_closed.outcome` is `allowed` as for a plain allow.
+- The grant never changes what executes: tool inputs are echoed unchanged, as for a plain allow.
 
 ## Fixtures
 

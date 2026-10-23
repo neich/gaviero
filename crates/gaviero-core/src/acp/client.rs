@@ -131,7 +131,11 @@ impl AcpPipeline {
             let caps = backend.capabilities();
             let request = CompletionRequest {
                 prompt: prompt.to_string(),
-                system_prompt: Some(shared::default_editor_system_prompt(&caps)),
+                system_prompt: Some(crate::instructions::append_to_system_prompt(
+                    shared::default_editor_system_prompt(&caps),
+                    &self.workspace_root,
+                    &self.additional_roots,
+                )),
                 workspace_root: self.workspace_root.clone(),
                 additional_roots: self.additional_roots.clone(),
                 allowed_tools: if caps.tool_use {

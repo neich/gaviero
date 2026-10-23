@@ -316,6 +316,13 @@ impl ClaudeSession {
             "turn_dispatch"
         );
 
+        // GAVIERO.md: discovered over the workspace folders only (not the
+        // attachment parents added to `--add-dir` below).
+        let project_instructions = crate::instructions::ProjectInstructions::discover(
+            &self.workspace_root,
+            &self.additional_roots,
+        );
+
         // ── Build AgentOptions for AcpSession ────────────────────────────
         let options = {
             #[allow(deprecated)]
@@ -330,6 +337,7 @@ impl ClaudeSession {
                 // `result` in auto-approve mode too — see `acp::turn`.
                 stdin_prompt: true,
                 host_capture: self.host_capture,
+                skip_native_instructions: project_instructions.is_some(),
                 ..AgentOptions::default()
             }
         };
@@ -340,11 +348,15 @@ impl ClaudeSession {
         let approved_tools: Vec<&str> = approved_owned.iter().map(String::as_str).collect();
 
         // System prompt (same as legacy path — from ClaudeCodeBackend capabilities).
-        let system_prompt = shared::default_editor_system_prompt(
+        let mut system_prompt = shared::default_editor_system_prompt(
             &crate::swarm::backend::claude_code::ClaudeCodeBackend::new(&self.claude_model)
                 .capabilities()
                 .with_exposed_tools(self.exposed_tools.as_deref()),
         );
+        if let Some(found) = &project_instructions {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&found.render());
+        }
 
         // Build `build_enriched_prompt`-equivalent for file refs + history.
         // `AcpSession::spawn` takes the enriched prompt directly; we pass the

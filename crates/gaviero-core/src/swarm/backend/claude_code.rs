@@ -75,6 +75,10 @@ impl AgentBackend for ClaudeCodeBackend {
                 .iter()
                 .find(|(k, _)| k == "agents_json")
                 .map(|(_, v)| v.clone()),
+            skip_native_instructions: crate::instructions::is_active(
+                &request.workspace_root,
+                &request.additional_roots,
+            ),
             ..AgentOptions::default()
         };
 

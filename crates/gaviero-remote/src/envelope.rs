@@ -101,6 +101,11 @@ pub struct PermissionDecision {
     /// Free text on deny; size-limited, control-character filtered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// 1.4 (`permission_turn_grant`): with `allow`, also answer later
+    /// requests covered by the grant without asking. Only valid on a
+    /// request that carries `mcp_server`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<PermissionGrant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

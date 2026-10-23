@@ -393,7 +393,11 @@ impl AgentSession for ToolAgentSession {
         apply_replay_compaction(&mut turn, &self.compaction, self.profile.max_context_tokens);
         self.connect_extra_servers().await;
 
-        let system = default_editor_system_prompt(&self.capabilities());
+        let system = crate::instructions::append_to_system_prompt(
+            default_editor_system_prompt(&self.capabilities()),
+            &self.workspace_root,
+            &self.additional_roots,
+        );
         let prompt = Self::build_prompt(&turn);
         let user_content =
             attachments::user_content(prompt, &turn.file_refs, self.vision()).await;
