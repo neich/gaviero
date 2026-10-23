@@ -317,11 +317,16 @@ impl ClaudeSession {
         );
 
         // GAVIERO.md: discovered over the workspace folders only (not the
-        // attachment parents added to `--add-dir` below).
+        // attachment parents added to `--add-dir` below). This runs on every
+        // turn, so a `/compact`, `/reset` or an edited GAVIERO.md is picked up
+        // by the next spawn instead of being frozen into a long-lived session.
         let project_instructions = crate::instructions::ProjectInstructions::discover(
             &self.workspace_root,
             &self.additional_roots,
         );
+        let skip_native_instructions = project_instructions
+            .as_ref()
+            .is_some_and(|found| found.replaces_native);
 
         // ── Build AgentOptions for AcpSession ────────────────────────────
         let options = {
@@ -337,7 +342,7 @@ impl ClaudeSession {
                 // `result` in auto-approve mode too — see `acp::turn`.
                 stdin_prompt: true,
                 host_capture: self.host_capture,
-                skip_native_instructions: project_instructions.is_some(),
+                skip_native_instructions,
                 ..AgentOptions::default()
             }
         };

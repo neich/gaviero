@@ -143,6 +143,8 @@ Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4
 
 **Agent permissions** are defined once under `agent` and pushed to every provider. Do not author shell rules in `.claude/settings.json`, `.cursor/cli.json` or `.codex/` — gaviero regenerates those from these keys on every launch and inside every swarm worktree (hand-written entries survive, but they never reach the other providers).
 
+**Project instructions** come from `GAVIERO.md`, one file for every provider. When a repository (or an enclosing `*.gaviero-workspace` folder) has one, gaviero switches off the provider's own `CLAUDE.md` / `AGENTS.md` discovery — Claude `claudeMdExcludes`, Codex `project_doc_max_bytes=0`, dsh's `agent-instructions` row, and a managed `.cursorignore` block for Cursor — and injects `GAVIERO.md` instead. Files are read from the repository root down to the workspace folder, so the deepest file wins; `$GAVIERO_ROOT/.gaviero/GAVIERO.md` is the user-wide baseline and never hides a project file on its own. Nested `GAVIERO.md` files are listed for the agent to read when it works in that folder, the way nested `CLAUDE.md` files are. There is no opt-out: a `GAVIERO.md` in the tree is always in effect. Claude's own `/compact` is not special — gaviero re-reads the file on the next turn, so edits apply after a compaction or reset.
+
 | Key | Meaning | Default |
 |---|---|---|
 | `agent.availableTools` | Hard tool surface. Claude `--tools`; Cursor `Shell(*)` / `Write(**)` deny rules when `Bash` / write tools are absent; Codex chat declines commands and file changes that are off the surface; tool registry of the in-process agent. | `Read, Glob, Grep, Write, Edit, MultiEdit` |

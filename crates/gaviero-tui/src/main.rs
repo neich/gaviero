@@ -266,6 +266,20 @@ async fn main() -> Result<()> {
         None => gaviero_core::workspace::Workspace::single_folder(path),
     };
 
+    // Cursor has no flag to switch its instruction files off; its only bypass
+    // is `.cursorignore`. Sync it before the first agent can spawn, whichever
+    // setup path this launch took.
+    {
+        let roots: Vec<std::path::PathBuf> = workspace
+            .roots()
+            .iter()
+            .map(|r| r.to_path_buf())
+            .collect();
+        for changed in gaviero_core::instructions::sync_cursorignore_roots(&roots) {
+            tracing::info!(".cursorignore synced for {}", changed.display());
+        }
+    }
+
     if init_providers {
         let written = setup::synthesize_provider_configs(&workspace);
         tracing::info!(

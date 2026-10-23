@@ -514,13 +514,22 @@ mod tests {
 
     #[test]
     fn launch_args_add_patch_after_profile() {
-        let args = acp_spec().launch_args(Some(Path::new("p.yml")));
+        let args = acp_spec().launch_args(&[Path::new("p.yml")]);
         assert_eq!(args, ["--profile", "acp", "--patch", "p.yml"]);
     }
 
     #[test]
+    fn launch_args_repeat_patch_per_overlay() {
+        let args = acp_spec().launch_args(&[Path::new("a.yml"), Path::new("b.yml")]);
+        assert_eq!(
+            args,
+            ["--profile", "acp", "--patch", "a.yml", "--patch", "b.yml"]
+        );
+    }
+
+    #[test]
     fn launch_args_without_patch_unchanged() {
-        assert_eq!(acp_spec().launch_args(None), ["--profile", "acp"]);
+        assert_eq!(acp_spec().launch_args(&[]), ["--profile", "acp"]);
     }
 
     #[test]
@@ -550,7 +559,7 @@ mod tests {
             return;
         }
         let spec = DshLaunchSpec::from_workspace_root(dir.path(), &[]);
-        let err = spec.build_command(dir.path()).unwrap_err();
+        let err = spec.build_command(dir.path(), &[]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("DEEPSEEK_API_KEY") || msg.contains("secrets.toml"),

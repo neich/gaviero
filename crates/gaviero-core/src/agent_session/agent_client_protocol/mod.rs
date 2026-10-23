@@ -201,7 +201,7 @@ impl AcpClientSession {
             return Ok(false);
         }
         let spec = DshLaunchSpec::from_workspace_root(&self.workspace_root, &self.extra);
-        let cmd = spec.build_command(&self.workspace_root)?;
+        let cmd = spec.build_command(&self.workspace_root, &self.additional_roots)?;
         let rpc = JsonRpcChild::spawn(cmd).await.with_context(|| {
             format!(
                 "spawning dsh ACP agent `{}` (install `@deepseek-ai/dsh` and use `dsh --profile acp`, or set providers.dsh.command)",
