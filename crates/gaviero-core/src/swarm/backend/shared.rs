@@ -136,10 +136,9 @@ pub const OPUS_ALIAS_CLI_MODEL: &str = "claude-opus-5-5";
 /// honoured. `opusplan` is a distinct alias (plan mode), not an `opus` variant,
 /// so it is never rewritten.
 ///
-/// Expects the `claude:` provider prefix to have already been stripped. Call
-/// sites: [`crate::acp::session::AcpSession::spawn`] (every one-shot /
-/// interactive Claude turn) and the persistent-session spawn in
-/// [`crate::acp::factory`].
+/// Expects the `claude:` provider prefix to have already been stripped. Sole
+/// call site: [`crate::acp::session::AcpSession::spawn`] (every one-shot /
+/// interactive Claude turn).
 pub fn resolve_claude_cli_model(model: &str) -> String {
     let trimmed = model.trim();
     let (base, suffix) = match trimmed.strip_suffix("[1m]") {

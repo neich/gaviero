@@ -72,7 +72,7 @@ gaviero-core/src/
 │  ├─ symbol_enrichment.rs rustdoc-JSON sidecar (gaviero-cli --graph --enrich)
 │  └─ symbol_search.rs    Semantic search over enriched symbols
 ├─ acp/                   Legacy Claude NDJSON transport
-│  ├─ session.rs / protocol.rs / client.rs / factory.rs
+│  ├─ session.rs / protocol.rs / client.rs
 ├─ agent_session/         V9 AgentSession trait + impls
 │  ├─ mod.rs              Turn, TransportContext, build_turn, LegacyAgentSession
 │  ├─ claude.rs / codex_exec.rs / codex_app_server.rs / cursor.rs / ollama.rs
