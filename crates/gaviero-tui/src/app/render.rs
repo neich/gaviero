@@ -2102,4 +2102,53 @@ mod tests {
             "nothing is truncated when the dialog fits: {lines:#?}"
         );
     }
+
+    // ── Status bar outline estimate ──────────────────────────────
+
+    fn outline_map(dir: &std::path::Path) -> std::sync::Arc<gaviero_core::repo_map::RepoMap> {
+        std::sync::Arc::new(gaviero_core::repo_map::RepoMap::build(dir, &[]).unwrap())
+    }
+
+    /// The status bar asks for the outline estimate on every frame; ranking
+    /// the graph each time made every keystroke wait on a PageRank. One
+    /// snapshot must be ranked once, and a new snapshot or budget re-ranked.
+    #[test]
+    fn outline_estimate_is_ranked_once_per_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() { b(); }\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "pub fn b() {}\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            gaviero_core::workspace::Workspace::single_folder(dir.path().to_path_buf()),
+            tx,
+        );
+        let root = dir.path();
+        let first = outline_map(root);
+        let fresh = first.rank_for_agent(&[], 4000).token_estimate;
+        assert!(fresh > 0, "the fixture must produce an outline");
+        assert_eq!(app.outline_token_estimate(root, &first, 4000), fresh);
+
+        // A cache hit must not rank again: a planted value comes back as is.
+        app.outline_estimate.borrow_mut().as_mut().unwrap().tokens = 999_999;
+        assert_eq!(app.outline_token_estimate(root, &first, 4000), 999_999);
+
+        // A different budget re-ranks.
+        assert_eq!(
+            app.outline_token_estimate(root, &first, 10),
+            first.rank_for_agent(&[], 10).token_estimate
+        );
+
+        // A newly published snapshot re-ranks, even with identical content.
+        app.outline_estimate.borrow_mut().as_mut().unwrap().tokens = 999_999;
+        let second = outline_map(root);
+        assert_eq!(
+            app.outline_token_estimate(root, &second, 10),
+            second.rank_for_agent(&[], 10).token_estimate
+        );
+        if let Some(state_dir) = gaviero_core::session_state::state_dir_for(root) {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
 }
