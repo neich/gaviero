@@ -1037,6 +1037,66 @@ impl Default for AgentSettings {
     }
 }
 
+/// One transcript row: styled segments plus the index of the message it
+/// belongs to (`None` for separators and the busy indicator).
+type TranscriptLine = (Vec<crate::panels::chat_markdown::StyledSegment>, Option<usize>);
+
+/// A row's plain text, as mouse selection and copy see it.
+fn line_text(segments: &[crate::panels::chat_markdown::StyledSegment]) -> String {
+    segments.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// The active conversation's transcript, laid out once per message.
+///
+/// Laying out every message on every frame cost ~30 ms for a 760-message
+/// conversation (markdown + wrap), ~140 ms once the CPU throttles, and the
+/// panel repaints on every keystroke. A message is laid out again only when
+/// something its layout reads changes: role, `kept`, timestamp, content, or
+/// the panel width. A change to message `k` re-lays out `k..`; streaming only
+/// ever touches the last message.
+#[derive(Default)]
+struct ChatLineCache {
+    conv_id: String,
+    width: usize,
+    /// Per laid-out message, in transcript order.
+    entries: Vec<CachedMessage>,
+    /// Rows that come from messages; the busy indicator is appended after
+    /// these each frame and cut off again by the next sync.
+    message_lines: usize,
+    lines: Vec<TranscriptLine>,
+}
+
+/// What a message's layout was built from, and where its rows start.
+struct CachedMessage {
+    role: ChatRole,
+    kept: bool,
+    timestamp: u64,
+    /// A copy, so a change is caught by comparison (a memcmp per frame) rather
+    /// than by trusting every mutation site to bump a revision.
+    content: String,
+    start: usize,
+}
+
+impl CachedMessage {
+    fn matches(&self, msg: &ChatMessage) -> bool {
+        self.role == msg.role
+            && self.kept == msg.kept
+            && self.timestamp == msg.timestamp
+            && self.content == msg.content
+    }
+}
+
+impl std::fmt::Debug for ChatLineCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatLineCache")
+            .field("conv_id", &self.conv_id)
+            .field("width", &self.width)
+            .field("messages", &self.entries.len())
+            .field("lines", &self.lines.len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct AgentChatState {
     /// All conversations for this workspace.
@@ -1083,6 +1143,8 @@ pub struct AgentChatState {
     /// Cached rendered line texts (set during render) for mouse text selection.
     /// Each entry is (text, message_index) where message_index groups lines from the same message.
     pub rendered_lines_cache: Vec<(String, Option<usize>)>,
+    /// Styled rows behind `rendered_lines_cache`, laid out incrementally.
+    line_cache: ChatLineCache,
     /// Cached conversation area rect (set during render).
     pub conv_area_cache: Option<Rect>,
     /// Cached prompt-input area rect (set during render) for mouse wheel hit-testing.
@@ -1172,6 +1234,7 @@ impl AgentChatState {
             cli_model_options: None,
             tick_count: 0,
             rendered_lines_cache: Vec::new(),
+            line_cache: ChatLineCache::default(),
             conv_area_cache: None,
             input_area_cache: None,
             text_sel_anchor: None,
@@ -5094,6 +5157,51 @@ impl AgentChatState {
         }
     }
 
+    /// Bring `line_cache.lines` and `rendered_lines_cache` up to date with the
+    /// active conversation at `width`, re-laying out only from the first
+    /// message that changed. Both end up holding message rows only.
+    fn sync_chat_lines(&mut self, width: usize) {
+        let conv = &self.conversations[self.active_conv];
+        let cache = &mut self.line_cache;
+        if cache.width != width || cache.conv_id != conv.id {
+            cache.entries.clear();
+            cache.message_lines = 0;
+            cache.width = width;
+            cache.conv_id.clone_from(&conv.id);
+        }
+        let keep = cache
+            .entries
+            .iter()
+            .zip(&conv.messages)
+            .take_while(|(entry, msg)| entry.matches(msg))
+            .count();
+        let start = cache
+            .entries
+            .get(keep)
+            .map_or(cache.message_lines, |entry| entry.start);
+        cache.entries.truncate(keep);
+        cache.lines.truncate(start);
+        // Also drops the previous frame's busy indicator.
+        self.rendered_lines_cache.truncate(start);
+        for (msg_idx, msg) in conv.messages.iter().enumerate().skip(keep) {
+            let first = cache.lines.len();
+            layout_message(msg_idx, msg, width, &mut cache.lines);
+            self.rendered_lines_cache.extend(
+                cache.lines[first..]
+                    .iter()
+                    .map(|(segments, mi)| (line_text(segments), *mi)),
+            );
+            cache.entries.push(CachedMessage {
+                role: msg.role.clone(),
+                kept: msg.kept,
+                timestamp: msg.timestamp,
+                content: msg.content.clone(),
+                start: first,
+            });
+        }
+        cache.message_lines = cache.lines.len();
+    }
+
     fn render_conversation(&mut self, area: Rect, buf: &mut RataBuf, theme: &Theme) {
         // Cache the conversation area for mouse hit-testing
         self.conv_area_cache = Some(area);
@@ -5129,76 +5237,10 @@ impl AgentChatState {
             None
         };
 
-        // Build rendered lines from messages: (segments, message_index).
-        // Each rendered visual line is a sequence of styled segments so that
-        // inline markdown styling (bold, italic, code, links) can be preserved
-        // across the whole line — not just per-line.
-        let mut lines: Vec<(
-            Vec<crate::panels::chat_markdown::StyledSegment>,
-            Option<usize>,
-        )> = Vec::new();
-
-        for (msg_idx, msg) in self.messages().iter().enumerate() {
-            let (role_label, base_style) = match msg.role {
-                ChatRole::User => ("You", Style::default().fg(theme::ACCENT)),
-                ChatRole::Assistant => ("Assistant", Style::default().fg(theme::TEXT_FG)),
-                ChatRole::System => ("System", Style::default().fg(theme::WARNING)),
-            };
-            // Stamp goes in the header so the transcript reads in wall-clock
-            // order after a restart, where `seq` alone only tells you the
-            // order within one conversation. Omitted for timestamp `0`
-            // (pre-timestamp records) rather than rendering the epoch.
-            // `★` marks a message whose exchange `/handoff` will carry.
-            let role_label = if msg.kept {
-                format!("★ {role_label}")
-            } else {
-                role_label.to_string()
-            };
-            let prefix = match format_message_timestamp(msg.timestamp) {
-                Some(stamp) => format!("{} [{}]: ", role_label, stamp),
-                None => format!("{}: ", role_label),
-            };
-
-            // Filter <file> blocks and strip `<turn_annotations>` from display
-            // (defense in depth — finalize also strips for storage/memory).
-            let display_content = if msg.role == ChatRole::Assistant {
-                filter_assistant_for_display(&msg.content)
-            } else {
-                filter_file_blocks_for_display(&msg.content)
-            };
-
-            if msg.role == ChatRole::Assistant && !display_content.is_empty() {
-                // Render assistant messages with markdown formatting
-                lines.push((
-                    vec![crate::panels::chat_markdown::StyledSegment::new(
-                        prefix, base_style,
-                    )],
-                    Some(msg_idx),
-                ));
-                let md_lines = crate::panels::chat_markdown::format_chat_markdown(
-                    &display_content,
-                    width,
-                    base_style,
-                );
-                for cl in md_lines {
-                    lines.push((cl.segments, Some(msg_idx)));
-                }
-            } else {
-                // User/System: simple word-wrap (plain, no inline styling)
-                let full_text = format!("{}{}", prefix, display_content);
-                for line in crate::widgets::render_utils::word_wrap(&full_text, width) {
-                    lines.push((
-                        vec![crate::panels::chat_markdown::StyledSegment::new(
-                            line, base_style,
-                        )],
-                        Some(msg_idx),
-                    ));
-                }
-            }
-
-            // Blank line between messages
-            lines.push((Vec::new(), None));
-        }
+        // Lay out only the messages that changed since the last frame; the
+        // busy indicator below is appended fresh every frame.
+        self.sync_chat_lines(width);
+        let mut tail: Vec<TranscriptLine> = Vec::new();
 
         // Streaming / background-agent indicator with animated spinner
         if self.active_conv_busy() {
@@ -5224,7 +5266,7 @@ impl AgentChatState {
                 })
                 .unwrap_or_default();
             let stream_style = Style::default().fg(theme::ACCENT);
-            lines.push((
+            tail.push((
                 vec![crate::panels::chat_markdown::StyledSegment::new(
                     format!("{} {}{}", frame, label, elapsed_str),
                     stream_style,
@@ -5237,7 +5279,7 @@ impl AgentChatState {
             let mut agents: Vec<&BackgroundAgent> = conv.background_agents.iter().collect();
             agents.sort_by_key(|a| a.finished);
             for agent in agents {
-                lines.push((
+                tail.push((
                     vec![crate::panels::chat_markdown::StyledSegment::new(
                         format!("  {}", agent.display_line()),
                         agent_style,
@@ -5247,14 +5289,11 @@ impl AgentChatState {
             }
         }
 
-        // Cache rendered line texts + message index for mouse text selection
-        self.rendered_lines_cache = lines
-            .iter()
-            .map(|(segments, mi)| {
-                let text: String = segments.iter().map(|s| s.text.as_str()).collect();
-                (text, *mi)
-            })
-            .collect();
+        // `sync_chat_lines` left both vectors holding the message lines only.
+        self.rendered_lines_cache
+            .extend(tail.iter().map(|(segments, mi)| (line_text(segments), *mi)));
+        self.line_cache.lines.extend(tail);
+        let lines = &self.line_cache.lines;
 
         // In browse mode, scroll to keep the browsed message visible
         let total = lines.len();
@@ -6125,6 +6164,67 @@ pub fn parse_file_references(text: &str) -> Vec<String> {
 }
 
 /// Filter `<file>` blocks for display: collapse complete blocks and hide in-progress ones.
+/// Append one message's transcript rows (header, body, blank separator) to
+/// `out`. Reads only the fields [`CachedMessage`] keys on, plus `width`.
+fn layout_message(msg_idx: usize, msg: &ChatMessage, width: usize, out: &mut Vec<TranscriptLine>) {
+    let (role_label, base_style) = match msg.role {
+        ChatRole::User => ("You", Style::default().fg(theme::ACCENT)),
+        ChatRole::Assistant => ("Assistant", Style::default().fg(theme::TEXT_FG)),
+        ChatRole::System => ("System", Style::default().fg(theme::WARNING)),
+    };
+    // Stamp goes in the header so the transcript reads in wall-clock
+    // order after a restart, where `seq` alone only tells you the
+    // order within one conversation. Omitted for timestamp `0`
+    // (pre-timestamp records) rather than rendering the epoch.
+    // `★` marks a message whose exchange `/handoff` will carry.
+    let role_label = if msg.kept {
+        format!("★ {role_label}")
+    } else {
+        role_label.to_string()
+    };
+    let prefix = match format_message_timestamp(msg.timestamp) {
+        Some(stamp) => format!("{} [{}]: ", role_label, stamp),
+        None => format!("{}: ", role_label),
+    };
+
+    // Filter <file> blocks and strip `<turn_annotations>` from display
+    // (defense in depth — finalize also strips for storage/memory).
+    let display_content = if msg.role == ChatRole::Assistant {
+        filter_assistant_for_display(&msg.content)
+    } else {
+        filter_file_blocks_for_display(&msg.content)
+    };
+
+    if msg.role == ChatRole::Assistant && !display_content.is_empty() {
+        // Render assistant messages with markdown formatting
+        out.push((
+            vec![crate::panels::chat_markdown::StyledSegment::new(
+                prefix, base_style,
+            )],
+            Some(msg_idx),
+        ));
+        let md_lines =
+            crate::panels::chat_markdown::format_chat_markdown(&display_content, width, base_style);
+        for cl in md_lines {
+            out.push((cl.segments, Some(msg_idx)));
+        }
+    } else {
+        // User/System: simple word-wrap (plain, no inline styling)
+        let full_text = format!("{}{}", prefix, display_content);
+        for line in crate::widgets::render_utils::word_wrap(&full_text, width) {
+            out.push((
+                vec![crate::panels::chat_markdown::StyledSegment::new(
+                    line, base_style,
+                )],
+                Some(msg_idx),
+            ));
+        }
+    }
+
+    // Blank line between messages
+    out.push((Vec::new(), None));
+}
+
 fn filter_file_blocks_for_display(text: &str) -> String {
     use crate::app::collapse_file_blocks;
 
@@ -9058,5 +9158,110 @@ mod tests {
         state.history_up();
         assert_eq!(state.text_input.text, "previous prompt");
         assert!(state.can_browse_history());
+    }
+
+    // ── Incremental transcript layout ────────────────────────────
+
+    /// The transcript laid out from scratch, as every frame used to.
+    fn fresh_transcript(state: &AgentChatState, width: usize) -> Vec<(String, Option<usize>)> {
+        let mut lines = Vec::new();
+        for (idx, msg) in state.messages().iter().enumerate() {
+            layout_message(idx, msg, width, &mut lines);
+        }
+        lines.iter().map(|(s, mi)| (line_text(s), *mi)).collect()
+    }
+
+    fn planted() -> Vec<crate::panels::chat_markdown::StyledSegment> {
+        vec![crate::panels::chat_markdown::StyledSegment::new(
+            "PLANTED",
+            Style::default(),
+        )]
+    }
+
+    #[test]
+    fn transcript_layout_reuses_unchanged_messages_and_follows_every_change() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.add_user_message("first question");
+        state.append_stream_chunk_to(
+            &conv_id,
+            "An **answer** long enough to wrap across several rows of a narrow panel.",
+        );
+        state.add_user_message("second question");
+        state.sync_chat_lines(30);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
+
+        // A message that did not change keeps its rows: a planted row survives
+        // a new message arriving and the last one streaming.
+        state.line_cache.lines[0].0 = planted();
+        state.append_stream_chunk_to(&conv_id, "a new reply");
+        state.sync_chat_lines(30);
+        state.append_stream_chunk_to(&conv_id, " that keeps streaming in");
+        state.sync_chat_lines(30);
+        assert_eq!(line_text(&state.line_cache.lines[0].0), "PLANTED");
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
+        let styled: Vec<String> = state.line_cache.lines[1..].iter().map(|(s, _)| line_text(s)).collect();
+        let fresh: Vec<String> = fresh_transcript(&state, 30)[1..].iter().map(|(t, _)| t.clone()).collect();
+        assert_eq!(styled, fresh, "styled rows must match a fresh layout");
+
+        // An edit to an earlier message re-lays it out, and everything after it.
+        state.conversations[state.active_conv].messages[0].content = "edited question".into();
+        state.sync_chat_lines(30);
+        assert_ne!(line_text(&state.line_cache.lines[0].0), "PLANTED");
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
+
+        // `kept`, a dropped message, and a width change are all layout inputs.
+        state.conversations[state.active_conv].messages[2].kept = true;
+        state.sync_chat_lines(30);
+        assert!(state.rendered_lines_cache.iter().any(|(t, _)| t.contains('★')));
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
+        state.conversations[state.active_conv].messages.pop();
+        state.sync_chat_lines(30);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
+        state.sync_chat_lines(12);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 12));
+        assert_eq!(state.line_cache.lines.len(), state.rendered_lines_cache.len());
+    }
+
+    #[test]
+    fn transcript_layout_follows_the_active_tab() {
+        let mut state = AgentChatState::new();
+        state.add_user_message("in the first tab");
+        state.sync_chat_lines(40);
+        state.new_conversation();
+        state.add_user_message("in the second tab, which says something else");
+        state.sync_chat_lines(40);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 40));
+        state.switch_conversation(0);
+        state.sync_chat_lines(40);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 40));
+    }
+
+    /// The busy indicator is appended every frame; it must replace the
+    /// previous frame's, not pile up behind the cached message rows.
+    #[test]
+    fn busy_indicator_rows_do_not_accumulate_across_frames() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.add_user_message("question");
+        state.append_stream_chunk_to(&conv_id, "partial answer");
+        state.conversations[state.active_conv].is_streaming = true;
+        let area = Rect::new(0, 0, 40, 30);
+        let theme = Theme::builtin_default();
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            let mut buf = RataBuf::empty(area);
+            state.render_conversation(area, &mut buf, &theme);
+            rows.push(state.rendered_lines_cache.len());
+        }
+        let messages = fresh_transcript(&state, 39).len();
+        assert_eq!(rows, vec![messages + 1; 3], "one spinner row per frame");
+        assert!(state.rendered_lines_cache.last().unwrap().0.contains("Writing..."));
+        assert_eq!(state.line_cache.lines.len(), state.rendered_lines_cache.len());
+
+        state.conversations[state.active_conv].is_streaming = false;
+        let mut buf = RataBuf::empty(area);
+        state.render_conversation(area, &mut buf, &theme);
+        assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 39));
     }
 }
