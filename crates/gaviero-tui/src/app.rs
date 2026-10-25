@@ -78,6 +78,26 @@ pub struct AcpTaskHandle {
     pub cancel: CancellationToken,
 }
 
+/// A cached outline-token estimate for the status bar's `ctx:` readout.
+///
+/// Keyed by snapshot identity rather than `GraphService::stats()`: the startup
+/// scan bumps `full_scans` before it publishes, so a generation key could pair
+/// the new generation with the old map and stay stale. A `Weak` keeps the
+/// allocation (not the map) alive, so a freed snapshot's address cannot be
+/// reused by its successor, and the map itself is still freed by the writer.
+struct OutlineEstimate {
+    root: std::path::PathBuf,
+    map: std::sync::Weak<gaviero_core::repo_map::RepoMap>,
+    budget: usize,
+    tokens: usize,
+}
+
+impl OutlineEstimate {
+    fn matches(&self, root: &Path, map: &Arc<gaviero_core::repo_map::RepoMap>, budget: usize) -> bool {
+        self.budget == budget && self.root == root && std::ptr::eq(self.map.as_ptr(), Arc::as_ptr(map))
+    }
+}
+
 // ── App ──────────────────────────────────────────────────────────
 
 pub struct App {
@@ -238,6 +258,10 @@ pub struct App {
     /// by chat injection and shared with the MCP server, so both see the
     /// same graph. Lazy until `start_all` at startup.
     pub graph_services: gaviero_core::repo_map::GraphServices,
+    /// The status bar's `ctx:` outline estimate, computed once per published
+    /// graph snapshot. Ranking the whole graph costs several ms, far too much
+    /// to repeat on every frame; see [`OutlineEstimate`].
+    outline_estimate: std::cell::RefCell<Option<OutlineEstimate>>,
     /// Shallow directory topology cache (per folder root).
     pub topology_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, String>>>,
@@ -532,6 +556,7 @@ impl App {
             memory_rerank_cfg: None,
             memory_sleeptime_scheduler: None,
             graph_services,
+            outline_estimate: std::cell::RefCell::new(None),
             topology_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
@@ -712,8 +737,7 @@ impl App {
         {
             let budget = self.chat_state.agent_settings.graph_budget_tokens;
             if budget > 0 {
-                let plan = map.rank_for_agent(&[], budget);
-                hints.outline_tokens = Some(plan.token_estimate);
+                hints.outline_tokens = Some(self.outline_token_estimate(&graph_root, &map, budget));
             }
         }
         let conv = self.chat_state.active_conversation();
@@ -722,6 +746,31 @@ impl App {
         }
 
         gaviero_core::context_planner::BootstrapEstimateContext { budgets, hints }
+    }
+
+    /// Outline tokens a whole-workspace ranking of `map` would inject at
+    /// `budget`. Ranked once per (root, budget, snapshot) and cached: the
+    /// status bar asks on every frame, and a fresh rank there added ~6 ms to
+    /// every keystroke (plus 18 log lines).
+    fn outline_token_estimate(
+        &self,
+        root: &Path,
+        map: &Arc<gaviero_core::repo_map::RepoMap>,
+        budget: usize,
+    ) -> usize {
+        if let Some(cached) = self.outline_estimate.borrow().as_ref()
+            && cached.matches(root, map, budget)
+        {
+            return cached.tokens;
+        }
+        let tokens = map.rank_for_agent(&[], budget).token_estimate;
+        *self.outline_estimate.borrow_mut() = Some(OutlineEstimate {
+            root: root.to_path_buf(),
+            map: Arc::downgrade(map),
+            budget,
+            tokens,
+        });
+        tokens
     }
 
     fn handle_action(&mut self, action: Action) {
