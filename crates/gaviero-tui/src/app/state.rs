@@ -213,6 +213,15 @@ pub(crate) struct SettingsErrorDialog {
     pub errors: Vec<gaviero_core::workspace::SettingsParseError>,
 }
 
+/// Save-time syntax warning. The save has already completed (the user's
+/// content is on disk); this dialog reports what the grammar rejected so the
+/// problem is impossible to miss. Any key dismisses it.
+#[derive(Debug, Clone)]
+pub(crate) struct SyntaxErrorDialog {
+    pub path: PathBuf,
+    pub errors: Vec<gaviero_core::tree_sitter::SyntaxError>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TreeDialogKind {
     NewFile,

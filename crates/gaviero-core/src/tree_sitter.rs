@@ -106,6 +106,99 @@ pub fn language_name_for_extension(ext: &str) -> Option<&'static str> {
     lookup_extension(ext).map(|(name, _)| name)
 }
 
+// ── Syntax errors ───────────────────────────────────────────────
+
+/// What kind of problem tree-sitter reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxErrorKind {
+    /// Input the grammar could not place (`ERROR` node).
+    Unexpected,
+    /// A token the grammar expected but the source does not contain
+    /// (`MISSING` node).
+    Missing,
+}
+
+impl SyntaxErrorKind {
+    /// Short human-readable label for a dialog or status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unexpected => "unexpected input",
+            Self::Missing => "missing token",
+        }
+    }
+}
+
+/// One syntax problem found in a source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxError {
+    /// Zero-based line of the problem.
+    pub line: usize,
+    /// Zero-based byte column of the problem.
+    pub column: usize,
+    pub kind: SyntaxErrorKind,
+    /// The tree-sitter node kind. For [`SyntaxErrorKind::Missing`] this is the
+    /// token the grammar expected (for example `}` or `identifier`).
+    pub node_kind: String,
+    /// The offending source line, trimmed, for display.
+    pub line_text: String,
+}
+
+/// Parse `content` with the grammar selected by `ext` and report every syntax
+/// error the parser can see.
+///
+/// The extension registry is the single source of truth, so every language
+/// gaviero can highlight is also checked here. Returns [`None`] when the
+/// extension has no grammar (Markdown, unknown files) — gaviero cannot decide
+/// whether those are syntactically valid. `Some(vec![])` means the file parsed
+/// cleanly.
+pub fn syntax_errors(content: &str, ext: &str) -> Option<Vec<SyntaxError>> {
+    let language = language_for_extension(ext)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(content, None)?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut errors = Vec::new();
+    collect_syntax_errors(tree.root_node(), &lines, &mut errors);
+    Some(errors)
+}
+
+/// Walk the tree collecting `ERROR` / `MISSING` nodes. An `ERROR` node is
+/// recorded but not descended into: it already covers its whole subtree, and
+/// descending would report the same broken input several times.
+fn collect_syntax_errors(
+    node: tree_sitter::Node<'_>,
+    lines: &[&str],
+    out: &mut Vec<SyntaxError>,
+) {
+    if node.is_error() || node.is_missing() {
+        let pos = node.start_position();
+        out.push(SyntaxError {
+            line: pos.row,
+            column: pos.column,
+            kind: if node.is_missing() {
+                SyntaxErrorKind::Missing
+            } else {
+                SyntaxErrorKind::Unexpected
+            },
+            node_kind: node.kind().to_string(),
+            line_text: lines
+                .get(pos.row)
+                .map(|line| line.trim().to_string())
+                .unwrap_or_default(),
+        });
+        if node.is_error() {
+            return;
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_syntax_errors(child, lines, out);
+        }
+    }
+}
+
 // ── Structural enrichment ────────────────────────────────────────
 
 /// Node kinds that represent meaningful enclosing structures.
@@ -321,6 +414,71 @@ mod tests {
         assert_eq!(language_name_for_extension("rs"), Some("rust"));
         assert_eq!(language_name_for_extension("ts"), Some("typescript"));
         assert_eq!(language_name_for_extension("xyz"), None);
+    }
+
+    #[test]
+    fn syntax_errors_are_none_for_languages_without_a_grammar() {
+        // Markdown is registered for highlighting but has no grammar, so
+        // gaviero cannot decide whether it is syntactically valid.
+        assert!(syntax_errors("# heading\n\n- item", "md").is_none());
+        assert!(syntax_errors("anything", "xyz").is_none());
+    }
+
+    #[test]
+    fn clean_source_reports_no_errors() {
+        let errs = syntax_errors("fn main() {\n    println!(\"hi\");\n}\n", "rs")
+            .expect("rust has a grammar");
+        assert!(errs.is_empty(), "valid Rust must parse cleanly: {errs:?}");
+    }
+
+    #[test]
+    fn missing_closing_brace_is_reported_with_a_line() {
+        let source = "fn main() {\n    let x = 1;\n";
+        let errs = syntax_errors(source, "rs").expect("rust has a grammar");
+        assert!(!errs.is_empty(), "unclosed fn must be rejected");
+        assert!(
+            errs.iter().all(|e| e.line <= 2),
+            "the error points inside the broken block: {errs:?}"
+        );
+        assert!(
+            errs.iter().all(|e| !e.line_text.is_empty()),
+            "line text comes from the source: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn every_grammar_backed_extension_is_checked() {
+        // Regression guard for "all languages gaviero can determine": every
+        // registry entry that names a grammar must produce a verdict (even if
+        // a permissive grammar finds no error in an empty snippet, the API
+        // must not return None).
+        for (exts, _, grammar) in LANGUAGE_REGISTRY {
+            if grammar.is_none() {
+                continue;
+            }
+            for ext in *exts {
+                assert!(
+                    syntax_errors("", ext).is_some(),
+                    "{ext} has a grammar but syntax_errors returned None"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_errors_are_reported_for_non_rust_languages() {
+        let json = syntax_errors("{\n  \"a\": 1,\n", "json").expect("json has a grammar");
+        assert!(!json.is_empty(), "trailing open object must be rejected");
+
+        let python = syntax_errors("def f(:\n    pass\n", "py").expect("python has a grammar");
+        assert!(!python.is_empty(), "broken def must be rejected");
+
+        let javascript =
+            syntax_errors("function f( {\n", "js").expect("javascript has a grammar");
+        assert!(
+            !javascript.is_empty(),
+            "unclosed parameter list must be rejected"
+        );
     }
 
     #[test]
