@@ -2334,6 +2334,7 @@ pub(super) fn save_current_buffer(app: &mut App) {
         .buffers
         .get(app.active_buffer)
         .and_then(|b| b.path.clone());
+    let mut syntax_warning = None;
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         if let Err(e) = buf.save() {
             tracing::error!("Save failed: {}", e);
@@ -2341,6 +2342,26 @@ pub(super) fn save_current_buffer(app: &mut App) {
             return;
         }
         buf.refresh_conflict_metadata(buf.git_unmerged);
+
+        // The save already succeeded, so the popup is a warning, not a gate:
+        // the user's content is on disk and these are the grammar's complaints
+        // about it. `syntax_errors` returns `None` for languages without a
+        // grammar (Markdown, unknown files), which is why this does not fire
+        // for every file.
+        if let Some(path) = buf.path.clone() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.is_empty() {
+                let content = buf.text.to_string();
+                if let Some(errors) = gaviero_core::tree_sitter::syntax_errors(&content, ext)
+                    && !errors.is_empty()
+                {
+                    syntax_warning = Some(SyntaxErrorDialog { path, errors });
+                }
+            }
+        }
+    }
+    if let Some(dialog) = syntax_warning {
+        app.syntax_error_dialog = Some(dialog);
     }
     if let Some(path) = saved {
         super::turn_review::note_host_write(app, &path);
@@ -2808,6 +2829,92 @@ mod tests {
 
         assert_eq!(app.buffers.len(), opened, "a plain click must not navigate");
         assert_eq!(app.buffers[app.active_buffer].cursor.col, 18);
+        cleanup_session(dir.path());
+    }
+
+    // ── Save-time syntax warning ─────────────────────────────────
+
+    /// Save the active buffer with `content` after opening `name` and return
+    /// the resulting dialog (if any). The buffer text — not the on-disk file —
+    /// is what the check parses, exactly as in the real save path.
+    fn save_with_content(app: &mut App, content: &str) -> Option<SyntaxErrorDialog> {
+        app.buffers[app.active_buffer].text = ropey::Rope::from_str(content);
+        app.buffers[app.active_buffer].modified = true;
+        app.syntax_error_dialog = None;
+        save_current_buffer(app);
+        app.syntax_error_dialog.take()
+    }
+
+    #[test]
+    fn saving_a_broken_rust_file_pops_the_syntax_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("broken.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+
+        let dialog = save_with_content(&mut app, "fn main() {\n    let x = 1;\n")
+            .expect("an unclosed fn must open the syntax dialog");
+
+        assert_eq!(
+            dialog.path.file_name().and_then(|n| n.to_str()),
+            Some("broken.rs")
+        );
+        assert!(!dialog.errors.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fn main() {\n    let x = 1;\n",
+            "the save still lands on disk; the popup is a warning"
+        );
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn saving_a_clean_rust_file_does_not_pop_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("good.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+
+        assert!(
+            save_with_content(&mut app, "fn main() {\n    println!(\"hi\");\n}\n").is_none(),
+            "valid Rust must not warn"
+        );
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn saving_a_file_without_a_grammar_does_not_pop_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("notes.txt");
+        std::fs::write(&target, "hello\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+
+        assert!(
+            save_with_content(&mut app, "{ this is not any known language").is_none(),
+            "gaviero cannot decide syntax for an unknown extension"
+        );
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn syntax_dialog_is_dismissed_by_any_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("broken.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+        let dialog = save_with_content(&mut app, "fn main( {\n").expect("dialog opened");
+        app.syntax_error_dialog = Some(dialog);
+
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(app.syntax_error_dialog.is_none());
         cleanup_session(dir.path());
     }
 }

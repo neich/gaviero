@@ -52,7 +52,8 @@ use self::state::{
     BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog,
     DiffHighlightCache, DiffKind, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
     MarkdownPreviewMode, MoveState, PanelVisibility, ReviewProposal, ScrollbarTarget,
-    SettingsErrorDialog, SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
+    SettingsErrorDialog, SidePanelMode, SyntaxErrorDialog, TreeDialog, TreeDialogKind,
+    build_simple_diff,
 };
 
 // ── Constants ────────────────────────────────────────────────────
@@ -98,6 +99,9 @@ pub struct App {
     /// Settings-parse-error prompt. `Some` from startup until the user
     /// quits or continues; captures every key and mouse event meanwhile.
     pub(crate) settings_error_dialog: Option<SettingsErrorDialog>,
+    /// Save-time syntax warning. `Some` after a save whose content the
+    /// tree-sitter grammar rejected; any key dismisses it.
+    pub(crate) syntax_error_dialog: Option<SyntaxErrorDialog>,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
     /// Reserved for cases where the real terminal diverged from ratatui's model
@@ -456,6 +460,7 @@ impl App {
             quit_confirm: false,
             codex_trust_dialog: None,
             settings_error_dialog: None,
+            syntax_error_dialog: None,
             needs_full_redraw: false,
             event_tx,
             theme,
@@ -1261,6 +1266,10 @@ impl App {
 
     fn render_settings_error_dialog(&self, frame: &mut Frame, area: Rect) {
         render::render_settings_error_dialog(self, frame, area);
+    }
+
+    fn render_syntax_error_dialog(&self, frame: &mut Frame, area: Rect) {
+        render::render_syntax_error_dialog(self, frame, area);
     }
 
     /// Open the settings-error prompt when any settings file failed to

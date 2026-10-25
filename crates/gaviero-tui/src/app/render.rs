@@ -38,7 +38,10 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         app.render_fullscreen(frame, main_area, fs_panel);
         app.render_status_bar(frame, status_area);
         render_agent_finish_toast(app, frame, main_area);
-        if fs_panel == Focus::Editor && app.settings_error_dialog.is_none() {
+        if fs_panel == Focus::Editor
+            && app.settings_error_dialog.is_none()
+            && app.syntax_error_dialog.is_none()
+        {
             app.update_cursor_position(frame, app.layout.editor_area);
         }
         if app.quit_confirm {
@@ -55,6 +58,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         }
         if app.settings_error_dialog.is_some() {
             app.render_settings_error_dialog(frame, size);
+        }
+        if app.syntax_error_dialog.is_some() {
+            app.render_syntax_error_dialog(frame, size);
         }
         if app.definition_picker.is_some() {
             super::nav::render_picker(app, frame, size);
@@ -196,7 +202,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     }
 
     app.render_status_bar(frame, status_area);
-    if app.settings_error_dialog.is_none() {
+    if app.settings_error_dialog.is_none() && app.syntax_error_dialog.is_none() {
         app.update_cursor_position(frame, app.layout.editor_area);
     }
 
@@ -211,6 +217,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     }
     if app.settings_error_dialog.is_some() {
         app.render_settings_error_dialog(frame, size);
+    }
+    if app.syntax_error_dialog.is_some() {
+        app.render_syntax_error_dialog(frame, size);
     }
     if app.definition_picker.is_some() {
         super::nav::render_picker(app, frame, size);
@@ -1643,6 +1652,127 @@ fn settings_error_dialog_lines(
     lines
 }
 
+/// Render the save-time syntax warning. The file has already been written;
+/// this reports what the grammar rejected so the problem is impossible to
+/// miss. Any key dismisses it.
+pub(super) fn render_syntax_error_dialog(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(dialog) = &app.syntax_error_dialog else {
+        return;
+    };
+    let lines = syntax_error_dialog_lines(dialog, area);
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let title_style = Style::default()
+        .fg(theme::FOCUS_BORDER)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+    draw_modal_box(
+        frame,
+        area,
+        &lines,
+        "Saved",
+        bg_style,
+        title_style,
+        hint_style,
+    );
+}
+
+/// Text of the save-time syntax modal, fitted to `area`. `draw_modal_box`
+/// silently draws nothing when the box is taller than the terminal, so the
+/// error list is trimmed to leave room for the title and the dismiss hint.
+fn syntax_error_dialog_lines(dialog: &SyntaxErrorDialog, area: Rect) -> Vec<String> {
+    // Keep a badly broken file from producing a wall of text; the rest is
+    // summarised.
+    const MAX_ERRORS: usize = 20;
+
+    // `draw_modal_box` needs two border columns plus four columns of margin.
+    let width = (area.width as usize).saturating_sub(8).min(96);
+    let max_lines = (area.height as usize).saturating_sub(2).max(1);
+    let count = dialog.errors.len();
+
+    let mut header = vec![String::new()];
+    header.extend(wrap_modal_text(
+        &format!(
+            "Saved {} with {} syntax error{}",
+            dialog.path.display(),
+            count,
+            if count == 1 { "" } else { "s" }
+        ),
+        width,
+    ));
+    header.push(String::new());
+
+    let mut footer = vec![String::new()];
+    footer.extend(wrap_modal_text(
+        "The file was saved. Fix the syntax errors above, then save again.",
+        width,
+    ));
+    footer.push(String::new());
+    footer.extend(wrap_modal_text("[Enter / Esc] Dismiss", width));
+    footer.push(String::new());
+
+    let mut lines = header;
+    // Reserve the footer plus a blank line before the "and N more" summary.
+    let mut budget = max_lines.saturating_sub(lines.len() + footer.len() + 2);
+    let mut shown = 0usize;
+    for err in dialog.errors.iter().take(MAX_ERRORS) {
+        let detail = match err.kind {
+            gaviero_core::tree_sitter::SyntaxErrorKind::Missing => {
+                format!("missing {}", err.node_kind)
+            }
+            gaviero_core::tree_sitter::SyntaxErrorKind::Unexpected => err.kind.label().to_string(),
+        };
+        let mut entry = wrap_modal_text(
+            &format!(
+                "Line {}, column {}: {}",
+                err.line + 1,
+                err.column + 1,
+                detail
+            ),
+            width,
+        );
+        if !err.line_text.is_empty() {
+            entry.extend(wrap_modal_text(&format!("    {}", err.line_text), width));
+        }
+        if entry.len() > budget {
+            break;
+        }
+        budget -= entry.len();
+        lines.extend(entry);
+        shown += 1;
+    }
+    if shown < count {
+        lines.push(String::new());
+        lines.extend(wrap_modal_text(
+            &format!("… and {} more", count - shown),
+            width,
+        ));
+    }
+    lines.extend(footer);
+
+    // A terminal too short for even the header + footer would make
+    // `draw_modal_box` bail and show nothing at all. Keep the title and the
+    // dismiss hint, dropping the body.
+    if lines.len() > max_lines {
+        let mut compact = vec![String::new()];
+        compact.extend(wrap_modal_text(
+            &format!(
+                "Saved {} with {} syntax error{}",
+                dialog.path.display(),
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            width,
+        ));
+        compact.push(String::new());
+        compact.extend(wrap_modal_text("[Enter / Esc] Dismiss", width));
+        compact.truncate(max_lines);
+        return compact;
+    }
+    lines
+}
+
 /// Greedy word wrap with a two-space indent. Words longer than the line
 /// (long paths) are split across lines.
 fn wrap_modal_text(text: &str, width: usize) -> Vec<String> {
@@ -1917,4 +2047,59 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
 
     write(&format!("MOVE {}  ", paths.len()), label_style);
     write("Navigate, Enter: select folder  Esc: cancel", dim_style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syntax_dialog(error_count: usize) -> SyntaxErrorDialog {
+        SyntaxErrorDialog {
+            path: std::path::PathBuf::from("src/broken.rs"),
+            errors: (0..error_count)
+                .map(|i| gaviero_core::tree_sitter::SyntaxError {
+                    line: i,
+                    column: 0,
+                    kind: gaviero_core::tree_sitter::SyntaxErrorKind::Unexpected,
+                    node_kind: "ERROR".into(),
+                    line_text: "let x = ;".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn syntax_dialog_keeps_title_and_hint_on_a_short_terminal() {
+        // 30 errors would be taller than 80x24; `draw_modal_box` silently
+        // draws nothing in that case, so the line builder must trim instead.
+        let lines = syntax_error_dialog_lines(&syntax_dialog(30), Rect::new(0, 0, 80, 24));
+        assert!(
+            lines.len() <= 22,
+            "box must fit a 24-row terminal: {} lines",
+            lines.len()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("with 30 syntax errors")),
+            "the count must survive trimming"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Dismiss")),
+            "the dismiss hint must survive trimming"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("more")),
+            "trimmed errors must be summarised"
+        );
+    }
+
+    #[test]
+    fn syntax_dialog_lists_every_error_when_it_fits() {
+        let lines = syntax_error_dialog_lines(&syntax_dialog(2), Rect::new(0, 0, 80, 40));
+        let details = lines.iter().filter(|l| l.contains("Line ")).count();
+        assert_eq!(details, 2, "both errors should be shown: {lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("more")),
+            "nothing is truncated when the dialog fits: {lines:#?}"
+        );
+    }
 }

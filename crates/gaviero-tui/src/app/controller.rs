@@ -78,6 +78,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 super::session::handle_settings_error_key(app, &key);
                 return;
             }
+            // The save already wrote the file; this modal only reports what
+            // the grammar rejected, so any key dismisses it.
+            if app.syntax_error_dialog.is_some() {
+                super::session::handle_syntax_error_key(app, &key);
+                return;
+            }
             if app.focus == Focus::Terminal
                 && !app.has_active_review()
                 && let Some(inst) = app.terminal_manager.active_instance()
@@ -231,7 +237,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_action(action);
         }
         Event::Paste(text) => {
-            if app.has_active_review() || app.settings_error_dialog.is_some() {
+            if app.has_active_review()
+                || app.settings_error_dialog.is_some()
+                || app.syntax_error_dialog.is_some()
+            {
                 return;
             }
             // Terminal delivered a paste — cancel the Windows Ctrl+V image fallback.
@@ -248,7 +257,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_paste(&text);
         }
         Event::Mouse(mouse) => {
-            if app.settings_error_dialog.is_none() {
+            if app.settings_error_dialog.is_none() && app.syntax_error_dialog.is_none() {
                 app.handle_mouse(mouse);
             }
         }

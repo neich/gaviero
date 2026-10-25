@@ -84,6 +84,12 @@ pub(super) fn handle_settings_error_key(app: &mut App, key: &crossterm::event::K
     }
 }
 
+/// Dismiss the save-time syntax warning. The save has already happened — the
+/// popup is informational — so any key (including Esc and Enter) closes it.
+pub(super) fn handle_syntax_error_key(app: &mut App, _key: &crossterm::event::KeyEvent) {
+    app.syntax_error_dialog = None;
+}
+
 /// Open each broken settings file at its error position. Iterates in
 /// reverse so the first (authoritative) file ends up as the active buffer.
 fn open_settings_error_locations(
