@@ -20,10 +20,10 @@ use gaviero_remote::server::{RemoteServerConfig, spawn};
 use gaviero_remote::{PROTOCOL_VERSION, pairing};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// The certificate is issued to the MagicDNS hostname, so the client must
+/// The certificate is issued to the machine host name, so the client must
 /// present that name in the TLS handshake while dialing loopback — the
 /// same split the plan describes for tests (§3.1).
-const MAGIC_DNS_HOST: &str = "testhost.tailnet.ts.net";
+const MACHINE_HOST: &str = "desk.gaviero.example.com";
 
 struct Tls {
     cert_pem: Vec<u8>,
@@ -33,7 +33,7 @@ struct Tls {
 
 fn issue_cert() -> Tls {
     let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(vec![MAGIC_DNS_HOST.to_string()])
+    let cert = rcgen::CertificateParams::new(vec![MACHINE_HOST.to_string()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
@@ -59,8 +59,8 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     let tls = issue_cert();
 
     // 1. The certificate the TUI would load passes the availability check.
-    let info = pairing::inspect_cert(&tls.cert_pem, MAGIC_DNS_HOST).expect("certificate parses");
-    assert!(info.covers_host, "cert must cover the MagicDNS host");
+    let info = pairing::inspect_cert(&tls.cert_pem, MACHINE_HOST).expect("certificate parses");
+    assert!(info.covers_host, "cert must cover the machine host");
     assert!(!info.is_expired());
 
     // 2. A token is generated the way `/remote` generates it.
@@ -89,9 +89,7 @@ async fn qr_payload_pairs_a_client_end_to_end() {
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         registry: None,
-        directory_bind_addrs: Vec::new(),
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: ["/autoapprove", "/yolo", "/reset", "/clear"]
             .iter()
@@ -116,13 +114,13 @@ async fn qr_payload_pairs_a_client_end_to_end() {
 
     // 4. Build the QR payload exactly as `/remote` does, then parse it back
     //    the way the app does (Plan B B9 validates kind + protocol_major).
-    let url = format!("wss://{MAGIC_DNS_HOST}:{port}/v1/ws");
+    let url = format!("wss://{MACHINE_HOST}:{port}/v1/ws");
     let qr = pairing::qr_payload_json(&pairing::QrPayloadInput {
         url: &url,
         token: &token,
         workspace: "gaviero",
         workspace_id: Some("4b156f1de41da274"),
-        machine: Some(MAGIC_DNS_HOST),
+        machine: Some(MACHINE_HOST),
         directory_url: None,
         tls_ca: None,
         relay_host: None,
@@ -131,12 +129,12 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     let scanned: serde_json::Value = serde_json::from_str(&qr).unwrap();
     assert_eq!(scanned["kind"], "gaviero-remote");
     assert_eq!(scanned["protocol_major"], PROTOCOL_VERSION.major);
-    assert_eq!(scanned["machine"], MAGIC_DNS_HOST);
+    assert_eq!(scanned["machine"], MACHINE_HOST);
     let scanned_url = scanned["url"].as_str().unwrap();
     let scanned_token = scanned["token"].as_str().unwrap();
 
     // 5. Connect using ONLY what the QR carried: bearer header (never the
-    //    URL), subprotocol gaviero.v1, TLS validated against the MagicDNS
+    //    URL), subprotocol gaviero.v1, TLS validated against the machine
     //    name while dialing loopback.
     let mut request = scanned_url.into_client_request().unwrap();
     request.headers_mut().insert(
@@ -206,7 +204,7 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     assert_eq!(envelope.instance_id, "inst-e2e");
 }
 
-/// VPS relay (`remote.tlsMode = "pinnedCa"`): a client that trusts ONLY the
+/// gaviero-relay (pinned private CA): a client that trusts ONLY the
 /// CA carried by the QR's `tls_ca` completes TLS against the generated leaf,
 /// while a different machine's CA or a different host name is refused.
 #[tokio::test]
@@ -301,9 +299,7 @@ async fn spawn_with(
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         registry: None,
-        directory_bind_addrs: Vec::new(),
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
@@ -341,9 +337,7 @@ async fn a_stale_qr_token_cannot_pair() {
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         registry: None,
-        directory_bind_addrs: Vec::new(),
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
@@ -362,7 +356,7 @@ async fn a_stale_qr_token_cannot_pair() {
 
     // A QR printed before a `/remote rotate` carries the old token.
     let stale = pairing::generate_token();
-    let url = format!("wss://{MAGIC_DNS_HOST}:{port}/v1/ws");
+    let url = format!("wss://{MACHINE_HOST}:{port}/v1/ws");
     let mut request = url.as_str().into_client_request().unwrap();
     request
         .headers_mut()
@@ -412,9 +406,7 @@ async fn a_token_in_the_query_string_is_not_accepted() {
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         registry: None,
-        directory_bind_addrs: Vec::new(),
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
@@ -431,7 +423,7 @@ async fn a_token_in_the_query_string_is_not_accepted() {
     .unwrap();
     let port = spawned.local_addr.port();
 
-    let url = format!("wss://{MAGIC_DNS_HOST}:{port}/v1/ws?token={token}");
+    let url = format!("wss://{MACHINE_HOST}:{port}/v1/ws?token={token}");
     let mut request = url.as_str().into_client_request().unwrap();
     request
         .headers_mut()

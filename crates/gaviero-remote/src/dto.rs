@@ -27,9 +27,9 @@ pub struct Limits {
     pub command_rate_per_second: u32,
 }
 
-/// The machine an instance runs on (1.1). `host` is the MagicDNS name the
-/// certificate covers; `directory_url` is the machine directory
-/// (`https://<host>:<directoryPort>/v1/instances`) when enabled.
+/// The machine an instance runs on (1.1). `host` is the machine name the
+/// certificate covers (`<machine>.<relay host>`); `directory_url` is this
+/// instance's `https://<route>/v1/instances`, which lists the whole machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MachineInfo {
     pub host: String,

@@ -40,22 +40,24 @@ pub struct QrPayload<'a> {
     /// it has ever connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<&'a str>,
-    /// 1.1: MagicDNS host — the pairing is per machine.
+    /// 1.1: machine host (`<machine>.<relay host>`) — the pairing is per
+    /// machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<&'a str>,
-    /// 1.1: `https://<host>:<directoryPort>/v1/instances`.
+    /// 1.1: `https://<route>/v1/instances` — this instance's route lists
+    /// every instance on the machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory_url: Option<&'a str>,
-    /// `remote.tlsMode = "pinnedCa"`: the machine CA certificate as base64
-    /// DER (PEM body without armor or line breaks — it keeps the QR small).
-    /// The app trusts only this CA for the machine. Never a private key.
+    /// The machine CA certificate as base64 DER (PEM body without armor or
+    /// line breaks — it keeps the QR small). The app trusts only this CA for
+    /// the machine. Never a private key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<&'a str>,
-    /// Relay mode (`remote.relay.host`): the app dials this host on 443 and
-    /// names the instance in SNI; `url`'s host is the route, never resolved.
+    /// `remote.relay.host`: the app dials this host on 443 and names the
+    /// instance in SNI; `url`'s host is the route, never resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_host: Option<&'a str>,
-    /// Relay mode: bearer secret for the relay's phone notification stream.
+    /// Bearer secret for the relay's phone notification stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_secret: Option<&'a str>,
 }
@@ -91,12 +93,11 @@ pub fn qr_payload_json(input: &QrPayloadInput<'_>) -> String {
     .expect("QR payload serializes")
 }
 
-// ── Pinned private CA (`remote.tlsMode = "pinnedCa"`) ───────────────
+// ── Pinned private CA ───────────────────────────────────────────────
 //
-// For a relay that passes TLS through (nginx `stream` + `ssh -R`): the
-// sidecar keeps terminating TLS, with a leaf issued by a per-machine CA the
-// app pins from the QR. Nothing is logged in Certificate Transparency and
-// nothing depends on Tailscale or a public CA.
+// gaviero-relay passes TLS through: the sidecar terminates TLS with a leaf
+// issued by a per-machine CA the app pins from the QR. Nothing is logged in
+// Certificate Transparency and nothing depends on a public CA.
 
 /// Sub-directory of the machine `tls/` folder holding the pinned material.
 pub const PINNED_DIR: &str = "pinned";
@@ -140,7 +141,7 @@ pub fn ensure_pinned_ca_with(
     extra_sans: &[String],
 ) -> Result<PinnedTls, String> {
     if host.trim().is_empty() {
-        return Err("pinned CA needs `remote.magicDnsHost`".to_string());
+        return Err("pinned CA needs a machine host name".to_string());
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let ca_path = dir.join(CA_FILE);
@@ -452,42 +453,6 @@ fn dns_name_matches(pattern: &str, host: &str) -> bool {
     false
 }
 
-// ── Bind policy (§3.2) ──────────────────────────────────────────────
-
-/// Tailscale addresses on this machine: CGNAT IPv4 (`100.64.0.0/10`) and
-/// the Tailscale ULA IPv6 prefix (`fd7a:115c:a1e0::/48`).
-pub fn detect_tailscale_addrs() -> Vec<std::net::IpAddr> {
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
-    interfaces
-        .into_iter()
-        .map(|iface| iface.ip())
-        .filter(is_tailscale_addr)
-        .collect()
-}
-
-pub fn is_tailscale_addr(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            // 100.64.0.0/10
-            let octets = v4.octets();
-            octets[0] == 100 && (64..128).contains(&octets[1])
-        }
-        std::net::IpAddr::V6(v6) => {
-            let segments = v6.segments();
-            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
-        }
-    }
-}
-
-/// A bind address the default policy refuses (§3.2): anything that is not
-/// loopback and not a Tailscale address — wildcard, LAN, and public
-/// addresses need `remote.allowPublicBind`.
-pub fn is_refused_bind_addr(ip: &std::net::IpAddr) -> bool {
-    !ip.is_loopback() && !is_tailscale_addr(ip)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,14 +477,14 @@ mod tests {
     #[test]
     fn qr_payload_shape_matches_the_frozen_contract() {
         let json = qr_payload_json(&QrPayloadInput {
-            url: "wss://host.tail.ts.net:50123/v1/ws",
+            url: "wss://4b156f1de41da274-desk.gaviero.example.com/v1/ws",
             token: "SECRET",
             workspace: "gaviero",
             ..Default::default()
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["kind"], "gaviero-remote");
-        assert_eq!(v["url"], "wss://host.tail.ts.net:50123/v1/ws");
+        assert_eq!(v["url"], "wss://4b156f1de41da274-desk.gaviero.example.com/v1/ws");
         assert_eq!(v["token"], "SECRET");
         assert_eq!(v["workspace"], "gaviero");
         assert_eq!(v["protocol_major"], 1);
@@ -531,57 +496,38 @@ mod tests {
     #[test]
     fn qr_payload_carries_the_optional_1_1_keys_when_known() {
         let json = qr_payload_json(&QrPayloadInput {
-            url: "wss://host.tail.ts.net:50123/v1/ws",
+            url: "wss://4b156f1de41da274-desk.gaviero.example.com/v1/ws",
             token: "SECRET",
             workspace: "gaviero",
             workspace_id: Some("4b156f1de41da274"),
-            machine: Some("host.tail.ts.net"),
-            directory_url: Some("https://host.tail.ts.net:49151/v1/instances"),
+            machine: Some("desk.gaviero.example.com"),
+            directory_url: Some("https://4b156f1de41da274-desk.gaviero.example.com/v1/instances"),
             tls_ca: None,
             relay_host: None,
             relay_secret: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["workspace_id"], "4b156f1de41da274");
-        assert_eq!(v["machine"], "host.tail.ts.net");
+        assert_eq!(v["machine"], "desk.gaviero.example.com");
         assert_eq!(
             v["directory_url"],
-            "https://host.tail.ts.net:49151/v1/instances"
+            "https://4b156f1de41da274-desk.gaviero.example.com/v1/instances"
         );
         assert_eq!(v["protocol_major"], 1, "still major 1 — the bump is minor");
     }
 
     #[test]
-    fn tailscale_ranges_are_recognized() {
-        assert!(is_tailscale_addr(&"100.101.102.103".parse().unwrap()));
-        assert!(!is_tailscale_addr(&"100.10.0.1".parse().unwrap()));
-        assert!(!is_tailscale_addr(&"192.168.1.10".parse().unwrap()));
-        assert!(is_tailscale_addr(&"fd7a:115c:a1e0::1234".parse().unwrap()));
-        assert!(!is_tailscale_addr(&"fd00::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn bind_policy_refuses_lan_and_wildcard_by_default() {
-        assert!(!is_refused_bind_addr(&"127.0.0.1".parse().unwrap()));
-        assert!(!is_refused_bind_addr(&"::1".parse().unwrap()));
-        assert!(!is_refused_bind_addr(&"100.75.1.2".parse().unwrap()));
-        assert!(is_refused_bind_addr(&"0.0.0.0".parse().unwrap()));
-        assert!(is_refused_bind_addr(&"192.168.1.5".parse().unwrap()));
-        assert!(is_refused_bind_addr(&"8.8.8.8".parse().unwrap()));
-    }
-
-    #[test]
     fn cert_inspection_checks_hostname_and_expiry() {
         let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["host.tailnet.ts.net".to_string()])
+        let cert = rcgen::CertificateParams::new(vec!["desk.gaviero.example.com".to_string()])
             .unwrap()
             .self_signed(&key)
             .unwrap();
         let pem = cert.pem();
-        let info = inspect_cert(pem.as_bytes(), "host.tailnet.ts.net").unwrap();
+        let info = inspect_cert(pem.as_bytes(), "desk.gaviero.example.com").unwrap();
         assert!(info.covers_host);
         assert!(!info.is_expired());
-        let wrong = inspect_cert(pem.as_bytes(), "other.tailnet.ts.net").unwrap();
+        let wrong = inspect_cert(pem.as_bytes(), "other.gaviero.example.com").unwrap();
         assert!(!wrong.covers_host);
     }
 
@@ -709,8 +655,8 @@ mod tests {
 
     #[test]
     fn wildcard_san_matches_one_label() {
-        assert!(dns_name_matches("*.tail.ts.net", "host.tail.ts.net"));
-        assert!(!dns_name_matches("*.tail.ts.net", "a.b.tail.ts.net"));
-        assert!(!dns_name_matches("*.tail.ts.net", "tail.ts.net"));
+        assert!(dns_name_matches("*.gaviero.example.com", "desk.gaviero.example.com"));
+        assert!(!dns_name_matches("*.gaviero.example.com", "a.b.gaviero.example.com"));
+        assert!(!dns_name_matches("*.gaviero.example.com", "gaviero.example.com"));
     }
 }

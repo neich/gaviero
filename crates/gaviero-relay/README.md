@@ -1,6 +1,6 @@
 # gaviero-relay
 
-A small rendezvous relay for **Gaviero Remote**. It replaces Tailscale, the `ssh -R` tunnel and ntfy with **one subdomain on port 443** of a VPS you control.
+A small rendezvous relay for **Gaviero Remote**: the only way the phone reaches gaviero, through **one subdomain on port 443** of a VPS you control.
 
 - **gaviero dials out from anywhere** (a desktop behind NAT, a VPS) to `wss://gaviero.<domain>/v1/host` and registers a route.
 - **Live control:** the phone opens TLS to `gaviero.<domain>:443` and names the instance in SNI (`<workspace-id>-<machine>.gaviero.<domain>`). nginx passes it, still encrypted, to the relay, which splices it to that host.
@@ -455,11 +455,10 @@ If `/remote` reports that `remote.relay.secret` is empty, step 2 didn't take eff
 
 Tapping an alert opens that conversation.
 
-**The ntfy app is no longer needed.** Retire ntfy only after alerts work on your phone:
+gaviero no longer publishes to ntfy. If this VPS still runs an ntfy server from an earlier setup, retire it once relay alerts work on your phone:
 1. stop and disable the ntfy user service;
 2. remove its link from `sites-enabled`, then reload nginx and delete the DNS record;
-3. run `sudo certbot delete --cert-name ntfy.example.com`;
-4. set `notifications.ntfy.enabled: false` in gaviero.
+3. run `sudo certbot delete --cert-name ntfy.example.com`.
 
 ## Operations
 
