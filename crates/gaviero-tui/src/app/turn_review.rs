@@ -1145,7 +1145,7 @@ mod tests {
         fn turn(&mut self, id: &str, edit: impl FnOnce(&Self)) {
             let scope = CaptureScope {
                 roots: vec![self.root().to_path_buf()],
-                excludes: vec![],
+                ..CaptureScope::default()
             };
             let conv = self.conv();
             let handle = self.app.turn_capture.begin(id, Some(&conv), scope).unwrap();

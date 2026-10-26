@@ -72,7 +72,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - `rmcp 1.5` + `schemars 1.2` + `axum 0.8` — in-process MCP server (stdio + streamable HTTP).
 - `zstd 0.13` + `bincode 1.3` — History compression.
 - `windows-sys 0.59` (Windows only) — kill-on-close Job Objects ([`util::spawn`](src/util/spawn.rs)).
-- `ignore 0.4` — turn capture's `.gitignore` / `files.exclude` walk with `require_git(false)` (no repository needed).
+- `ignore 0.4` — turn capture's `.gitignore` / `files.exclude` walk with `require_git(false)` (no repository needed); `include_ignored` folders are walked with ignore files off.
 - `reqwest`, `async-trait`, `futures`, `tokio-stream`, `tokio-util`, `chrono`, `regex`, `walkdir`, `toml`, `tempfile`, `ropey`, `similar`, …
 - Dev: `wiremock 0.6`, `insta 1` ([tests/snapshots/](tests/snapshots)).
 

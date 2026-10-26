@@ -28,6 +28,10 @@ pub mod settings {
     /// exactly like [`FILE_TREE_WIDTH`].
     pub const TERMINAL_SPLIT_PERCENT: &str = "panels.terminal.splitPercent";
     pub const GIT_TREE_ALLOW_LIST: &str = "git.treeAllowList";
+    /// Gitignored folders (paths relative to each workspace folder) whose
+    /// files the TURN REVIEW captures anyway. Default `[]`: only files no
+    /// `.gitignore` hides (plus sensitive paths and `.gaviero/settings.json`).
+    pub const TURN_REVIEW_INCLUDE_IGNORED: &str = "turnReview.includeIgnored";
 
     // Agent / Claude settings
     pub const AGENT_MODEL: &str = "agent.model";
@@ -1372,6 +1376,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::INSERT_SPACES => serde_json::json!(true),
         settings::FORMAT_ON_SAVE => serde_json::json!(false),
         settings::FILES_EXCLUDE => serde_json::json!({}),
+        settings::TURN_REVIEW_INCLUDE_IGNORED => serde_json::json!([]),
         settings::FILE_TREE_WIDTH => serde_json::json!(30),
         settings::SIDE_PANEL_WIDTH => serde_json::json!(40),
         settings::TERMINAL_SPLIT_PERCENT => serde_json::json!(30),
