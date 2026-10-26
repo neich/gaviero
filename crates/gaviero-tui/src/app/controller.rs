@@ -1,16 +1,15 @@
 use super::*;
 
-/// Phone notifications (ntfy and/or gaviero-relay) do not honour terminal
+/// Phone notifications go through gaviero-relay and do not honour terminal
 /// focus — the phone is the point. Still requires
 /// `notifications.agentFinished.enabled` / `agentWaiting.enabled`
-/// (`desktop_event_enabled`); ntfy additionally needs its master switch.
-/// The relay gets only `{machine, workspace, conv, kind}`, never the body.
-fn publish_ntfy_for_event(
+/// (`desktop_event_enabled`). The relay gets only
+/// `{machine, workspace, conv, kind}`, never the body.
+fn notify_phone(
     app: &App,
     event: crate::notify::NotifyEvent,
     desktop_event_enabled: bool,
     conv_id: &str,
-    body: &str,
 ) {
     if !desktop_event_enabled {
         return;
@@ -27,46 +26,6 @@ fn publish_ntfy_for_event(
             conv_id,
         );
     }
-    let roots = app.workspace.roots();
-    let root = roots.first().copied();
-    let ntfy = crate::notify::resolve_ntfy_config(&app.workspace, root, None);
-    if !ntfy.enabled {
-        return;
-    }
-    let (host, workspace_id, display) = ntfy_remote_identity(app);
-    let click = crate::notify::ntfy_click_url(&host, &workspace_id, conv_id);
-    let title = crate::notify::ntfy_title(event, &display);
-    crate::notify::publish_ntfy(&ntfy, event, &title, body, &click);
-}
-
-fn ntfy_remote_identity(app: &App) -> (String, String, String) {
-    use crate::app::remote::RemoteStatus;
-    let mut host = match &app.remote.status {
-        RemoteStatus::Running(s) => s.host.clone(),
-        _ => String::new(),
-    };
-    let mut workspace_id = String::new();
-    let mut display = String::new();
-    if let Ok(config) = crate::app::remote_setup::resolve_config(&app.workspace) {
-        if host.is_empty() {
-            host = config.magic_dns_host;
-        }
-        workspace_id = config.workspace_id;
-        display = config.workspace_display_name;
-    }
-    if workspace_id.is_empty()
-        && let Some(root) = app.workspace.roots().first()
-    {
-        workspace_id = gaviero_core::workspace::identity::workspace_id_hex16(root);
-        if display.is_empty() {
-            display = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-        }
-    }
-    (host, workspace_id, display)
 }
 
 pub(super) fn handle_event(app: &mut App, event: Event) {
@@ -1009,12 +968,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     &body,
                 );
             }
-            publish_ntfy_for_event(
+            notify_phone(
                 app,
                 crate::notify::NotifyEvent::AgentFinished,
                 config.enabled,
                 &conv_id,
-                &body,
             );
         }
         // Granted earlier with `a` / `A` on this conversation's overlay:
@@ -1110,12 +1068,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         &notify_body,
                     );
                 }
-                publish_ntfy_for_event(
+                notify_phone(
                     app,
                     crate::notify::NotifyEvent::AgentWaiting,
                     config.enabled,
                     &conv_id,
-                    &notify_body,
                 );
             } else {
                 let _ = respond.send(gaviero_core::observer::PermissionDecision::deny());
@@ -1780,11 +1737,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.remote.status = crate::app::remote::RemoteStatus::Running(started);
         }
         Event::RemoteUnavailable(reason) => {
-            if matches!(
-                reason,
-                crate::app::remote_setup::RemoteUnavailable::Disabled
-            ) {
-                tracing::debug!("remote sidecar disabled by settings");
+            if reason.is_quiet() {
+                tracing::debug!("remote sidecar not started: {reason}");
             } else {
                 tracing::warn!("remote sidecar unavailable: {reason}");
             }

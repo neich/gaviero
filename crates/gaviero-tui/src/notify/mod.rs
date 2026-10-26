@@ -1,4 +1,4 @@
-//! Agent notifications: sound, desktop toast, status-bar banner, ntfy push.
+//! Agent notifications: sound, desktop toast, status-bar banner.
 //!
 //! Two trigger points, configured independently ([`NotifyEvent`]):
 //!
@@ -8,9 +8,9 @@
 //!   permission decision or an `AskUserQuestion` answer
 //!   (`notifications.agentWaiting.*`).
 //!
-//! Phone delivery lives in [`ntfy`]: the TUI POSTs to ntfy when a turn
-//! finishes or blocks; the official ntfy Android app delivers. This module
-//! never holds a subscribe socket.
+//! Phone delivery goes through gaviero-relay: the controller hands the relay
+//! client `{conv, kind}` and the Gaviero Remote app's alert service renders
+//! it. This module only handles what happens on this machine.
 //!
 //! **Sound ignores terminal focus.** The whole point of the alert is to reach a
 //! user who has alt-tabbed away, so BEL / the system sound fires whether or not
@@ -22,13 +22,6 @@
 //! same one. A toast exists to reach someone looking at another window; with
 //! gaviero on screen the status-bar banner and the chat panel already carry the
 //! news, so a toast there would be noise over the window being read.
-
-mod ntfy;
-
-pub use ntfy::{
-    handle_ntfy_command, ntfy_click_url, ntfy_enabled, ntfy_title, publish_ntfy,
-    resolve_ntfy_config,
-};
 
 use gaviero_core::workspace::{Workspace, settings};
 use std::path::Path;

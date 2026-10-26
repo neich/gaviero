@@ -1,11 +1,5 @@
 use super::*;
 
-/// `/ntfy` / `/ntfy hide` — desktop-only (the topic is a capability URL).
-/// Not on the remote slash allow-list.
-pub(super) fn handle_ntfy_command(app: &mut App, line: &str) {
-    crate::notify::handle_ntfy_command(app, line);
-}
-
 const MCP_PROBE_NOTE: &str = "\
 MCP reach probe runs from the CLI (vendor CLIs are not spawned from the TUI).\n\
   gaviero-cli --mcp-reach-probe [--reach-providers claude,codex] [--reach-transport stdio|http|both]\n\
