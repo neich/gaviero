@@ -22,7 +22,7 @@ impl Ws {
     fn scope(&self) -> CaptureScope {
         CaptureScope {
             roots: vec![self.root.clone()],
-            excludes: vec![],
+            ..CaptureScope::default()
         }
     }
 
@@ -202,6 +202,34 @@ fn sensitive_paths_are_auto_reverted() {
     assert_eq!(kinds(&set), vec![("ok.txt".into(), ChangeKind::Added)]);
     assert_eq!(set.auto_reverted, vec![".env".to_string()]);
     assert_eq!(w.read(".env").as_deref(), Some("SECRET=old\n"));
+}
+
+#[test]
+fn edits_in_included_ignored_folders_are_reviewed_and_revertible() {
+    let w = ws();
+    w.write(".gitignore", "plans/\ntarget/\n");
+    w.write("plans/next.md", "v1\n");
+    w.write("target/debug/out", "old\n");
+    let scope = CaptureScope {
+        include_ignored: vec!["plans".into()],
+        ..w.scope()
+    };
+    let h = w.cap.begin("t1", Some("conv"), scope).unwrap();
+    w.write("plans/next.md", "v2\n");
+    w.write("plans/new.md", "fresh\n");
+    w.write("target/debug/out", "rebuilt\n");
+    let set = w.cap.end(h, TurnOutcome::Completed).unwrap().set;
+    assert_eq!(
+        kinds(&set),
+        vec![
+            ("plans/new.md".into(), ChangeKind::Added),
+            ("plans/next.md".into(), ChangeKind::Modified),
+        ]
+    );
+    let modified = set.files.iter().find(|c| c.rel == "plans/next.md").unwrap();
+    assert!(modified.revertible);
+    assert_eq!(revert_file(&w.cap, modified, false).unwrap(), RevertOutcome::Reverted);
+    assert_eq!(w.read("plans/next.md").as_deref(), Some("v1\n"));
 }
 
 #[test]

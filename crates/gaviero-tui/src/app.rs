@@ -1420,6 +1420,25 @@ pub(crate) fn parse_exclude_patterns(
     patterns
 }
 
+/// `turnReview.includeIgnored` for `root`: gitignored folders the turn review
+/// captures anyway.
+pub(crate) fn parse_include_ignored_folders(
+    workspace: &Workspace,
+    root: Option<&std::path::Path>,
+) -> Vec<String> {
+    use gaviero_core::workspace::settings;
+    let val = workspace.resolve_setting(settings::TURN_REVIEW_INCLUDE_IGNORED, root);
+    let mut folders = Vec::new();
+    if let Some(arr) = val.as_array() {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                folders.push(s.to_string());
+            }
+        }
+    }
+    folders
+}
+
 fn parse_git_allow_list(workspace: &Workspace) -> Vec<String> {
     use gaviero_core::workspace::settings;
     let val = workspace.resolve_setting(settings::GIT_TREE_ALLOW_LIST, None);

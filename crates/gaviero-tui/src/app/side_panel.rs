@@ -2493,19 +2493,31 @@ pub(crate) fn dispatch_prompt_core(
 
     // Turn capture covers every folder the agent can write to: the primary
     // root plus the `--add-dir` siblings, each pruned by its `files.exclude`.
+    // Gitignored files are left out except the `turnReview.includeIgnored`
+    // folders.
     let turn_capture = app.turn_capture.clone();
     let capture_scope = {
         let mut roots = vec![root.clone()];
         roots.extend(additional_roots.iter().cloned());
         let mut excludes: Vec<String> = Vec::new();
+        let mut include_ignored: Vec<String> = Vec::new();
         for r in &roots {
             for p in parse_exclude_patterns(&app.workspace, Some(r)) {
                 if !excludes.contains(&p) {
                     excludes.push(p);
                 }
             }
+            for f in parse_include_ignored_folders(&app.workspace, Some(r)) {
+                if !include_ignored.contains(&f) {
+                    include_ignored.push(f);
+                }
+            }
         }
-        gaviero_core::turn_capture::CaptureScope { roots, excludes }
+        gaviero_core::turn_capture::CaptureScope {
+            roots,
+            excludes,
+            include_ignored,
+        }
     };
 
     let conv_id_clone = conv_id.clone();

@@ -191,7 +191,7 @@ CONSOLIDATE Consolidator + TierStats → memory
 ### Turn capture (TUI chat)
 
 ```
-TurnCapture::begin   stat walk (.gitignore + files.exclude, no git) → re-hash changed → blobs ≤ 8 MiB
+TurnCapture::begin   stat walk (.gitignore + files.exclude + include_ignored folders, no git) → re-hash changed → blobs ≤ 8 MiB
   session runs       providers write freely (host_capture); host writes → HostWriteLedger
   session closed     (also on cancel: the select drops the session first)
 TurnCapture::end     stat walk → hash suspects → TurnChangeSet {added|modified|deleted, before/after blobs}
