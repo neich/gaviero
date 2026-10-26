@@ -63,9 +63,7 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         registry: None,
-        directory_bind_addrs: Vec::new(),
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: vec![
             "/autoapprove".into(),
@@ -802,11 +800,6 @@ use gaviero_remote::dto::{InstanceDirectory, InstanceInfo, MachineInfo};
 use gaviero_remote::server::registry::{self, RegistryConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_loopback_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 fn registry_entry(id: &str, name: &str, port: u16) -> InstanceInfo {
     InstanceInfo {
         instance_id: id.into(),
@@ -1044,56 +1037,6 @@ async fn shutdown_deletes_registry_entry() {
             panic!("heartbeat file survived shutdown");
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_port_ws_is_404_and_leader_handover_works() {
-    let tls = make_tls();
-    let dir_port = free_loopback_port();
-    let dir_addr: SocketAddr = format!("127.0.0.1:{dir_port}").parse().unwrap();
-
-    let mut cfg_a = test_config(&tls);
-    cfg_a.directory_bind_addrs = vec![dir_addr];
-    cfg_a.directory_retry_interval = Duration::from_millis(80);
-    let a = spawn(cfg_a).await.unwrap();
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !a
-        .directory_leader
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        if tokio::time::Instant::now() > deadline {
-            panic!("A never became directory leader");
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
-
-    let mut cfg_b = test_config(&tls);
-    cfg_b.instance_id = "inst-b".into();
-    cfg_b.directory_bind_addrs = vec![dir_addr];
-    cfg_b.directory_retry_interval = Duration::from_millis(80);
-    let b = spawn(cfg_b).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        !b.directory_leader
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "B must not be leader while A holds the port"
-    );
-
-    let (status, _, _) = https_get(&tls, dir_addr, TEST_HOST, Some(TOKEN), WS_PATH).await;
-    assert_eq!(status, 404, "/v1/ws on the directory port must 404");
-
-    a.handle.try_send(HubInput::Shutdown).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !b
-        .directory_leader
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        if tokio::time::Instant::now() > deadline {
-            panic!("B did not become leader after A shutdown");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

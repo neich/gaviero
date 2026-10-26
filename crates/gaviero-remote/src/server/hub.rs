@@ -73,7 +73,6 @@ pub(crate) struct RemoteHub {
     token_poll_interval: Duration,
     registry: Option<RegistryConfig>,
     heartbeat_interval: Duration,
-    directory_shutdown: Option<watch::Sender<bool>>,
 
     registration_rx: mpsc::Receiver<Registration>,
     inbound_rx: mpsc::Receiver<ConnIn>,
@@ -103,7 +102,6 @@ impl RemoteHub {
         input_rx: mpsc::Receiver<HubInput>,
         output_tx: mpsc::Sender<HubOutput>,
         axum_handles: Vec<axum_server::Handle>,
-        directory_shutdown: Option<watch::Sender<bool>>,
     ) -> Self {
         let rate = config.limits.command_rate_per_second;
         let hello = Hello {
@@ -126,7 +124,6 @@ impl RemoteHub {
             token_poll_interval: config.token_poll_interval,
             registry: config.registry,
             heartbeat_interval: config.heartbeat_interval,
-            directory_shutdown,
             registration_rx,
             inbound_rx,
             input_rx,
@@ -387,9 +384,6 @@ impl RemoteHub {
                 .await;
                 for handle in &self.axum_handles {
                     handle.graceful_shutdown(Some(Duration::from_millis(250)));
-                }
-                if let Some(tx) = self.directory_shutdown.take() {
-                    let _ = tx.send(true);
                 }
                 if let Some(reg) = self.registry.take() {
                     let dir = reg.dir;

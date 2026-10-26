@@ -332,51 +332,22 @@ pub mod settings {
     /// `bellStyle: none`) or for muted Windows sound schemes.
     pub const NOTIFICATIONS_SOUND_STYLE: &str = "notifications.sound.style";
 
-    /// Always-on phone alerts via ntfy (Plan remote-ntfy v1). Master switch
-    /// is off by default: ntfy.sh is a third party and a guessable topic is a
-    /// capability URL. Topic is minted to `~/.gaviero/ntfy/topic` on first
-    /// enable when this setting is empty — it is not written back here.
-    pub const NOTIFICATIONS_NTFY_ENABLED: &str = "notifications.ntfy.enabled";
-    pub const NOTIFICATIONS_NTFY_SERVER: &str = "notifications.ntfy.server";
-    pub const NOTIFICATIONS_NTFY_TOPIC: &str = "notifications.ntfy.topic";
-    pub const NOTIFICATIONS_NTFY_TOKEN: &str = "notifications.ntfy.token";
-    pub const NOTIFICATIONS_NTFY_AGENT_FINISHED: &str = "notifications.ntfy.agentFinished";
-    pub const NOTIFICATIONS_NTFY_AGENT_WAITING: &str = "notifications.ntfy.agentWaiting";
-
-    // Remote sidecar (Plan A §3.2). `remote.port` absent/null means derived
-    // from the workspace identity; `0` is a configuration ERROR (it
-    // conventionally means OS-assigned ephemeral, which would break QR
-    // stability) — reject it, never bind it.
+    // Remote sidecar. gaviero-relay is the only transport: the sidecar binds
+    // loopback only, terminates TLS with a per-machine private CA the pairing
+    // QR carries, and dials OUT to the relay. `remote.port` absent/null means
+    // derived from the workspace identity; `0` is a configuration ERROR (it
+    // conventionally means OS-assigned ephemeral) — reject it, never bind it.
+    // The token is machine-scoped unless `tokenScope` is "workspace".
     pub const REMOTE_ENABLED: &str = "remote.enabled";
-    pub const REMOTE_BIND_MODE: &str = "remote.bindMode";
     pub const REMOTE_PORT: &str = "remote.port";
-    pub const REMOTE_MAGIC_DNS_HOST: &str = "remote.magicDnsHost";
-    pub const REMOTE_CERT_PATH: &str = "remote.certPath";
-    pub const REMOTE_KEY_PATH: &str = "remote.keyPath";
-    pub const REMOTE_ALLOW_PUBLIC_BIND: &str = "remote.allowPublicBind";
     pub const REMOTE_MAX_FRAME_BYTES: &str = "remote.maxFrameBytes";
     pub const REMOTE_MAX_PROMPT_BYTES: &str = "remote.maxPromptBytes";
     pub const REMOTE_COMMAND_RATE_PER_SECOND: &str = "remote.commandRatePerSecond";
-    // Plan C V1 §3. `remote.enabled` now defaults to true; an empty
-    // `magicDnsHost` means auto-detect; empty cert/key paths mean "explicit
-    // → legacy workspace pair → machine pair"; the token is machine-scoped
-    // unless `tokenScope` is "workspace"; the machine directory listener
-    // is leader-by-bind on `directoryPort` (0 is an error, like `port`).
-    pub const REMOTE_AUTO_CERT: &str = "remote.autoCert";
     pub const REMOTE_TOKEN_SCOPE: &str = "remote.tokenScope";
-    pub const REMOTE_DIRECTORY_ENABLED: &str = "remote.directoryEnabled";
-    pub const REMOTE_DIRECTORY_PORT: &str = "remote.directoryPort";
-    // VPS relay (research/vps-relay-gaviero-remote-2026-10-14.md).
-    // `bindMode: "loopback"` binds 127.0.0.1/::1 only and needs no Tailscale
-    // address — for an `ssh -R` tunnel or a same-host nginx `stream` relay.
-    // `tlsMode: "pinnedCa"` replaces `tailscale cert` with a per-machine
-    // private CA whose certificate the pairing QR carries (`tls_ca`).
-    pub const REMOTE_TLS_MODE: &str = "remote.tlsMode";
-    // gaviero-relay (research/bidirectional-relay-replacing-ntfy-2026-10-15.md).
-    // A non-empty `relay.host` turns relay mode on: loopback bind, pinned CA,
-    // the sidecar dials OUT to `wss://<host>` and phones reach it through
-    // the relay by SNI. `relay.machine` defaults to the sanitised hostname;
-    // `relay.url` overrides the relay base URL (tests, non-standard ports).
+    // gaviero-relay. Without `relay.host` + `relay.secret` the sidecar does
+    // not start. Phones reach it through the relay by SNI. `relay.machine`
+    // defaults to the sanitised hostname; `relay.url` overrides the relay
+    // base URL (tests, non-standard ports).
     pub const REMOTE_RELAY_HOST: &str = "remote.relay.host";
     pub const REMOTE_RELAY_SECRET: &str = "remote.relay.secret";
     pub const REMOTE_RELAY_MACHINE: &str = "remote.relay.machine";
@@ -1606,15 +1577,6 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::NOTIFICATIONS_AGENT_WAITING_STATUS_BAR => serde_json::json!(true),
         settings::NOTIFICATIONS_SOUND_STYLE => serde_json::json!("auto"),
 
-        // Always-on ntfy (TUI publisher). Opt-in; empty topic is minted to
-        // ~/.gaviero/ntfy/topic rather than written into settings.json.
-        settings::NOTIFICATIONS_NTFY_ENABLED => serde_json::json!(false),
-        settings::NOTIFICATIONS_NTFY_SERVER => serde_json::json!("https://ntfy.sh"),
-        settings::NOTIFICATIONS_NTFY_TOPIC => serde_json::json!(""),
-        settings::NOTIFICATIONS_NTFY_TOKEN => serde_json::json!(""),
-        settings::NOTIFICATIONS_NTFY_AGENT_FINISHED => serde_json::json!(true),
-        settings::NOTIFICATIONS_NTFY_AGENT_WAITING => serde_json::json!(true),
-
         // Tier B / B5 — session consolidator + sleeptime
         settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),
         settings::MEMORY_SESSION_IDLE_TIMEOUT_SEC => serde_json::json!(90),
@@ -1632,25 +1594,14 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_TELEMETRY_TRUST_ADJUST_DELTA => serde_json::json!(0.05),
         settings::MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS => serde_json::json!(20),
 
-        // Remote sidecar (Plan A §3.2, Plan C §3). `REMOTE_PORT` deliberately
-        // has NO default: absent/null means "derive from the workspace
-        // identity". Enabled by default since Plan C; an empty host means
-        // auto-detect; empty cert/key paths mean explicit → legacy workspace
-        // pair → `~/.gaviero/remote/tls/`.
+        // Remote sidecar. `REMOTE_PORT` deliberately has NO default:
+        // absent/null means "derive from the workspace identity". Enabled by
+        // default, but it only starts once `remote.relay.host` is set.
         settings::REMOTE_ENABLED => serde_json::json!(true),
-        settings::REMOTE_BIND_MODE => serde_json::json!("loopback+tailnet"),
-        settings::REMOTE_MAGIC_DNS_HOST => serde_json::json!(""),
-        settings::REMOTE_CERT_PATH => serde_json::json!(""),
-        settings::REMOTE_KEY_PATH => serde_json::json!(""),
-        settings::REMOTE_ALLOW_PUBLIC_BIND => serde_json::json!(false),
         settings::REMOTE_MAX_FRAME_BYTES => serde_json::json!(262_144),
         settings::REMOTE_MAX_PROMPT_BYTES => serde_json::json!(131_072),
         settings::REMOTE_COMMAND_RATE_PER_SECOND => serde_json::json!(10),
-        settings::REMOTE_AUTO_CERT => serde_json::json!(true),
         settings::REMOTE_TOKEN_SCOPE => serde_json::json!("machine"),
-        settings::REMOTE_DIRECTORY_ENABLED => serde_json::json!(true),
-        settings::REMOTE_DIRECTORY_PORT => serde_json::json!(49151),
-        settings::REMOTE_TLS_MODE => serde_json::json!("tailscale"),
         settings::REMOTE_RELAY_HOST => serde_json::json!(""),
         settings::REMOTE_RELAY_SECRET => serde_json::json!(""),
         settings::REMOTE_RELAY_MACHINE => serde_json::json!(""),
@@ -1704,7 +1655,7 @@ pub fn user_gaviero_dir() -> Option<PathBuf> {
 
 /// Per-machine gaviero directory, always `~/.gaviero` regardless of
 /// `GAVIERO_ROOT` (which may be shared between machines): remote token,
-/// TLS pair and instance registry, ntfy topic, dsh credential patch.
+/// pinned TLS material and instance registry, dsh credential patch.
 pub fn home_gaviero_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".gaviero"))
 }
@@ -1719,8 +1670,8 @@ pub fn remote_machine_state_dir() -> Option<PathBuf> {
 
 /// User-wide settings file: `~/.gaviero/settings.json` on every OS
 /// (`%USERPROFILE%\.gaviero\settings.json` on Windows; see
-/// [`user_gaviero_root`] for `GAVIERO_ROOT`). Same tree as `remote/` and
-/// `ntfy/`. `None` only when the root cannot be resolved.
+/// [`user_gaviero_root`] for `GAVIERO_ROOT`). Same tree as `remote/`.
+/// `None` only when the root cannot be resolved.
 pub fn user_settings_path() -> Option<PathBuf> {
     user_gaviero_dir().map(|dir| dir.join("settings.json"))
 }
@@ -1977,59 +1928,43 @@ mod tests {
     }
 
     #[test]
-    fn ntfy_defaults_are_opt_in_with_ntfy_sh() {
+    fn remote_relay_defaults_are_empty() {
         let dir = tempfile::tempdir().unwrap();
         let mut ws = Workspace::single_folder(dir.path().to_path_buf());
         ws.user_settings_cache = None;
         assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_ENABLED, None),
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_SERVER, None),
-            serde_json::json!("https://ntfy.sh")
-        );
-        assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOPIC, None),
+            ws.resolve_setting(settings::REMOTE_RELAY_HOST, None),
             serde_json::json!("")
         );
         assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOKEN, None),
+            ws.resolve_setting(settings::REMOTE_RELAY_SECRET, None),
             serde_json::json!("")
-        );
-        assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_AGENT_FINISHED, None),
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_AGENT_WAITING, None),
-            serde_json::json!(true)
         );
     }
 
     #[test]
-    fn ntfy_nested_json_overrides_reach_resolve_setting() {
+    fn remote_relay_nested_json_overrides_reach_resolve_setting() {
         let dir = tempfile::tempdir().unwrap();
         let gaviero_dir = dir.path().join(".gaviero");
         fs::create_dir_all(&gaviero_dir).unwrap();
         fs::write(
             gaviero_dir.join("settings.json"),
-            r#"{ "notifications": { "ntfy": { "enabled": true, "server": "https://ntfy.example" } } }"#,
+            r#"{ "remote": { "relay": { "host": "gaviero.example.com", "secret": "s" } } }"#,
         )
         .unwrap();
         let ws = Workspace::single_folder(dir.path().to_path_buf());
         assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_ENABLED, None),
-            serde_json::json!(true)
+            ws.resolve_setting(settings::REMOTE_RELAY_HOST, None),
+            serde_json::json!("gaviero.example.com")
         );
         assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_SERVER, None),
-            serde_json::json!("https://ntfy.example")
+            ws.resolve_setting(settings::REMOTE_RELAY_SECRET, None),
+            serde_json::json!("s")
         );
         assert_eq!(
-            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOPIC, None),
+            ws.resolve_setting(settings::REMOTE_RELAY_MACHINE, None),
             serde_json::json!(""),
-            "unset topic stays the empty default — mint is the TUI's job"
+            "unset machine stays the empty default"
         );
     }
 

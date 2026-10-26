@@ -353,12 +353,6 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.chat_state.text_input.text.clear();
                     app.chat_state.text_input.cursor = 0;
                     crate::app::remote_setup::handle_remote_command(app, &line);
-                } else if app.chat_state.text_input.text.trim().starts_with("/ntfy") {
-                    let line = app.chat_state.text_input.text.trim().to_string();
-                    app.chat_state.add_user_message(&line);
-                    app.chat_state.text_input.text.clear();
-                    app.chat_state.text_input.cursor = 0;
-                    super::commands::handle_ntfy_command(app, &line);
                 } else if is_mcp_command(app.chat_state.text_input.text.trim()) {
                     let line = app.chat_state.text_input.text.trim().to_string();
                     super::commands::handle_mcp_command(app, &line);

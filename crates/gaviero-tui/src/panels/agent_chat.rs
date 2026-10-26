@@ -2718,10 +2718,9 @@ impl AgentChatState {
                      /restore <deletion-id>   — Replay a soft-deleted row through the dedup pipeline\n\
                      /restore --since <N minutes|N hours|N days>\n                              — Replay every soft-deletion in the window\n\n\
                      Remote:\n\
-                     /remote                  — Pairing QR, MagicDNS host, port, token fingerprint\n\
+                     /remote                  — Pairing QR, relay route, port, token fingerprint\n\
                      /remote hide             — Clear the pairing QR from this transcript\n\
-                     /ntfy                    — ntfy subscribe URL + QR (always-on phone alerts)\n\
-                     /ntfy hide               — Clear the ntfy topic QR from this transcript\n\n\
+                     /remote rotate           — Invalidate the pairing token\n\n\
                      MCP:\n\
                      /mcp                     — Reach record, endpoint, transport, exposed tools\n\
                      /mcp probe               — How to run the CLI reach probe\n\n\

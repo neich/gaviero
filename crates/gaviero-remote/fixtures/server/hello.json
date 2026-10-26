@@ -26,8 +26,8 @@
       "command_rate_per_second": 10
     },
     "machine": {
-      "host": "host.tailnet.ts.net",
-      "directory_url": "https://host.tailnet.ts.net:49151/v1/instances"
+      "host": "desk.gaviero.example.com",
+      "directory_url": "https://4b156f1de41da274-desk.gaviero.example.com/v1/instances"
     }
   }
 }

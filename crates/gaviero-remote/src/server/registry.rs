@@ -17,9 +17,6 @@ pub const STALE_AFTER: Duration = Duration::from_secs(90);
 /// Heartbeat cadence the hub writes at.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Directory-port leader election retry.
-pub const DIRECTORY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-
 /// `GET /v1/instances` cap per listener (Plan C §5.2).
 pub const DIRECTORY_RATE_PER_SECOND: u32 = 10;
 
@@ -160,7 +157,7 @@ mod tests {
                 id: format!("ws-{id}"),
                 display_name: name.into(),
             },
-            url: format!("wss://host.tailnet.ts.net:52093{}", crate::WS_PATH),
+            url: format!("wss://0b7d245998c0e8c3-desk.gaviero.example.com{}", crate::WS_PATH),
             port: 52093,
             tui_version: "0.1.0".into(),
             started_at: "2026-09-09T12:00:00Z".into(),
@@ -173,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_entry(dir.path(), &sample("aaaa", "alpha", false)).unwrap();
         write_entry(dir.path(), &sample("bbbb", "beta", true)).unwrap();
-        let listed = read_directory(dir.path(), "host.tailnet.ts.net", STALE_AFTER);
-        assert_eq!(listed.host, "host.tailnet.ts.net");
+        let listed = read_directory(dir.path(), "desk.gaviero.example.com", STALE_AFTER);
+        assert_eq!(listed.host, "desk.gaviero.example.com");
         assert_eq!(listed.instances.len(), 2);
         assert!(listed.instances.iter().any(|i| i.client_connected));
 
@@ -184,7 +181,7 @@ mod tests {
             .unwrap();
         drop(f);
 
-        let listed = read_directory(dir.path(), "host.tailnet.ts.net", STALE_AFTER);
+        let listed = read_directory(dir.path(), "desk.gaviero.example.com", STALE_AFTER);
         assert_eq!(listed.instances.len(), 1);
         assert_eq!(listed.instances[0].instance_id, "bbbb");
         assert!(!stale_path.exists(), "stale entry must be deleted");

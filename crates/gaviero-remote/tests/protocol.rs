@@ -168,7 +168,7 @@ fn hello_machine_is_optional() {
         panic!("expected hello");
     };
     let machine = h.machine.as_ref().expect("1.1 fixture carries machine");
-    assert_eq!(machine.host, "host.tailnet.ts.net");
+    assert_eq!(machine.host, "desk.gaviero.example.com");
     assert!(
         h.capabilities
             .iter()

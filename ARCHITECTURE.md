@@ -38,7 +38,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 | [`gaviero-tui`](crates/gaviero-tui/) | bin `gaviero` | Ratatui UI, observers, slash commands | [ARCHITECTURE](crates/gaviero-tui/ARCHITECTURE.md) |
 | [`gaviero-cli`](crates/gaviero-cli/) | bin `gaviero-cli` | Clap runner (~4000-line `main.rs`), eval/memory admin | [ARCHITECTURE](crates/gaviero-cli/ARCHITECTURE.md) |
 | [`gaviero-dsl`](crates/gaviero-dsl/) | lib (**9** pub mods) | `.gaviero` compiler → `CompiledPlan` | [ARCHITECTURE](crates/gaviero-dsl/ARCHITECTURE.md) |
-| [`gaviero-remote`](crates/gaviero-remote/) | lib | WSS sidecar + wire protocol (`gaviero.v1`); in-process rustls, Tailscale or loopback-only (VPS relay) binds | [PROTOCOL](crates/gaviero-remote/PROTOCOL.md) |
+| [`gaviero-remote`](crates/gaviero-remote/) | lib | WSS sidecar + wire protocol (`gaviero.v1`); in-process rustls, loopback-only bind reached through gaviero-relay | [PROTOCOL](crates/gaviero-remote/PROTOCOL.md) |
 | [`gaviero-relay`](crates/gaviero-relay/) | bin `gaviero-relay` (VPS only, never installed with gaviero) | SNI-routed rendezvous relay for Gaviero Remote + phone notification stream; depends only on `gaviero-remote`'s plain wire types (`relay_proto`) | [PROTOCOL](crates/gaviero-relay/PROTOCOL.md) |
 | [`gaviero-mcp-shim`](crates/gaviero-mcp-shim/) | bin | stdio↔`McpEndpoint` bridge; zero workspace deps | [ARCHITECTURE](crates/gaviero-mcp-shim/ARCHITECTURE.md) |
 | [`tree-sitter-gaviero`](crates/tree-sitter-gaviero/) | grammar | Editor syntax tree for `.gaviero` | [ARCHITECTURE](crates/tree-sitter-gaviero/ARCHITECTURE.md) |
@@ -91,7 +91,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 ### Remote sidecar
 
-The TUI process hosts an in-process WSS sidecar ([`gaviero-remote`](crates/gaviero-remote/)) on loopback + Tailscale addresses, or loopback only (`remote.bindMode: "loopback"`) behind a TLS-passthrough VPS relay with a per-machine pinned CA (`remote.tlsMode: "pinnedCa"`, [docs/remote-relay.md](docs/remote-relay.md)). It starts in a background task (never blocking the first frame), writes a machine-level heartbeat, and optionally leads `GET /v1/instances` on port 49151. The phone is a mirror: every conversation is addressable by `conv_id`; `/remote` is the pairing surface. Wire contract: [`PROTOCOL.md`](crates/gaviero-remote/PROTOCOL.md).
+The TUI process hosts an in-process WSS sidecar ([`gaviero-remote`](crates/gaviero-remote/)) bound to loopback only. It dials out to [gaviero-relay](crates/gaviero-relay/README.md), which passes the phone's TLS through by SNI; the leaf comes from a per-machine private CA the pairing QR pins ([docs/remote-relay.md](docs/remote-relay.md)). Without `remote.relay.host` it does not start. It starts in a background task (never blocking the first frame), writes a machine-level heartbeat, and every instance serves the machine's `GET /v1/instances`. The phone is a mirror: every conversation is addressable by `conv_id`; `/remote` is the pairing surface. Wire contract: [`PROTOCOL.md`](crates/gaviero-remote/PROTOCOL.md).
 
 ---
 

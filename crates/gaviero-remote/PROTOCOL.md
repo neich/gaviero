@@ -11,8 +11,7 @@ schema disagree, the schema wins.
 PROTOCOL_VERSION  = { major: 1, minor: 4 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
-Instances path    = /v1/instances      (HTTPS GET, 1.1)
-Directory port    = 49151 by default   (machine-wide, 1.1)
+Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
 ```
 
 The document version of the plan that produced this (V3 / Plan C V1) is unrelated to the wire
@@ -25,9 +24,9 @@ Feature-detect through `hello.capabilities`, never through `minor`.
 | Where | Addition | Capability |
 |---|---|---|
 | `hello.capabilities` | contains `"latest_page"` and `"instances"` | — |
-| `hello.machine` | optional `MachineInfo { host, directory_url? }` — the MagicDNS host the certificate covers and, when the machine directory is enabled, `https://<host>:<directoryPort>/v1/instances` | — |
+| `hello.machine` | optional `MachineInfo { host, directory_url? }` — the machine host the certificate covers (`<machine>.<relay host>`) and `https://<route>/v1/instances` | — |
 | `request_messages.before_seq` | **optional**; absent ⇒ the newest page, exactly as if `u64::MAX` had been sent | `latest_page` |
-| `GET /v1/instances` | HTTPS resource on every instance listener **and** on the machine directory port. `Authorization: Bearer` required (`401` otherwise), `Cache-Control: no-store`, `429` above 10 requests/s per listener. Body is `InstanceDirectory` (§DTOs). Only instances with a fresh heartbeat (≤ 90 s) are listed. `/v1/ws` on the directory port is `404`. | `instances` |
+| `GET /v1/instances` | HTTPS resource on every instance listener, so any instance's relay route lists the whole machine. `Authorization: Bearer` required (`401` otherwise), `Cache-Control: no-store`, `429` above 10 requests/s per listener. Body is `InstanceDirectory` (§DTOs). Only instances with a fresh heartbeat (≤ 90 s) are listed. | `instances` |
 | QR payload | optional `workspace_id`, `machine`, `directory_url` (§QR pairing payload) | — |
 | Token scope | one bearer token per **machine** by default (`~/.gaviero/remote/token`); a workspace may opt out with `remote.tokenScope: "workspace"` and then has its own token. Rotation propagates to every running instance on the machine (each closes its client with `4006`). | — |
 
@@ -66,15 +65,13 @@ blocked conversation fails with a code it maps to `unrecognized`.
 
 ## Transport and handshake
 
-- TLS is terminated in-process (rustls). The QR URL always uses the machine's host name
-  (`remote.magicDnsHost`: a Tailscale MagicDNS name, or the relay host name behind a VPS
-  relay — [docs/remote-relay.md](../../docs/remote-relay.md)), never an IP or `localhost`.
-- Trust: by default the certificate chains to a public CA (`tailscale cert` → Let's
-  Encrypt) and clients use system trust. With `remote.tlsMode = "pinnedCa"` the leaf is
-  issued by a per-machine private CA delivered in the QR as `tls_ca`; a client that stored
-  `tls_ca` for a machine MUST trust only that CA for it (no system roots) and keep
-  host-name verification on. A relay in between only passes TCP through; it never
-  terminates TLS.
+- TLS is terminated in-process (rustls). The sidecar binds loopback only and is reached
+  through gaviero-relay ([docs/remote-relay.md](../../docs/remote-relay.md)). The QR URL is
+  `wss://<route>/v1/ws`, where the route `<workspace-id>-<machine>.<relay host>` is the
+  TLS server name the client sends in SNI to the relay on 443 — never an IP or `localhost`.
+- Trust: the leaf is issued by a per-machine private CA delivered in the QR as `tls_ca`; a
+  client MUST trust only that CA for the machine (no system roots) and keep host-name
+  verification on. The relay only passes TCP through; it never terminates TLS.
 - The bearer token is accepted **only** in the HTTP upgrade header
   `Authorization: Bearer <token>`. Never in the URL, query string, subprotocol, or any
   frame. The server rejects the upgrade otherwise.
@@ -354,19 +351,21 @@ boundary — `/runaway` does not match `/run`.
 ## QR pairing payload
 
 ```json
-{ "kind": "gaviero-remote", "url": "wss://host.tailnet.ts.net:PORT/v1/ws",
+{ "kind": "gaviero-remote",
+  "url": "wss://0b7d245998c0e8c3-desk.gaviero.example.com/v1/ws",
   "token": "SECRET", "workspace": "display-name", "protocol_major": 1,
-  "workspace_id": "0b7d245998c0e8c3", "machine": "host.tailnet.ts.net",
-  "directory_url": "https://host.tailnet.ts.net:49151/v1/instances",
-  "tls_ca": "MIIBhDCCASqgAwIBAgIU…" }
+  "workspace_id": "0b7d245998c0e8c3", "machine": "desk.gaviero.example.com",
+  "directory_url": "https://0b7d245998c0e8c3-desk.gaviero.example.com/v1/instances",
+  "tls_ca": "MIIBhDCCASqgAwIBAgIU…",
+  "relay_host": "gaviero.example.com", "relay_secret": "RELAY-SECRET" }
 ```
 
 `workspace_id`, `machine` and `directory_url` are optional (1.1) and omitted when unknown;
-1.0 apps ignore them. `tls_ca` is optional and present only in `remote.tlsMode = "pinnedCa"`:
-the machine CA certificate as base64 DER (the PEM body without armor or line breaks). It is
-never a private key. A client that does not understand it simply cannot validate the relay
-certificate, so pinned-CA machines need a client that does; a malformed value should fail
-pairing rather than be ignored.
+1.0 apps ignore them. The desktop always sends `tls_ca`, `relay_host` and `relay_secret`.
+`tls_ca` is the machine CA certificate as base64 DER (the PEM body without armor or line
+breaks); it is never a private key, and a malformed value should fail pairing rather than be
+ignored. `relay_host` is where the client dials (port 443); `relay_secret` authenticates the
+client's `/v1/phone/stream` alert subscription at the relay.
 `token` is the machine token unless the workspace opted out (`remote.tokenScope`). The QR is
 the only intentional display of the token.
 

@@ -1383,7 +1383,7 @@
         "type": "object"
       },
       "MachineInfo": {
-        "description": "The machine an instance runs on (1.1). `host` is the MagicDNS name the\ncertificate covers; `directory_url` is the machine directory\n(`https://<host>:<directoryPort>/v1/instances`) when enabled.",
+        "description": "The machine an instance runs on (1.1). `host` is the machine name the\ncertificate covers (`<machine>.<relay host>`); `directory_url` is this\ninstance's `https://<route>/v1/instances`, which lists the whole machine.",
         "properties": {
           "directory_url": {
             "type": [

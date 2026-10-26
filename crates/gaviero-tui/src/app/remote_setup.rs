@@ -1,18 +1,14 @@
-//! Remote sidecar bootstrap and the `/remote` command (Plan A unit A6,
-//! reworked by Plan C V1 units C1/C2): settings resolution, MagicDNS host
-//! detection, certificate selection and provisioning, machine-scoped
-//! token lifecycle, bind policy with a bounded port window, background
-//! server spawn, and QR rendering.
+//! Remote sidecar bootstrap and the `/remote` command. gaviero-relay is the
+//! only transport: settings resolution, the pinned private CA and its leaf,
+//! the machine-scoped token lifecycle, a loopback-only listener with a
+//! bounded port window, the outbound relay client, and QR rendering.
 //!
 //! Availability is fail-closed (§3.1): the sidecar refuses to claim it is
-//! reachable unless a host is known, the certificate loads, covers that
-//! host, and is not expired. The bootstrap runs in a spawned task and
-//! reports through `Event::RemoteStarted` / `Event::RemoteUnavailable`
-//! (Plan C invariant 13) — the event loop never runs the Tailscale CLI.
-//! Secrets never reach logs — only
-//! [`gaviero_remote::pairing::token_fingerprint`].
-
-mod tailscale;
+//! reachable unless the relay is configured and the pinned leaf loads,
+//! covers the machine host, and is not expired. The bootstrap runs in a
+//! spawned task and reports through `Event::RemoteStarted` /
+//! `Event::RemoteUnavailable` (Plan C invariant 13). Secrets never reach
+//! logs — only [`gaviero_remote::pairing::token_fingerprint`].
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -28,93 +24,6 @@ use crate::event::Event;
 /// Derived-port fallback window (Plan C §2.5): derived, derived+1 … +9.
 /// An explicit `remote.port` never falls forward.
 pub const PORT_WINDOW: u16 = 10;
-
-/// Where the MagicDNS host came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostSource {
-    /// `remote.magicDnsHost` in settings.
-    Setting,
-    /// `tailscale status --json` → `Self.DNSName`.
-    Detected,
-    /// Neither: the setting is empty and detection has not succeeded.
-    Unresolved,
-}
-
-/// Which certificate pair is in force (Plan C §2.2 step 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CertSource {
-    /// `remote.certPath` / `remote.keyPath`.
-    Explicit,
-    /// `<workspace>/.gaviero/remote/tls/` from before Plan C, still valid.
-    LegacyWorkspace,
-    /// `~/.gaviero/remote/tls/` — shared by every workspace, auto-provisioned.
-    Machine,
-    /// `remote.tlsMode = "pinnedCa"`: leaf issued by the machine's private
-    /// CA under `~/.gaviero/remote/tls/pinned/`; the QR carries the CA.
-    PinnedCa,
-}
-
-impl CertSource {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit (remote.certPath)",
-            Self::LegacyWorkspace => "legacy workspace pair",
-            Self::Machine => "machine pair (~/.gaviero/remote/tls)",
-            Self::PinnedCa => "pinned private CA (~/.gaviero/remote/tls/pinned)",
-        }
-    }
-}
-
-/// `remote.bindMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindMode {
-    /// Loopback plus detected Tailscale addresses — the default.
-    LoopbackTailnet,
-    /// Loopback only, no Tailscale needed: a relay (`ssh -R` tunnel or a
-    /// same-host nginx `stream` proxy) carries the traffic.
-    Loopback,
-}
-
-impl BindMode {
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "loopback" => Self::Loopback,
-            _ => Self::LoopbackTailnet,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::LoopbackTailnet => "loopback+tailnet",
-            Self::Loopback => "loopback",
-        }
-    }
-}
-
-/// `remote.tlsMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsMode {
-    /// `tailscale cert` provisioning (the default).
-    Tailscale,
-    /// Per-machine private CA pinned by the app through the QR.
-    PinnedCa,
-}
-
-impl TlsMode {
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "pinnedca" | "pinned-ca" | "pinned" => Self::PinnedCa,
-            _ => Self::Tailscale,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Tailscale => "tailscale",
-            Self::PinnedCa => "pinnedCa",
-        }
-    }
-}
 
 /// `remote.tokenScope` (Plan C §0.1 item 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,8 +50,8 @@ impl TokenScope {
     }
 }
 
-/// Relay mode (`remote.relay.host` set): the sidecar stays on loopback and
-/// dials OUT to `gaviero-relay`; phones reach it by SNI through the relay.
+/// `remote.relay.*`: the sidecar stays on loopback and dials OUT to
+/// `gaviero-relay`; phones reach it by SNI through the relay.
 #[derive(Clone)]
 pub struct RelayConfig {
     /// The relay's public name, e.g. `gaviero.example.com`.
@@ -199,24 +108,14 @@ fn hostname() -> String {
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     pub enabled: bool,
-    /// Configured or derived port. Absent setting ⇒ derived; the fallback
-    /// window applies only when `explicit_port` is false.
+    /// Configured or derived loopback port. Absent setting ⇒ derived; the
+    /// fallback window applies only when `explicit_port` is false.
     pub port: u16,
     pub explicit_port: bool,
-    /// Empty until detected (setting empty and `resolve_host` not yet run).
-    pub magic_dns_host: String,
-    pub host_source: HostSource,
-    /// Why detection failed, for `/remote`.
-    pub host_detail: Option<String>,
-    /// `remote.certPath` / `keyPath` when either is set.
-    pub explicit_cert: Option<(PathBuf, PathBuf)>,
-    /// The Plan A workspace pair, when both files exist.
-    pub legacy_cert: Option<(PathBuf, PathBuf)>,
-    pub allow_public_bind: bool,
-    pub bind_mode: BindMode,
-    pub tls_mode: TlsMode,
-    /// Relay mode; forces loopback bind, pinned CA, and no directory port.
-    pub relay: Option<RelayConfig>,
+    /// `<machine>.<relay host>`: the QR `machine`, `hello.machine.host`, and
+    /// the pinned leaf's primary name.
+    pub machine_host: String,
+    pub relay: RelayConfig,
     pub max_frame_bytes: u64,
     pub max_prompt_bytes: u64,
     pub command_rate_per_second: u32,
@@ -226,9 +125,6 @@ pub struct RemoteConfig {
     /// Tests override this so they never touch the real home directory.
     pub machine_state_dir: Option<PathBuf>,
     pub token_scope: TokenScope,
-    pub auto_cert: bool,
-    pub directory_enabled: bool,
-    pub directory_port: u16,
     pub workspace_id: String,
     pub workspace_display_name: String,
 }
@@ -240,14 +136,12 @@ pub enum RemoteUnavailable {
     Disabled,
     NoWorkspaceRoot,
     /// `remote.port = 0` is a configuration error (§3.2): `0` means
-    /// OS-assigned ephemeral, which would silently break QR stability.
+    /// OS-assigned ephemeral, which would change on every restart.
     PortZero,
-    /// Same rule for `remote.directoryPort`.
-    DirectoryPortZero,
-    /// No `remote.magicDnsHost` and auto-detection failed.
-    NoMagicDnsHost {
-        detail: String,
-    },
+    /// `remote.relay.host` is empty: there is no way to reach this machine.
+    RelayNotConfigured,
+    /// `remote.relay.host` is set but `remote.relay.secret` is empty.
+    RelaySecretMissing,
     CertLoad(String),
     CertHostMismatch {
         host: String,
@@ -255,9 +149,8 @@ pub enum RemoteUnavailable {
     CertExpired {
         not_after: String,
     },
-    /// `tailscale cert` failed; carries the CLI's own message.
+    /// Creating the machine CA or issuing its leaf failed.
     CertProvision(String),
-    NoTailnetAddress,
     Bind(String),
     /// Every port in the derived window was busy.
     NoFreePort {
@@ -266,8 +159,14 @@ pub enum RemoteUnavailable {
     },
     /// Token read/create failure.
     Token(String),
-    /// `remote.relay.host` is set but `remote.relay.secret` is empty.
-    RelaySecretMissing,
+}
+
+impl RemoteUnavailable {
+    /// Expected states that need no warning in the log: the user turned the
+    /// sidecar off, or never configured a relay.
+    pub fn is_quiet(&self) -> bool {
+        matches!(self, Self::Disabled | Self::RelayNotConfigured)
+    }
 }
 
 impl std::fmt::Display for RemoteUnavailable {
@@ -275,52 +174,41 @@ impl std::fmt::Display for RemoteUnavailable {
         match self {
             Self::Disabled => write!(
                 f,
-                "remote is disabled — remove `remote.enabled: false` from .gaviero/settings.json \
-                 (remote is on by default)"
+                "remote is disabled — remove `remote.enabled: false` from .gaviero/settings.json"
             ),
             Self::NoWorkspaceRoot => write!(f, "no workspace root to anchor remote state"),
             Self::PortZero => write!(
                 f,
                 "`remote.port: 0` is not allowed (0 means an OS-assigned ephemeral port, \
-                 which would change on every restart and break pairing). Remove the setting \
-                 to use the stable derived port, or set a fixed port."
+                 which would change on every restart). Remove the setting to use the stable \
+                 derived port, or set a fixed port."
             ),
-            Self::DirectoryPortZero => write!(
+            Self::RelayNotConfigured => write!(
                 f,
-                "`remote.directoryPort: 0` is not allowed — remove the setting to use 49151, \
-                 or set a fixed port"
+                "no gaviero-relay configured — set `remote.relay.host` and `remote.relay.secret` \
+                 in ~/.gaviero/settings.json (see docs/remote-relay.md)"
             ),
-            Self::NoMagicDnsHost { detail } => write!(
+            Self::RelaySecretMissing => write!(
                 f,
-                "no MagicDNS host: {detail}. Either fix Tailscale or set `remote.magicDnsHost` \
-                 (e.g. host.tailnet.ts.net) in .gaviero/settings.json"
+                "`remote.relay.host` is set but `remote.relay.secret` is empty — copy the \
+                 relay's secret (gaviero-relay --secret-file) into ~/.gaviero/settings.json"
             ),
             Self::CertLoad(e) => write!(f, "could not load the TLS certificate/key: {e}"),
             Self::CertHostMismatch { host } => write!(
                 f,
-                "the certificate does not cover {host} — reissue it with `tailscale cert {host}`"
+                "the pinned certificate does not cover {host} — restart gaviero to reissue it"
             ),
             Self::CertExpired { not_after } => write!(
                 f,
-                "the certificate expired at {not_after} — renew with `tailscale cert`"
+                "the pinned certificate expired at {not_after} — restart gaviero to reissue it"
             ),
-            Self::CertProvision(e) => write!(f, "could not provision the TLS certificate: {e}"),
-            Self::NoTailnetAddress => write!(
-                f,
-                "no Tailscale address found on this machine — is Tailscale running and logged in? \
-                 (Behind a VPS relay, set `remote.bindMode: \"loopback\"` instead.)"
-            ),
+            Self::CertProvision(e) => write!(f, "could not create the TLS certificate: {e}"),
             Self::Bind(e) => write!(f, "could not bind the remote listener: {e}"),
             Self::NoFreePort { from, to } => write!(
                 f,
                 "every port from {from} to {to} is busy — set `remote.port` to a free port"
             ),
             Self::Token(e) => write!(f, "could not read or create the pairing token: {e}"),
-            Self::RelaySecretMissing => write!(
-                f,
-                "`remote.relay.host` is set but `remote.relay.secret` is empty — copy the \
-                 relay's secret (gaviero-relay --secret-file) into ~/.gaviero/settings.json"
-            ),
         }
     }
 }
@@ -329,8 +217,8 @@ impl std::fmt::Display for RemoteUnavailable {
 
 /// Read the `remote.*` settings for the workspace. `remote.port` absent or
 /// null derives a stable port from the workspace identity (§3.3); `0` is
-/// rejected rather than bound. Pure: computes paths, never creates files,
-/// never runs the Tailscale CLI.
+/// rejected rather than bound. Without `remote.relay.host` there is nothing
+/// to start. Pure: computes paths, never creates files.
 pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnavailable> {
     let Some(root) = workspace.roots().first().map(|p| p.to_path_buf()) else {
         return Err(RemoteUnavailable::NoWorkspaceRoot);
@@ -348,123 +236,54 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
             _ => (identity::derive_remote_port(&root), false),
         },
     };
-    let directory_port = match get(settings::REMOTE_DIRECTORY_PORT) {
-        serde_json::Value::Null => gaviero_remote::DEFAULT_DIRECTORY_PORT,
-        v => match v.as_u64() {
-            Some(0) => return Err(RemoteUnavailable::DirectoryPortZero),
-            Some(p) if p <= u16::MAX as u64 => p as u16,
-            _ => gaviero_remote::DEFAULT_DIRECTORY_PORT,
-        },
-    };
 
     let state_dir = workspace
         .remote_state_dir()
         .ok_or(RemoteUnavailable::NoWorkspaceRoot)?;
     let machine_state_dir = gaviero_core::workspace::remote_machine_state_dir();
-    let resolve_path = |raw: &str| -> PathBuf {
-        let p = gaviero_core::workspace::expand_tilde_path(raw);
-        if p.is_absolute() { p } else { root.join(p) }
-    };
-
-    let cert_setting = get(settings::REMOTE_CERT_PATH)
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let key_setting = get(settings::REMOTE_KEY_PATH)
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let explicit_cert = if cert_setting.is_empty() && key_setting.is_empty() {
-        None
-    } else {
-        // One of the two set ⇒ the other is its sibling with the default name.
-        let cert = if cert_setting.is_empty() {
-            resolve_path(&key_setting).with_file_name("cert.pem")
-        } else {
-            resolve_path(&cert_setting)
-        };
-        let key = if key_setting.is_empty() {
-            cert.with_file_name("key.pem")
-        } else {
-            resolve_path(&key_setting)
-        };
-        Some((cert, key))
-    };
-    let legacy_dir = state_dir.join("tls");
-    let legacy_pair = (legacy_dir.join("cert.pem"), legacy_dir.join("key.pem"));
-    let legacy_cert = (legacy_pair.0.is_file() && legacy_pair.1.is_file()).then_some(legacy_pair);
-
-    let mut magic_dns_host = get(settings::REMOTE_MAGIC_DNS_HOST)
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches('.')
-        .to_string();
 
     let workspace_id = identity::workspace_id_hex16(&root);
     let str_setting = |key: &str| get(key).as_str().unwrap_or("").trim().to_string();
     let relay_host = str_setting(settings::REMOTE_RELAY_HOST)
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let relay = if relay_host.is_empty() {
-        None
-    } else {
-        let secret = str_setting(settings::REMOTE_RELAY_SECRET);
-        if secret.is_empty() {
-            return Err(RemoteUnavailable::RelaySecretMissing);
-        }
-        let mut machine_setting = str_setting(settings::REMOTE_RELAY_MACHINE);
-        if machine_setting.is_empty() {
-            machine_setting = hostname();
-        }
-        let machine = machine_label(&machine_setting);
-        let url = str_setting(settings::REMOTE_RELAY_URL);
-        // The machine identity (QR `machine`, hello, ntfy/relay notify) is a
-        // name under the relay host; the route adds the workspace.
-        magic_dns_host = format!("{machine}.{relay_host}");
-        Some(RelayConfig {
-            base_url: if url.is_empty() {
-                format!("wss://{relay_host}")
-            } else {
-                url.trim_end_matches('/').to_string()
-            },
-            route: format!("{workspace_id}-{machine}.{relay_host}"),
-            host: relay_host,
-            secret,
-            machine,
-        })
+    if relay_host.is_empty() {
+        return Err(if enabled {
+            RemoteUnavailable::RelayNotConfigured
+        } else {
+            RemoteUnavailable::Disabled
+        });
+    }
+    let secret = str_setting(settings::REMOTE_RELAY_SECRET);
+    if secret.is_empty() {
+        return Err(RemoteUnavailable::RelaySecretMissing);
+    }
+    let mut machine_setting = str_setting(settings::REMOTE_RELAY_MACHINE);
+    if machine_setting.is_empty() {
+        machine_setting = hostname();
+    }
+    let machine = machine_label(&machine_setting);
+    let url = str_setting(settings::REMOTE_RELAY_URL);
+    // The machine identity (QR `machine`, hello, relay notifications) is a
+    // name under the relay host; the route adds the workspace.
+    let machine_host = format!("{machine}.{relay_host}");
+    let relay = RelayConfig {
+        base_url: if url.is_empty() {
+            format!("wss://{relay_host}")
+        } else {
+            url.trim_end_matches('/').to_string()
+        },
+        route: format!("{workspace_id}-{machine}.{relay_host}"),
+        host: relay_host,
+        secret,
+        machine,
     };
-    let host_source = if magic_dns_host.is_empty() {
-        HostSource::Unresolved
-    } else {
-        HostSource::Setting
-    };
-    let in_relay = relay.is_some();
 
     Ok(RemoteConfig {
         enabled,
         port,
         explicit_port,
-        magic_dns_host,
-        host_source,
-        host_detail: None,
-        explicit_cert,
-        legacy_cert,
-        allow_public_bind: get(settings::REMOTE_ALLOW_PUBLIC_BIND)
-            .as_bool()
-            .unwrap_or(false),
-        bind_mode: if in_relay {
-            BindMode::Loopback
-        } else {
-            BindMode::parse(get(settings::REMOTE_BIND_MODE).as_str().unwrap_or(""))
-        },
-        tls_mode: if in_relay {
-            TlsMode::PinnedCa
-        } else {
-            TlsMode::parse(get(settings::REMOTE_TLS_MODE).as_str().unwrap_or(""))
-        },
+        machine_host,
         relay,
         max_frame_bytes: get(settings::REMOTE_MAX_FRAME_BYTES)
             .as_u64()
@@ -478,14 +297,6 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
         state_dir,
         machine_state_dir,
         token_scope: TokenScope::parse(get(settings::REMOTE_TOKEN_SCOPE).as_str().unwrap_or("")),
-        auto_cert: get(settings::REMOTE_AUTO_CERT).as_bool().unwrap_or(true),
-        // Relay mode: every instance serves /v1/instances on its own route,
-        // and a loopback-only directory port would be unreachable anyway.
-        directory_enabled: !in_relay
-            && get(settings::REMOTE_DIRECTORY_ENABLED)
-                .as_bool()
-                .unwrap_or(true),
-        directory_port,
         workspace_id,
         workspace_display_name: root
             .file_name()
@@ -494,29 +305,7 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
     })
 }
 
-// ── Host detection (§2.2 step 2, async) ─────────────────────────────
-
-/// Fill in the MagicDNS host when the setting is empty. Only ever awaited
-/// from the bootstrap task.
-pub async fn resolve_host(config: &mut RemoteConfig) {
-    if !config.magic_dns_host.is_empty() {
-        config.host_source = HostSource::Setting;
-        return;
-    }
-    match tailscale::detect_magic_dns_host().await {
-        Ok(host) => {
-            config.magic_dns_host = host;
-            config.host_source = HostSource::Detected;
-            config.host_detail = None;
-        }
-        Err(detail) => {
-            config.host_source = HostSource::Unresolved;
-            config.host_detail = Some(detail);
-        }
-    }
-}
-
-// ── Certificate selection and provisioning (§2.2 step 3) ────────────
+// ── Pinned private CA (§2.2 step 3) ─────────────────────────────────
 
 /// `~/.gaviero/remote/tls/pinned` (workspace state dir without a home).
 fn pinned_dir(config: &RemoteConfig) -> PathBuf {
@@ -528,106 +317,29 @@ fn pinned_dir(config: &RemoteConfig) -> PathBuf {
         .join(pairing::PINNED_DIR)
 }
 
-/// Explicit → (pinned-CA leaf when `tlsMode = "pinnedCa"`) → legacy
-/// workspace pair (only if it still covers the host and is not expired) →
-/// machine pair. Sync: a couple of file reads at most.
-pub fn select_cert(config: &RemoteConfig) -> (CertSource, PathBuf, PathBuf) {
-    if let Some((cert, key)) = &config.explicit_cert {
-        return (CertSource::Explicit, cert.clone(), key.clone());
-    }
-    if config.tls_mode == TlsMode::PinnedCa {
-        // One bundle holds the leaf certificate and its key.
-        let leaf = pinned_dir(config).join(pairing::LEAF_FILE);
-        return (CertSource::PinnedCa, leaf.clone(), leaf);
-    }
-    if let Some((cert, key)) = &config.legacy_cert {
-        let usable = std::fs::read(cert)
-            .ok()
-            .and_then(|pem| pairing::inspect_cert(&pem, &config.magic_dns_host).ok())
-            .is_some_and(|info| {
-                (config.magic_dns_host.is_empty() || info.covers_host) && !info.is_expired()
-            });
-        if usable {
-            return (CertSource::LegacyWorkspace, cert.clone(), key.clone());
-        }
-        tracing::info!(
-            path = %cert.display(),
-            "legacy workspace certificate ignored (does not cover the host or expired) — \
-             using the machine pair"
-        );
-    }
-    let dir = config
-        .machine_state_dir
-        .clone()
-        .unwrap_or_else(|| config.state_dir.clone())
-        .join("tls");
-    (
-        CertSource::Machine,
-        dir.join("cert.pem"),
-        dir.join("key.pem"),
-    )
+/// The leaf bundle: one file holds the certificate and its key.
+pub fn leaf_path(config: &RemoteConfig) -> PathBuf {
+    pinned_dir(config).join(pairing::LEAF_FILE)
 }
 
-/// Provision or renew the machine pair with `tailscale cert` when it is
-/// missing, does not cover the host, or expires within 7 days. In pinned-CA
-/// mode, create the machine CA once and (re)issue its leaf instead — no
-/// Tailscale involved. Never touches an explicit or legacy pair. Returns
-/// whether a certificate was issued. Only ever awaited from the bootstrap
-/// task.
+/// Create the machine CA once and (re)issue its leaf for the machine host
+/// plus `*.<relay host>`, which covers every route on this machine. Returns
+/// whether anything was issued. Only ever awaited from the bootstrap task.
 pub async fn ensure_certificate(config: &RemoteConfig) -> Result<bool, RemoteUnavailable> {
-    if config.magic_dns_host.is_empty() {
-        return Ok(false);
+    // Key generation and file writes: keep them off the async workers.
+    let dir = pinned_dir(config);
+    let host = config.machine_host.clone();
+    let extra = vec![format!("*.{}", config.relay.host)];
+    let pinned = tokio::task::spawn_blocking(move || {
+        pairing::ensure_pinned_ca_with(&dir, &host, &extra)
+    })
+    .await
+    .map_err(|e| RemoteUnavailable::CertProvision(e.to_string()))?
+    .map_err(RemoteUnavailable::CertProvision)?;
+    if pinned.issued {
+        tracing::info!(host = %config.machine_host, "issued pinned-CA TLS material");
     }
-    let (source, cert_path, key_path) = select_cert(config);
-    if source == CertSource::PinnedCa {
-        // Key generation and file writes: keep them off the async workers.
-        let dir = pinned_dir(config);
-        let host = config.magic_dns_host.clone();
-        // Relay mode: the leaf also covers every route under the relay host.
-        let extra: Vec<String> = config
-            .relay
-            .as_ref()
-            .map(|r| vec![format!("*.{}", r.host)])
-            .unwrap_or_default();
-        let pinned = tokio::task::spawn_blocking(move || {
-            pairing::ensure_pinned_ca_with(&dir, &host, &extra)
-        })
-            .await
-            .map_err(|e| RemoteUnavailable::CertProvision(e.to_string()))?
-            .map_err(RemoteUnavailable::CertProvision)?;
-        if pinned.issued {
-            tracing::info!(host = %config.magic_dns_host, "issued pinned-CA TLS material");
-        }
-        return Ok(pinned.issued);
-    }
-    if !config.auto_cert || source != CertSource::Machine {
-        return Ok(false);
-    }
-    let cert_needs_issue = match std::fs::read(&cert_path)
-        .ok()
-        .and_then(|pem| pairing::inspect_cert(&pem, &config.magic_dns_host).ok())
-    {
-        Some(info) => !info.covers_host || info.is_expired() || info.is_near_expiry(),
-        None => true,
-    };
-    // A certificate without its key is unusable: reissue the pair.
-    if !cert_needs_issue && key_path.is_file() {
-        return Ok(false);
-    }
-    tracing::info!(host = %config.magic_dns_host, path = %cert_path.display(), "issuing TLS certificate with tailscale cert");
-    tailscale::provision_cert(&config.magic_dns_host, &cert_path, &key_path)
-        .await
-        .map_err(RemoteUnavailable::CertProvision)?;
-    #[cfg(windows)]
-    {
-        if let Some(dir) = key_path.parent() {
-            tracing::info!(
-                dir = %dir.display(),
-                "TLS key stored with inherited directory ACL — restrict this folder if the machine is shared"
-            );
-        }
-    }
-    Ok(true)
+    Ok(pinned.issued)
 }
 
 // ── Token lifecycle (§3.4, Plan C §2.2 step 4) ──────────────────────
@@ -741,33 +453,25 @@ pub struct Availability {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     pub cert: pairing::CertInfo,
-    pub cert_source: CertSource,
-    pub tailnet_addrs: Vec<IpAddr>,
-    /// Pinned-CA mode: the CA the QR carries as `tls_ca` (base64 DER).
-    pub tls_ca: Option<String>,
+    /// The machine CA the QR carries as `tls_ca` (base64 DER).
+    pub tls_ca: String,
 }
 
 /// Fail-closed availability check. Every failure names the fix. Sync —
 /// safe to call from `/remote` inside the event loop.
 pub fn check_availability(config: &RemoteConfig) -> Result<Availability, RemoteUnavailable> {
-    if config.magic_dns_host.trim().is_empty() {
-        return Err(RemoteUnavailable::NoMagicDnsHost {
-            detail: config
-                .host_detail
-                .clone()
-                .unwrap_or_else(|| "auto-detection has not run yet".to_string()),
-        });
-    }
-    let (cert_source, cert_path, key_path) = select_cert(config);
-    let cert_pem = std::fs::read(&cert_path)
-        .map_err(|e| RemoteUnavailable::CertLoad(format!("{}: {e}", cert_path.display())))?;
-    let key_pem = std::fs::read(&key_path)
-        .map_err(|e| RemoteUnavailable::CertLoad(format!("{}: {e}", key_path.display())))?;
-    let cert = pairing::inspect_cert(&cert_pem, &config.magic_dns_host)
+    let leaf = leaf_path(config);
+    let cert_pem = std::fs::read(&leaf).map_err(|e| {
+        RemoteUnavailable::CertLoad(format!(
+            "{}: {e} — restart gaviero to create it",
+            leaf.display()
+        ))
+    })?;
+    let cert = pairing::inspect_cert(&cert_pem, &config.machine_host)
         .map_err(RemoteUnavailable::CertLoad)?;
     if !cert.covers_host {
         return Err(RemoteUnavailable::CertHostMismatch {
-            host: config.magic_dns_host.clone(),
+            host: config.machine_host.clone(),
         });
     }
     if cert.is_expired() {
@@ -775,123 +479,60 @@ pub fn check_availability(config: &RemoteConfig) -> Result<Availability, RemoteU
             not_after: cert.not_after.clone(),
         });
     }
-    let tls_ca = if cert_source == CertSource::PinnedCa {
-        Some(pairing::pinned_ca_b64(&pinned_dir(config)).ok_or_else(|| {
-            RemoteUnavailable::CertLoad(format!(
-                "{}: no usable machine CA — restart gaviero to create it",
-                pinned_dir(config).display()
-            ))
-        })?)
-    } else {
-        None
-    };
-    // Loopback mode never looks for Tailscale: a relay carries the traffic.
-    let tailnet_addrs = match config.bind_mode {
-        BindMode::Loopback => Vec::new(),
-        BindMode::LoopbackTailnet => {
-            let addrs = pairing::detect_tailscale_addrs();
-            if addrs.is_empty() && !config.allow_public_bind {
-                return Err(RemoteUnavailable::NoTailnetAddress);
-            }
-            addrs
-        }
-    };
+    let tls_ca = pairing::pinned_ca_b64(&pinned_dir(config)).ok_or_else(|| {
+        RemoteUnavailable::CertLoad(format!(
+            "{}: no usable machine CA — restart gaviero to create it",
+            pinned_dir(config).display()
+        ))
+    })?;
     Ok(Availability {
+        key_pem: cert_pem.clone(),
         cert_pem,
-        key_pem,
         cert,
-        cert_source,
-        tailnet_addrs,
         tls_ca,
     })
 }
 
-/// Bind list (§3.2): loopback plus detected tailnet addresses (none in
-/// `bindMode: "loopback"`, where `check_availability` returns an empty
-/// list). Never a wildcard; anything else requires `remote.allowPublicBind`.
-#[cfg(test)]
-pub fn bind_addrs(config: &RemoteConfig, tailnet: &[IpAddr]) -> Vec<SocketAddr> {
-    bind_addrs_on(config, tailnet, config.port)
-}
-
-fn bind_addrs_on(config: &RemoteConfig, tailnet: &[IpAddr], port: u16) -> Vec<SocketAddr> {
-    let mut addrs: Vec<SocketAddr> = vec![
+/// Loopback only (`127.0.0.1`, then `::1`): the relay client is the way in,
+/// so nothing else on the network can reach the listener.
+pub fn bind_addrs(port: u16) -> Vec<SocketAddr> {
+    vec![
         SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
         SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
-    ];
-    for ip in tailnet {
-        if pairing::is_refused_bind_addr(ip) && !config.allow_public_bind {
-            tracing::warn!(%ip, "refusing non-loopback, non-tailnet bind address");
-            continue;
-        }
-        addrs.push(SocketAddr::new(*ip, port));
-    }
-    addrs
+    ]
 }
 
-/// The pairing URL — always `remote.magicDnsHost` (a MagicDNS name, or the
-/// relay host name behind a VPS relay), never an IP or `localhost`, because
-/// the certificate is issued to that name (§3.1).
-#[cfg(test)]
+/// `wss://<route>/v1/ws`. No port: the phone dials the relay on 443 and
+/// names the route in SNI.
 pub fn pairing_url(config: &RemoteConfig) -> String {
-    pairing_url_on(config, config.port)
+    format!("wss://{}{}", config.relay.route, gaviero_remote::WS_PATH)
 }
 
-pub fn pairing_url_on(config: &RemoteConfig, port: u16) -> String {
-    // Relay mode: the route is the URL host (the phone dials the relay on
-    // 443 and names the route in SNI), so the local port never appears.
-    if let Some(relay) = &config.relay {
-        return format!("wss://{}{}", relay.route, gaviero_remote::WS_PATH);
-    }
+/// `https://<route>/v1/instances` — every instance listener serves the
+/// machine's instance list, so this instance's route lists them all.
+pub fn directory_url(config: &RemoteConfig) -> String {
     format!(
-        "wss://{}:{}{}",
-        config.magic_dns_host,
-        port,
-        gaviero_remote::WS_PATH
+        "https://{}{}",
+        config.relay.route,
+        gaviero_remote::INSTANCES_PATH
     )
 }
 
-/// `https://<host>:<directoryPort>/v1/instances` when the directory is on.
-/// Relay mode: this instance's own route — every instance listener serves
-/// the machine's instance list.
-pub fn directory_url(config: &RemoteConfig) -> Option<String> {
-    if let Some(relay) = &config.relay {
-        return Some(format!(
-            "https://{}{}",
-            relay.route,
-            gaviero_remote::INSTANCES_PATH
-        ));
-    }
-    config.directory_enabled.then(|| {
-        format!(
-            "https://{}:{}{}",
-            config.magic_dns_host,
-            config.directory_port,
-            gaviero_remote::INSTANCES_PATH
-        )
-    })
-}
-
-/// The QR payload `/remote` renders: the 1.0 keys plus the 1.1 identity
-/// keys (workspace id, machine host, directory URL when known) and, in
-/// pinned-CA mode, the CA certificate the app must trust (`tls_ca`).
-pub fn qr_payload_for(
-    config: &RemoteConfig,
-    url: &str,
-    token: &str,
-    directory_url: Option<&str>,
-    tls_ca: Option<&str>,
-) -> String {
+/// The QR payload `/remote` renders: the 1.0 keys, the 1.1 identity keys,
+/// the machine CA the app pins (`tls_ca`), and the relay fields.
+pub fn qr_payload_for(config: &RemoteConfig, token: &str, tls_ca: &str) -> String {
+    let url = pairing_url(config);
+    let directory_url = directory_url(config);
     pairing::qr_payload_json(&pairing::QrPayloadInput {
-        url,
+        url: &url,
         token,
         workspace: &config.workspace_display_name,
         workspace_id: Some(&config.workspace_id),
-        machine: Some(&config.magic_dns_host),
-        directory_url,
-        tls_ca,
-        relay_host: config.relay.as_ref().map(|r| r.host.as_str()),
-        relay_secret: config.relay.as_ref().map(|r| r.secret.as_str()),
+        machine: Some(&config.machine_host),
+        directory_url: Some(&directory_url),
+        tls_ca: Some(tls_ca),
+        relay_host: Some(&config.relay.host),
+        relay_secret: Some(&config.relay.secret),
     })
 }
 
@@ -902,23 +543,15 @@ pub fn qr_payload_for(
 #[derive(Clone)]
 pub struct RemoteStarted {
     pub handle: RemoteHandle,
-    /// The port actually bound (may differ from the derived one, §2.5).
+    /// The loopback port actually bound (may differ from the derived one).
     pub port: u16,
     pub host: String,
-    pub host_source: HostSource,
-    pub cert_source: CertSource,
     pub cert_not_after: String,
-    /// `tailscale cert` ran during this bootstrap.
-    pub cert_provisioned: bool,
     pub token_scope: TokenScope,
     pub token_fingerprint: String,
-    /// The machine directory port this instance participates in, if enabled.
-    pub directory_port: Option<u16>,
-    /// True while this process holds the directory listener. `None` if the
-    /// directory is disabled.
-    pub directory_leader: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub max_prompt_bytes: usize,
-    /// Relay mode: the outbound relay client (status + notifications).
+    /// The outbound relay client (status + notifications). Set by the
+    /// bootstrap right after the listener binds.
     pub relay: Option<gaviero_remote::relay_client::RelayClient>,
 }
 
@@ -927,12 +560,9 @@ impl std::fmt::Debug for RemoteStarted {
         f.debug_struct("RemoteStarted")
             .field("port", &self.port)
             .field("host", &self.host)
-            .field("host_source", &self.host_source)
-            .field("cert_source", &self.cert_source)
             .field("cert_not_after", &self.cert_not_after)
             .field("token_scope", &self.token_scope)
             .field("token_fingerprint", &self.token_fingerprint)
-            .field("directory_port", &self.directory_port)
             .finish_non_exhaustive()
     }
 }
@@ -958,14 +588,8 @@ pub async fn start(
 
     let mut last_bind_error = String::new();
     for port in candidates {
-        let mut addrs = bind_addrs_on(config, &availability.tailnet_addrs, port);
+        let mut addrs = bind_addrs(port);
         let primary = addrs.remove(0);
-        let dir_url = directory_url(config);
-        let directory_bind_addrs = if config.directory_enabled {
-            bind_addrs_on(config, &availability.tailnet_addrs, config.directory_port)
-        } else {
-            Vec::new()
-        };
         let registry = config.machine_state_dir.as_ref().map(|machine| {
             gaviero_remote::server::RegistryConfig {
                 dir: machine.join("instances"),
@@ -975,7 +599,7 @@ pub async fn start(
                         id: config.workspace_id.clone(),
                         display_name: config.workspace_display_name.clone(),
                     },
-                    url: pairing_url_on(config, port),
+                    url: pairing_url(config),
                     port,
                     tui_version: env!("CARGO_PKG_VERSION").to_string(),
                     started_at: gaviero_remote::server::registry::utc_now_rfc3339(),
@@ -1005,15 +629,13 @@ pub async fn start(
                 gaviero_remote::version::capability::PERMISSION_TURN_GRANT.to_string(),
             ],
             machine: Some(gaviero_remote::dto::MachineInfo {
-                host: config.magic_dns_host.clone(),
-                directory_url: dir_url.clone(),
+                host: config.machine_host.clone(),
+                directory_url: Some(directory_url(config)),
             }),
             token_path: Some(token.path.clone()),
             token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
             registry,
-            directory_bind_addrs,
             heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
-            directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
             stale_after: gaviero_remote::server::registry::STALE_AFTER,
             confirm_required: crate::app::remote::REMOTE_CONFIRM_REQUIRED
                 .iter()
@@ -1064,17 +686,10 @@ pub async fn start(
         return Ok(RemoteStarted {
             handle: spawned.handle,
             port: spawned.local_addr.port(),
-            host: config.magic_dns_host.clone(),
-            host_source: config.host_source,
-            cert_source: availability.cert_source,
+            host: config.machine_host.clone(),
             cert_not_after: availability.cert.not_after.clone(),
-            cert_provisioned: false,
             token_scope: token.scope,
             token_fingerprint: pairing::token_fingerprint(&token.token),
-            directory_port: config.directory_enabled.then_some(config.directory_port),
-            directory_leader: config
-                .directory_enabled
-                .then(|| spawned.directory_leader.clone()),
             max_prompt_bytes: config.max_prompt_bytes as usize,
             relay: None,
         });
@@ -1091,9 +706,9 @@ pub async fn start(
 
 // ── Background bootstrap (Plan C §2.2, invariant 13) ────────────────
 
-/// Resolve → detect host → ensure certificate → token → bind, then report
-/// through the event channel. Spawned from `main`; never awaited by the
-/// event loop.
+/// Resolve → ensure certificate → token → bind → dial the relay, then
+/// report through the event channel. Spawned from `main`; never awaited by
+/// the event loop.
 pub async fn bootstrap(workspace: Workspace, event_tx: tokio::sync::mpsc::UnboundedSender<Event>) {
     let event = match bootstrap_inner(&workspace, event_tx.clone()).await {
         Ok(started) => Event::RemoteStarted(Box::new(started)),
@@ -1106,43 +721,28 @@ async fn bootstrap_inner(
     workspace: &Workspace,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
 ) -> Result<RemoteStarted, RemoteUnavailable> {
-    let mut config = resolve_config(workspace)?;
+    let config = resolve_config(workspace)?;
     if !config.enabled {
         return Err(RemoteUnavailable::Disabled);
     }
-    resolve_host(&mut config).await;
-    if config.magic_dns_host.is_empty() {
-        return Err(RemoteUnavailable::NoMagicDnsHost {
-            detail: config
-                .host_detail
-                .clone()
-                .unwrap_or_else(|| "detection produced no host".to_string()),
-        });
-    }
-    let provisioned = ensure_certificate(&config).await?;
+    ensure_certificate(&config).await?;
     let availability = check_availability(&config)?;
     let token = load_or_create_token(&config).map_err(RemoteUnavailable::Token)?;
     let instance_id = pairing::generate_token()[..16].to_string();
     let mut started = start(&config, availability, token, instance_id, event_tx).await?;
-    started.cert_provisioned = provisioned;
-    if let Some(relay) = &config.relay {
-        started.relay = Some(gaviero_remote::relay_client::RelayClient::spawn(
-            gaviero_remote::relay_client::RelayClientConfig {
-                base_url: relay.base_url.clone(),
-                secret: relay.secret.clone(),
-                route: gaviero_remote::relay_client::RelayRoute {
-                    route: relay.route.clone(),
-                    machine: config.magic_dns_host.clone(),
-                    workspace_id: config.workspace_id.clone(),
-                    display_name: config.workspace_display_name.clone(),
-                },
-                local_addr: SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    started.port,
-                ),
+    started.relay = Some(gaviero_remote::relay_client::RelayClient::spawn(
+        gaviero_remote::relay_client::RelayClientConfig {
+            base_url: config.relay.base_url.clone(),
+            secret: config.relay.secret.clone(),
+            route: gaviero_remote::relay_client::RelayRoute {
+                route: config.relay.route.clone(),
+                machine: config.machine_host.clone(),
+                workspace_id: config.workspace_id.clone(),
+                display_name: config.workspace_display_name.clone(),
             },
-        ));
-    }
+            local_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), started.port),
+        },
+    ));
     Ok(started)
 }
 
@@ -1209,8 +809,7 @@ pub fn render_qr(payload: &str) -> Result<String, String> {
 
 /// `/remote [status|rotate|hide]`. Rendered into the chat transcript as a
 /// system message — the QR is the one intentional token display (§3.4).
-/// Runs inside the event loop: file reads only, never the Tailscale CLI —
-/// the host comes from settings or from what the bootstrap detected.
+/// Runs inside the event loop: file reads only.
 pub fn handle_remote_command(app: &mut App, line: &str) {
     let arg = line
         .trim()
@@ -1219,19 +818,13 @@ pub fn handle_remote_command(app: &mut App, line: &str) {
         .trim()
         .to_ascii_lowercase();
 
-    let mut config = match resolve_config(&app.workspace) {
+    let config = match resolve_config(&app.workspace) {
         Ok(c) => c,
         Err(e) => {
             app.chat_state.add_system_message(&format!("Remote: {e}"));
             return;
         }
     };
-    if config.magic_dns_host.is_empty()
-        && let RemoteStatus::Running(started) = &app.remote.status
-    {
-        config.magic_dns_host = started.host.clone();
-        config.host_source = started.host_source;
-    }
 
     match arg.as_str() {
         "hide" => {
@@ -1285,7 +878,7 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     if !config.enabled {
         report.push_str(
             "Remote: disabled by `remote.enabled: false` in .gaviero/settings.json — remove it \
-             and restart gaviero (remote is on by default).\n",
+             and restart gaviero.\n",
         );
     }
     let running = match &app.remote.status {
@@ -1294,94 +887,43 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     };
     let port = running.map(|s| s.port).unwrap_or(config.port);
     report.push_str(&format!(
-        "Workspace: {} ({})\nPort: {}{}\n",
+        "Workspace: {} ({})\nMachine: {}\nLocal port: {} (loopback only{})\n",
         config.workspace_display_name,
         config.workspace_id,
+        config.machine_host,
         port,
         if config.explicit_port {
-            " (fixed by remote.port)".to_string()
+            ", fixed by remote.port".to_string()
         } else if port != config.port {
-            format!(
-                " (derived port {} was busy — the phone keeps that port until it \
-                 refreshes the directory; pull-to-refresh Instances or reopen the app)",
-                config.port
-            )
+            format!(", derived port {} was busy", config.port)
         } else {
-            " (derived from the workspace identity)".to_string()
+            String::new()
         }
     ));
+    let relay_state = match running.and_then(|s| s.relay.as_ref()) {
+        Some(client) => client.status().to_string(),
+        None => "not started".to_string(),
+    };
     report.push_str(&format!(
-        "Host: {}\n",
-        match config.host_source {
-            HostSource::Setting if config.relay.is_some() => {
-                format!("{} (relay machine name)", config.magic_dns_host)
-            }
-            HostSource::Setting => format!("{} (remote.magicDnsHost)", config.magic_dns_host),
-            HostSource::Detected =>
-                format!("{} (auto-detected via tailscale)", config.magic_dns_host),
-            HostSource::Unresolved => match &app.remote.status {
-                RemoteStatus::Unavailable(e) => format!("unresolved — {e}"),
-                RemoteStatus::Pending => "detecting…".to_string(),
-                RemoteStatus::Running(s) => s.host.clone(),
-            },
-        }
+        "Relay: {} — route {} — {relay_state}\n",
+        config.relay.base_url, config.relay.route
     ));
-
-    report.push_str(&format!(
-        "Bind: {}{}\nTLS mode: {}\n",
-        config.bind_mode.as_str(),
-        if config.bind_mode == BindMode::Loopback {
-            " (127.0.0.1/::1 only — reached through the VPS relay)"
-        } else {
-            ""
-        },
-        config.tls_mode.as_str()
-    ));
-    if let Some(relay) = &config.relay {
-        let state = match running.and_then(|s| s.relay.as_ref()) {
-            Some(client) => client.status().to_string(),
-            None => "not started".to_string(),
-        };
-        report.push_str(&format!(
-            "Relay: {} — route {} — {state}\n",
-            relay.base_url, relay.route
-        ));
-    }
 
     let availability = check_availability(config);
     match &availability {
         Ok(availability) => {
-            let auto_renews = availability.cert_source == CertSource::PinnedCa
-                || (availability.cert_source == CertSource::Machine && config.auto_cert);
             let expiry = if availability.cert.is_near_expiry() {
                 format!(
-                    "{} (EXPIRES SOON — {})",
-                    availability.cert.not_after,
-                    if auto_renews {
-                        "renews automatically on the next start".to_string()
-                    } else {
-                        format!("renew with `tailscale cert {}`", config.magic_dns_host)
-                    }
+                    "{} (EXPIRES SOON — reissued automatically on the next start)",
+                    availability.cert.not_after
                 )
             } else {
                 availability.cert.not_after.clone()
             };
             report.push_str(&format!(
-                "Certificate: {} — valid until {}\n",
-                availability.cert_source.label(),
-                expiry,
+                "Certificate: pinned private CA (~/.gaviero/remote/tls/pinned) — valid until \
+                 {expiry}\n"
             ));
-            if config.bind_mode == BindMode::LoopbackTailnet {
-                report.push_str(&format!(
-                    "Tailnet addresses: {}\n",
-                    availability
-                        .tailnet_addrs
-                        .iter()
-                        .map(|ip| ip.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
         }
         Err(e) => report.push_str(&format!("Certificate: unavailable — {e}\n")),
     }
@@ -1396,34 +938,10 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         Err(e) => report.push_str(&format!("Token: {e}\n")),
     }
 
-    let dir_role = match &app.remote.status {
-        RemoteStatus::Running(s) if s.directory_port.is_none() => "disabled".to_string(),
-        RemoteStatus::Running(s) => {
-            let leader = s
-                .directory_leader
-                .as_ref()
-                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
-            if leader {
-                format!(
-                    "leader on {}",
-                    s.directory_port.unwrap_or(config.directory_port)
-                )
-            } else {
-                format!(
-                    "follower (another instance holds {})",
-                    s.directory_port.unwrap_or(config.directory_port)
-                )
-            }
-        }
-        _ if !config.directory_enabled => "disabled".to_string(),
-        _ => "starting".to_string(),
-    };
-    report.push_str(&format!("Directory: {dir_role}\n"));
-
     if let Some(machine) = &config.machine_state_dir {
         let listed = gaviero_remote::server::registry::read_directory(
             &machine.join("instances"),
-            &config.magic_dns_host,
+            &config.machine_host,
             gaviero_remote::server::registry::STALE_AFTER,
         );
         let others: Vec<_> = listed
@@ -1452,8 +970,7 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     report.push_str(&format!(
         "Status: {}\n",
         match &app.remote.status {
-            RemoteStatus::Pending =>
-                "starting (host detection / certificate check in progress)".to_string(),
+            RemoteStatus::Pending => "starting (certificate check in progress)".to_string(),
             RemoteStatus::Unavailable(e) => format!("unavailable — {e}"),
             RemoteStatus::Running(_) if app.remote.client_connected =>
                 "client connected".to_string(),
@@ -1461,15 +978,8 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         }
     ));
 
-    {
-        let roots = app.workspace.roots();
-        if crate::notify::ntfy_enabled(&app.workspace, roots.first().copied()) {
-            report.push_str("ntfy: on (run /ntfy)\n");
-        }
-    }
-
-    // gaviero-relay: "instance offline" means the relay route isn't up.
-    if running.is_some() && !app.remote.client_connected && config.relay.is_some() {
+    // "Instance offline" in the app means the relay route isn't up.
+    if running.is_some() && !app.remote.client_connected {
         report.push_str(
             "\nIf the app says \"instance offline\", check the Relay line above: it must say \
              \"registered\". A 401 means remote.relay.secret differs from the relay's \
@@ -1477,67 +987,9 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         );
     }
 
-    // Behind an ssh -R relay, "instance offline" means the tunnel or the VPS proxy.
-    if running.is_some()
-        && !app.remote.client_connected
-        && config.bind_mode == BindMode::Loopback
-        && config.relay.is_none()
-    {
-        report.push_str(&format!(
-            "\nIf the app says \"instance offline\", check the relay: the `ssh -R` tunnel to the \
-             VPS must be up (it forwards this machine's ports {} and {port}), and the VPS nginx \
-             `stream` block must forward the public ports to it. On the VPS, \
-             `ss -ltnp | grep sshd` lists the tunnel ports.\n",
-            config.directory_port
-        ));
-    }
-
-    // Listening with no client is usually the phone off the tailnet, then
-    // (on Windows) the host firewall dropping inbound on the Tailscale NIC.
-    // The app only reports "instance offline" for both.
-    if running.is_some()
-        && !app.remote.client_connected
-        && config.bind_mode == BindMode::LoopbackTailnet
-    {
-        report.push_str(
-            "\nIf the app says \"instance offline\", check `tailscale status` on this PC: \
-             the phone must be listed without \"offline\" (open the Tailscale app on the phone, \
-             same tailnet). Disconnect Proton / other VPNs on the phone — a kill switch \
-             swallows 100.x and MagicDNS.\n",
-        );
-        #[cfg(windows)]
-        report.push_str(&format!(
-            "If the phone is online and still cannot connect, Windows Firewall is dropping \
-             inbound on the tailnet interface. In an ADMIN PowerShell (one rule covers every \
-             workspace and the directory port):\n  \
-             New-NetFirewallRule -DisplayName \"Gaviero Remote (tailnet)\" -Direction Inbound \
-             -Action Allow -Protocol TCP -LocalPort {},49152-65535 \
-             -RemoteAddress 100.64.0.0/10,fd7a:115c:a1e0::/48\n",
-            config.directory_port
-        ));
-    }
-
-    if let (Some(started), Ok(loaded)) = (running, &token) {
-        let url = pairing_url_on(config, started.port);
-        let dir_url = if config.relay.is_some() {
-            directory_url(config)
-        } else {
-            started.directory_port.map(|p| {
-                format!(
-                    "https://{}:{p}{}",
-                    config.magic_dns_host,
-                    gaviero_remote::INSTANCES_PATH
-                )
-            })
-        };
-        let tls_ca = availability.as_ref().ok().and_then(|a| a.tls_ca.clone());
-        let payload = qr_payload_for(
-            config,
-            &url,
-            &loaded.token,
-            dir_url.as_deref(),
-            tls_ca.as_deref(),
-        );
+    if let (Some(_), Ok(loaded), Ok(availability)) = (running, &token, &availability) {
+        let url = pairing_url(config);
+        let payload = qr_payload_for(config, &loaded.token, &availability.tls_ca);
         match render_qr(&payload) {
             Ok(qr) => report.push_str(&format!(
                 "\nScan this gaviero-remote pairing code with the Gaviero Remote app \
@@ -1567,6 +1019,23 @@ mod tests {
         (dir, ws)
     }
 
+    /// A workspace with a configured relay plus `extra` `remote.*` keys.
+    fn relay_workspace(extra: serde_json::Value) -> (tempfile::TempDir, Workspace) {
+        let mut remote = serde_json::json!({
+            "relay": {
+                "host": "Gaviero.Example.com.",
+                "secret": "relay-secret-0123456789abcdef",
+                "machine": "Desk Top"
+            }
+        });
+        if let Some(extra) = extra.as_object() {
+            for (k, v) in extra {
+                remote[k] = v.clone();
+            }
+        }
+        workspace_with(serde_json::json!({ "remote": remote }))
+    }
+
     /// Tests must never touch the real `~/.gaviero/remote`.
     fn isolated(ws: &Workspace, machine: &tempfile::TempDir) -> RemoteConfig {
         let mut config = resolve_config(ws).unwrap();
@@ -1574,34 +1043,35 @@ mod tests {
         config
     }
 
-    fn write_pair(dir: &std::path::Path, host: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec![host.to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
-        std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
+    /// Explicit empty relay keys: workspace settings win over the user's
+    /// `~/.gaviero/settings.json`, which may configure a real relay.
+    #[test]
+    fn without_a_relay_there_is_nothing_to_start_and_it_says_so_quietly() {
+        let (_dir, ws) =
+            workspace_with(serde_json::json!({ "remote": { "relay": { "host": "" } } }));
+        let err = resolve_config(&ws).expect_err("no relay, no sidecar");
+        assert!(matches!(err, RemoteUnavailable::RelayNotConfigured));
+        assert!(err.is_quiet(), "an unconfigured relay is not a warning");
+        assert!(err.to_string().contains("remote.relay.host"), "{err}");
+
+        let (_dir, ws) = workspace_with(serde_json::json!({
+            "remote": { "enabled": false, "relay": { "host": "" } }
+        }));
+        let err = resolve_config(&ws).expect_err("disabled");
+        assert!(matches!(err, RemoteUnavailable::Disabled));
     }
 
     #[test]
-    fn remote_is_enabled_by_default() {
-        let (_dir, ws) = workspace_with(serde_json::json!({}));
+    fn remote_is_enabled_by_default_once_a_relay_is_set() {
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let config = resolve_config(&ws).unwrap();
-        assert!(config.enabled, "Plan C: on by default");
+        assert!(config.enabled);
         assert_eq!(config.token_scope, TokenScope::Machine);
-        assert!(config.auto_cert);
-        assert!(config.directory_enabled);
-        assert_eq!(config.directory_port, 49151);
-        assert_eq!(config.host_source, HostSource::Unresolved);
-        assert!(config.explicit_cert.is_none());
-        assert!(config.legacy_cert.is_none());
     }
 
     #[test]
     fn port_zero_is_rejected_with_an_actionable_message() {
-        let (_dir, ws) = workspace_with(serde_json::json!({ "remote": { "port": 0 } }));
+        let (_dir, ws) = relay_workspace(serde_json::json!({ "port": 0 }));
         let err = resolve_config(&ws).expect_err("port 0 must be refused");
         assert!(matches!(err, RemoteUnavailable::PortZero));
         let msg = err.to_string();
@@ -1609,15 +1079,8 @@ mod tests {
     }
 
     #[test]
-    fn directory_port_zero_is_rejected() {
-        let (_dir, ws) = workspace_with(serde_json::json!({ "remote": { "directoryPort": 0 } }));
-        let err = resolve_config(&ws).expect_err("directory port 0 must be refused");
-        assert!(matches!(err, RemoteUnavailable::DirectoryPortZero));
-    }
-
-    #[test]
     fn absent_port_derives_a_stable_workspace_port() {
-        let (dir, ws) = workspace_with(serde_json::json!({}));
+        let (dir, ws) = relay_workspace(serde_json::json!({}));
         let a = resolve_config(&ws).unwrap();
         let b = resolve_config(&ws).unwrap();
         assert_eq!(a.port, b.port, "derived port is identical across restarts");
@@ -1628,151 +1091,15 @@ mod tests {
 
     #[test]
     fn explicit_port_overrides_the_derivation() {
-        let (_dir, ws) = workspace_with(serde_json::json!({ "remote": { "port": 51234 } }));
+        let (_dir, ws) = relay_workspace(serde_json::json!({ "port": 51234 }));
         let config = resolve_config(&ws).unwrap();
         assert_eq!(config.port, 51234);
         assert!(config.explicit_port, "an explicit port never falls forward");
     }
 
     #[test]
-    fn setting_host_wins_and_trailing_dot_is_stripped() {
-        let (_dir, ws) = workspace_with(
-            serde_json::json!({ "remote": { "magicDnsHost": "host.tailnet.ts.net." } }),
-        );
-        let config = resolve_config(&ws).unwrap();
-        assert_eq!(config.magic_dns_host, "host.tailnet.ts.net");
-        assert_eq!(config.host_source, HostSource::Setting);
-    }
-
-    #[test]
-    fn availability_fails_closed_without_a_magic_dns_host() {
-        let (_dir, ws) = workspace_with(serde_json::json!({ "remote": { "enabled": true } }));
-        let machine = tempfile::tempdir().unwrap();
-        let mut config = isolated(&ws, &machine);
-        config.host_detail = Some("tailscale CLI not found".to_string());
-        let err = check_availability(&config).expect_err("must refuse to claim availability");
-        match err {
-            RemoteUnavailable::NoMagicDnsHost { ref detail } => {
-                assert!(detail.contains("tailscale CLI not found"));
-            }
-            other => panic!("expected NoMagicDnsHost, got {other:?}"),
-        }
-        assert!(err.to_string().contains("remote.magicDnsHost"));
-    }
-
-    #[test]
-    fn explicit_cert_setting_reports_a_hostname_mismatch() {
-        let (dir, ws) = workspace_with(serde_json::json!({
-            "remote": {
-                "magicDnsHost": "wrong.tailnet.ts.net",
-                "certPath": "certs/cert.pem",
-                "keyPath": "certs/key.pem"
-            }
-        }));
-        write_pair(&dir.path().join("certs"), "host.tailnet.ts.net");
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        let (source, cert, _) = select_cert(&config);
-        assert_eq!(source, CertSource::Explicit);
-        assert_eq!(cert, dir.path().join("certs").join("cert.pem"));
-        let err = check_availability(&config).expect_err("hostname mismatch must fail");
-        match err {
-            RemoteUnavailable::CertHostMismatch { host } => {
-                assert_eq!(host, "wrong.tailnet.ts.net");
-            }
-            other => panic!("expected CertHostMismatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn valid_legacy_workspace_pair_is_preferred_over_a_missing_machine_pair() {
-        let (dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net" }
-        }));
-        write_pair(
-            &dir.path().join(".gaviero/remote/tls"),
-            "host.tailnet.ts.net",
-        );
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        assert!(config.legacy_cert.is_some());
-        let (source, cert, _) = select_cert(&config);
-        assert_eq!(source, CertSource::LegacyWorkspace);
-        assert_eq!(cert, dir.path().join(".gaviero/remote/tls/cert.pem"));
-    }
-
-    #[test]
-    fn mismatched_legacy_pair_is_skipped_and_the_machine_path_is_named() {
-        let (dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "wrong.tailnet.ts.net" }
-        }));
-        write_pair(
-            &dir.path().join(".gaviero/remote/tls"),
-            "host.tailnet.ts.net",
-        );
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        let (source, cert, _) = select_cert(&config);
-        assert_eq!(
-            source,
-            CertSource::Machine,
-            "mismatched legacy pair must be ignored"
-        );
-        assert!(cert.starts_with(machine.path()));
-        let err = check_availability(&config).expect_err("machine pair does not exist yet");
-        match err {
-            RemoteUnavailable::CertLoad(msg) => {
-                assert!(msg.contains("remote"), "names the machine path: {msg}");
-            }
-            other => panic!("expected CertLoad, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn valid_machine_pair_is_used_when_nothing_else_exists() {
-        let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net" }
-        }));
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        write_pair(&machine.path().join("remote/tls"), "host.tailnet.ts.net");
-        let (source, _, _) = select_cert(&config);
-        assert_eq!(source, CertSource::Machine);
-        // Tailnet detection may legitimately find nothing on CI; only the
-        // certificate part of availability is asserted here.
-        match check_availability(&config) {
-            Ok(a) => assert_eq!(a.cert_source, CertSource::Machine),
-            Err(RemoteUnavailable::NoTailnetAddress) => {}
-            Err(other) => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ensure_certificate_is_a_no_op_for_explicit_and_legacy_pairs() {
-        let (dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net" }
-        }));
-        write_pair(
-            &dir.path().join(".gaviero/remote/tls"),
-            "host.tailnet.ts.net",
-        );
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        assert!(!ensure_certificate(&config).await.unwrap());
-        assert!(!machine.path().join("remote/tls/cert.pem").exists());
-
-        let mut off = config.clone();
-        off.auto_cert = false;
-        off.legacy_cert = None;
-        assert!(
-            !ensure_certificate(&off).await.unwrap(),
-            "autoCert off never provisions"
-        );
-    }
-
-    #[test]
     fn machine_token_is_created_once_reread_stably_and_rotated() {
-        let (_dir, ws) = workspace_with(serde_json::json!({}));
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
         let first = load_or_create_token(&config).unwrap();
@@ -1793,8 +1120,8 @@ mod tests {
 
     #[test]
     fn two_workspaces_share_the_machine_token() {
-        let (_a, ws_a) = workspace_with(serde_json::json!({}));
-        let (_b, ws_b) = workspace_with(serde_json::json!({}));
+        let (_a, ws_a) = relay_workspace(serde_json::json!({}));
+        let (_b, ws_b) = relay_workspace(serde_json::json!({}));
         let machine = tempfile::tempdir().unwrap();
         let a = load_or_create_token(&isolated(&ws_a, &machine)).unwrap();
         let b = load_or_create_token(&isolated(&ws_b, &machine)).unwrap();
@@ -1803,8 +1130,7 @@ mod tests {
 
     #[test]
     fn workspace_scope_opts_out_of_the_machine_token() {
-        let (_dir, ws) =
-            workspace_with(serde_json::json!({ "remote": { "tokenScope": "workspace" } }));
+        let (_dir, ws) = relay_workspace(serde_json::json!({ "tokenScope": "workspace" }));
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
         let loaded = load_or_create_token(&config).unwrap();
@@ -1815,7 +1141,7 @@ mod tests {
 
     #[test]
     fn unwritable_machine_root_falls_back_to_the_workspace_token() {
-        let (_dir, ws) = workspace_with(serde_json::json!({}));
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let machine = tempfile::tempdir().unwrap();
         // A regular file where the directory should be: create_dir_all fails.
         let blocker = machine.path().join("blocker");
@@ -1837,139 +1163,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_list_is_loopback_plus_tailnet_never_wildcard() {
-        let (_dir, ws) = workspace_with(serde_json::json!({}));
-        let config = resolve_config(&ws).unwrap();
-        let tailnet: Vec<IpAddr> = vec![
-            "100.101.102.103".parse().unwrap(),
-            "192.168.1.5".parse().unwrap(), // LAN — must be refused
-        ];
-        let addrs = bind_addrs(&config, &tailnet);
-        assert!(addrs.iter().any(|a| a.ip().is_loopback()));
-        assert!(
-            addrs
-                .iter()
-                .any(|a| a.ip().to_string() == "100.101.102.103")
-        );
-        assert!(
-            !addrs.iter().any(|a| a.ip().to_string() == "192.168.1.5"),
-            "LAN address must be refused without allowPublicBind"
-        );
-        assert!(
-            !addrs.iter().any(|a| a.ip().is_unspecified()),
-            "never bind a wildcard address"
-        );
-    }
-
-    #[test]
-    fn bind_and_tls_modes_default_to_tailscale_and_parse_leniently() {
-        let (_dir, ws) = workspace_with(serde_json::json!({}));
-        let config = resolve_config(&ws).unwrap();
-        assert_eq!(config.bind_mode, BindMode::LoopbackTailnet);
-        assert_eq!(config.tls_mode, TlsMode::Tailscale);
-        assert_eq!(BindMode::parse(" Loopback "), BindMode::Loopback);
-        assert_eq!(BindMode::parse("nonsense"), BindMode::LoopbackTailnet);
-        assert_eq!(TlsMode::parse("pinnedCa"), TlsMode::PinnedCa);
-        assert_eq!(TlsMode::parse("PINNED-CA"), TlsMode::PinnedCa);
-        assert_eq!(TlsMode::parse(""), TlsMode::Tailscale);
-    }
-
-    fn relay_workspace() -> (tempfile::TempDir, Workspace) {
-        workspace_with(serde_json::json!({
-            "remote": {
-                "magicDnsHost": "desk.example.com",
-                "bindMode": "loopback",
-                "tlsMode": "pinnedCa",
-                "port": 50101,
-                "directoryPort": 50100
-            }
-        }))
-    }
-
-    /// W1: loopback mode never needs (or looks for) a Tailscale address,
-    /// and the bind list it produces is loopback only — never a wildcard.
-    #[tokio::test]
-    async fn loopback_mode_is_available_without_tailscale_and_binds_loopback_only() {
-        let (_dir, ws) = relay_workspace();
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        assert_eq!(config.bind_mode, BindMode::Loopback);
-        assert!(!config.allow_public_bind, "no allowPublicBind needed");
-        assert!(ensure_certificate(&config).await.unwrap(), "first start issues");
-
-        let availability = check_availability(&config).expect("available without a tailnet");
-        assert!(availability.tailnet_addrs.is_empty());
-        let addrs = bind_addrs(&config, &availability.tailnet_addrs);
+    fn the_listener_binds_loopback_only_never_a_wildcard() {
+        let addrs = bind_addrs(50101);
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
         assert!(addrs.iter().all(|a| a.port() == 50101));
-    }
-
-    /// W2: pinned-CA mode selects the pinned leaf, issues it once, and the
-    /// QR carries the CA (never a key) so the app can pin it.
-    #[tokio::test]
-    async fn pinned_ca_mode_issues_once_and_the_qr_carries_the_ca() {
-        let (_dir, ws) = relay_workspace();
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        let (source, cert, key) = select_cert(&config);
-        assert_eq!(source, CertSource::PinnedCa);
-        assert_eq!(cert, key, "one bundle holds the leaf and its key");
-        assert!(cert.starts_with(machine.path()), "machine-scoped: {cert:?}");
-
-        assert!(ensure_certificate(&config).await.unwrap());
-        assert!(
-            !ensure_certificate(&config).await.unwrap(),
-            "a second start re-issues nothing"
-        );
-        let availability = check_availability(&config).unwrap();
-        assert_eq!(availability.cert_source, CertSource::PinnedCa);
-        assert!(availability.cert.covers_host);
-        let tls_ca = availability.tls_ca.clone().expect("pinned mode exposes the CA");
-
-        let loaded = load_or_create_token(&config).unwrap();
-        let payload = qr_payload_for(
-            &config,
-            &pairing_url(&config),
-            &loaded.token,
-            directory_url(&config).as_deref(),
-            Some(&tls_ca),
-        );
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(v["url"], "wss://desk.example.com:50101/v1/ws");
-        assert_eq!(v["directory_url"], "https://desk.example.com:50100/v1/instances");
-        assert_eq!(v["tls_ca"], tls_ca.as_str());
-        assert!(!payload.contains("PRIVATE"), "never a key in the QR");
-        let qr = render_qr(&payload).expect("the pinned payload encodes");
-        let width = qr.lines().next().unwrap().chars().count();
-        assert!(width <= 120, "pinned QR is {width} columns — too wide");
-    }
-
-    /// Pinned mode without a CA on disk reports an actionable CertLoad.
-    #[test]
-    fn pinned_ca_mode_without_material_fails_closed() {
-        let (_dir, ws) = relay_workspace();
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        match check_availability(&config) {
-            Err(RemoteUnavailable::CertLoad(msg)) => assert!(msg.contains("pinned"), "{msg}"),
-            other => panic!("expected CertLoad, got {other:?}"),
-        }
-    }
-
-    /// An explicit pair still wins over `tlsMode: "pinnedCa"`.
-    #[test]
-    fn explicit_cert_wins_over_pinned_ca() {
-        let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": {
-                "magicDnsHost": "desk.example.com",
-                "tlsMode": "pinnedCa",
-                "certPath": "certs/cert.pem"
-            }
-        }));
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        assert_eq!(select_cert(&config).0, CertSource::Explicit);
     }
 
     #[test]
@@ -1981,21 +1179,11 @@ mod tests {
         assert!(!machine_label("a-very-long-name-that-ends-exactly-at-forty-x-y").ends_with('-'));
     }
 
-    fn relay_mode_workspace() -> (tempfile::TempDir, Workspace) {
-        workspace_with(serde_json::json!({
-            "remote": { "relay": {
-                "host": "Gaviero.Example.com.",
-                "secret": "relay-secret-0123456789abcdef",
-                "machine": "Desk Top"
-            } }
-        }))
-    }
-
     #[test]
-    fn relay_mode_derives_route_urls_and_forces_loopback_pinned_ca() {
-        let (_dir, ws) = relay_mode_workspace();
+    fn relay_settings_derive_route_urls() {
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let config = resolve_config(&ws).unwrap();
-        let relay = config.relay.clone().expect("relay mode");
+        let relay = &config.relay;
         assert_eq!(relay.host, "gaviero.example.com");
         assert_eq!(relay.machine, "desk-top");
         assert_eq!(relay.base_url, "wss://gaviero.example.com");
@@ -2003,84 +1191,92 @@ mod tests {
             relay.route,
             format!("{}-desk-top.gaviero.example.com", config.workspace_id)
         );
-        assert_eq!(config.magic_dns_host, "desk-top.gaviero.example.com");
-        assert_eq!(config.bind_mode, BindMode::Loopback);
-        assert_eq!(config.tls_mode, TlsMode::PinnedCa);
-        assert!(!config.directory_enabled, "no loopback directory port");
+        assert_eq!(config.machine_host, "desk-top.gaviero.example.com");
         assert_eq!(
             pairing_url(&config),
             format!("wss://{}/v1/ws", relay.route),
             "no port: the phone dials the relay on 443"
         );
         assert_eq!(
-            directory_url(&config).unwrap(),
+            directory_url(&config),
             format!("https://{}/v1/instances", relay.route)
         );
         assert!(!format!("{relay:?}").contains("relay-secret"), "Debug redacts the secret");
     }
 
     #[test]
-    fn relay_mode_without_a_secret_is_an_actionable_error() {
+    fn a_relay_without_a_secret_is_an_actionable_error() {
         let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "relay": { "host": "gaviero.example.com" } }
+            "remote": { "relay": { "host": "gaviero.example.com", "secret": "" } }
         }));
         let err = resolve_config(&ws).expect_err("secret required");
         assert!(matches!(err, RemoteUnavailable::RelaySecretMissing));
+        assert!(!err.is_quiet(), "a half-configured relay is worth a warning");
         assert!(err.to_string().contains("remote.relay.secret"));
     }
 
-    #[tokio::test]
-    async fn relay_mode_leaf_covers_the_route_and_the_qr_carries_relay_fields() {
-        let (_dir, ws) = relay_mode_workspace();
+    /// Without the pinned material on disk, availability reports an
+    /// actionable CertLoad naming the path.
+    #[test]
+    fn missing_pinned_material_fails_closed() {
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
-        let relay = config.relay.clone().unwrap();
-        assert!(ensure_certificate(&config).await.unwrap());
-        let availability = check_availability(&config).expect("available without tailscale");
-        let leaf = std::fs::read(select_cert(&config).1).unwrap();
+        match check_availability(&config) {
+            Err(RemoteUnavailable::CertLoad(msg)) => assert!(msg.contains("pinned"), "{msg}"),
+            other => panic!("expected CertLoad, got {other:?}"),
+        }
+    }
+
+    /// The pinned leaf is issued once, covers the machine host and every
+    /// route, and the QR carries the CA (never a key) plus the relay fields.
+    #[tokio::test]
+    async fn the_leaf_is_issued_once_and_the_qr_carries_the_ca_and_relay_fields() {
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
+        let machine = tempfile::tempdir().unwrap();
+        let config = isolated(&ws, &machine);
+        assert!(leaf_path(&config).starts_with(machine.path()), "machine-scoped");
+        assert!(ensure_certificate(&config).await.unwrap(), "first start issues");
         assert!(
-            pairing::inspect_cert(&leaf, &relay.route).unwrap().covers_host,
+            !ensure_certificate(&config).await.unwrap(),
+            "a second start re-issues nothing"
+        );
+        let availability = check_availability(&config).expect("available");
+        assert!(availability.cert.covers_host);
+        let leaf = std::fs::read(leaf_path(&config)).unwrap();
+        assert!(
+            pairing::inspect_cert(&leaf, &config.relay.route)
+                .unwrap()
+                .covers_host,
             "the *.relay-host SAN covers the route"
         );
+
         let token = load_or_create_token(&config).unwrap();
-        let payload = qr_payload_for(
-            &config,
-            &pairing_url(&config),
-            &token.token,
-            directory_url(&config).as_deref(),
-            availability.tls_ca.as_deref(),
-        );
+        let payload = qr_payload_for(&config, &token.token, &availability.tls_ca);
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["kind"], "gaviero-remote");
+        assert_eq!(v["protocol_major"], 1);
+        assert_eq!(v["token"], token.token);
+        assert_eq!(v["workspace_id"], config.workspace_id);
         assert_eq!(v["relay_host"], "gaviero.example.com");
         assert_eq!(v["relay_secret"], "relay-secret-0123456789abcdef");
         assert_eq!(v["machine"], "desk-top.gaviero.example.com");
-        assert_eq!(v["url"], format!("wss://{}/v1/ws", relay.route));
-        assert!(v["tls_ca"].is_string());
-        let qr = render_qr(&payload).expect("relay payload encodes");
+        assert_eq!(v["url"], format!("wss://{}/v1/ws", config.relay.route));
+        assert_eq!(
+            v["directory_url"],
+            format!("https://{}/v1/instances", config.relay.route)
+        );
+        assert_eq!(v["tls_ca"], availability.tls_ca.as_str());
+        assert!(!payload.contains("PRIVATE"), "never a key in the QR");
+        let qr = render_qr(&payload).expect("the relay payload encodes");
         let width = qr.lines().next().unwrap().chars().count();
         assert!(width <= 120, "relay QR is {width} columns — too wide");
     }
 
     #[test]
-    fn pairing_url_uses_magic_dns_never_an_ip() {
-        let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net", "port": 50123 }
-        }));
-        let config = resolve_config(&ws).unwrap();
-        assert_eq!(
-            pairing_url(&config),
-            "wss://host.tailnet.ts.net:50123/v1/ws"
-        );
-        assert_eq!(
-            directory_url(&config).unwrap(),
-            "https://host.tailnet.ts.net:49151/v1/instances"
-        );
-    }
-
-    #[test]
     fn qr_renders_and_encodes_the_payload() {
         let payload = pairing::qr_payload_json(&pairing::QrPayloadInput {
-            url: "wss://host.tailnet.ts.net:50123/v1/ws",
+            url: "wss://0b7d245998c0e8c3-desk.gaviero.example.com/v1/ws",
             token: &pairing::generate_token(),
             workspace: "gaviero",
             ..Default::default()
@@ -2091,24 +1287,38 @@ mod tests {
         assert!(qr.lines().all(|l| l.chars().count() == width), "square");
     }
 
-    /// The realistic worst case: a 64-hex token, a long MagicDNS hostname,
-    /// a long workspace name, AND the three 1.1 keys (workspace id, machine,
-    /// directory URL) must still encode, and the rendering must stay inside
-    /// a normal terminal width (the QR is useless if it wraps).
+    /// A typical relay pairing — 64-hex token, real machine CA, both relay
+    /// fields — must encode inside a normal terminal width (the QR is
+    /// useless if it wraps). The route appears three times (`url`,
+    /// `directory_url`, `machine`), so the width grows with the relay host,
+    /// machine label and workspace name; with a 36-char workspace name this
+    /// same setup sits on the 117/121-column version boundary, and a 26-char
+    /// relay host or a 40-char label reaches 121–129.
     #[test]
-    fn worst_case_payload_encodes_and_fits_a_terminal() {
+    fn typical_relay_payload_encodes_and_fits_a_terminal() {
+        let ca_dir = tempfile::tempdir().unwrap();
+        let machine = "desktop-abc1234";
+        let relay_host = "gaviero.example.com";
+        let host = format!("{machine}.{relay_host}");
+        let pinned = pairing::ensure_pinned_ca_with(
+            ca_dir.path(),
+            &host,
+            &[format!("*.{relay_host}")],
+        )
+        .unwrap();
+        let route = format!("0b7d245998c0e8c3-{machine}.{relay_host}");
+        let url = format!("wss://{route}/v1/ws");
+        let directory_url = format!("https://{route}/v1/instances");
         let payload = pairing::qr_payload_json(&pairing::QrPayloadInput {
-            url: "wss://very-long-machine-name.tail9f2c81.ts.net:65535/v1/ws",
+            url: &url,
             token: &pairing::generate_token(),
-            workspace: "a-fairly-long-workspace-display-name",
+            workspace: "gaviero",
             workspace_id: Some("0b7d245998c0e8c3"),
-            machine: Some("very-long-machine-name.tail9f2c81.ts.net"),
-            directory_url: Some(
-                "https://very-long-machine-name.tail9f2c81.ts.net:49151/v1/instances",
-            ),
-            tls_ca: None,
-            relay_host: None,
-            relay_secret: None,
+            machine: Some(&host),
+            directory_url: Some(&directory_url),
+            tls_ca: Some(&pinned.ca_der_b64),
+            relay_host: Some(relay_host),
+            relay_secret: Some(&pairing::generate_token()),
         });
         let qr = render_qr(&payload).expect("worst-case payload still encodes");
         let width = qr.lines().next().unwrap().chars().count();
@@ -2128,7 +1338,7 @@ mod tests {
     #[test]
     fn rendered_modules_match_the_encoder_exactly() {
         let payload = pairing::qr_payload_json(&pairing::QrPayloadInput {
-            url: "wss://host.tailnet.ts.net:50123/v1/ws",
+            url: "wss://0b7d245998c0e8c3-desk.gaviero.example.com/v1/ws",
             token: &pairing::generate_token(),
             workspace: "gaviero",
             ..Default::default()
@@ -2179,51 +1389,15 @@ mod tests {
         assert!(rows[0].iter().all(|&c| c == '█'), "top quiet zone");
     }
 
-    /// The payload the app validates: `kind` and `protocol_major` gate
-    /// pairing on the client (Plan B B9), so they must survive the exact
-    /// path `/remote` uses — now with the 1.1 identity keys.
-    #[test]
-    fn rendered_pairing_payload_carries_what_the_app_validates() {
-        let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net", "port": 50123 }
-        }));
-        let machine = tempfile::tempdir().unwrap();
-        let config = isolated(&ws, &machine);
-        let loaded = load_or_create_token(&config).unwrap();
-        let dir_url = directory_url(&config);
-        let payload = qr_payload_for(
-            &config,
-            &pairing_url(&config),
-            &loaded.token,
-            dir_url.as_deref(),
-            None,
-        );
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert!(v.get("tls_ca").is_none(), "tailscale mode pins nothing");
-        assert_eq!(v["kind"], "gaviero-remote");
-        assert_eq!(v["protocol_major"], 1);
-        assert_eq!(v["url"], "wss://host.tailnet.ts.net:50123/v1/ws");
-        assert_eq!(v["token"], loaded.token);
-        assert_eq!(v["workspace_id"], config.workspace_id);
-        assert_eq!(v["machine"], "host.tailnet.ts.net");
-        assert_eq!(
-            v["directory_url"],
-            "https://host.tailnet.ts.net:49151/v1/instances"
-        );
-        render_qr(&payload).expect("the /remote payload encodes");
-    }
-
     /// Plan C §2.5: a busy derived port falls forward inside the window; an
-    /// explicit port does not. Binds real loopback listeners with a
-    /// generated certificate.
+    /// explicit port does not. Binds real loopback listeners with the
+    /// pinned leaf.
     #[tokio::test]
     async fn busy_derived_port_falls_forward_but_explicit_port_does_not() {
-        let (_dir, ws) = workspace_with(serde_json::json!({
-            "remote": { "magicDnsHost": "host.tailnet.ts.net", "allowPublicBind": true }
-        }));
+        let (_dir, ws) = relay_workspace(serde_json::json!({}));
         let machine = tempfile::tempdir().unwrap();
         let mut config = isolated(&ws, &machine);
-        write_pair(&machine.path().join("remote/tls"), "host.tailnet.ts.net");
+        ensure_certificate(&config).await.unwrap();
 
         // Occupy a free port and point the "derived" port at it.
         let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2231,25 +1405,12 @@ mod tests {
         config.port = busy;
         config.explicit_port = false;
 
-        let availability = || {
-            let cert_pem = std::fs::read(machine.path().join("remote/tls/cert.pem")).unwrap();
-            let key_pem = std::fs::read(machine.path().join("remote/tls/key.pem")).unwrap();
-            let cert = pairing::inspect_cert(&cert_pem, "host.tailnet.ts.net").unwrap();
-            Availability {
-                cert_pem,
-                key_pem,
-                cert,
-                cert_source: CertSource::Machine,
-                tailnet_addrs: Vec::new(),
-                tls_ca: None,
-            }
-        };
         let token = load_or_create_token(&config).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = start(
             &config,
-            availability(),
+            check_availability(&config).unwrap(),
             token.clone(),
             "inst-test".into(),
             tx.clone(),
@@ -2264,9 +1425,15 @@ mod tests {
             .try_send(gaviero_remote::server::HubInput::Shutdown);
 
         config.explicit_port = true;
-        let err = start(&config, availability(), token, "inst-test-2".into(), tx)
-            .await
-            .expect_err("an explicit busy port must fail, never fall forward");
+        let err = start(
+            &config,
+            check_availability(&config).unwrap(),
+            token,
+            "inst-test-2".into(),
+            tx,
+        )
+        .await
+        .expect_err("an explicit busy port must fail, never fall forward");
         assert!(matches!(err, RemoteUnavailable::Bind(_)), "{err}");
     }
 }
@@ -2280,7 +1447,7 @@ mod render_preview {
     fn preview_pairing_qr() {
         let payload =
             gaviero_remote::pairing::qr_payload_json(&gaviero_remote::pairing::QrPayloadInput {
-                url: "wss://host.tailnet.ts.net:50123/v1/ws",
+                url: "wss://0b7d245998c0e8c3-desk.gaviero.example.com/v1/ws",
                 token: &gaviero_remote::pairing::generate_token(),
                 workspace: "gaviero",
                 ..Default::default()
@@ -2300,46 +1467,37 @@ mod render_preview {
 mod live_diagnostic {
     use super::*;
 
-    /// Prints what `/remote` would report for a workspace right now,
-    /// including real host detection. Under `cargo test` the cwd is the
-    /// crate dir, so pass the workspace root explicitly:
+    /// Prints what `/remote` would report for a workspace right now. Under
+    /// `cargo test` the cwd is the crate dir, so pass the workspace root
+    /// explicitly:
     /// `GAVIERO_WS=<root> cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
-    #[tokio::test]
+    #[test]
     #[ignore = "diagnostic: reports this machine's real remote readiness"]
-    async fn live_remote_status() {
+    fn live_remote_status() {
         let root = std::env::var("GAVIERO_WS")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap());
         let ws = Workspace::single_folder(root);
         match resolve_config(&ws) {
-            Ok(mut config) => {
-                resolve_host(&mut config).await;
+            Ok(config) => {
                 println!("enabled:   {}", config.enabled);
                 println!(
                     "port:      {} (explicit: {})",
                     config.port, config.explicit_port
                 );
-                println!(
-                    "host:      {} ({:?}) {}",
-                    config.magic_dns_host,
-                    config.host_source,
-                    config.host_detail.clone().unwrap_or_default()
-                );
+                println!("machine:   {}", config.machine_host);
+                println!("relay:     {} route {}", config.relay.base_url, config.relay.route);
                 println!(
                     "workspace: {} ({})",
                     config.workspace_display_name, config.workspace_id
                 );
-                let (source, cert, _) = select_cert(&config);
-                println!("cert:      {:?} {}", source, cert.display());
+                println!("leaf:      {}", leaf_path(&config).display());
                 println!(
                     "token:     {:?} machine dir {:?}",
                     config.token_scope, config.machine_state_dir
                 );
                 match check_availability(&config) {
-                    Ok(a) => println!(
-                        "AVAILABLE — cert until {}, tailnet {:?}",
-                        a.cert.not_after, a.tailnet_addrs
-                    ),
+                    Ok(a) => println!("AVAILABLE — cert until {}", a.cert.not_after),
                     Err(e) => println!("UNAVAILABLE — {e}"),
                 }
             }
