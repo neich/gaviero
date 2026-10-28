@@ -270,6 +270,11 @@ pub struct App {
 
     // Git panel (M4)
     pub git_panel: crate::panels::git_panel::GitPanelState,
+    /// Whether the GIT panel was shown, and shown + focused, after the last
+    /// event. `side_panel::sync_git_panel_entry` refreshes on either
+    /// false → true edge.
+    pub git_panel_shown: bool,
+    pub git_panel_entered: bool,
     /// One git repo per workspace folder root that opens successfully.
     /// Empty when no folder root is a git repository.
     pub git_repos: Vec<GitRepoEntry>,
@@ -560,6 +565,8 @@ impl App {
             topology_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
+            git_panel_shown: false,
+            git_panel_entered: false,
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             history_panel: crate::panels::history_panel::HistoryPanelState::new(),
             code_graph_panel: Default::default(),
@@ -598,6 +605,9 @@ impl App {
         // Single lifecycle hook for the CODE GRAPH panel: a no-op unless the
         // visible panel's source file no longer matches the active buffer.
         self.maybe_refresh_code_graph_panel();
+        // Same for the GIT panel: shell git commands leave it stale, so it
+        // reloads whenever it comes into view or gains focus.
+        side_panel::sync_git_panel_entry(self);
         // Post-reducer projection + delivery (§2.1 path 2, invariant 11):
         // drain reducer frames and summary changes with try_send only.
         projection::pump_remote(self);

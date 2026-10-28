@@ -664,6 +664,23 @@ pub(super) fn refresh_git_panel(app: &mut App) {
     }
 }
 
+/// Refresh the GIT panel when it comes into view (side panel toggled on,
+/// header arrow, `Alt+g`) and again when focus moves into it (a click or a
+/// focus key). Git commands run in a terminal don't notify the panel, so
+/// these edges are where it catches up. A no-op while nothing changes.
+/// Returns whether it refreshed.
+pub(super) fn sync_git_panel_entry(app: &mut App) -> bool {
+    let shown = app.panel_visible.side_panel && app.side_panel == SidePanelMode::GitPanel;
+    let entered = shown && app.focus == Focus::SidePanel;
+    let refresh = (shown && !app.git_panel_shown) || (entered && !app.git_panel_entered);
+    if refresh {
+        refresh_git_panel(app);
+    }
+    app.git_panel_shown = shown;
+    app.git_panel_entered = entered;
+    refresh
+}
+
 /// Open a read-only diff-view tab for the file currently selected in the git
 /// panel. If the file is unchanged vs HEAD, opens the file as a normal
 /// editable buffer instead. Used by both the Enter key and mouse clicks.
@@ -4033,6 +4050,47 @@ mod tests {
         assert_eq!(std::fs::read_to_string(resolved).unwrap(), "workspace");
         let member_copy = super::resolve_at_path("gaviero/.gaviero/settings.json", &roots).unwrap();
         assert_eq!(std::fs::read_to_string(member_copy).unwrap(), "member");
+    }
+
+    // ── GIT panel ───────────────────────────────────────────────
+
+    #[test]
+    fn git_panel_reloads_on_each_entry_only() {
+        use crate::app::state::{Focus, SidePanelMode};
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let mut app = chat_app(dir.path());
+        app.panel_visible.side_panel = false;
+        app.side_panel = SidePanelMode::GitPanel;
+        app.focus = Focus::Editor;
+        let unstaged = |app: &crate::app::App| -> Vec<String> {
+            app.git_panel.unstaged.iter().map(|e| e.path.clone()).collect()
+        };
+
+        assert!(!super::sync_git_panel_entry(&mut app), "hidden");
+
+        // Stand-ins for files a shell git workflow leaves behind.
+        std::fs::write(dir.path().join("shown.txt"), "s").unwrap();
+        app.panel_visible.side_panel = true;
+        assert!(super::sync_git_panel_entry(&mut app), "shown without focus");
+        assert!(unstaged(&app).contains(&"shown.txt".to_string()), "{:?}", unstaged(&app));
+        assert!(!super::sync_git_panel_entry(&mut app), "still shown");
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        app.focus = Focus::SidePanel;
+        assert!(super::sync_git_panel_entry(&mut app));
+        assert!(unstaged(&app).contains(&"a.txt".to_string()), "{:?}", unstaged(&app));
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        assert!(!super::sync_git_panel_entry(&mut app), "staying in the panel");
+        assert!(!unstaged(&app).contains(&"b.txt".to_string()));
+
+        app.focus = Focus::Terminal;
+        assert!(!super::sync_git_panel_entry(&mut app));
+        app.focus = Focus::SidePanel;
+        assert!(super::sync_git_panel_entry(&mut app));
+        assert!(unstaged(&app).contains(&"b.txt".to_string()), "{:?}", unstaged(&app));
+        cleanup_session(dir.path());
     }
 
     // ── CODE GRAPH panel ────────────────────────────────────────

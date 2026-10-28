@@ -1984,7 +1984,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.panel_visible.side_panel = true;
             app.side_panel = SidePanelMode::GitPanel;
             app.focus = Focus::SidePanel;
-            app.refresh_git_panel();
+            // Counts as a fresh entry, so `Alt+g` inside the panel reloads too.
+            app.git_panel_entered = false;
+            super::side_panel::sync_git_panel_entry(app);
         }
         Action::SetSideModeMemory => {
             app.panel_visible.side_panel = true;

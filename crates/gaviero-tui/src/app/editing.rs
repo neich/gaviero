@@ -796,6 +796,12 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
 
                 if app.side_panel == SidePanelMode::GitPanel {
+                    // A click that enters the panel only reloads it: the rows
+                    // can shift, so the file under the cursor may not be the
+                    // one the user saw.
+                    if super::side_panel::sync_git_panel_entry(app) {
+                        return;
+                    }
                     let rel_y = row.saturating_sub(area.y);
                     if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height) {
                         app.git_panel.select_file(region, idx);
