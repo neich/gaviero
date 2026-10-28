@@ -4,6 +4,7 @@ pub mod diff_overlay;
 pub mod fold;
 pub mod highlight;
 pub mod markdown;
+pub mod preview_fold;
 pub mod view;
 pub mod wrap;
 

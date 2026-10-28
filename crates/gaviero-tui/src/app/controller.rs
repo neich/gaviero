@@ -2212,6 +2212,12 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 app.ensure_editor_cursor_visible();
             }
         }
+        Action::ToggleFold if super::editing::preview_owns_folding(app) => {
+            super::editing::toggle_preview_fold_at_top(app)
+        }
+        Action::ToggleAllFolds if super::editing::preview_owns_folding(app) => {
+            super::editing::cycle_preview_outline(app)
+        }
         Action::ToggleFold => super::editing::toggle_fold_at_cursor(app),
         Action::ToggleAllFolds => super::editing::toggle_all_folds(app),
         Action::GoToDefinition => super::nav::goto_definition(app),

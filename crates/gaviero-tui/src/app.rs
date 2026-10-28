@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::editor::buffer::Buffer;
 use crate::editor::diff_overlay::{self, DiffReviewState};
 use crate::editor::highlight::{HighlightConfig, load_highlight_config};
+use crate::editor::preview_fold::{HeadingKey, RenderedHeading};
 use crate::editor::view::EditorView;
 use crate::event::Event;
 use crate::keymap::{Action, Keymap};
@@ -197,6 +198,8 @@ pub struct App {
     pub preview_line_count: usize,
     /// Last formatted preview lines, used for click/hover hit-testing.
     pub preview_lines: Vec<crate::panels::chat_markdown::ChatLine>,
+    /// Foldable headings of the last preview render, for click / F10 folding.
+    pub preview_headings: Vec<RenderedHeading>,
     /// Destination under the pointer, if any. Drives hover paint + status bar.
     pub preview_hover_href: Option<String>,
     /// Last mouse cell, so preview scroll can re-hit-test without a move event.
@@ -526,6 +529,7 @@ impl App {
             preview_viewport_lines: 1,
             preview_line_count: 0,
             preview_lines: Vec::new(),
+            preview_headings: Vec::new(),
             preview_hover_href: None,
             last_mouse: None,
             needs_immediate_render: false,
