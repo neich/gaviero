@@ -1143,23 +1143,38 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
     frame.render_widget(block, area);
     let inner = markdown_preview_inner(area, mode);
 
-    let (source, editor_top) = match app.buffers.get(app.active_buffer) {
+    let (layout, editor_top) = match app.buffers.get(app.active_buffer) {
         Some(buf) => (
-            buf.text.to_string(),
+            layout_preview(
+                &buf.text.to_string(),
+                &buf.preview_folds,
+                preview_content_width(inner),
+                app.theme.default_style(),
+            ),
             editor_top_source_line(buf, app.layout.editor_area),
         ),
         None => {
             app.preview_lines.clear();
+            app.preview_headings.clear();
             return;
         }
     };
-    let content_width = inner.width.saturating_sub(2) as usize;
-    let (lines, source_map) = chat_markdown::format_chat_markdown_mapped(
-        &source,
-        content_width.max(1),
-        app.theme.default_style(),
-    );
+    let PreviewLayout {
+        mut lines,
+        source_map,
+        headings,
+    } = layout;
+    let marker_style = Style::default().fg(theme::TOOL_DIM);
+    for h in headings.iter().filter(|h| h.collapsed) {
+        if let Some(line) = lines.get_mut(h.end - 1) {
+            line.segments.push(chat_markdown::StyledSegment::new(
+                format!("  ▸ {} lines", h.body_lines),
+                marker_style,
+            ));
+        }
+    }
     app.preview_lines = lines;
+    app.preview_headings = headings;
     app.preview_viewport_lines = inner.height.max(1) as usize;
     app.preview_line_count = app.preview_lines.len();
     sync_preview_to_editor(app, editor_top, &source_map);
@@ -1187,6 +1202,57 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         app.preview_viewport_lines,
         scroll,
     );
+}
+
+/// Text width of the preview for an inner rect (one column of padding on each
+/// side, the right one shared with the scrollbar).
+pub(super) fn preview_content_width(inner: Rect) -> usize {
+    inner.width.saturating_sub(2).max(1) as usize
+}
+
+/// Rendered preview with the buffer's collapsed sections removed.
+pub(super) struct PreviewLayout {
+    pub lines: Vec<crate::panels::chat_markdown::ChatLine>,
+    /// Original source line → first rendered line; a line inside a collapsed
+    /// section maps to its heading.
+    pub source_map: Vec<usize>,
+    /// Foldable headings on screen, top to bottom.
+    pub headings: Vec<RenderedHeading>,
+}
+
+pub(super) fn layout_preview(
+    source: &str,
+    folds: &std::collections::HashSet<HeadingKey>,
+    width: usize,
+    base_style: Style,
+) -> PreviewLayout {
+    let folded = crate::editor::preview_fold::fold_source(source, folds);
+    let (lines, map) =
+        crate::panels::chat_markdown::format_chat_markdown_mapped(&folded.text, width, base_style);
+    let at = |k: usize| map.get(k).copied().unwrap_or(lines.len());
+    let source_map = folded.line_map.iter().map(|&k| at(k)).collect();
+    let headings = folded
+        .headings
+        .iter()
+        .filter(|h| folded.is_visible(h))
+        .map(|h| {
+            let k = folded.line_map[h.line];
+            let start = at(k);
+            let collapsed = folds.contains(&h.key) && h.body_lines() > 0;
+            RenderedHeading {
+                key: h.key.clone(),
+                start,
+                end: at(k + 1).max(start + 1),
+                collapsed,
+                body_lines: h.body_lines(),
+            }
+        })
+        .collect();
+    PreviewLayout {
+        lines,
+        source_map,
+        headings,
+    }
 }
 
 /// Logical source line at the top of the editor viewport.
@@ -2052,6 +2118,27 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_layout_maps_folded_lines_to_their_heading() {
+        let source = "# Top\nintro\n## Sub\nline one\nline two\n\n## Next\nend\n";
+        let open = layout_preview(source, &Default::default(), 40, Style::default());
+        let sub = open.headings.iter().find(|h| h.key.title == "Sub").unwrap();
+        assert!(!sub.collapsed);
+        assert_eq!(sub.body_lines, 2);
+
+        let folds = std::collections::HashSet::from([sub.key.clone()]);
+        let closed = layout_preview(source, &folds, 40, Style::default());
+        let sub = closed.headings.iter().find(|h| h.key.title == "Sub").unwrap();
+        assert!(sub.collapsed);
+        assert_eq!(closed.lines.len(), open.lines.len() - 2);
+        // Editor lines inside the fold sync the preview to the heading.
+        assert_eq!(closed.source_map[3], sub.start);
+        assert_eq!(closed.source_map[4], sub.start);
+        let next = closed.headings.iter().find(|h| h.key.title == "Next").unwrap();
+        assert_eq!(closed.source_map[6], next.start);
+        assert_eq!(closed.lines[next.start].text().trim_start_matches(['▌', ' ']), "Next");
+    }
 
     fn syntax_dialog(error_count: usize) -> SyntaxErrorDialog {
         SyntaxErrorDialog {

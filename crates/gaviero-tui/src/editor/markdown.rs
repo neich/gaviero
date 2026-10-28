@@ -44,7 +44,7 @@ impl MarkdownPreviewMode {
         match self {
             Self::Off => "Markdown",
             Self::Split => "Markdown · split (Alt+P)",
-            Self::PreviewOnly => "Markdown · preview (Alt+P)",
+            Self::PreviewOnly => "Markdown · preview (Alt+P · F10 fold)",
         }
     }
 

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::fold::{FoldMap, FoldMarker, HiddenLines};
 use super::markdown::MarkdownPreviewMode;
+use super::preview_fold::HeadingKey;
 use super::wrap::{VisualSegment, char_display_width};
 
 #[derive(Clone, Debug, Default)]
@@ -130,6 +131,11 @@ pub struct Buffer {
     pub preview_mode: MarkdownPreviewMode,
     /// Scroll offset of this buffer's rendered preview pane, in preview lines.
     pub preview_scroll: usize,
+    /// Sections collapsed in this buffer's preview (`#` – `###`).
+    pub preview_folds: HashSet<HeadingKey>,
+    /// Outline depth last applied with Shift+F10 in the preview; `None` once
+    /// folds are expanded or toggled one at a time.
+    pub preview_outline: Option<u8>,
     /// Tab display width (from settings, default 4).
     pub tab_width: u8,
     /// String used for one indent level (from settings, default "    ").
@@ -195,6 +201,8 @@ impl Buffer {
             word_wrap: false,
             preview_mode: MarkdownPreviewMode::Off,
             preview_scroll: 0,
+            preview_folds: HashSet::new(),
+            preview_outline: None,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -312,6 +320,8 @@ impl Buffer {
             word_wrap: false,
             preview_mode: MarkdownPreviewMode::Off,
             preview_scroll: 0,
+            preview_folds: HashSet::new(),
+            preview_outline: None,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -387,6 +397,8 @@ impl Buffer {
             word_wrap: false,
             preview_mode: MarkdownPreviewMode::Off,
             preview_scroll: 0,
+            preview_folds: HashSet::new(),
+            preview_outline: None,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,

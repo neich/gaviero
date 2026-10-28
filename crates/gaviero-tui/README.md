@@ -84,6 +84,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+F / F3 | Find in file / workspace search |
 | F5 / F7 | Format buffer / toggle word wrap |
 | F10 / Shift+F10 | Fold block at cursor / fold all — or click the `▾` in the gutter |
+| F10 / Shift+F10 (markdown preview-only, Alt+P) | Fold the `#`–`###` section at the top of the preview / step the outline: `#` only → down to `##` → down to `###` → all expanded. Clicking a heading folds it in split view too |
 | Ctrl+T / Ctrl+W | New tab / close tab |
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |

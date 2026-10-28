@@ -506,19 +506,121 @@ fn scroll_preview_to_fragment(app: &mut App, fragment: &str) {
         return;
     };
     let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
-    let source = match app.buffers.get(app.active_buffer) {
-        Some(buf) => buf.text.to_string(),
-        None => return,
+    let width = super::render::preview_content_width(inner);
+    let style = app.theme.default_style();
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return;
     };
-    let content_width = inner.width.saturating_sub(2).max(1) as usize;
-    let lines =
-        chat_markdown::format_chat_markdown(&source, content_width, app.theme.default_style());
-    if let Some(idx) = chat_markdown::preview_line_for_fragment(&lines, fragment) {
+    let source = buf.text.to_string();
+    let mut lines = super::render::layout_preview(&source, &buf.preview_folds, width, style).lines;
+    let mut idx = chat_markdown::preview_line_for_fragment(&lines, fragment);
+    if idx.is_none() && !buf.preview_folds.is_empty() {
+        // The target may sit inside a collapsed section: expand to reach it.
+        let expanded = super::render::layout_preview(&source, &Default::default(), width, style);
+        idx = chat_markdown::preview_line_for_fragment(&expanded.lines, fragment);
+        if idx.is_some() {
+            buf.preview_folds.clear();
+            buf.preview_outline = None;
+            lines = expanded.lines;
+        }
+    }
+    if let Some(idx) = idx {
         app.preview_line_count = lines.len();
         app.set_preview_scroll(idx);
         super::render::clamp_preview_scroll(app, lines.len());
         app.preview_synced_top = None;
     }
+}
+
+/// Index into `app.preview_headings` of the heading under `(col, row)`.
+fn preview_heading_under_pointer(app: &App, col: u16, row: u16) -> Option<usize> {
+    let preview = app.layout.preview_area?;
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
+    if !inner.contains((col, row).into()) {
+        return None;
+    }
+    let line = app.preview_scroll() + (row - inner.y) as usize;
+    app.preview_headings
+        .iter()
+        .position(|h| h.start <= line && line < h.end)
+}
+
+/// Collapse or expand the preview section `app.preview_headings[idx]`.
+fn toggle_preview_fold(app: &mut App, idx: usize) {
+    let Some(heading) = app.preview_headings.get(idx).cloned() else {
+        return;
+    };
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return;
+    };
+    let message = if heading.body_lines == 0 {
+        format!("\"{}\" has nothing to fold", heading.key.title)
+    } else if buf.preview_folds.remove(&heading.key) {
+        format!("Expanded \"{}\"", heading.key.title)
+    } else {
+        buf.preview_folds.insert(heading.key.clone());
+        format!("Collapsed \"{}\"", heading.key.title)
+    };
+    buf.preview_outline = None;
+    app.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// F10 in preview-only mode: fold the section the top of the preview is in.
+/// Scrolls the heading to the top so a collapse never leaves the view past
+/// the end of the shortened document.
+pub(super) fn toggle_preview_fold_at_top(app: &mut App) {
+    let top = app.preview_scroll();
+    let bottom = top + app.preview_viewport_lines;
+    let idx = app
+        .preview_headings
+        .iter()
+        .rposition(|h| h.start <= top)
+        .or_else(|| app.preview_headings.iter().position(|h| h.start < bottom));
+    let Some(idx) = idx else {
+        app.status_message = Some((
+            "No # – ### heading to fold here".to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    };
+    let start = app.preview_headings[idx].start;
+    toggle_preview_fold(app, idx);
+    if start < top {
+        app.set_preview_scroll(start);
+    }
+}
+
+/// Shift+F10 in preview-only mode: step the outline depth — `#` only, down
+/// to `##`, down to `###`, then everything expanded. Levels with nothing to
+/// fold are skipped.
+pub(super) fn cycle_preview_outline(app: &mut App) {
+    use crate::editor::preview_fold::{folds_for_depth, next_outline_depth, preview_headings};
+
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return;
+    };
+    let headings = preview_headings(&buf.text.to_string());
+    let next = next_outline_depth(&headings, buf.preview_outline);
+    let message = match next {
+        None if buf.preview_outline.is_none() && buf.preview_folds.is_empty() => {
+            "No # – ### sections to fold".to_string()
+        }
+        None => "Preview outline: all sections expanded".to_string(),
+        Some(level) => format!(
+            "Preview outline: down to {} (Shift+F10 for more)",
+            "#".repeat(level as usize)
+        ),
+    };
+    buf.preview_folds = next.map(|level| folds_for_depth(&headings, level)).unwrap_or_default();
+    buf.preview_outline = next;
+    app.set_preview_scroll(0);
+    app.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// Whether F10 / Shift+F10 act on the preview instead of the source folds:
+/// only when the preview is all there is on screen.
+pub(super) fn preview_owns_folding(app: &App) -> bool {
+    app.preview_mode() == MarkdownPreviewMode::PreviewOnly && is_current_buffer_markdown(app)
 }
 
 pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
@@ -688,6 +790,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 if col == scrollbar_x {
                     app.scrollbar_dragging = Some(ScrollbarTarget::MarkdownPreview);
                     app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
+                    return;
+                }
+                // Links win over folding: a heading can carry a link.
+                if preview_href_under_pointer(app, col, row).is_none()
+                    && let Some(idx) = preview_heading_under_pointer(app, col, row)
+                {
+                    toggle_preview_fold(app, idx);
                     return;
                 }
                 follow_preview_link_at(app, col, row);
