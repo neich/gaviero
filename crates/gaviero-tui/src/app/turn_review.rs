@@ -174,6 +174,117 @@ fn selected_change(app: &App) -> Option<&FileChange> {
     active_review(app).and_then(|r| r.set.files.get(app.turn_review_view.selected))
 }
 
+/// One row of the review list. Files are always grouped under a header per
+/// workspace folder (`FileChange::root`), so a multi-folder workspace never
+/// shows two folders' `src/main.rs` as indistinguishable rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListRow {
+    /// A folder header: the first file of the group and the group's size.
+    Folder { first: usize, count: usize },
+    /// A file, as its index into `set.files`.
+    File(usize),
+}
+
+/// The list as drawn: folders in order of first appearance, each file under
+/// its folder in the change set's own order. Selection, `j`/`k`, the
+/// next-undecided jump and mouse clicks all follow this order.
+fn list_rows(review: &PendingReview) -> Vec<ListRow> {
+    let mut groups: Vec<(&std::path::Path, Vec<usize>)> = Vec::new();
+    for (i, c) in review.set.files.iter().enumerate() {
+        match groups.iter_mut().find(|(root, _)| *root == c.root.as_path()) {
+            Some((_, files)) => files.push(i),
+            None => groups.push((c.root.as_path(), vec![i])),
+        }
+    }
+    let mut rows = Vec::with_capacity(review.set.files.len() + groups.len());
+    for (_, files) in groups {
+        rows.push(ListRow::Folder {
+            first: files[0],
+            count: files.len(),
+        });
+        rows.extend(files.into_iter().map(ListRow::File));
+    }
+    rows
+}
+
+/// File indices in list order.
+fn file_order(review: &PendingReview) -> Vec<usize> {
+    list_rows(review)
+        .into_iter()
+        .filter_map(|row| match row {
+            ListRow::File(i) => Some(i),
+            ListRow::Folder { .. } => None,
+        })
+        .collect()
+}
+
+/// A folder header's label: the workspace folder's display name, else the
+/// root's directory name.
+fn folder_label(app: &App, root: &std::path::Path) -> String {
+    app.workspace
+        .folders()
+        .iter()
+        .find(|f| f.path == root)
+        .map(|f| f.display_name().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// Every folder of `review` with a label unique within it: the folder's
+/// [`folder_label`], or its full path when two folders share that label. The
+/// TUI headers and the phone's `TurnReviewFile.folder` both use it, and a
+/// phone action names its file by `(folder, path)`.
+fn folder_labels(app: &App, review: &PendingReview) -> Vec<(std::path::PathBuf, String)> {
+    let mut labels: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for c in &review.set.files {
+        if !labels.iter().any(|(root, _)| *root == c.root) {
+            labels.push((c.root.clone(), folder_label(app, &c.root)));
+        }
+    }
+    let shared: Vec<String> = labels
+        .iter()
+        .filter(|(_, l)| labels.iter().filter(|(_, o)| o == l).count() > 1)
+        .map(|(_, l)| l.clone())
+        .collect();
+    for (root, label) in &mut labels {
+        if shared.contains(label) {
+            *label = root.display().to_string();
+        }
+    }
+    labels
+}
+
+fn label_of<'a>(labels: &'a [(std::path::PathBuf, String)], root: &std::path::Path) -> &'a str {
+    labels
+        .iter()
+        .find(|(r, _)| r == root)
+        .map(|(_, l)| l.as_str())
+        .unwrap_or_default()
+}
+
+/// Move the selection one file along the list order, stopping at the ends.
+fn move_selection(app: &mut App, forward: bool) {
+    let Some(review) = active_review(app) else {
+        return;
+    };
+    let order = file_order(review);
+    let Some(pos) = order.iter().position(|&i| i == app.turn_review_view.selected) else {
+        if let Some(&first) = order.first() {
+            app.turn_review_view.selected = first;
+        }
+        return;
+    };
+    let next = if forward {
+        order.get(pos + 1)
+    } else {
+        pos.checked_sub(1).and_then(|p| order.get(p))
+    };
+    if let Some(&i) = next {
+        app.turn_review_view.selected = i;
+    }
+}
+
 /// The decision taken on a file, or `None` while it is still undecided.
 /// `Keep` = accepted; `Revert` = rejected (already applied on disk).
 fn decided<'a>(review: &'a PendingReview, change: &FileChange) -> Option<&'a FileDecision> {
@@ -208,21 +319,16 @@ pub(super) fn handle_turn_review_action(app: &mut App, action: &Action) -> bool 
         app.left_panel = LeftPanelMode::FileTree;
         return false;
     }
-    let files = active_review(app).map(|r| r.set.files.len()).unwrap_or(0);
     // The "changed since the turn" confirmation survives only a repeat of
     // the key that raised it.
     let armed_before = app.turn_review_view.confirm_force.clone();
     let consumed = match action {
         Action::CursorDown | Action::InsertChar('j') => {
-            if app.turn_review_view.selected + 1 < files {
-                app.turn_review_view.selected += 1;
-            }
+            move_selection(app, true);
             true
         }
         Action::CursorUp | Action::InsertChar('k') => {
-            if app.turn_review_view.selected > 0 {
-                app.turn_review_view.selected -= 1;
-            }
+            move_selection(app, false);
             true
         }
         // The whole file with its changes highlighted, in the editor's diff tab
@@ -458,10 +564,15 @@ fn advance_or_finish(app: &mut App) {
     let Some(review) = active_review(app) else {
         return;
     };
-    let n = review.set.files.len();
-    let start = app.turn_review_view.selected;
+    // In list order, so the jump stays within the folder group on screen.
+    let order = file_order(review);
+    let n = order.len();
+    let start = order
+        .iter()
+        .position(|&i| i == app.turn_review_view.selected)
+        .unwrap_or(0);
     let next = (1..=n)
-        .map(|step| (start + step) % n)
+        .map(|step| order[(start + step) % n])
         .find(|&i| decided(review, &review.set.files[i]).is_none());
     match next {
         Some(i) => {
@@ -764,8 +875,9 @@ fn recorded_blob(sha256: &str) -> BlobRef {
 
 // ── Remote projection ────────────────────────────────────────────────
 
-pub(crate) fn review_dto(review: &PendingReview) -> gaviero_remote::dto::TurnReview {
+pub(crate) fn review_dto(app: &App, review: &PendingReview) -> gaviero_remote::dto::TurnReview {
     use gaviero_remote::dto as rdto;
+    let labels = folder_labels(app, review);
     rdto::TurnReview {
         turn_id: review.set.turn_id.clone(),
         conv_id: review.set.conv_id.clone(),
@@ -780,6 +892,8 @@ pub(crate) fn review_dto(review: &PendingReview) -> gaviero_remote::dto::TurnRev
             .iter()
             .map(|c| rdto::TurnReviewFile {
                 path: c.rel.clone(),
+                // Always sent, so the phone groups like the desktop list.
+                folder: Some(label_of(&labels, &c.root).to_string()),
                 change: match c.kind {
                     ChangeKind::Added => rdto::TurnFileChange::Added,
                     ChangeKind::Modified => rdto::TurnFileChange::Modified,
@@ -802,7 +916,10 @@ pub(crate) fn review_dto(review: &PendingReview) -> gaviero_remote::dto::TurnRev
 
 /// Every pending review, for `snapshot.open_turn_reviews`.
 pub(crate) fn open_reviews_dto(app: &App) -> Vec<gaviero_remote::dto::TurnReview> {
-    app.pending_turn_reviews.iter().map(review_dto).collect()
+    app.pending_turn_reviews
+        .iter()
+        .map(|r| review_dto(app, r))
+        .collect()
 }
 
 fn push_review_frame(app: &mut App, turn_id: &str, created: bool) {
@@ -815,7 +932,7 @@ fn push_review_frame(app: &mut App, turn_id: &str, created: bool) {
         return;
     };
     let event = TurnReviewEvent {
-        review: review_dto(review),
+        review: review_dto(app, review),
     };
     app.remote.push_frame(if created {
         ServerFrame::TurnReviewPending(event)
@@ -837,6 +954,7 @@ pub(crate) fn apply_remote_action(
     turn_id: &str,
     action: &str,
     path: Option<&str>,
+    folder: Option<&str>,
 ) -> Result<(), String> {
     let Some(index) = app
         .pending_turn_reviews
@@ -851,13 +969,23 @@ pub(crate) fn apply_remote_action(
             ..TurnReviewView::default()
         };
     }
+    // `(folder, path)` names one file when two folders change the same path;
+    // a client that sent no folder (before 1.5) gets the first match.
     let file_idx = |app: &App, rel: &str| -> Result<usize, String> {
-        app.pending_turn_reviews[index]
+        let review = &app.pending_turn_reviews[index];
+        let labels = folder_labels(app, review);
+        review
             .set
             .files
             .iter()
-            .position(|c| c.rel == rel || c.key() == rel)
-            .ok_or_else(|| format!("{rel} is not part of this turn"))
+            .position(|c| {
+                (c.rel == rel || c.key() == rel)
+                    && folder.is_none_or(|f| label_of(&labels, &c.root) == f)
+            })
+            .ok_or_else(|| match folder {
+                Some(f) => format!("{f}/{rel} is not part of this turn"),
+                None => format!("{rel} is not part of this turn"),
+            })
     };
     match action {
         "keep_file" | "revert_file" => {
@@ -986,26 +1114,71 @@ pub(super) fn render_turn_review_list(app: &mut App, frame: &mut Frame, area: Re
         ..inner
     };
     let visible = list.height as usize;
+    let rows = list_rows(review);
+    // `scroll_offset` counts list rows, folder headers included.
+    let selected_row = rows
+        .iter()
+        .position(|r| *r == ListRow::File(app.turn_review_view.selected))
+        .unwrap_or(0);
+    // Scrolling up to a group's first file also brings its header into view.
+    let top_row = match selected_row.checked_sub(1).map(|r| rows[r]) {
+        Some(ListRow::Folder { .. }) => selected_row - 1,
+        _ => selected_row,
+    };
     let view = &mut app.turn_review_view;
     if visible > 0 {
-        if view.selected < view.scroll_offset {
-            view.scroll_offset = view.selected;
-        } else if view.selected >= view.scroll_offset + visible {
-            view.scroll_offset = view.selected + 1 - visible;
+        if top_row < view.scroll_offset {
+            view.scroll_offset = top_row;
+        } else if selected_row >= view.scroll_offset + visible {
+            view.scroll_offset = selected_row + 1 - visible;
         }
     }
     let review = &app.pending_turn_reviews[app.turn_review_view.active];
     let view = &app.turn_review_view;
-    for (row, (i, c)) in review
-        .set
-        .files
+    let labels = folder_labels(app, review);
+    for (row, list_row) in rows
         .iter()
-        .enumerate()
         .skip(view.scroll_offset)
         .take(visible)
         .enumerate()
     {
         let y = list.y + row as u16;
+        let i = match *list_row {
+            ListRow::File(i) => i,
+            ListRow::Folder { first, count } => {
+                let root = &review.set.files[first].root;
+                let undecided = review
+                    .set
+                    .files
+                    .iter()
+                    .filter(|c| c.root == *root && decided(review, c).is_none())
+                    .count();
+                let counts = if undecided == 0 {
+                    format!("  {count} file(s), all decided")
+                } else {
+                    format!("  {undecided} of {count} file(s) left")
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!(" ▾ {}", label_of(&labels, root)),
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(counts, Style::default().fg(theme::TEXT_DIM)),
+                ])
+                .render(
+                    Rect {
+                        y,
+                        height: 1,
+                        ..list
+                    },
+                    frame.buffer_mut(),
+                );
+                continue;
+            }
+        };
+        let c = &review.set.files[i];
         let selected = i == view.selected;
         let (decision, decision_color) = match decided(review, c) {
             None => ("        ", theme::TEXT_DIM),
@@ -1037,7 +1210,8 @@ pub(super) fn render_turn_review_list(app: &mut App, frame: &mut Frame, area: Re
             Style::default().fg(theme::TEXT_FG)
         };
         let line = Line::from(vec![
-            Span::styled(format!(" {decision} "), Style::default().fg(decision_color)),
+            // Indented under its folder header.
+            Span::styled(format!("   {decision} "), Style::default().fg(decision_color)),
             Span::styled(format!("{kind} "), Style::default().fg(kind_color)),
             Span::styled(c.rel.clone(), name_style),
             Span::styled(flags, Style::default().fg(theme::WARNING)),
@@ -1090,11 +1264,12 @@ pub(super) fn click_row(app: &mut App, relative_row: usize) -> Option<(usize, bo
         .map(|r| r.set.warnings.len())
         .unwrap_or(0);
     let row = relative_row.checked_sub(header)?;
-    let idx = app.turn_review_view.scroll_offset + row;
-    let files = active_review(app).map(|r| r.set.files.len()).unwrap_or(0);
-    if idx >= files {
+    // A folder header is not selectable.
+    let ListRow::File(idx) = *list_rows(active_review(app)?)
+        .get(app.turn_review_view.scroll_offset + row)?
+    else {
         return None;
-    }
+    };
     let was_selected = app.turn_review_view.selected == idx;
     app.turn_review_view.selected = idx;
     Some((idx, was_selected))
@@ -1433,6 +1608,209 @@ mod tests {
         assert_eq!(f.read("a.txt").as_deref(), Some("v3\n"));
     }
 
+    /// A multi-folder workspace: two folders each change a `main.rs`. The
+    /// list groups them under a header per folder, whatever order the change
+    /// set holds them in, and the cursor walks the list as drawn.
+    #[test]
+    fn files_are_grouped_under_their_workspace_folder() {
+        let mut f = Fixture::new();
+        let app_root = f.root().join("app");
+        let lib_root = f.root().join("lib");
+        for root in [&app_root, &lib_root] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("main.rs"), "v1\n").unwrap();
+        }
+        f.app
+            .workspace
+            .add_root(lib_root.clone(), Some("library".into()));
+
+        let scope = CaptureScope {
+            roots: vec![app_root.clone(), lib_root.clone()],
+            ..CaptureScope::default()
+        };
+        let conv = f.conv();
+        let handle = f.app.turn_capture.begin("t1", Some(&conv), scope).unwrap();
+        std::fs::write(app_root.join("main.rs"), "v2\n").unwrap();
+        std::fs::write(app_root.join("z.rs"), "new\n").unwrap();
+        std::fs::write(lib_root.join("main.rs"), "v2\n").unwrap();
+        let end = f
+            .app
+            .turn_capture
+            .end(handle, TurnOutcome::Completed)
+            .unwrap();
+        let mut review = PendingReview::new(end.set);
+        // Interleave the folders: grouping must not rely on the set's order.
+        let pos = |r: &PendingReview, root: &std::path::Path, rel: &str| {
+            r.set
+                .files
+                .iter()
+                .position(|c| c.root == root && c.rel == rel)
+                .unwrap()
+        };
+        let order = [
+            pos(&review, &app_root, "main.rs"),
+            pos(&review, &lib_root, "main.rs"),
+            pos(&review, &app_root, "z.rs"),
+        ];
+        review.set.files = order.iter().map(|&i| review.set.files[i].clone()).collect();
+        on_turn_review_pending(&mut f.app, review, end.overlapped_reviews);
+
+        let review = active_review(&f.app).unwrap();
+        assert_eq!(
+            list_rows(review),
+            vec![
+                ListRow::Folder { first: 0, count: 2 },
+                ListRow::File(0),
+                ListRow::File(2),
+                ListRow::Folder { first: 1, count: 1 },
+                ListRow::File(1),
+            ]
+        );
+
+        let text = render_to_text(&mut f.app);
+        assert!(text.contains("▾ app"), "{text}");
+        assert!(text.contains("▾ library"), "workspace display name: {text}");
+
+        // `j` follows the drawn order: app/main.rs → app/z.rs → lib/main.rs.
+        let selected = |f: &Fixture| {
+            let c = selected_change(&f.app).unwrap();
+            (c.root.clone(), c.rel.clone())
+        };
+        assert_eq!(selected(&f), (app_root.clone(), "main.rs".into()));
+        f.key('j');
+        assert_eq!(selected(&f), (app_root.clone(), "z.rs".into()));
+        f.key('j');
+        assert_eq!(selected(&f), (lib_root.clone(), "main.rs".into()));
+        f.key('k');
+        assert_eq!(selected(&f), (app_root.clone(), "z.rs".into()));
+
+        // A header row is not selectable; the row below it is the first file.
+        // Rows: title, file count, then the list.
+        assert_eq!(click_row(&mut f.app, 2), None);
+        assert_eq!(click_row(&mut f.app, 3), Some((0, false)));
+
+        // Accepting moves to the next undecided file in list order.
+        f.key('a');
+        assert_eq!(selected(&f), (app_root.clone(), "z.rs".into()));
+        f.key('a');
+        assert_eq!(selected(&f), (lib_root.clone(), "main.rs".into()));
+        f.key('r');
+        assert!(!conv_has_pending_review(&f.app, &conv));
+        assert_eq!(
+            std::fs::read_to_string(lib_root.join("main.rs")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app_root.join("main.rs")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    /// A turn over two workspace folders, `app` and `lib` (named "library"),
+    /// that changes `main.rs` in both. Returns the two roots.
+    fn two_folder_turn(f: &mut Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+        let app_root = f.root().join("app");
+        let lib_root = f.root().join("lib");
+        for root in [&app_root, &lib_root] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("main.rs"), "v1\n").unwrap();
+        }
+        f.app
+            .workspace
+            .add_root(lib_root.clone(), Some("library".into()));
+        let scope = CaptureScope {
+            roots: vec![app_root.clone(), lib_root.clone()],
+            ..CaptureScope::default()
+        };
+        let conv = f.conv();
+        let handle = f.app.turn_capture.begin("t1", Some(&conv), scope).unwrap();
+        std::fs::write(app_root.join("main.rs"), "v2\n").unwrap();
+        std::fs::write(lib_root.join("main.rs"), "v2\n").unwrap();
+        let end = f
+            .app
+            .turn_capture
+            .end(handle, TurnOutcome::Completed)
+            .unwrap();
+        on_turn_review_pending(&mut f.app, PendingReview::new(end.set), end.overlapped_reviews);
+        (app_root, lib_root)
+    }
+
+    /// The phone gets each file's folder, and names a file by `(folder, path)`
+    /// — `main.rs` alone would be ambiguous.
+    #[test]
+    fn the_phone_groups_by_folder_and_names_files_by_folder_and_path() {
+        use gaviero_remote::dto::TurnReviewActionKind as K;
+        use gaviero_remote::envelope::TurnReviewAction;
+
+        let mut f = Fixture::new();
+        let (app_root, lib_root) = two_folder_turn(&mut f);
+
+        let snap = super::super::projection::build_snapshot(&f.app);
+        let mut folders: Vec<(String, String)> = snap.open_turn_reviews[0]
+            .files
+            .iter()
+            .map(|file| (file.folder.clone().unwrap(), file.path.clone()))
+            .collect();
+        folders.sort();
+        assert_eq!(
+            folders,
+            vec![
+                ("app".to_string(), "main.rs".to_string()),
+                ("library".to_string(), "main.rs".to_string()),
+            ]
+        );
+
+        let reject = |folder: &str| TurnReviewAction {
+            turn_id: "t1".into(),
+            action: K::RevertFile,
+            path: Some("main.rs".into()),
+            folder: Some(folder.into()),
+        };
+        assert!(
+            super::super::remote::apply_turn_review_action(&mut f.app, &reject("nope")).is_err(),
+            "an unknown folder names no file"
+        );
+        super::super::remote::apply_turn_review_action(&mut f.app, &reject("library")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(lib_root.join("main.rs")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app_root.join("main.rs")).unwrap(),
+            "v2\n",
+            "the other folder's main.rs is untouched"
+        );
+        assert!(conv_has_pending_review(&f.app, &f.conv()));
+    }
+
+    /// Two folders with the same name are told apart by their full paths.
+    #[test]
+    fn folders_sharing_a_name_are_labelled_by_path() {
+        let mut f = Fixture::new();
+        let a = f.root().join("a").join("src");
+        let b = f.root().join("b").join("src");
+        let scope = CaptureScope {
+            roots: vec![a.clone(), b.clone()],
+            ..CaptureScope::default()
+        };
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let conv = f.conv();
+        let handle = f.app.turn_capture.begin("t1", Some(&conv), scope).unwrap();
+        std::fs::write(a.join("x.rs"), "x\n").unwrap();
+        std::fs::write(b.join("x.rs"), "x\n").unwrap();
+        let end = f
+            .app
+            .turn_capture
+            .end(handle, TurnOutcome::Completed)
+            .unwrap();
+        let review = PendingReview::new(end.set);
+        let labels = folder_labels(&f.app, &review);
+        assert_eq!(label_of(&labels, &a), a.display().to_string());
+        assert_eq!(label_of(&labels, &b), b.display().to_string());
+    }
+
     #[test]
     fn rejecting_a_file_edited_after_the_turn_needs_a_second_press() {
         let mut f = Fixture::new();
@@ -1495,6 +1873,7 @@ mod tests {
             turn_id: "t1".into(),
             action,
             path: path.map(str::to_string),
+            folder: None,
         };
         assert_eq!(
             snap.open_turn_reviews[0].files[0].decision,
@@ -1534,6 +1913,7 @@ mod tests {
             turn_id: "t1".into(),
             action: K::RevertAll,
             path: None,
+            folder: None,
         };
         assert!(super::super::remote::apply_turn_review_action(&mut f.app, &reject_all).is_err());
         assert!(super::super::remote::apply_turn_review_action(&mut f.app, &reject_all).is_err());

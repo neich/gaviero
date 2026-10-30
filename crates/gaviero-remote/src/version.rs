@@ -10,14 +10,17 @@ use serde::{Deserialize, Serialize};
 /// and two error codes. Minor 3 is additive: the `file_browser` capability
 /// with the `list_directory` / `read_file` client frames. Minor 4 is
 /// additive: the `permission_turn_grant` capability, optional
-/// `permission_request.mcp_server` and `permission_decision.grant`.
+/// `permission_request.mcp_server` and `permission_decision.grant`. Minor 5
+/// is additive: optional `TurnReviewFile.folder` and
+/// `turn_review_action.folder` (no capability — a client groups by `folder`
+/// when files carry it, and echoes it only then).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {

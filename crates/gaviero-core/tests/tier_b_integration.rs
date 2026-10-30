@@ -139,6 +139,7 @@ async fn b6_telemetry_to_b5_trust_rescore_full_loop() {
         "embedder_name": "test-embedder-v1",
         "query_text": "widget retries",
         "selected_ids": [mem_id],
+        "selected": [{ "id": mem_id, "scope_level": 2, "repo_id": "repo-alpha" }],
         "token_budget_used": 64,
         "token_budget_limit": 1000,
     });
@@ -181,6 +182,7 @@ async fn b6_telemetry_to_b5_trust_rescore_full_loop() {
             "schema_version": 1,
             "query_text": format!("widget retries v{n}"),
             "selected_ids": [mem_id],
+            "selected": [{ "id": mem_id, "scope_level": 2, "repo_id": "repo-alpha" }],
             "token_budget_used": 64,
             "token_budget_limit": 1000,
         });
@@ -214,10 +216,12 @@ async fn b6_telemetry_to_b5_trust_rescore_full_loop() {
         utils[0].utilization_rate
     );
 
-    // Run sleeptime with telemetry-driven trust rescore. Default
-    // thresholds: ≥5 injections, used > 0.6 → +0.05 trust.
+    // Run sleeptime with telemetry-driven trust rescore (opt-in via
+    // `trust_adjust_enabled`). Default thresholds: ≥5 injections,
+    // used > 0.6 → +0.05 trust.
     let mut sleep_cfg = SleeptimeConfig::default();
     sleep_cfg.dry_run = false;
+    sleep_cfg.trust_adjust_enabled = true;
     let report: SleeptimeReport = run_sleeptime(&store, &sleep_cfg, None).await.unwrap();
     assert!(
         report.trust_adjusted >= 1,
@@ -500,9 +504,10 @@ async fn eval_from_manifests_replays_persisted_pool() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// T6. B5 trust adjustment respects the floor: many "unused"
-//     classifications drag trust down by 0.05 per pass, but it never
-//     drops below `cfg.trust_floor` (default 0.2).
+// T6. B5 trust adjustment respects the floor: each batch of fresh
+//     "unused" classifications drags trust down by 0.05, but it never
+//     drops below `cfg.trust_floor` (default 0.2). Every pass consumes
+//     its evidence, so each pass is fed a new batch.
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -518,18 +523,27 @@ async fn trust_rescore_floors_at_configured_minimum() {
         WriteMeta::for_source(MemorySource::LlmExtracted).with_trust_score(0.30),
     )
     .await;
-    // 6 unused classifications crosses the 5-injection floor.
-    for rank in 1..=6 {
-        store
-            .record_retrieval_use(id, &format!("t-{rank}"), None, rank, "unused", 0.10, false)
-            .await
-            .unwrap();
-    }
     let mut cfg = SleeptimeConfig::default();
     cfg.dry_run = false;
+    cfg.trust_adjust_enabled = true;
     // Run repeatedly until adjustment stops.
     let mut last_trust = 0.30_f32;
-    for _ in 0..10 {
+    for pass in 0..10 {
+        // 6 fresh unused classifications cross the 5-injection floor.
+        for rank in 1..=6 {
+            store
+                .record_retrieval_use(
+                    id,
+                    &format!("t-{pass}-{rank}"),
+                    None,
+                    rank,
+                    "unused",
+                    0.10,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         run_sleeptime(&store, &cfg, None).await.unwrap();
         let row = store
             .search_at_level(

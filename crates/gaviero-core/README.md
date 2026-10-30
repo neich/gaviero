@@ -74,6 +74,9 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `memory.embedder.model` | `nomic` | Embedder: `nomic`, `gte-modernbert`, `jina-code`, `e5-small-v2`, or `dual:<a>,<b>` |
 | `memory.retrieval.mode` | merged | `merged` (multi-scope RRF) or `cascade` (legacy) |
 | `memory.reranker.enabled` | `true` | Cross-encoder reranker |
+| `memory.telemetry.enabled` | `true` | Records whether injected memories were echoed in the reply (B6) |
+| `memory.telemetry.trustAdjustEnabled` | `false` | Lets sleeptime adjust memory trust from that telemetry; each recorded verdict is used at most once |
+| `memory.sleeptime.enabled` | `true` | Background hygiene pass; does not auto-run until a first manual `gaviero-cli --sleep` (`memory.sleeptime.firstRunRequireConfirm`) |
 | `repoMap.symbolEnrichment.enabled` | `false` | Enables `symbol_search` / `symbol_doc` MCP tools |
 | `skills.extraRoots` | `[]` | Extra skill directories (`~` expanded); missing roots warn in the TUI |
 | `agent.toolAgent.maxRounds` | `40` | Tool rounds per `deepseek:` turn before it stops and asks for a hand-off |

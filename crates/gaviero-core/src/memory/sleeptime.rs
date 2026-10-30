@@ -13,9 +13,9 @@
 //! 3. **Cross-scope promotion** — copy module-level Decision / Convention /
 //!    Invariant rows that have a cross-module access-log hit to repo scope.
 //!    Source rows stay; user-authored rows are never auto-widened.
-//! 4. **Trust re-scoring** — uses B6 `retrieval_use` rates when
-//!    available; falls back to raw injection counts (manifest hits)
-//!    until B6 has produced enough rows.
+//! 4. **Trust re-scoring** — uses B6 `retrieval_use` rates; each
+//!    recorded verdict is consumed by at most one adjustment. Gated by
+//!    `memory.telemetry.trustAdjustEnabled` (default off).
 //! 5. **KG node-doc refresh** — Tier D1 stub (no-op).
 //!
 //! Every operation is logged into `sleeptime_audit` so the Tier C2
@@ -41,6 +41,9 @@ pub struct SleeptimeConfig {
     /// When true, all destructive ops are skipped; audit rows are
     /// still produced (with `dry_run = 1`) for review.
     pub dry_run: bool,
+    /// Master switch for step 4 (trust re-scoring). Default false: the
+    /// B6 classifier is not a validated usefulness signal.
+    pub trust_adjust_enabled: bool,
     /// Weighting hooks for trust re-scoring (B5 step 4 / B6).
     pub trust_min_injections: u32,
     pub trust_adjust_delta: f32,
@@ -73,6 +76,7 @@ impl Default for SleeptimeConfig {
             near_dup_threshold: 0.92,
             first_run_require_confirm: true,
             dry_run: false,
+            trust_adjust_enabled: false,
             trust_min_injections: 5,
             trust_adjust_delta: 0.05,
             utilization_used_threshold: 0.6,
@@ -83,6 +87,20 @@ impl Default for SleeptimeConfig {
             compress_history_batch: 32,
             prune_summaries_after_days: 365,
         }
+    }
+}
+
+impl SleeptimeConfig {
+    /// The `WriterMessage::Sleeptime` payload carrying the settings the
+    /// writer-side pass honours (see `writer::parse_sleeptime_payload`).
+    pub fn to_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": self.dry_run,
+            "near_dup_threshold": self.near_dup_threshold,
+            "trust_min_injections": self.trust_min_injections,
+            "trust_adjust_delta": self.trust_adjust_delta,
+            "trust_adjust_enabled": self.trust_adjust_enabled,
+        })
     }
 }
 
@@ -350,16 +368,23 @@ pub async fn run_sleeptime(
         report.promoted = ops.len();
     }
 
-    // Step 4 — trust re-scoring (B6-aware; falls back to manifest
-    // injection counts).
-    if let Ok(ops) = store.sleeptime_trust_rescore(cfg).await {
-        for op in &ops {
-            audit(store, &run_id, op, cfg.dry_run).await;
-            if let Some(o) = observer {
-                o.on_operation(op);
+    // Step 4 — trust re-scoring from B6 telemetry. Off unless
+    // `memory.telemetry.trustAdjustEnabled` is set.
+    if cfg.trust_adjust_enabled {
+        if let Ok(ops) = store.sleeptime_trust_rescore(cfg).await {
+            for op in &ops {
+                audit(store, &run_id, op, cfg.dry_run).await;
+                if let Some(o) = observer {
+                    o.on_operation(op);
+                }
             }
+            report.trust_adjusted = ops.len();
         }
-        report.trust_adjusted = ops.len();
+    } else {
+        tracing::debug!(
+            target: "memory_sleeptime",
+            "trust re-scoring disabled (memory.telemetry.trustAdjustEnabled = false)"
+        );
     }
 
     // Step 5 — telemetry retention prune (90-day default).

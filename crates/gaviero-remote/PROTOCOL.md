@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.4 (1.0 frozen; 1.1, 1.2, 1.3 and 1.4 additive)
+# Gaviero Remote Protocol — v1.5 (1.0 frozen; 1.1 through 1.5 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 4 }
+PROTOCOL_VERSION  = { major: 1, minor: 5 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
@@ -180,7 +180,7 @@ holds the current token.
 | `request_file_completions` | `{ query, limit? }` — requires `file_completions`; workspace paths for an `@` reference |
 | `list_directory` | `{ path? }` — requires `file_browser`; absent/empty ⇒ the workspace roots. `path` is an explorer display path `<root-label>/<rel>`. |
 | `read_file` | `{ path }` — requires `file_browser`; reads one regular UTF-8 file, read-only. |
-| `turn_review_action` | `{ turn_id, action, path? }` — requires `turn_review` (1.2); see §1.2 additions |
+| `turn_review_action` | `{ turn_id, action, path?, folder? }` — requires `turn_review` (1.2); see §1.2 additions; `folder` since 1.5 (§Turn review folders) |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -273,12 +273,12 @@ HunkSummary          { index, hunk_type, description, status }
 
 TurnReview           { turn_id, conv_id?, outcome, files: [TurnReviewFile], warnings? }  (1.2)
   outcome ∈ completed | cancelled | failed
-TurnReviewFile       { path, change, decision, revertible, binary, overlap_with? }       (1.2)
+TurnReviewFile       { path, folder?, change, decision, revertible, binary, overlap_with? }  (1.2; folder 1.5)
   change ∈ added | modified | deleted
   decision ∈ pending | keep | revert | revert_hunks — pending = not decided yet; keep =
   accepted; revert = rejected (already back to the pre-prompt version on disk);
   revert_hunks is not produced by current desktops.
-  path is workspace-folder-relative. revertible: false ⇒ keep is the only option.
+  path is workspace-folder-relative; folder (1.5) labels that workspace folder. revertible: false ⇒ keep is the only option.
   overlap_with lists turn ids whose window overlapped and changed the same path.
 
 RemoteSettings       { default_model?, default_effort? }
@@ -497,6 +497,23 @@ of the current prompt.
 - `grant` with `allow: false`, or on a request without `mcp_server`, is `invalid_payload` and
   leaves the request parked. `permission_closed.outcome` is `allowed` as for a plain allow.
 - The grant never changes what executes: tool inputs are echoed unchanged, as for a plain allow.
+
+## Turn review folders (1.5)
+
+A multi-folder workspace can change the same relative `path` in two folders, so 1.5 names each
+file's workspace folder. There is no capability: the field's presence is the signal.
+
+- `TurnReviewFile.folder` (optional) — the folder's display label, unique within the review (two
+  folders sharing a name are labelled by their full paths). 1.5 servers always send it, even
+  for a single-folder workspace. Clients list files grouped under a header per `folder`, in
+  order of first appearance; files without one (older servers) are listed flat.
+- `turn_review_action.folder` (optional, with `path`) — the file's `TurnReviewFile.folder`.
+  `(folder, path)` names one file; a client sends `folder` exactly when the file carried one.
+  Without it the server takes the first file with `path`; a `folder` matching no file is
+  `invalid_payload`.
+
+Compatibility: a 1.2–1.4 client ignores `folder` and acts on the first file with `path`. A 1.5
+client talking to an older server never receives `folder`, so it never sends one.
 
 ## Fixtures
 

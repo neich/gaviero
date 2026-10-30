@@ -28,6 +28,27 @@ fn notify_phone(
     }
 }
 
+/// System chat notice for a reranker that fell back to composite-only
+/// ranking. `None` when the user configured no reranker (`""` / `"none"`)
+/// and nothing failed; otherwise the reason, so the fallback is not
+/// visible only in `gaviero.log`.
+fn reranker_fallback_notice(model: &str, error: Option<&str>) -> Option<String> {
+    if let Some(e) = error {
+        return Some(format!(
+            "Memory reranker `{model}` failed to load ({e}); retrieval is using composite \
+             ranking only. Details in gaviero.log."
+        ));
+    }
+    match model.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => None,
+        _ => Some(format!(
+            "Memory reranker `{model}` is not a known model; retrieval is using composite \
+             ranking only. Set `memory.reranker.model` to `minilm`, `gte-reranker-modernbert`, \
+             `gte-reranker-modernbert-int8`, or `none`."
+        )),
+    }
+}
+
 pub(super) fn handle_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) => {
@@ -478,6 +499,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                 response_text: visible_content.clone(),
                                 extractor_enabled,
                                 telemetry_enabled,
+                                telemetry_cfg: app
+                                    .workspace
+                                    .resolve_telemetry_classify_config(Some(scope_root)),
                             },
                         );
                     }
@@ -1262,6 +1286,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             model = %model_name,
                             "rerank model resolved to none — falling back to composite"
                         );
+                        if let Some(content) = reranker_fallback_notice(&model_name, None) {
+                            let _ = app.event_tx.send(Event::MessageComplete {
+                                conv_id: String::new(),
+                                role: "system".to_string(),
+                                content,
+                            });
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1270,6 +1301,15 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             error = %e,
                             "failed to load reranker model — falling back to composite"
                         );
+                        let error = format!("{e:#}");
+                        if let Some(content) = reranker_fallback_notice(&model_name, Some(&error))
+                        {
+                            let _ = app.event_tx.send(Event::MessageComplete {
+                                conv_id: String::new(),
+                                role: "system".to_string(),
+                                content,
+                            });
+                        }
                     }
                 }
             }
@@ -1283,46 +1323,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             // `WriterMessage::Sleeptime` when the system has been idle
             // for `min_idle_minutes` AND `last_sleeptime_at` is >24h
             // old, or unconditionally when `weekly_force_run` and >7d.
-            let sleeptime_enabled = app
+            let sleep_cfg = app
                 .workspace
-                .resolve_setting(
-                    gaviero_core::workspace::settings::MEMORY_SLEEPTIME_ENABLED,
-                    Some(&workspace_root),
-                )
-                .as_bool()
-                .unwrap_or(true);
-            if sleeptime_enabled {
-                let mut sleep_cfg = gaviero_core::memory::SleeptimeConfig::default();
-                if let Some(v) = app
-                    .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_MIN_IDLE_MINUTES,
-                        Some(&workspace_root),
-                    )
-                    .as_u64()
-                {
-                    sleep_cfg.min_idle_minutes = v as usize;
-                }
-                if let Some(v) = app
-                    .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_WEEKLY_FORCE_RUN,
-                        Some(&workspace_root),
-                    )
-                    .as_bool()
-                {
-                    sleep_cfg.weekly_force_run = v;
-                }
-                if let Some(v) = app
-                    .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_FIRST_RUN_REQUIRE_CONFIRM,
-                        Some(&workspace_root),
-                    )
-                    .as_bool()
-                {
-                    sleep_cfg.first_run_require_confirm = v;
-                }
+                .resolve_sleeptime_config(Some(&workspace_root));
+            if sleep_cfg.enabled {
                 let scheduler = gaviero_core::memory::SleeptimeScheduler::spawn(
                     stores.clone(),
                     writer,
@@ -2278,5 +2282,24 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             SidePanelMode::CodeGraph => app.handle_code_graph_action(action),
         },
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod reranker_notice_tests {
+    use super::reranker_fallback_notice;
+
+    #[test]
+    fn reranker_fallback_notice_cases() {
+        assert_eq!(reranker_fallback_notice("none", None), None);
+        assert_eq!(reranker_fallback_notice("", None), None);
+        assert!(
+            reranker_fallback_notice("bogus", None)
+                .is_some_and(|m| m.contains("not a known model"))
+        );
+        assert!(
+            reranker_fallback_notice("minilm", Some("download failed"))
+                .is_some_and(|m| m.contains("download failed"))
+        );
     }
 }

@@ -12,6 +12,14 @@ use anyhow::{Context, Result};
 
 use super::{MemoryStore, stmt_or_err};
 
+/// `retrieval_use.routing_version` for a row recorded in the store that
+/// owns `memory_id` (schema v17). Only these rows feed trust re-scoring.
+pub const RETRIEVAL_USE_ROUTED: i32 = 2;
+
+/// `retrieval_use.routing_version` for a row whose `memory_id` was looked
+/// up in the workspace store only (legacy manifests without scope info).
+pub const RETRIEVAL_USE_LEGACY: i32 = 1;
+
 /// B6: aggregated retrieval-use stats for one memory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryUtilization {
@@ -40,7 +48,8 @@ impl MemoryStore {
         Ok(n)
     }
 
-    /// B6: persist one classification row from the telemetry pass.
+    /// B6: persist one classification row from the telemetry pass,
+    /// recorded as owner-routed ([`RETRIEVAL_USE_ROUTED`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_retrieval_use(
         &self,
@@ -52,12 +61,41 @@ impl MemoryStore {
         cosine_to_response: f32,
         substring_hit: bool,
     ) -> Result<i64> {
+        self.record_retrieval_use_versioned(
+            memory_id,
+            turn_id,
+            session_id,
+            injected_rank,
+            classification,
+            cosine_to_response,
+            substring_hit,
+            RETRIEVAL_USE_ROUTED,
+        )
+        .await
+    }
+
+    /// B6: persist one classification row with an explicit
+    /// `routing_version` ([`RETRIEVAL_USE_ROUTED`] or
+    /// [`RETRIEVAL_USE_LEGACY`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_retrieval_use_versioned(
+        &self,
+        memory_id: i64,
+        turn_id: &str,
+        session_id: Option<&str>,
+        injected_rank: i32,
+        classification: &str,
+        cosine_to_response: f32,
+        substring_hit: bool,
+        routing_version: i32,
+    ) -> Result<i64> {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO retrieval_use
                  (memory_id, turn_id, session_id, injected_rank,
-                  classification, cosine_to_response, substring_hit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                  classification, cosine_to_response, substring_hit,
+                  routing_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 memory_id,
                 turn_id,
@@ -66,6 +104,7 @@ impl MemoryStore {
                 classification,
                 cosine_to_response,
                 substring_hit as i64,
+                routing_version,
             ],
         )
         .context("inserting retrieval_use row")?;

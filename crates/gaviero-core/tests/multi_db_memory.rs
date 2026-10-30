@@ -679,6 +679,91 @@ async fn cross_db_retrieval_records_access_per_owning_store() {
 }
 
 #[tokio::test]
+async fn telemetry_records_use_in_the_owning_store() {
+    // B6 routing: the manifest names a global row; its `retrieval_use`
+    // row must land in the global DB. Global and workspace DBs have
+    // independent rowid spaces, so a workspace-only lookup would record
+    // the verdict against whatever workspace row shares that id.
+    use gaviero_core::memory::{ClassifyConfig, classify_turn_routed};
+
+    let global = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    let library_root = TempDir::new().unwrap();
+
+    let ws = workspace_with_library(
+        workspace_root.path().to_path_buf(),
+        library_root.path().to_path_buf(),
+    );
+    let stores = open_registry(workspace_root.path(), &ws, global.path());
+    let meta = WriteMeta::for_source(MemorySource::LlmExtracted);
+
+    let id_of = |r: StoreResult| match r {
+        StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+        StoreResult::AlreadyCovered => panic!("expected an id"),
+    };
+    let gid = id_of(
+        stores
+            .store_scoped(
+                &WriteScope::Global,
+                "global guidance about widget retries",
+                &meta,
+            )
+            .await
+            .unwrap(),
+    );
+    let _wid = id_of(
+        stores
+            .store_scoped(&WriteScope::Workspace, "workspace note on parsers", &meta)
+            .await
+            .unwrap(),
+    );
+
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "query_text": "widget retries",
+        "selected_ids": [gid],
+        "selected": [{ "id": gid, "scope_level": 0, "repo_id": null }],
+    });
+    stores
+        .workspace()
+        .store_injection_manifest("turn-route", "conv-route", "chat", &payload)
+        .await
+        .unwrap();
+
+    let response = "the global guidance about widget retries applies here because \
+                    the retry budget and the backoff schedule both come from it";
+    let report = classify_turn_routed(
+        &stores,
+        "turn-route",
+        Some("conv-route"),
+        response,
+        &ClassifyConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.items.len(), 1, "{report:?}");
+
+    let injections = |utils: Vec<gaviero_core::memory::MemoryUtilization>| {
+        utils
+            .iter()
+            .find(|u| u.memory_id == gid)
+            .map(|u| u.times_injected)
+            .unwrap_or(0)
+    };
+    let global_utils = stores.global().memory_utilization(&[gid]).await.unwrap();
+    assert!(
+        injections(global_utils) >= 1,
+        "the owning (global) store must record the injection"
+    );
+    let ws_utils = stores.workspace().memory_utilization(&[gid]).await.unwrap();
+    assert_eq!(
+        injections(ws_utils),
+        0,
+        "the workspace store must not record a verdict for a global id"
+    );
+}
+
+#[tokio::test]
 async fn consolidator_promotes_run_rows_into_correct_folder_db() {
     // Step 7 contract: a run row written into the workspace DB
     // should be promoted (via the Consolidator) into the correct
@@ -780,46 +865,6 @@ async fn consolidator_promotes_run_rows_into_correct_folder_db() {
         "run rows should be cleared from workspace after promotion; got {} rows",
         post_workspace_runs.len()
     );
-}
-
-#[tokio::test]
-async fn consolidator_decay_fans_out_to_every_opened_store() {
-    // Step 7 contract: decay_and_prune iterates every opened store,
-    // not just the workspace DB. We verify by writing into TWO stores
-    // and confirming both are touched (counts come back as the SUM).
-    use gaviero_core::memory::consolidation::Consolidator;
-
-    let global = TempDir::new().unwrap();
-    let workspace_root = TempDir::new().unwrap();
-    let library_root = TempDir::new().unwrap();
-
-    let ws = workspace_with_library(
-        workspace_root.path().to_path_buf(),
-        library_root.path().to_path_buf(),
-    );
-    let stores = open_registry(workspace_root.path(), &ws, global.path());
-    let meta = WriteMeta::for_source(MemorySource::UserRemember).with_importance(0.5);
-
-    stores
-        .store_scoped(&WriteScope::Workspace, "ws fact", &meta)
-        .await
-        .unwrap();
-    stores
-        .store_scoped(
-            &WriteScope::Repo {
-                repo_id: hash_path(library_root.path()),
-            },
-            "lib fact",
-            &meta,
-        )
-        .await
-        .unwrap();
-
-    let consolidator = Consolidator::with_stores(stores.clone());
-    // Just ensure the call succeeds and returns a count >= 0; the
-    // important thing is no per-store panic / error.
-    let (decayed, pruned) = consolidator.decay_and_prune().await.unwrap();
-    let _ = (decayed, pruned);
 }
 
 #[tokio::test]

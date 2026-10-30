@@ -347,8 +347,16 @@ impl MemoryStore {
     }
 
     /// B5 step 4: trust re-scoring driven by retrieval-use telemetry
-    /// (B6) and the manifest hit count fallback. Returns one
-    /// [`SleeptimeOperation::TrustAdjusted`] per adjusted row.
+    /// (B6). Returns one [`SleeptimeOperation::TrustAdjusted`] per
+    /// adjusted row.
+    ///
+    /// Only owner-routed rows (`routing_version >= 2`) not yet consumed
+    /// (`rescored_at IS NULL`) count, and every row of a memory that is
+    /// evaluated — adjusted, neutral, or already at its clamp — is marked
+    /// consumed, so each recorded verdict contributes to at most one
+    /// adjustment. Memories below `trust_min_injections` keep their rows
+    /// pending until enough accumulate. Legacy (`routing_version = 1`)
+    /// rows are ignored: their `memory_id` may name a different memory.
     pub async fn sleeptime_trust_rescore(
         &self,
         cfg: &SleeptimeConfig,
@@ -359,15 +367,20 @@ impl MemoryStore {
                 "SELECT m.id, m.trust_score, m.source,
                         COUNT(ru.id)                                       AS injections,
                         SUM(CASE WHEN ru.classification = 'used'    THEN 1 ELSE 0 END) AS used,
-                        SUM(CASE WHEN ru.classification = 'unused'  THEN 1 ELSE 0 END) AS unused
+                        SUM(CASE WHEN ru.classification = 'unused'  THEN 1 ELSE 0 END) AS unused,
+                        MAX(ru.id)                                         AS max_ru_id
                  FROM memories m
-                 LEFT JOIN retrieval_use ru ON ru.memory_id = m.id
+                 JOIN retrieval_use ru ON ru.memory_id = m.id
+                      AND ru.rescored_at IS NULL
+                      AND ru.routing_version >= 2
                  WHERE m.superseded_by IS NULL
                  GROUP BY m.id",
             )
             .context("preparing trust_rescore")?;
         let mut q = stmt.query([]).context("running trust_rescore")?;
         let mut updates: Vec<(i64, f32, f32, Option<f32>, u32)> = Vec::new();
+        // (memory_id, max retrieval_use id) for every evaluated memory.
+        let mut consumed: Vec<(i64, i64)> = Vec::new();
         while let Some(r) = q.next().context("trust_rescore row")? {
             let id: i64 = r.get(0)?;
             let trust: f32 = r.get(1)?;
@@ -375,6 +388,7 @@ impl MemoryStore {
             let injections: u32 = r.get::<_, i64>(3)? as u32;
             let used: u32 = r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u32;
             let _unused: u32 = r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u32;
+            let max_ru_id: i64 = r.get(6)?;
             if injections < cfg.trust_min_injections {
                 continue;
             }
@@ -384,6 +398,7 @@ impl MemoryStore {
             if user_authored {
                 continue;
             }
+            consumed.push((id, max_ru_id));
             let rate = used as f32 / injections as f32;
             let delta = if rate > cfg.utilization_used_threshold {
                 cfg.trust_adjust_delta
@@ -400,6 +415,17 @@ impl MemoryStore {
         }
         drop(q);
         drop(stmt);
+        if !cfg.dry_run {
+            for (id, max_ru_id) in &consumed {
+                conn.execute(
+                    "UPDATE retrieval_use SET rescored_at = datetime('now')
+                     WHERE memory_id = ?1 AND rescored_at IS NULL
+                       AND routing_version >= 2 AND id <= ?2",
+                    rusqlite::params![id, max_ru_id],
+                )
+                .context("marking retrieval_use rows consumed")?;
+            }
+        }
         // Apply updates in a fresh write-pass.
         let mut ops = Vec::with_capacity(updates.len());
         for (id, old_trust, new_trust, rate, injections) in updates {

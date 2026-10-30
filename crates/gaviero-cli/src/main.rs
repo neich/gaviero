@@ -1975,10 +1975,10 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
     .await
     .context("init memory stores (sleeptime)")??;
 
-    let cfg = gaviero_core::memory::SleeptimeConfig {
-        dry_run,
-        ..Default::default()
-    };
+    let mut cfg = ws
+        .workspace
+        .resolve_sleeptime_config(Some(ws.state_root.as_path()));
+    cfg.dry_run = dry_run;
     let _ = stores.open_all_folders().await;
     let mut targets = vec![stores.workspace().clone()];
     for store in stores.opened_folder_stores().await {
@@ -2011,6 +2011,14 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
     println!("─── Sleeptime report ────────────────────────────────");
     println!("run_id          : {last_run_id}");
     println!("dry_run         : {dry_run}");
+    println!(
+        "trust_adjust    : {}",
+        if cfg.trust_adjust_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("decay_flagged   : {decay_flagged}");
     println!("near_dup_merged : {near_dup_merged}");
     println!("promoted        : {promoted}");

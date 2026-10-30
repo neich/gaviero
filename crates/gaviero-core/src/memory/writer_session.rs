@@ -450,8 +450,11 @@ pub(crate) async fn apply_session_consolidate(
             ConsolidationOp::Merge { into_memory_id, .. } => {
                 // Best-effort trust bump on the surviving row;
                 // text-merge is deferred (the LLM picked the existing
-                // row to "fold into" — keeping its content).
+                // row to "fold into" — keeping its content). The bump
+                // never lowers trust, and user-authored / History rows
+                // are refused outright: the LLM may not touch them.
                 let before = store.get_memory_row(into_memory_id).await.ok().flatten();
+                let mut new_trust = MERGE_TRUST;
                 let (error, before_json) = match &before {
                     None => (
                         Some(format!(
@@ -463,13 +466,23 @@ pub(crate) async fn apply_session_consolidate(
                         let before_json =
                             json!({ "trust_score": row.trust_score, "memory_id": row.id })
                                 .to_string();
-                        match store.set_trust_score(into_memory_id, MERGE_TRUST).await {
-                            Ok(()) => (None, Some(before_json)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "memory_consolidator", error = %e, "MERGE failed"
-                                );
-                                (Some(format!("{e:#}")), Some(before_json))
+                        if !crate::memory::trust_defaults::is_agent_flaggable(row.source) {
+                            (
+                                Some(format!(
+                                    "merge target memory {into_memory_id} is user-authored or history; refused"
+                                )),
+                                Some(before_json),
+                            )
+                        } else {
+                            new_trust = row.trust_score.max(MERGE_TRUST);
+                            match store.set_trust_score(into_memory_id, new_trust).await {
+                                Ok(()) => (None, Some(before_json)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "memory_consolidator", error = %e, "MERGE failed"
+                                    );
+                                    (Some(format!("{e:#}")), Some(before_json))
+                                }
                             }
                         }
                     }
@@ -479,7 +492,7 @@ pub(crate) async fn apply_session_consolidate(
                 }
                 let after_json = error
                     .is_none()
-                    .then(|| json!({ "trust_score": MERGE_TRUST }).to_string());
+                    .then(|| json!({ "trust_score": new_trust }).to_string());
                 record_consolidation_op(
                     store,
                     ConsolidationAudit {
@@ -511,6 +524,32 @@ pub(crate) async fn apply_session_consolidate(
                     .flatten();
                 if superseded.is_none() {
                     let error = format!("superseded memory {supersedes_memory_id} does not exist");
+                    tracing::warn!(target: "memory_consolidator", %error, "rejecting SUPERSEDE");
+                    record_consolidation_op(
+                        store,
+                        ConsolidationAudit {
+                            run_id,
+                            batch_id,
+                            kind,
+                            memory_id: None,
+                            related_id: Some(supersedes_memory_id),
+                            op_json: &op_json,
+                            before_json: None,
+                            after_json: None,
+                            error: Some(&error),
+                            scope: &scope_label,
+                            expected_outcome: expected.as_deref(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(row) = &superseded
+                    && !crate::memory::trust_defaults::is_agent_flaggable(row.source)
+                {
+                    let error = format!(
+                        "superseded memory {supersedes_memory_id} is user-authored or history; refused"
+                    );
                     tracing::warn!(target: "memory_consolidator", %error, "rejecting SUPERSEDE");
                     record_consolidation_op(
                         store,
@@ -1434,6 +1473,136 @@ mod tests {
             before_trust,
             "before_json must capture the trust rollback will restore"
         );
+    }
+
+    /// Store one repo-scoped row and return its id.
+    async fn repo_row(store: &Arc<MemoryStore>, text: &str, meta: &WriteMeta) -> i64 {
+        match store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                text,
+                meta,
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        }
+    }
+
+    /// The LLM may not demote what the user wrote: a MERGE naming a
+    /// user-authored row is refused and its trust stays at 1.0.
+    #[tokio::test]
+    async fn a_merge_into_a_user_authored_memory_is_refused() {
+        let run_id = "run-merge-user";
+        let store = store_with_candidates(run_id, 1).await;
+        let target_id = repo_row(&store, "a note the user remembered", &WriteMeta::user_remember()).await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "MERGE", "candidate_index": 0, "into_memory_id": target_id }
+                ]
+            }),
+        )
+        .await;
+
+        let row = store.get_memory_row(target_id).await.unwrap().unwrap();
+        assert_eq!(row.trust_score, 1.0, "user trust must be untouched");
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let merge = rows.iter().find(|r| r.kind == "merge").expect("merge row");
+        assert!(!merge.applied, "merge into a user row must not apply");
+        assert!(
+            merge
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("user-authored")),
+            "refusal reason should be recorded: {:?}",
+            merge.error
+        );
+    }
+
+    /// The LLM may not retire what the user wrote: a SUPERSEDE naming a
+    /// user-authored row is refused, the row stays live, and the
+    /// candidate is not stored as its replacement.
+    #[tokio::test]
+    async fn a_supersede_of_a_user_authored_memory_is_refused() {
+        let run_id = "run-supersede-user";
+        let store = store_with_candidates(run_id, 1).await;
+        let user_text = "the user's own belief about the thing";
+        let old_id = repo_row(&store, user_text, &WriteMeta::user_remember()).await;
+        let before = live_ids(&store).await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "SUPERSEDE", "candidate_index": 0, "supersedes_memory_id": old_id }
+                ]
+            }),
+        )
+        .await;
+
+        assert!(store.get_memory_row(old_id).await.unwrap().is_some());
+        let live_records = store.list_for_skills_emit(500).await.unwrap();
+        assert!(
+            live_records.iter().any(|(_, content, _)| content == user_text),
+            "the user row must not be marked superseded"
+        );
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let sup = rows.iter().find(|r| r.kind == "supersede").expect("supersede row");
+        assert!(!sup.applied, "supersede of a user row must not apply");
+        assert!(
+            sup.error
+                .as_deref()
+                .is_some_and(|e| e.contains("user-authored")),
+            "refusal reason should be recorded: {:?}",
+            sup.error
+        );
+        assert_eq!(
+            live_ids(&store).await,
+            before,
+            "no replacement row may be stored"
+        );
+    }
+
+    /// MERGE records a reconfirmation; it must never lower a row's trust.
+    #[tokio::test]
+    async fn a_merge_never_lowers_trust() {
+        let run_id = "run-merge-high";
+        let store = store_with_candidates(run_id, 1).await;
+        let target_id = repo_row(
+            &store,
+            "a well-trusted annotated memory",
+            &WriteMeta::for_source(MemorySource::LlmAnnotated).with_trust_score(0.9),
+        )
+        .await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "MERGE", "candidate_index": 0, "into_memory_id": target_id }
+                ]
+            }),
+        )
+        .await;
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let merge = rows.iter().find(|r| r.kind == "merge").expect("merge row");
+        assert!(merge.applied, "merge should apply: {:?}", merge.error);
+        let trust = store.get_memory_row(target_id).await.unwrap().unwrap().trust_score;
+        assert!((trust - 0.9).abs() < 1e-6, "trust lowered to {trust}");
     }
 
     #[tokio::test]

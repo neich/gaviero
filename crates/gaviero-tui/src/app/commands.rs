@@ -430,8 +430,11 @@ pub(super) fn handle_sleep_command(app: &mut App) {
             .add_system_message("Memory writer not initialised; cannot run sleeptime.");
         return;
     };
-    let payload = serde_json::json!({ "dry_run": dry_run });
-    if let Err(e) = writer.sleeptime(payload) {
+    let mut cfg = app
+        .workspace
+        .resolve_sleeptime_config(app.workspace.roots().first().copied());
+    cfg.dry_run = dry_run;
+    if let Err(e) = writer.sleeptime(cfg.to_payload()) {
         app.chat_state
             .add_system_message(&format!("Sleeptime enqueue failed: {e}"));
     } else {

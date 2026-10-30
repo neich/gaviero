@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
 
 /// First schema version where the `memory_kind` discriminator exists.
 /// Used by [`needs_c1_backup`] to decide whether to take a one-shot
@@ -83,6 +83,9 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 16 {
         migrate_v16(conn).context("migration v16")?;
+    }
+    if version < 17 {
+        migrate_v17(conn).context("migration v17")?;
     }
 
     // Stamp the current version
@@ -927,6 +930,32 @@ fn migrate_v16(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v17 — make B6 telemetry safe to re-score from.
+///
+/// * `routing_version`: `1` marks a legacy row whose `memory_id` was
+///   looked up in the workspace store only. Global and folder DBs have
+///   independent rowid spaces, so such a row may describe a different
+///   memory than the one injected; it is never used for trust. `2` marks
+///   a row recorded in the store that owns `memory_id`.
+/// * `rescored_at`: set when a sleeptime trust re-score consumes the
+///   row, so each verdict contributes to at most one adjustment instead
+///   of being re-applied on every pass.
+fn migrate_v17(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "retrieval_use",
+        "routing_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "retrieval_use", "rescored_at", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_use_pending
+             ON retrieval_use(memory_id) WHERE rescored_at IS NULL;",
+    )
+    .context("indexing pending retrieval_use rows")?;
+    Ok(())
+}
+
 /// Drop the C1.3 immutability triggers. **Crate-private and only the
 /// C2.4 `RedactHistory` handler may call this**, inside a transaction
 /// that re-installs them before commit. Any other callsite is a bug
@@ -1192,6 +1221,68 @@ mod tests {
             .unwrap();
         assert_eq!(origin, "sleeptime");
         assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn upgrading_from_v16_adds_retrieval_use_routing_columns() {
+        let conn = setup_conn();
+
+        // A genuine v16 database: every migration before v17, no more.
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn, 8).unwrap();
+        migrate_v4(&conn, 8).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        migrate_v12(&conn).unwrap();
+        migrate_v13(&conn).unwrap();
+        migrate_v14(&conn).unwrap();
+        migrate_v15(&conn).unwrap();
+        migrate_v16(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 16u32).unwrap();
+
+        let columns = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT name FROM pragma_table_info('retrieval_use')")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = columns(&conn);
+        assert!(!before.contains(&"routing_version".to_string()));
+        assert!(!before.contains(&"rescored_at".to_string()));
+        conn.execute(
+            "INSERT INTO retrieval_use
+                 (memory_id, turn_id, injected_rank, classification, cosine_to_response)
+             VALUES (1, 't', 1, 'used', 0.7)",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn, 8).unwrap();
+
+        let after = columns(&conn);
+        assert!(after.contains(&"routing_version".to_string()));
+        assert!(after.contains(&"rescored_at".to_string()));
+        let (routing, rescored): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT routing_version, rescored_at FROM retrieval_use WHERE turn_id = 't'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(routing, 1, "pre-existing rows are legacy-routed");
+        assert!(rescored.is_none());
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 17);
     }
 
     #[test]
