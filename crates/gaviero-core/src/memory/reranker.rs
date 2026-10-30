@@ -7,10 +7,11 @@
 //!
 //! Optional cross-encoder reranker stage for retrieval. Enabled by default
 //! (`memory.reranker.enabled = true`, model `minilm`) after the B2f ablation
-//! gate cleared on the code gold set. When the model file is missing or the
-//! the model file is missing or the configured tier is `"none"`,
-//! [`build_reranker`] returns `None` and retrieval falls back silently
-//! to composite-only ranking.
+//! gate cleared on the code gold set. [`build_reranker`] returns `None` for
+//! an empty, `"none"`, or unknown model name. A missing model file is
+//! downloaded by `ModelManager::ensure_downloaded`; a failed download or
+//! load returns `Err`. In both cases callers fall back to composite-only
+//! ranking, and the TUI reports the fallback as a system chat message.
 
 use anyhow::Result;
 use async_trait::async_trait;
