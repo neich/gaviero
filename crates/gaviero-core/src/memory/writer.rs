@@ -237,6 +237,8 @@ pub enum WriterMessage {
         turn_id: String,
         session_id: String,
         response: String,
+        /// Resolved `memory.telemetry.*` classifier thresholds.
+        cfg: crate::memory::telemetry::ClassifyConfig,
     },
     /// Tier C / C2.2: restore a single audit row by id. The handler
     /// reconstructs the original `WriteScope` + `WriteMeta` + content
@@ -815,11 +817,13 @@ impl WriterHandle {
         turn_id: impl Into<String>,
         session_id: impl Into<String>,
         response: impl Into<String>,
+        cfg: crate::memory::telemetry::ClassifyConfig,
     ) -> Result<()> {
         self.enqueue(WriterMessage::TelemetryClassify {
             turn_id: turn_id.into(),
             session_id: session_id.into(),
             response: response.into(),
+            cfg,
         })
     }
 
@@ -1238,10 +1242,8 @@ async fn process_message(
             turn_id,
             session_id,
             response,
-        } => {
-            let store = stores.workspace().clone();
-            process_telemetry_classify(&store, &turn_id, &session_id, &response).await
-        }
+            cfg,
+        } => process_telemetry_classify(stores, &turn_id, &session_id, &response, &cfg).await,
         WriterMessage::ConsolidationRollback { run_id, ack } => {
             // Consolidation writes land in the workspace store, so its
             // audit trail and the rows to reverse are both there.
@@ -1349,21 +1351,27 @@ fn parse_sleeptime_payload(payload: &JsonValue) -> super::sleeptime::SleeptimeCo
     if let Some(n) = payload.get("trust_min_injections").and_then(|v| v.as_u64()) {
         cfg.trust_min_injections = n as u32;
     }
+    if let Some(d) = payload.get("trust_adjust_delta").and_then(|v| v.as_f64()) {
+        cfg.trust_adjust_delta = d as f32;
+    }
+    if let Some(b) = payload.get("trust_adjust_enabled").and_then(|v| v.as_bool()) {
+        cfg.trust_adjust_enabled = b;
+    }
     cfg
 }
 
 async fn process_telemetry_classify(
-    store: &Arc<MemoryStore>,
+    stores: &Arc<MemoryStores>,
     turn_id: &str,
     session_id: &str,
     response: &str,
+    cfg: &super::telemetry::ClassifyConfig,
 ) -> Result<WriteResult> {
-    use super::telemetry::{ClassifyConfig, classify_turn};
-    let cfg = ClassifyConfig::default();
     if response.split_whitespace().count() < cfg.min_response_tokens as usize {
         return Ok(WriteResult::Skipped);
     }
-    classify_turn(store, turn_id, Some(session_id), response, &cfg).await?;
+    super::telemetry::classify_turn_routed(stores, turn_id, Some(session_id), response, cfg)
+        .await?;
     Ok(WriteResult::Skipped)
 }
 
@@ -1875,6 +1883,28 @@ mod tests {
 
     use super::*;
     use crate::memory::embedder::Embedder;
+
+    /// Every setting the scheduler, `/sleep` and `--sleep` resolve must
+    /// survive the trip through the writer payload; an empty payload
+    /// keeps trust adjustment off.
+    #[test]
+    fn sleeptime_payload_round_trips_config() {
+        let cfg = super::super::sleeptime::SleeptimeConfig {
+            dry_run: true,
+            near_dup_threshold: 0.8,
+            trust_min_injections: 9,
+            trust_adjust_delta: 0.02,
+            trust_adjust_enabled: true,
+            ..Default::default()
+        };
+        let parsed = parse_sleeptime_payload(&cfg.to_payload());
+        assert!(parsed.dry_run);
+        assert!((parsed.near_dup_threshold - 0.8).abs() < 1e-6);
+        assert_eq!(parsed.trust_min_injections, 9);
+        assert!((parsed.trust_adjust_delta - 0.02).abs() < 1e-6);
+        assert!(parsed.trust_adjust_enabled);
+        assert!(!parse_sleeptime_payload(&serde_json::json!({})).trust_adjust_enabled);
+    }
 
     /// Minimal in-memory embedder for tests — content-addressed so dedup
     /// against the store has a deterministic but non-zero vector.

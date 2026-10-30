@@ -210,6 +210,8 @@ pub struct PostTurnRequest<'a> {
     pub extractor_enabled: bool,
     /// `memory.telemetry.enabled` resolved for the turn's scope.
     pub telemetry_enabled: bool,
+    /// Resolved `memory.telemetry.*` classifier thresholds.
+    pub telemetry_cfg: crate::memory::telemetry::ClassifyConfig,
 }
 
 /// Enqueue post-turn writer messages per [`PostTurnRequest`].
@@ -238,9 +240,12 @@ pub fn enqueue_post_turn(req: PostTurnRequest<'_>) {
     }
 
     if req.telemetry_enabled
-        && let Err(e) =
-            req.writer
-                .telemetry_classify(req.turn_id, req.session_id, req.response_text)
+        && let Err(e) = req.writer.telemetry_classify(
+            req.turn_id,
+            req.session_id,
+            req.response_text,
+            req.telemetry_cfg,
+        )
     {
         tracing::warn!(
             target: "memory_post_turn",
@@ -290,6 +295,20 @@ fn build_manifest_payload(
     reranker_name: Option<&str>,
 ) -> JsonValue {
     let selected_ids: Vec<i64> = inj.items.iter().map(|m| m.id).collect();
+    // Owning scope per selected row. Global / workspace / folder DBs have
+    // independent rowid spaces, so telemetry needs (scope_level, repo_id)
+    // to look each id up in the store that owns it.
+    let selected: Vec<JsonValue> = inj
+        .items
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "scope_level": m.scope_level,
+                "repo_id": m.repo_id,
+            })
+        })
+        .collect();
     let any_reranked = inj.pool.iter().any(|c| c.rerank_score.is_some());
     let schema_version = if any_reranked { 2 } else { 1 };
     let scoring_formula_version = if any_reranked {
@@ -304,6 +323,7 @@ fn build_manifest_payload(
         "embedder_name": embedder_name,
         "query_text": query_text,
         "selected_ids": selected_ids,
+        "selected": selected,
         "token_budget_used": inj.tokens_used,
         "token_budget_limit": inj.token_budget,
     });
@@ -470,6 +490,64 @@ mod tests {
         );
     }
 
+    /// Telemetry routes each injected id to its owning store, so the
+    /// manifest must record every selected row's scope alongside the
+    /// legacy `selected_ids` list.
+    #[tokio::test]
+    async fn manifest_payload_records_selected_scope() {
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::Path::new("/tmp/wsx");
+        let content = "selected scope sentinel";
+        services
+            .stores
+            .store_scoped(&WriteScope::Workspace, content, &WriteMeta::user_remember())
+            .await
+            .unwrap();
+        services
+            .stores
+            .store_scoped(
+                &WriteScope::Global,
+                "selected scope sentinel global",
+                &WriteMeta::user_remember(),
+            )
+            .await
+            .unwrap();
+
+        let cfg = null_injection_config(true);
+        let rcfg = null_retrieval_config();
+        let outcome = perform_injection(ChatMemoryRequest {
+            stores: &services.stores,
+            writer: Some(&services.writer),
+            workspace_root: root,
+            folder_root: None,
+            user_prompt: content,
+            turn_id: "t-selected",
+            session_id: "s-selected",
+            injection_config: &cfg,
+            retrieval_config: &rcfg,
+            reranker: None,
+            rerank_config: None,
+            manifests_enabled: true,
+            capture_candidate_pool: true,
+            embedder_name: "null",
+            reranker_name: None,
+        })
+        .await;
+        let injection = outcome.injection.as_ref().expect("rows are retrievable");
+        let payload = outcome.manifest_payload.expect("payload built");
+
+        let selected = payload["selected"].as_array().expect("selected array");
+        assert_eq!(selected.len(), injection.items.len());
+        assert!(!selected.is_empty());
+        for (entry, item) in selected.iter().zip(&injection.items) {
+            assert_eq!(entry["id"], serde_json::json!(item.id));
+            assert_eq!(entry["scope_level"], serde_json::json!(item.scope_level));
+            assert_eq!(entry["repo_id"], serde_json::json!(item.repo_id));
+        }
+        let ids: Vec<i64> = injection.items.iter().map(|m| m.id).collect();
+        assert_eq!(payload["selected_ids"], serde_json::json!(ids));
+    }
+
     #[tokio::test]
     async fn module_context_makes_module_memory_retrievable() {
         let services = MemoryServices::for_tests_in_memory().unwrap();
@@ -543,6 +621,7 @@ mod tests {
             response_text: "hi back".into(),
             extractor_enabled: false,
             telemetry_enabled: false,
+            telemetry_cfg: Default::default(),
         });
         // The writer task is async; just confirm we didn't enqueue
         // anything on the synchronous side.

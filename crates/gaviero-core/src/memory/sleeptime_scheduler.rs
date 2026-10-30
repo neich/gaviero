@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -131,7 +130,9 @@ async fn scheduler_loop(
                     trigger = kind.as_str(),
                     "enqueueing Sleeptime"
                 );
-                if let Err(e) = writer.enqueue(WriterMessage::Sleeptime { payload: json!({}) }) {
+                if let Err(e) = writer.enqueue(WriterMessage::Sleeptime {
+                    payload: cfg.to_payload(),
+                }) {
                     tracing::warn!(
                         target: "memory_sleeptime_scheduler",
                         error = %e,

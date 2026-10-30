@@ -241,6 +241,9 @@ pub mod settings {
     pub const MEMORY_TELEMETRY_MIN_INJECTIONS_FOR_TRUST: &str =
         "memory.telemetry.minInjectionsForTrustAdjust";
     pub const MEMORY_TELEMETRY_TRUST_ADJUST_DELTA: &str = "memory.telemetry.trustAdjustDelta";
+    /// Master switch for sleeptime trust re-scoring from B6 telemetry.
+    /// Off by default: the classifier is not a validated usefulness signal.
+    pub const MEMORY_TELEMETRY_TRUST_ADJUST_ENABLED: &str = "memory.telemetry.trustAdjustEnabled";
     pub const MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS: &str = "memory.telemetry.minResponseTokens";
 
     // /remember scope defaults + UX (Tier A / A2)
@@ -1300,6 +1303,91 @@ impl Workspace {
         }
     }
 
+    /// Resolve the sleeptime pass configuration (`memory.sleeptime.*`
+    /// plus the trust re-scoring knobs under `memory.telemetry.*`).
+    /// Unset keys keep [`crate::memory::SleeptimeConfig::default`].
+    pub fn resolve_sleeptime_config(&self, root: Option<&Path>) -> crate::memory::SleeptimeConfig {
+        let mut cfg = crate::memory::SleeptimeConfig::default();
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_SLEEPTIME_ENABLED, root)
+            .as_bool()
+        {
+            cfg.enabled = v;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_SLEEPTIME_MIN_IDLE_MINUTES, root)
+            .as_u64()
+        {
+            cfg.min_idle_minutes = v as usize;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_SLEEPTIME_WEEKLY_FORCE_RUN, root)
+            .as_bool()
+        {
+            cfg.weekly_force_run = v;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_SLEEPTIME_NEAR_DUP_THRESHOLD, root)
+            .as_f64()
+        {
+            cfg.near_dup_threshold = v as f32;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_SLEEPTIME_FIRST_RUN_REQUIRE_CONFIRM, root)
+            .as_bool()
+        {
+            cfg.first_run_require_confirm = v;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_MIN_INJECTIONS_FOR_TRUST, root)
+            .as_u64()
+        {
+            cfg.trust_min_injections = v as u32;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_TRUST_ADJUST_DELTA, root)
+            .as_f64()
+        {
+            cfg.trust_adjust_delta = v as f32;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_TRUST_ADJUST_ENABLED, root)
+            .as_bool()
+        {
+            cfg.trust_adjust_enabled = v;
+        }
+        cfg
+    }
+
+    /// Resolve the B6 retrieval-use classifier thresholds
+    /// (`memory.telemetry.*`). Unset keys keep
+    /// [`crate::memory::ClassifyConfig::default`].
+    pub fn resolve_telemetry_classify_config(
+        &self,
+        root: Option<&Path>,
+    ) -> crate::memory::ClassifyConfig {
+        let mut cfg = crate::memory::ClassifyConfig::default();
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_USED_THRESHOLD, root)
+            .as_f64()
+        {
+            cfg.used_threshold = v as f32;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_PARTIAL_THRESHOLD, root)
+            .as_f64()
+        {
+            cfg.partial_threshold = v as f32;
+        }
+        if let Some(v) = self
+            .resolve_setting(settings::MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS, root)
+            .as_u64()
+        {
+            cfg.min_response_tokens = v as u32;
+        }
+        cfg
+    }
+
     /// Resolve the read namespaces (searched when querying memory).
     ///
     /// Always includes the write namespace. Additional namespaces come from
@@ -1597,6 +1685,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_TELEMETRY_PARTIAL_THRESHOLD => serde_json::json!(0.35),
         settings::MEMORY_TELEMETRY_MIN_INJECTIONS_FOR_TRUST => serde_json::json!(5),
         settings::MEMORY_TELEMETRY_TRUST_ADJUST_DELTA => serde_json::json!(0.05),
+        settings::MEMORY_TELEMETRY_TRUST_ADJUST_ENABLED => serde_json::json!(false),
         settings::MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS => serde_json::json!(20),
 
         // Remote sidecar. `REMOTE_PORT` deliberately has NO default:
@@ -1971,6 +2060,50 @@ mod tests {
             serde_json::json!(""),
             "unset machine stays the empty default"
         );
+    }
+
+    #[test]
+    fn resolve_sleeptime_config_reads_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let cfg = ws.resolve_sleeptime_config(None);
+        assert!(!cfg.trust_adjust_enabled, "trust adjustment defaults off");
+        assert!((cfg.near_dup_threshold - 0.92).abs() < 1e-6);
+
+        let gaviero_dir = dir.path().join(".gaviero");
+        fs::create_dir_all(&gaviero_dir).unwrap();
+        fs::write(
+            gaviero_dir.join("settings.json"),
+            r#"{ "memory": {
+                "telemetry": { "trustAdjustEnabled": true, "trustAdjustDelta": 0.02,
+                               "minInjectionsForTrustAdjust": 9 },
+                "sleeptime": { "nearDupThreshold": 0.8 } } }"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let cfg = ws.resolve_sleeptime_config(None);
+        assert!(cfg.trust_adjust_enabled);
+        assert!((cfg.trust_adjust_delta - 0.02).abs() < 1e-6);
+        assert_eq!(cfg.trust_min_injections, 9);
+        assert!((cfg.near_dup_threshold - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_telemetry_classify_config_reads_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero_dir = dir.path().join(".gaviero");
+        fs::create_dir_all(&gaviero_dir).unwrap();
+        fs::write(
+            gaviero_dir.join("settings.json"),
+            r#"{ "memory": { "telemetry": {
+                "usedThreshold": 0.7, "partialThreshold": 0.5, "minResponseTokens": 40 } } }"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let cfg = ws.resolve_telemetry_classify_config(None);
+        assert!((cfg.used_threshold - 0.7).abs() < 1e-6);
+        assert!((cfg.partial_threshold - 0.5).abs() < 1e-6);
+        assert_eq!(cfg.min_response_tokens, 40);
     }
 
     #[test]

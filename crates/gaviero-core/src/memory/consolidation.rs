@@ -1,15 +1,13 @@
-//! Memory consolidation: run triage, importance decay, and upward promotion.
+//! Memory consolidation: run triage and upward promotion.
 //!
-//! Three phases run after each swarm execution:
+//! **Run memory triage** ([`Consolidator::consolidate_run`]) runs after a
+//! swarm execution or when a chat conversation closes: it promotes durable
+//! run-level memories to module or repo scope, then deletes the run's
+//! run-scope rows.
 //!
-//! 1. **Run memory triage**: Scan run-level memories, promote durable facts
-//!    to module or repo scope, then delete the ephemeral run memories.
-//!
-//! 2. **Importance decay and pruning**: Exponentially decay importance
-//!    based on time since last access. Prune entries below threshold.
-//!
-//! 3. **Upward promotion**: Module memories accessed across multiple modules
-//!    get promoted to repo scope.
+//! **Upward promotion** ([`Consolidator::promote_frequent_cross_scope`]) is
+//! an on-demand helper: module memories accessed across multiple modules
+//! get promoted to repo scope.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,23 +54,13 @@ pub struct ConsolidationReport {
     pub reinforced: usize,
     pub promoted: usize,
     pub pruned: usize,
-    pub decayed: usize,
 }
 
-/// Full maintenance report combining all phases.
-#[derive(Debug, Default)]
-pub struct MaintenanceReport {
-    pub consolidation: Option<ConsolidationReport>,
-    pub decay_count: usize,
-    pub prune_count: usize,
-    pub promotion_count: usize,
-}
-
-/// Handles memory consolidation, decay, and promotion.
+/// Handles run-memory consolidation and promotion.
 ///
 /// Step 7: holds the multi-DB registry. Reads against run rows go to
-/// `stores.workspace()`; maintenance passes (decay/prune, promotion
-/// analysis) fan out across every opened store via
+/// `stores.workspace()`; promotion analysis fans out across every
+/// opened store via
 /// [`MemoryStores::opened_stores`] / [`MemoryStores::opened_folder_stores`].
 pub struct Consolidator {
     stores: Arc<MemoryStores>,
@@ -261,8 +249,9 @@ impl Consolidator {
         }
 
         // Delete all run-level memories. Best-effort: a failure here
-        // leaves the rows at run scope, where decay ages them out, and
-        // must not mask the promotions that did land.
+        // leaves the rows at run scope until a later `consolidate_run`
+        // for the same `run_id` deletes them (nothing ages them out
+        // automatically), and must not mask the promotions that did land.
         match self.writer.delete_run(run_id).await {
             Ok(WriteResult::Inserted(deleted)) => {
                 report.pruned = deleted as usize;
@@ -289,25 +278,7 @@ impl Consolidator {
         Ok(report)
     }
 
-    /// Phase 2: Decay importance and prune stale entries. Step 7:
-    /// fans out across every opened physical store so per-folder DBs
-    /// also age out their own rows.
-    pub async fn decay_and_prune(&self) -> Result<(usize, usize)> {
-        // Materialise every registered folder store first so the
-        // decay pass touches all of them, not just whatever was
-        // lazy-opened by retrieval traffic.
-        let _ = self.stores.open_all_folders().await;
-        let mut decayed_total = 0usize;
-        let mut pruned_total = 0usize;
-        for store in self.stores.opened_stores().await {
-            let (decayed, pruned) = store.decay_and_prune().await?;
-            decayed_total += decayed;
-            pruned_total += pruned;
-        }
-        Ok((decayed_total, pruned_total))
-    }
-
-    /// Phase 3: Promote module memories accessed across multiple modules.
+    /// Promote module memories accessed across multiple modules.
     ///
     /// If a module-level memory is accessed by agents in 3+ different modules,
     /// promote a copy to repo scope with boosted importance.
@@ -361,29 +332,6 @@ impl Consolidator {
         Ok(promoted)
     }
 
-    /// Run full maintenance: consolidation + decay + promotion.
-    pub async fn maintain(&self) -> Result<MaintenanceReport> {
-        let mut report = MaintenanceReport::default();
-
-        // Phase 2: decay and prune
-        let (decayed, pruned) = self.decay_and_prune().await?;
-        report.decay_count = decayed;
-        report.prune_count = pruned;
-
-        // Phase 3: promote cross-module memories
-        let promoted = self.promote_frequent_cross_scope(3).await?;
-        report.promotion_count = promoted;
-
-        tracing::info!(
-            decayed = report.decay_count,
-            pruned = report.prune_count,
-            promoted = report.promotion_count,
-            "maintenance complete"
-        );
-
-        Ok(report)
-    }
-
     /// Check if a new entry should be deduplicated against existing entries.
     ///
     /// Returns `Some(existing_id)` if the entry was reinforced (similarity > 0.85),
@@ -408,18 +356,6 @@ impl Consolidator {
         }
         Ok(None)
     }
-}
-
-/// Helper to merge two memory entries' content using LLM.
-///
-/// Falls back to concatenation if LLM is unavailable.
-pub async fn merge_content(
-    content_a: &str,
-    content_b: &str,
-    _llm_available: bool,
-) -> Result<String> {
-    // TODO: Implement LLM-based merge via AcpSession
-    Ok(format!("{content_a}\n---\n{content_b}"))
 }
 
 #[cfg(test)]
@@ -469,13 +405,6 @@ mod tests {
         assert_eq!(report.pruned, 0);
     }
 
-    #[tokio::test]
-    async fn test_maintain_no_crash() {
-        let store = Arc::new(MemoryStore::in_memory(Arc::new(MockEmbedder)).unwrap());
-        let consolidator = Consolidator::new(store);
-        let report = consolidator.maintain().await.unwrap();
-        assert_eq!(report.prune_count, 0);
-    }
 
     /// Embeds slower than the 500ms the ack budget used to allow.
     struct SlowEmbedder;

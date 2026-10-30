@@ -19,7 +19,7 @@ pub mod write;
 pub use deletions_ops::{BulkForgetReport, ForgetFilter, RestoreOutcome};
 pub use manifest::InjectionManifestRow;
 pub use panel_ops::MemoryRow;
-pub use telemetry_ops::MemoryUtilization;
+pub use telemetry_ops::{MemoryUtilization, RETRIEVAL_USE_LEGACY, RETRIEVAL_USE_ROUTED};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -741,87 +741,6 @@ impl MemoryStore {
 
     // ── Maintenance ───────────────────────────────────────────────
 
-    /// Decay importance and prune stale entries.
-    ///
-    /// - Decays importance based on time since last access (30-day half-life).
-    /// - Prunes entries below min_importance that haven't been accessed in 90 days.
-    /// - Never auto-prunes human-authored (trust=high) entries.
-    pub async fn decay_and_prune(&self) -> Result<(usize, usize)> {
-        let conn = self.conn.lock().await;
-
-        let half_life_days = 30.0_f64;
-        let lambda = 2.0_f64.ln() / half_life_days;
-        let min_importance = 0.05;
-
-        // Decay importance in Rust (SQLite doesn't have exp())
-        let rows: Vec<(i64, f32, String)> = conn
-            .prepare(
-                "SELECT id, importance, COALESCE(last_accessed_at, updated_at)
-                 FROM memories WHERE scope_level >= 2",
-            )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let now_str = chrono_now_utc();
-        let mut decayed = 0usize;
-        for (id, importance, ts) in &rows {
-            let days = hours_since(&Some(ts.clone()), ts, &now_str) / 24.0;
-            let decay_factor = (-lambda * days).exp() as f32;
-            let new_importance = importance * decay_factor;
-            if (new_importance - importance).abs() > 0.001 {
-                conn.execute(
-                    "UPDATE memories SET importance = ?1 WHERE id = ?2",
-                    rusqlite::params![new_importance, id],
-                )?;
-                decayed += 1;
-            }
-        }
-
-        // Prune
-        let prune_ids: Vec<i64> = conn
-            .prepare(
-                "SELECT id FROM memories
-                 WHERE importance < ?1
-                 AND COALESCE(last_accessed_at, updated_at) < datetime('now', '-90 days')
-                 AND trust != 'high'",
-            )?
-            .query_map(rusqlite::params![min_importance], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for id in &prune_ids {
-            let _ = conn.execute(
-                "DELETE FROM vec_memories_scoped WHERE memory_id = ?1",
-                rusqlite::params![id],
-            );
-            let _ = conn.execute(
-                "DELETE FROM vec_memories WHERE memory_id = ?1",
-                rusqlite::params![id],
-            );
-            let _ = conn.execute(
-                "DELETE FROM memory_access_log WHERE memory_id = ?1",
-                rusqlite::params![id],
-            );
-        }
-
-        let pruned = conn.execute(
-            "DELETE FROM memories
-             WHERE importance < ?1
-             AND COALESCE(last_accessed_at, updated_at) < datetime('now', '-90 days')
-             AND trust != 'high'",
-            rusqlite::params![min_importance],
-        )?;
-
-        // Clean orphaned vectors
-        let _ = conn.execute(
-            "DELETE FROM vec_memories_scoped WHERE memory_id NOT IN (SELECT id FROM memories)",
-            [],
-        );
-
-        Ok((decayed, pruned))
-    }
-
     /// Find module-level memories accessed from other modules (promotion candidates).
     pub async fn find_promotion_candidates(
         &self,
@@ -878,118 +797,6 @@ impl MemoryStore {
             .collect();
 
         Ok(results)
-    }
-
-    // ── Legacy API (kept for backward compat) ─────────────────────
-
-    /// Delete stale swarm-generated entries based on retention policy.
-    ///
-    /// Preserves all `user:*` entries (explicit `/remember` commands).
-    /// Preserves entries that don't match swarm key patterns (agents:, verification:, tiers:).
-    pub async fn prune(
-        &self,
-        namespace: &str,
-        max_age_days: u32,
-        max_runs: usize,
-    ) -> Result<usize> {
-        let conn = self.conn.lock().await;
-
-        let mut total_deleted = 0;
-
-        // Delete entries older than max_age_days (only swarm-generated keys)
-        if max_age_days > 0 {
-            // Collect ids to delete from vec_memories too
-            let ids: Vec<i64> = conn
-                .prepare(
-                    "SELECT id FROM memories WHERE namespace = ?1
-                 AND key NOT LIKE 'user:%'
-                 AND (key LIKE 'agents:%' OR key LIKE 'verification:%' OR key LIKE 'tiers:%')
-                 AND created_at < datetime('now', ?2)",
-                )?
-                .query_map(
-                    rusqlite::params![namespace, format!("-{} days", max_age_days)],
-                    |row| row.get(0),
-                )?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            for id in &ids {
-                let _ = conn.execute(
-                    "DELETE FROM vec_memories WHERE memory_id = ?1",
-                    rusqlite::params![id],
-                );
-            }
-
-            let rows = conn.execute(
-                "DELETE FROM memories WHERE namespace = ?1
-                 AND key NOT LIKE 'user:%'
-                 AND (key LIKE 'agents:%' OR key LIKE 'verification:%' OR key LIKE 'tiers:%')
-                 AND created_at < datetime('now', ?2)",
-                rusqlite::params![namespace, format!("-{} days", max_age_days),],
-            )?;
-            total_deleted += rows;
-        }
-
-        // Enforce max_runs: keep only the latest N run IDs
-        if max_runs > 0 {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT substr(key, 8, instr(substr(key, 8), ':') - 1) as parsed_run_id,
-                        MIN(created_at) as first_seen
-                 FROM memories
-                 WHERE namespace = ?1 AND key LIKE 'agents:%'
-                 GROUP BY parsed_run_id
-                 ORDER BY first_seen DESC",
-            )?;
-
-            let run_ids: Vec<String> = stmt
-                .query_map(rusqlite::params![namespace], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if run_ids.len() > max_runs {
-                let old_runs = &run_ids[max_runs..];
-                for run_id in old_runs {
-                    // Collect ids for vec_memories cleanup
-                    let ids: Vec<i64> = conn
-                        .prepare(
-                            "SELECT id FROM memories WHERE namespace = ?1
-                         AND (key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4)",
-                        )?
-                        .query_map(
-                            rusqlite::params![
-                                namespace,
-                                format!("agents:{}:%", run_id),
-                                format!("verification:{}", run_id),
-                                format!("tiers:{}", run_id),
-                            ],
-                            |row| row.get(0),
-                        )?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    for id in &ids {
-                        let _ = conn.execute(
-                            "DELETE FROM vec_memories WHERE memory_id = ?1",
-                            rusqlite::params![id],
-                        );
-                    }
-
-                    let rows = conn.execute(
-                        "DELETE FROM memories WHERE namespace = ?1
-                         AND (key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4)",
-                        rusqlite::params![
-                            namespace,
-                            format!("agents:{}:%", run_id),
-                            format!("verification:{}", run_id),
-                            format!("tiers:{}", run_id),
-                        ],
-                    )?;
-                    total_deleted += rows;
-                }
-            }
-        }
-
-        Ok(total_deleted)
     }
 }
 
@@ -1489,76 +1296,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prune_preserves_user_entries() {
-        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        store
-            .store("ns", "user:note1", "my note", None)
-            .await
-            .unwrap();
-        store
-            .store("ns", "agents:run1:unit1", "agent result", None)
-            .await
-            .unwrap();
-        store
-            .store("ns", "verification:run1", "v result", None)
-            .await
-            .unwrap();
-
-        // Prune with 0 max_age (won't delete recent), but exercise the code
-        let deleted = store.prune("ns", 0, 100).await.unwrap();
-        assert_eq!(deleted, 0); // Nothing old enough
-
-        // user entry should always survive
-        let keys = store.list_keys("ns").await.unwrap();
-        assert!(keys.contains(&"user:note1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_prune_by_max_runs() {
-        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-
-        // Create entries for 3 runs
-        for run in 1..=3 {
-            store
-                .store(
-                    "ns",
-                    &format!("agents:run{}:a", run),
-                    &format!("run {} a", run),
-                    None,
-                )
-                .await
-                .unwrap();
-            store
-                .store(
-                    "ns",
-                    &format!("agents:run{}:b", run),
-                    &format!("run {} b", run),
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        // Also a user entry that should not be pruned
-        store
-            .store("ns", "user:important", "keep this", None)
-            .await
-            .unwrap();
-
-        let keys_before = store.list_keys("ns").await.unwrap();
-        assert_eq!(keys_before.len(), 7); // 6 agent + 1 user
-
-        // Prune to keep only 2 most recent runs
-        let deleted = store.prune("ns", 0, 2).await.unwrap();
-        // The oldest run (run1) should be pruned
-        assert!(deleted > 0);
-
-        let keys_after = store.list_keys("ns").await.unwrap();
-        assert!(keys_after.contains(&"user:important".to_string()));
-        // run1 entries should be gone
-        assert!(!keys_after.contains(&"agents:run1:a".to_string()));
-    }
-
-    #[tokio::test]
     async fn test_retrieval_score_function() {
         // Recent, important, relevant → high score
         let high = retrieval_score(0.0, 1.0, 1.0, 5);
@@ -1984,6 +1721,158 @@ mod tests {
         )));
     }
 
+    /// One LLM-extracted repo row at trust 0.6.
+    async fn llm_row_for_rescore(store: &MemoryStore) -> i64 {
+        match store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "an llm row that keeps getting injected",
+                &WriteMeta::for_source(MemorySource::LlmExtracted).with_trust_score(0.6),
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            _ => panic!("store failed"),
+        }
+    }
+
+    async fn record_used(store: &MemoryStore, id: i64, n: i32, routing_version: i32) {
+        for rank in 1..=n {
+            store
+                .record_retrieval_use_versioned(
+                    id,
+                    "t",
+                    None,
+                    rank,
+                    "used",
+                    0.7,
+                    false,
+                    routing_version,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn trust_of(store: &MemoryStore, id: i64) -> f32 {
+        store.get_memory_row(id).await.unwrap().unwrap().trust_score
+    }
+
+    /// Each recorded verdict feeds at most one adjustment: a second pass
+    /// with no new telemetry must not bump trust again.
+    #[tokio::test]
+    async fn trust_rescore_consumes_its_evidence() {
+        let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
+        let id = llm_row_for_rescore(&store).await;
+        record_used(&store, id, 6, RETRIEVAL_USE_ROUTED).await;
+        let cfg = crate::memory::sleeptime::SleeptimeConfig::default();
+
+        let first = store.sleeptime_trust_rescore(&cfg).await.unwrap();
+        assert_eq!(first.len(), 1, "first pass adjusts once: {first:?}");
+        let after_first = trust_of(&store, id).await;
+        assert!((after_first - 0.65).abs() < 1e-4, "got {after_first}");
+
+        let second = store.sleeptime_trust_rescore(&cfg).await.unwrap();
+        assert!(second.is_empty(), "no new evidence, no adjustment: {second:?}");
+        assert!((trust_of(&store, id).await - after_first).abs() < 1e-6);
+
+        record_used(&store, id, 6, RETRIEVAL_USE_ROUTED).await;
+        let third = store.sleeptime_trust_rescore(&cfg).await.unwrap();
+        assert_eq!(third.len(), 1, "fresh evidence adjusts again: {third:?}");
+    }
+
+    /// Legacy rows may name a different memory (workspace-only lookup),
+    /// so they never move trust.
+    #[tokio::test]
+    async fn trust_rescore_ignores_legacy_routing_rows() {
+        let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
+        let id = llm_row_for_rescore(&store).await;
+        record_used(&store, id, 6, RETRIEVAL_USE_LEGACY).await;
+        let cfg = crate::memory::sleeptime::SleeptimeConfig::default();
+        let ops = store.sleeptime_trust_rescore(&cfg).await.unwrap();
+        assert!(ops.is_empty(), "legacy rows must be ignored: {ops:?}");
+        assert!((trust_of(&store, id).await - 0.6).abs() < 1e-6);
+    }
+
+    /// Dry-run neither moves trust nor consumes the evidence.
+    #[tokio::test]
+    async fn trust_rescore_dry_run_does_not_consume() {
+        let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
+        let id = llm_row_for_rescore(&store).await;
+        record_used(&store, id, 6, RETRIEVAL_USE_ROUTED).await;
+        let cfg = crate::memory::sleeptime::SleeptimeConfig {
+            dry_run: true,
+            ..Default::default()
+        };
+        for pass in 0..2 {
+            let ops = store.sleeptime_trust_rescore(&cfg).await.unwrap();
+            assert_eq!(ops.len(), 1, "dry-run pass {pass} should report the op");
+        }
+        assert!((trust_of(&store, id).await - 0.6).abs() < 1e-6);
+    }
+
+    /// A manifest without `selected` (pre-routing) can only be resolved
+    /// against the workspace store, so its verdicts are tagged legacy and
+    /// never feed trust re-scoring.
+    #[tokio::test]
+    async fn telemetry_legacy_manifest_writes_routing_version_1() {
+        let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
+        let id = llm_row_for_rescore(&store).await;
+        let payload = serde_json::json!({ "query_text": "q", "selected_ids": [id] });
+        store
+            .store_injection_manifest("turn-legacy", "conv-legacy", "chat", &payload)
+            .await
+            .unwrap();
+        let response = "an llm row that keeps getting injected shows up in this reply \
+                        often enough to clear the minimum response length check";
+        crate::memory::telemetry::classify_turn(
+            &store,
+            "turn-legacy",
+            Some("conv-legacy"),
+            response,
+            &crate::memory::telemetry::ClassifyConfig::default(),
+        )
+        .await
+        .unwrap();
+        let conn = store.conn.lock().await;
+        let routing: i64 = conn
+            .query_row(
+                "SELECT routing_version FROM retrieval_use WHERE turn_id = 'turn-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(routing, i64::from(RETRIEVAL_USE_LEGACY));
+    }
+
+    /// Trust re-scoring is off unless `trust_adjust_enabled` is set.
+    #[tokio::test]
+    async fn sleeptime_skips_trust_rescore_unless_enabled() {
+        let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
+        let id = llm_row_for_rescore(&store).await;
+        record_used(&store, id, 6, RETRIEVAL_USE_ROUTED).await;
+
+        let off = crate::memory::sleeptime::SleeptimeConfig::default();
+        let report = crate::memory::sleeptime::run_sleeptime(&store, &off, None)
+            .await
+            .unwrap();
+        assert_eq!(report.trust_adjusted, 0);
+        assert!((trust_of(&store, id).await - 0.6).abs() < 1e-6);
+
+        let on = crate::memory::sleeptime::SleeptimeConfig {
+            trust_adjust_enabled: true,
+            ..Default::default()
+        };
+        let report = crate::memory::sleeptime::run_sleeptime(&store, &on, None)
+            .await
+            .unwrap();
+        assert_eq!(report.trust_adjusted, 1);
+        assert!(trust_of(&store, id).await > 0.6);
+    }
+
     /// B5 acceptance: dry-run audit rows land but no destructive
     /// writes occur. Specifically, a near-dup pair must NOT be
     /// merged when `dry_run = true`.
@@ -2356,6 +2245,62 @@ mod tests {
                 .take(3)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// User-authored rows are ground truth the consolidator LLM may not
+    /// demote (MERGE) or retire (SUPERSEDE), so they never reach its
+    /// target list — ranked or importance-ordered.
+    #[tokio::test]
+    async fn existing_memories_exclude_user_authored_and_history_rows() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
+        let user_text = "the writer task owns every sqlite write in gaviero";
+        let llm_text = "retrieval fuses vector and keyword hits with reciprocal rank fusion";
+        let user_id = match store
+            .store_scoped(&scope, user_text, &WriteMeta::user_remember())
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            _ => panic!("store failed"),
+        };
+        let llm_id = match store
+            .store_scoped(
+                &scope,
+                llm_text,
+                &WriteMeta::for_source(MemorySource::LlmExtracted),
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            _ => panic!("store failed"),
+        };
+
+        for query in [Some(user_text), None] {
+            let ids: Vec<i64> = store
+                .consolidation_existing_memories(
+                    crate::memory::scope::SCOPE_REPO,
+                    Some("r1"),
+                    20,
+                    query,
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            assert!(
+                !ids.contains(&user_id),
+                "user-authored row offered as a target (query {query:?}): {ids:?}"
+            );
+            assert!(
+                ids.contains(&llm_id),
+                "LLM row missing from targets (query {query:?}): {ids:?}"
+            );
+        }
     }
 
     /// Pins the bug the ranking replaced — if this ever stops failing to

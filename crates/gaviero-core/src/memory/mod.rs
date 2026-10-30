@@ -69,6 +69,7 @@ pub use store::{
 pub use stores::{EmbedderMismatch, MemoryStores};
 pub use telemetry::{
     ClassifiedItem, ClassifyConfig, TelemetryObserver, TelemetryReport, UseClass, classify_turn,
+    classify_turn_routed,
 };
 pub use trust_defaults::{
     FLAG_DEMOTION_FACTOR, FLAG_TRUST_FLOOR, MemorySource, clamp_trust, flagged_trust,

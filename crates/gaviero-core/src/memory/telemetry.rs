@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::store::MemoryStore;
+use super::scope::store_kind_for_scope;
+use super::store::{MemoryStore, RETRIEVAL_USE_LEGACY, RETRIEVAL_USE_ROUTED};
+use super::stores::MemoryStores;
 
 /// Per-pass classifier config. Resolved from `memory.telemetry.*`
 /// settings; defaults match the plan.
@@ -127,11 +129,10 @@ fn substring_match(needle: &str, haystack: &str, min_tokens: usize) -> bool {
         .any(|w| h.contains(&w.join(" ")))
 }
 
-/// Run B6 classification for one turn. Reads the most recent
-/// `injection_manifests` row for `turn_id`, embeds the response once,
-/// computes per-memory cosines against the stored embedding, persists
-/// `retrieval_use` rows, and returns the report. Caller forwards the
-/// report to a [`TelemetryObserver`] if any.
+/// Run B6 classification for one turn against a single store.
+///
+/// Thin wrapper over [`classify_turn_routed`]: the store is wrapped as
+/// a single-store registry, so every scope resolves to it.
 pub async fn classify_turn(
     store: &Arc<MemoryStore>,
     turn_id: &str,
@@ -139,7 +140,32 @@ pub async fn classify_turn(
     response: &str,
     cfg: &ClassifyConfig,
 ) -> Result<TelemetryReport> {
-    let manifests = store
+    let stores = MemoryStores::from_single_store(store.clone());
+    classify_turn_routed(&stores, turn_id, session_id, response, cfg).await
+}
+
+/// Run B6 classification for one turn. Reads the most recent
+/// `injection_manifests` row for `turn_id` (workspace store), embeds the
+/// response once, computes per-memory cosines against the stored
+/// embedding, persists `retrieval_use` rows, and returns the report.
+/// Caller forwards the report to a [`TelemetryObserver`] if any.
+///
+/// Each injected id is looked up — and its `retrieval_use` row written —
+/// in the store that owns it, resolved from the manifest's `selected`
+/// `(scope_level, repo_id)` entries. Global / workspace / folder DBs have
+/// independent rowid spaces, so a workspace-only lookup can read a
+/// different memory. Legacy manifests carrying only `selected_ids` fall
+/// back to the workspace store and are recorded as
+/// [`RETRIEVAL_USE_LEGACY`], which trust re-scoring ignores.
+pub async fn classify_turn_routed(
+    stores: &MemoryStores,
+    turn_id: &str,
+    session_id: Option<&str>,
+    response: &str,
+    cfg: &ClassifyConfig,
+) -> Result<TelemetryReport> {
+    let manifests = stores
+        .workspace()
         .manifests_for_turn(turn_id)
         .await
         .context("telemetry: fetching manifest")?;
@@ -152,17 +178,45 @@ pub async fn classify_turn(
 
     let payload: serde_json::Value =
         serde_json::from_str(&manifest.payload).context("telemetry: parsing manifest payload")?;
-    let injected: Vec<(i64, String)> = payload
-        .get("selected_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_i64())
-                .enumerate()
-                .map(|(i, id)| (id, format!("rank-{}", i + 1)))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let injected: Vec<(i64, Arc<MemoryStore>, i32)> =
+        match payload.get("selected").and_then(|v| v.as_array()) {
+            Some(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let Some(memory_id) = entry.get("id").and_then(|v| v.as_i64()) else {
+                        continue;
+                    };
+                    let scope_level = entry
+                        .get("scope_level")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1) as i32;
+                    let repo_id = entry.get("repo_id").and_then(|v| v.as_str());
+                    let owner = match store_kind_for_scope(scope_level, repo_id) {
+                        Some(kind) => stores.get(&kind).await.ok(),
+                        None => None,
+                    };
+                    match owner {
+                        Some(store) => out.push((memory_id, store, RETRIEVAL_USE_ROUTED)),
+                        None => tracing::warn!(
+                            target: "memory_telemetry",
+                            memory_id,
+                            "unresolvable owning store; skipped"
+                        ),
+                    }
+                }
+                out
+            }
+            None => payload
+                .get("selected_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_i64())
+                        .map(|id| (id, stores.workspace().clone(), RETRIEVAL_USE_LEGACY))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        };
     if injected.is_empty() {
         return Ok(TelemetryReport {
             turn_id: turn_id.to_string(),
@@ -171,7 +225,7 @@ pub async fn classify_turn(
     }
 
     // Single response embedding — reused across all injected memories.
-    let response_embedding = store
+    let response_embedding = stores
         .embedder()
         .embed_query(response)
         .await
@@ -181,7 +235,7 @@ pub async fn classify_turn(
         turn_id: turn_id.to_string(),
         ..Default::default()
     };
-    for (rank, (memory_id, _)) in injected.iter().enumerate() {
+    for (rank, (memory_id, store, routing_version)) in injected.iter().enumerate() {
         let mem_emb = match store.embedding_for(*memory_id).await {
             Ok(Some(e)) => e,
             Ok(None) => continue,
@@ -215,7 +269,7 @@ pub async fn classify_turn(
         report.items.push(item);
 
         if let Err(e) = store
-            .record_retrieval_use(
+            .record_retrieval_use_versioned(
                 *memory_id,
                 turn_id,
                 session_id,
@@ -223,6 +277,7 @@ pub async fn classify_turn(
                 class.as_str(),
                 cos,
                 substring_hit,
+                *routing_version,
             )
             .await
         {

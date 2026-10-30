@@ -43,8 +43,9 @@ pub(crate) fn build_turn_transcript(
 
 /// Run `Consolidator::consolidate_run` for the given conversation id.
 ///
-/// Mirrors the post-swarm consolidation pass: promotes durable turns up-scope,
-/// decays and prunes low-importance ones. Fires when a conversation is closed.
+/// Mirrors the post-swarm consolidation pass: promotes durable turns up-scope
+/// and deletes the conversation's run-scope rows (unpromoted rows are
+/// discarded). Fires when a conversation is closed.
 pub(crate) fn consolidate_conversation(app: &App, conv_id: &str) {
     let Some(ref memory) = app.memory else {
         return;

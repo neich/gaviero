@@ -4182,6 +4182,7 @@ async fn store_agent_result(
             response_text: String::new(),
             extractor_enabled: true,
             telemetry_enabled: false,
+            telemetry_cfg: Default::default(),
         });
     }
 }
