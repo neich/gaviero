@@ -74,6 +74,12 @@ pub struct TurnReviewAction {
     /// Required for `keep_file` / `revert_file`: a `TurnReviewFile.path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// 1.5, with `path`: that file's `TurnReviewFile.folder`, so the same
+    /// `path` in two workspace folders names one file. Send it whenever the
+    /// file carried one; without it the server picks the first file with
+    /// `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

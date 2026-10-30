@@ -440,6 +440,12 @@ pub enum TurnOutcome {
 pub struct TurnReviewFile {
     /// Workspace-folder-relative, `/`-separated.
     pub path: String,
+    /// 1.5: the workspace folder the file belongs to, as a display label
+    /// unique within the review. Clients group files by it; `(folder, path)`
+    /// names one file when two folders change the same `path`. Omitted by
+    /// older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
     pub change: TurnFileChange,
     pub decision: TurnFileDecision,
     /// False when the pre-turn content was not stored: keep is the only option.

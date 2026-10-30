@@ -642,8 +642,14 @@ pub fn apply_turn_review_action(
         K::RevertAll => "revert_all",
         K::Finalize => "finalize",
     };
-    crate::app::turn_review::apply_remote_action(app, &action.turn_id, kind, action.path.as_deref())
-        .map_err(|reason| CommandFailure::new(ErrorCode::InvalidPayload, reason))
+    crate::app::turn_review::apply_remote_action(
+        app,
+        &action.turn_id,
+        kind,
+        action.path.as_deref(),
+        action.folder.as_deref(),
+    )
+    .map_err(|reason| CommandFailure::new(ErrorCode::InvalidPayload, reason))
 }
 
 // ── Slash commands (§5.1) ───────────────────────────────────────────
