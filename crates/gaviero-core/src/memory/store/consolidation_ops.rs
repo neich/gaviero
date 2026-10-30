@@ -373,6 +373,10 @@ impl MemoryStore {
     /// belief — but nothing narrower, and nothing already superseded or
     /// run-local.
     ///
+    /// User-authored and History rows are never offered, mirroring
+    /// [`crate::memory::trust_defaults::is_agent_flaggable`]: the LLM may
+    /// not demote or retire what the user wrote, nor the raw transcript.
+    ///
     /// `query` is the session's own material (its candidate texts). When
     /// present the rows are ranked by cosine similarity to it; without
     /// it they fall back to importance order.
@@ -457,6 +461,8 @@ impl MemoryStore {
                     AND scope_level <= ?1
                     AND scope_level < ?2
                     AND (repo_id IS NULL OR ?3 IS NULL OR repo_id = ?3)
+                    AND source NOT IN ('user_remember', 'user_panel', 'raw_transcript')
+                    AND memory_kind != 'history'
                   ORDER BY importance DESC, id DESC
                   LIMIT ?4",
             )
@@ -508,6 +514,8 @@ impl MemoryStore {
                     AND scope_level <= ?1
                     AND scope_level < ?2
                     AND (repo_id IS NULL OR ?3 IS NULL OR repo_id = ?3)
+                    AND source NOT IN ('user_remember', 'user_panel', 'raw_transcript')
+                    AND memory_kind != 'history'
                     AND embedding IS NOT NULL
                     AND model_id = ?4
                   ORDER BY id DESC
