@@ -544,8 +544,21 @@ pub fn agent_command(name: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&inv.program);
     cmd.args(&inv.prepend_args);
     cmd.envs(inv.envs);
+    for (key, value) in egress_env(name) {
+        cmd.env(key, value);
+    }
     isolate_console(&mut cmd);
     cmd
+}
+
+/// Proxy variables routing `name`'s traffic through the egress proxy
+/// ([`crate::egress`]), when one is installed. The provider label is the
+/// program name (`claude`, `codex`, `agent`, `dsh`, …).
+fn egress_env(name: &str) -> Vec<(&'static str, String)> {
+    crate::egress::global()
+        .and_then(|svc| svc.listener_for(name))
+        .map(crate::egress::proxy_env)
+        .unwrap_or_default()
 }
 
 /// `std::process::Command` twin of [`agent_command`] for the blocking
@@ -555,6 +568,9 @@ pub fn agent_command_std(name: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(&inv.program);
     cmd.args(&inv.prepend_args);
     cmd.envs(inv.envs);
+    for (key, value) in egress_env(name) {
+        cmd.env(key, value);
+    }
     isolate_console_std(&mut cmd);
     cmd
 }
@@ -644,6 +660,20 @@ pub fn shell_command_lenient(script: &str) -> tokio::process::Command {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn spawn_without_egress_service_sets_no_proxy() {
+        // Only meaningful while nothing in this test binary installed the
+        // global egress service (no test does).
+        if crate::egress::global().is_some() {
+            return;
+        }
+        let cmd = agent_command_std("claude");
+        assert!(
+            !cmd.get_envs().any(|(k, _)| k == "HTTPS_PROXY"),
+            "HTTPS_PROXY set without an egress service"
+        );
+    }
     use super::*;
 
     #[cfg(windows)]

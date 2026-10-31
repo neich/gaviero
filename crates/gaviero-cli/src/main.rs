@@ -560,6 +560,13 @@ struct Cli {
     #[arg(long = "history-path", value_name = "PATH", requires = "history")]
     history_path: Option<PathBuf>,
 
+    /// Agent hook endpoint (internal): `claude:post-tool-use` |
+    /// `cursor:before-read-file` | `cursor:before-shell-execution`. Reads the
+    /// hook JSON on stdin and writes the decision JSON on stdout; the policy
+    /// comes from the workspace's `.gaviero/settings.json`.
+    #[arg(long = "hook", value_name = "PROVIDER:EVENT")]
+    hook: Option<String>,
+
     /// Layer-4 MCP reach probe: spawn each vendor CLI, ask it to call
     /// `memory_ping` at depth 0 and (when supported) depth 1, persist
     /// `<repo>/.gaviero/mcp_reach.json`, print the table, and exit.
@@ -4336,9 +4343,56 @@ async fn run_admin_command(cli: &Cli, ws: &state::Discovered) -> Result<()> {
     anyhow::bail!("internal error: no handler for the selected admin command")
 }
 
+/// Egress proxy observer for headless runs: warn on stderr the first time a
+/// provider reaches an unlisted host; `ask` is refused (no prompt).
+struct CliEgressObserver;
+
+impl gaviero_core::egress::EgressObserver for CliEgressObserver {
+    fn on_egress(&self, event: &gaviero_core::egress::EgressEvent) {
+        if event.first_seen && event.decision != "allowed" {
+            tracing::warn!(
+                provider = %event.provider,
+                host = %event.host,
+                port = event.port,
+                decision = event.decision,
+                "egress: host not in agent.network.allow"
+            );
+        }
+    }
+}
+
+/// `--hook <provider:event>`: decide one agent hook event (stdin JSON →
+/// stdout JSON) and append an audit row under `.gaviero/egress/`.
+fn run_hook(arg: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use gaviero_core::agent_guard::hook;
+
+    let (provider, event) = hook::parse_hook_arg(arg)?;
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .context("reading hook input from stdin")?;
+    let input: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let outcome = hook::handle_hook(provider, event, &input);
+    if let Some(root) = hook::hook_root(provider, &input) {
+        hook::append_audit(&root, &outcome.audit);
+    }
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(outcome.stdout.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Hook mode answers an agent CLI mid-tool-call: stdout must carry only
+    // the decision JSON and nothing may slow it down, so it runs before
+    // tracing, the job object and any workspace setup.
+    if let Some(arg) = &cli.hook {
+        return run_hook(arg);
+    }
 
     // Initialize tracing: JSON to file when --trace is set, human-readable to stderr otherwise.
     // --verbose/-v = INFO, -vv = DEBUG.
@@ -4561,6 +4615,24 @@ async fn main() -> Result<()> {
     // Settings cascade of the discovered workspace (also for isolated runs,
     // which only swap out memory, graph and telemetry).
     let workspace = run_state.workspace().clone();
+
+    // Egress proxy (`agent.network.mode`): every agent spawned by this run is
+    // routed through it. The CLI has no prompt, so `ask` acts as `enforce`.
+    {
+        let config = gaviero_core::egress::EgressConfig::from_workspace(&workspace, &repo);
+        if config.mode != gaviero_core::egress::NetworkMode::Off {
+            if config.mode == gaviero_core::egress::NetworkMode::Ask {
+                eprintln!(
+                    "[egress] agent.network.mode = \"ask\" has no prompt in gaviero-cli; \
+                     unlisted hosts are refused"
+                );
+            }
+            gaviero_core::egress::install(gaviero_core::egress::EgressService::new(
+                config,
+                std::sync::Arc::new(CliEgressObserver),
+            ));
+        }
+    }
 
     // Resolve namespaces: CLI flags override settings, which override folder name
     let write_ns = cli

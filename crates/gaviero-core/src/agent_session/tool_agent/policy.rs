@@ -438,11 +438,61 @@ impl AcpObserver for ScriptingObserver {
     }
 }
 
+/// `Some(reason)` when a shell command names a file agents must not read.
+///
+/// Every non-flag token (split on whitespace and `; & | < >`, quotes and
+/// parentheses stripped, `~/` expanded) is resolved against `cwd` and checked
+/// with [`SensitivePolicy::read_refusal`]. This catches `cat .env` and
+/// `grep KEY ~/.codex/auth.json`; it cannot see files a command discovers on
+/// its own (`grep -r`, `rg`) — that residual is documented, not hidden.
+///
+/// [`SensitivePolicy::read_refusal`]: crate::scope_enforcer::SensitivePolicy::read_refusal
+pub fn command_protected_path(
+    command: &str,
+    cwd: &Path,
+    policy: &crate::scope_enforcer::SensitivePolicy,
+    workspace_root: &Path,
+) -> Option<String> {
+    let home = dirs::home_dir();
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>'))
+        .map(|t| t.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')')))
+        .filter(|t| !t.is_empty() && !t.starts_with('-'))
+        .find_map(|token| {
+            let path = match (token.strip_prefix("~/"), home.as_ref()) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ => {
+                    let p = Path::new(token);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cwd.join(p)
+                    }
+                }
+            };
+            policy.read_refusal(&path, workspace_root)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn command_protected_path_blocks_named_secret_files() {
+        let root = Path::new("/w");
+        let policy = crate::scope_enforcer::SensitivePolicy::strict();
+        assert!(command_protected_path("cat .env", root, &policy, root).is_some());
+        assert!(command_protected_path("cat src/main.rs", root, &policy, root).is_none());
+        assert!(
+            command_protected_path("grep KEY ~/.codex/auth.json", root, &policy, root).is_some()
+        );
+        // Documented residual: recursive search names no file.
+        assert!(command_protected_path("rg foo", root, &policy, root).is_none());
+        assert!(command_protected_path("echo $(cat '.env')", root, &policy, root).is_some());
+    }
 
     #[test]
     fn builtin_denylist_blocks_sudo_and_rm_rf() {

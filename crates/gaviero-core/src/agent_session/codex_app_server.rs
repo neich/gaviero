@@ -144,8 +144,10 @@ fn thread_start_params(
         "model": model,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
-        "sandbox": "read-only",
-        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
+        // The read-only sandbox, network and the deny-read profile from
+        // `.gaviero/settings.json` all come from this config: Codex rejects
+        // a `default_permissions` profile combined with `sandbox` modes.
+        "config": crate::agent_guard::codex::codex_thread_config(cwd, allow_network),
         "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }
@@ -160,22 +162,18 @@ fn thread_resume_params(
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
-        "sandbox": "read-only",
-        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
+        "config": crate::agent_guard::codex::codex_thread_config(cwd, allow_network),
         "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }
 
-fn turn_start_params(
-    thread_id: &str,
-    user_message: &str,
-    allow_network: bool,
-) -> serde_json::Value {
+/// No `sandboxPolicy`: a turn-level policy could override the thread's
+/// deny-read profile, and network access is carried by that profile.
+fn turn_start_params(thread_id: &str, user_message: &str) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "input": [{ "type": "text", "text": user_message }],
         "approvalPolicy": "on-request",
-        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
     })
 }
 
@@ -603,11 +601,10 @@ impl AgentSession for CodexAppServerSession {
             *active = Some(ActiveTurn::new(tx));
         }
 
-        let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
         let request = rpc_request(
             "turn/start",
             next_id(),
-            turn_start_params(&thread_id, &rendered_message, allow_network),
+            turn_start_params(&thread_id, &rendered_message),
         );
 
         let write_result = {
@@ -789,7 +786,17 @@ async fn read_thread_id<R: tokio::io::AsyncBufRead + Unpin>(
         if value.get("id").and_then(|id| id.as_u64()) == Some(request_id)
             && let Some(error) = value.get("error")
         {
-            anyhow::bail!("{}", rpc_error_message(error));
+            let message = rpc_error_message(error);
+            // Fail closed, but say why: the deny-read profile needs a
+            // sandbox that can enforce it (MXC on Windows).
+            if message.contains("deny-read") || message.contains("mxc") || message.contains("MXC") {
+                anyhow::bail!(
+                    "{message}\n\ngaviero: Codex could not enforce the read protection from \
+                     .gaviero/settings.json (needs the MXC sandbox on Windows). The session \
+                     was not started."
+                );
+            }
+            anyhow::bail!("{message}");
         }
         if value.get("method").and_then(|method| method.as_str()) == Some("thread/started") {
             return Ok(value
@@ -2171,6 +2178,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_thread_id_explains_a_deny_read_failure() {
+        let mut lines = lines_of(concat!(
+            "{\"id\":7,\"error\":{\"code\":-32603,\"message\":\"error creating thread: windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed\"}}\n",
+        ));
+        let err = format!("{:#}", read_thread_id(&mut lines, 7).await.unwrap_err());
+        assert!(err.contains("cannot enforce deny-read"), "got: {err}");
+        assert!(err.contains("gaviero: Codex could not enforce the read protection"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn read_thread_id_ignores_errors_for_other_requests() {
         let mut lines = lines_of(concat!(
             "{\"id\":3,\"error\":{\"message\":\"unrelated\"}}\n",
@@ -2339,9 +2356,16 @@ url = "https://example/mcp/"
     fn thread_policy_uses_native_edit_and_verification_approvals() {
         let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], false);
         assert_eq!(params["approvalPolicy"], "on-request");
-        assert_eq!(params["sandbox"], "read-only");
-        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
+        // The sandbox comes from the deny-read profile in `config`.
+        assert!(params.get("sandbox").is_none());
+        assert!(params.get("sandboxPolicy").is_none());
+        assert_eq!(params["config"]["default_permissions"], "gaviero");
+        assert_eq!(params["config"]["permissions"]["gaviero"]["extends"], ":read-only");
+        assert_eq!(params["config"]["permissions"]["gaviero"]["network"]["enabled"], false);
+        assert_eq!(
+            params["config"]["permissions"]["gaviero"]["filesystem"][":workspace_roots"]["**/.env"],
+            "deny"
+        );
 
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("apply_patch"));
@@ -2358,17 +2382,17 @@ url = "https://example/mcp/"
         let resume = thread_resume_params("thread-1", Path::new("/tmp/work"), &[], true);
         assert_eq!(resume["threadId"], "thread-1");
         assert_eq!(resume["approvalPolicy"], "on-request");
-        assert_eq!(resume["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(resume["sandboxPolicy"]["networkAccess"], true);
+        assert!(resume.get("sandboxPolicy").is_none());
+        assert_eq!(resume["config"]["default_permissions"], "gaviero");
+        assert_eq!(resume["config"]["permissions"]["gaviero"]["network"]["enabled"], true);
         assert_eq!(
             resume["developerInstructions"],
             thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], true)["developerInstructions"]
         );
 
-        let turn = turn_start_params("thread-1", "hello", false);
+        let turn = turn_start_params("thread-1", "hello");
         assert_eq!(turn["approvalPolicy"], "on-request");
-        assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(turn["sandboxPolicy"]["networkAccess"], false);
+        assert!(turn.get("sandboxPolicy").is_none());
     }
 
     #[test]

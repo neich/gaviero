@@ -173,9 +173,43 @@ pub struct ClaudeSession {
     /// killed, and the snapshot revert path runs so no half-applied tool
     /// edits remain on disk.
     cancel_token: CancellationToken,
+    /// Findings already reported by the post-turn egress scan, so a secret
+    /// repeated in every later request of the session warns once.
+    egress_seen: std::collections::HashSet<String>,
 }
 
 impl ClaudeSession {
+    /// Scan the raw request bodies Claude wrote this turn
+    /// (`OTEL_LOG_RAW_API_BODIES`, see `acp::session`) and warn about any
+    /// secret-looking value that left for the API. Bodies are deleted; only
+    /// the index and findings are kept (`crate::egress::bodies`).
+    async fn scan_egress_bodies(&mut self) {
+        let root = self.workspace_root.clone();
+        let dir = crate::egress::claude_body_dir(&root);
+        if !crate::egress::capture_claude_bodies(&root) || !dir.is_dir() {
+            return;
+        }
+        let log = root.join(".gaviero").join("egress").join("claude-requests.ndjson");
+        let mut seen = std::mem::take(&mut self.egress_seen);
+        let scanned = tokio::task::spawn_blocking(move || {
+            let rows = crate::egress::bodies::scan_claude_bodies(&dir, &log, &mut seen);
+            (rows, seen)
+        })
+        .await;
+        let Ok((rows, seen)) = scanned else {
+            return;
+        };
+        self.egress_seen = seen;
+        for row in rows {
+            for finding in &row.findings {
+                self.observer.on_egress_warning(&format!(
+                    "Egress: a request to Anthropic ({}) contained a value matching '{}': {}",
+                    row.model, finding.rule, finding.excerpt
+                ));
+            }
+        }
+    }
+
     /// Construct a new `ClaudeSession` from the unified `SessionConstruction`
     /// args. Called exclusively by `registry::create_session` for Claude
     /// providers (`ContinuityMode::NativeResume`).
@@ -225,6 +259,7 @@ impl ClaudeSession {
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
+            egress_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -1246,7 +1281,9 @@ impl AgentSession for ClaudeSession {
             _ => None,
         };
 
-        self.run_claude_turn(&turn, resume_session_id).await?;
+        let result = self.run_claude_turn(&turn, resume_session_id).await;
+        self.scan_egress_bodies().await;
+        result?;
 
         // M6: return empty stream — events flow through the observer.
         // A later milestone migrates the TUI to consume the stream directly.

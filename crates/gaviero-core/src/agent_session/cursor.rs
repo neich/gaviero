@@ -262,6 +262,15 @@ impl CursorSession {
         // user pre-approved the turn (`/autoapprove`); otherwise the
         // translated allowlist is the only shell Cursor will run.
         let force_shell = turn.auto_approve || self.bash_approved;
+        // Read policy: Cursor honours hooks, not `cli.json` Read denies. The
+        // TUI writes the file at startup (a host write, before any turn), so
+        // this call is normally a no-op and never shows up in TURN REVIEW.
+        if let Err(e) = crate::agent_guard::cursor::ensure_cursor_hooks(
+            &self.workspace_root,
+            &crate::mcp::resolver::resolve_cli_binary(),
+        ) {
+            tracing::warn!(error = %e, "cursor: could not write .cursor/hooks.json");
+        }
         let mut cmd = crate::util::spawn::agent_command("agent");
         for arg in cursor_argv(
             &self.cursor_model,

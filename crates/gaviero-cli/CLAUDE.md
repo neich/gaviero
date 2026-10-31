@@ -30,6 +30,7 @@ Mode families (flags on `Cli`):
 | MCP | `--mcp-stats` (+ `--mcp-stats-path`); `--mcp-reach-probe` (+ `--reach-providers`, `--reach-depth`, `--reach-transport`, `--reach-json`); `--mcp-register-user` / `--mcp-unregister-user`; runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
 | History | `--history` (+ `--history-last`, `--history-conv`, `--history-turn`, `--history-json`, `--history-stats`, `--history-path`) — reads the TUI's per-turn log via `gaviero_core::history::reader` |
 | Eval | `--eval-fixture` (+ ablation / budget / anchor-ab / scope-matrix / seed-corpus flags) |
+| Agent hooks (internal) | `--hook <claude:post-tool-use \| cursor:before-read-file \| cursor:before-shell-execution>` — stdin JSON → decision JSON on stdout, dispatched before tracing/workspace setup ([`agent_guard::hook`](../gaviero-core/src/agent_guard/hook.rs)) |
 
 Full user-facing flag tables: [README.md](README.md). Do not duplicate every field here.
 

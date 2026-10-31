@@ -137,6 +137,13 @@ impl AgentBackend for CursorBackend {
         let (prompt_tempfile, argv_prompt) =
             prepare_cursor_prompt(&request.workspace_root, &combined_prompt)?;
 
+        // Read policy: Cursor honours hooks, not `cli.json` Read denies.
+        if let Err(e) = crate::agent_guard::cursor::ensure_cursor_hooks(
+            &request.workspace_root,
+            &crate::mcp::resolver::resolve_cli_binary(),
+        ) {
+            tracing::warn!(target: "backend.cursor", error = %e, "could not write .cursor/hooks.json");
+        }
         let mut cmd = crate::util::spawn::agent_command("agent");
         let mcp_json = request.workspace_root.join(".cursor/mcp.json");
         if crate::mcp::config_synth::worktree_has_remote_mcp_urls(&request.workspace_root) {
