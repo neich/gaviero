@@ -152,10 +152,97 @@ Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4
 | `agent.permissions.bash.allowlist` | Command prefixes that run without a prompt even when `Bash` is not approved. Claude `Bash(prefix:*)` and Cursor `Shell(prefix*)` allow rules; enforced directly by Codex chat and the in-process agent. Set `[]` to disable. | read-only commands plus `cargo check / test / build / clippy` |
 | `agent.permissions.bash.denylist` | Command token sequences that never run, whatever else is approved. Claude and Cursor deny rules; Codex `.codex/rules/gaviero.rules` (`forbidden`, enforced even under the swarm bypass flag); enforced directly by Codex chat and the in-process agent. | none (a built-in list blocks `sudo`, `rm -rf`, `curl … \| sh`) |
 | `agent.permissions.bash.timeoutSecs` / `outputCapBytes` | Limits for one in-process shell command. | `120` / `30720` |
+| `agent.permissions.sensitivePaths.allow` | Path globs exempted from the sensitive-file list (`.env*`, keys, `*.pem`, `.npmrc`, `.docker/config.json`, …). Never exempts the hard floor: agent credentials (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gaviero/remote`, `~/.gaviero/secrets.toml`) and gaviero's own state (`.gaviero/history`, `turns`, `egress`, `remote`, `mcp-http-token`, `memory.db*`, …). | none |
+| `agent.permissions.read.deny` | Extra workspace-relative globs agents may never read. | none |
+| `agent.permissions.read.blockOutsideWorkspace` | Refuse agent file reads outside the workspace folders (Claude `blockReadsOutsideWorkingDirectories`, which also covers Bash; commands Claude cannot analyse, such as `node -e`, prompt instead). | `true` |
+| `agent.network.mode` | `off` · `log` · `ask` · `enforce`. Every agent CLI and gaviero's own HTTP clients go through a loopback CONNECT proxy (no TLS decryption) that records host:port per provider in `.gaviero/egress/connections.ndjson`. `log` warns in chat on hosts not in `agent.network.allow`, `ask` holds the connection for your decision, and `enforce` refuses it. `gaviero-cli` treats `ask` as `enforce`. | `log` |
+| `agent.network.allow` | Host patterns that never warn (`host` or `*.suffix`). | `*.anthropic.com`, `chatgpt.com`, `*.chatgpt.com`, `api.openai.com`, `*.openai.com`, `*.cursor.sh`, `api.deepseek.com`, `context7.com`, `*.context7.com` |
+| `agent.network.askTimeoutSecs` | How long an `ask` waits before denying. | `60` |
+| `agent.egress.captureClaudeBodies` | Have Claude write each raw API request body (`OTEL_LOG_RAW_API_BODIES`). After the turn, gaviero scans the bodies for secrets, warns in chat, logs one row per request (size, SHA-256, redacted findings) to `.gaviero/egress/claude-requests.ndjson`, and deletes them. | `true` |
 
 Matching: an allowlist entry is a prefix on a word boundary, and every segment of a compound command (`&&`, `||`, `;`, `|`) must match one — `cargo test && curl x` is not cleared by `cargo test`. A denylist entry matches as a token sequence anywhere in the command, last token as a prefix — `git push --force` catches `cd x && git push --force-with-lease`; `gh` catches `gh pr create` but not `echo high`. Claude and Cursor only support prefix rules natively, and Codex only token prefixes, so a denied sequence buried mid-segment is caught by gaviero's own gate (Codex chat, DeepSeek) but not by Claude or Cursor.
 
 What happens to a command that is available but neither approved nor allow-listed: Claude, Codex chat and DeepSeek prompt you; headless Cursor auto-rejects it. Swarm agents always run auto-approved, so only the denylist applies there.
+
+### Protected files and outbound traffic
+
+`.gaviero/settings.json` decides which files agents may read and where they may connect. Gaviero compiles that policy into each provider's own form at every launch; never edit the provider files by hand.
+
+**Choose which files are off-limits:**
+
+```json
+{
+  "agent": {
+    "permissions": {
+      "read": {
+        "deny": ["private/**", "config/prod.yaml"],
+        "blockOutsideWorkspace": true
+      },
+      "sensitivePaths": {
+        "allow": ["tests/fixtures/**"]
+      }
+    }
+  }
+}
+```
+
+| Category | Files | Can you exempt it? |
+|---|---|---|
+| Your additions | Globs listed in `agent.permissions.read.deny`, relative to the folder | You remove the entry |
+| Built-in sensitive files | `.env` and `.env.*` (templates such as `.env.example` stay readable), `id_rsa`, `id_ed25519`, `id_dsa`, `id_ecdsa`, `.ssh/`, `.aws/`, `credentials`, `.netrc`, `secrets.{toml,yaml,json}`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `.npmrc`, `.pypirc`, `.git-credentials`, `.pgpass`, `.docker/config.json`, `.kube/config` | Yes, with `agent.permissions.sensitivePaths.allow` |
+| Hard floor | `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gaviero/remote`, `~/.gaviero/secrets.toml`, and gaviero's own state: `.gaviero/history`, `turns`, `egress`, `remote`, `mcp-http-token`, `secrets.toml`, `mcp_calls.ndjson`, `memory.db*`, `code_graph.db*` | Never |
+| Outside the workspace | Anything outside the workspace folders, while `agent.permissions.read.blockOutsideWorkspace` is `true` (the default) | Set it to `false` |
+
+`.gaviero/settings.json`, `.gaviero/skills/` and `.gaviero/tmp/` stay readable; spilled prompts live in `.gaviero/tmp/`.
+
+**How each provider gets the policy:**
+
+| Provider | How the policy is applied |
+|---|---|
+| Claude | `--setting-sources user,project` plus a `--settings` layer of `Read(...)` deny rules (they cover the Read tool, Grep and Bash `cat`) and the outside-workspace block. A `PostToolUse` Bash hook (`gaviero-cli --hook claude:post-tool-use`) withholds output lines from protected files, e.g. `grep -r` hits, and redacts secret-looking values. A startup chat message lists any `~/.claude/settings.json` allow rules that would skip gaviero's prompts. |
+| Cursor | `.cursor/hooks.json`, written in each workspace folder at startup (`beforeReadFile`, `beforeShellExecution` → `gaviero-cli --hook cursor:…`). Cursor's `cli.json` `Read()` denies do not stop reads. |
+| Codex (chat) | A deny-read permission profile in `thread/start`, running under the MXC sandbox on Windows. If Codex cannot enforce it, the session fails closed with an explanation. Shell environment variables named `*KEY*`, `*SECRET*` or `*TOKEN*` are filtered out. |
+| `deepseek:` | Enforced in-process, Bash file arguments included. |
+
+Gaviero itself refuses to inline a protected `@`-mention or attachment; a chat message says which rule matched. It also redacts secret-looking values from injected memory, memory-extractor transcripts and the history log.
+
+**Watch outbound traffic:**
+
+```json
+{
+  "agent": {
+    "network": {
+      "mode": "log",
+      "allow": ["*.anthropic.com", "chatgpt.com", "*.cursor.sh"],
+      "askTimeoutSecs": 60
+    },
+    "egress": { "captureClaudeBodies": true }
+  }
+}
+```
+
+`mode` can be:
+- `off`: no proxy.
+- `log` (default): warn in chat the first time a provider reaches a host not on the allowlist.
+- `ask`: hold the connection until you answer in the permission overlay. `gaviero-cli` has no prompt, so it refuses instead.
+- `enforce`: refuse hosts not on the allowlist.
+
+**Logs**, in `<folder>/.gaviero/egress/` (agents cannot read this directory):
+
+| File | What it records |
+|---|---|
+| `connections.ndjson` | One row per connection: time, provider (`claude`, `codex`, `agent` for Cursor, `deepseek`, `context7`, …), host, port, decision, bytes up and down, duration. Destinations only: the proxy does not decrypt TLS. |
+| `claude-requests.ndjson` | One row per Claude API request: session, model, size, SHA-256, and any secret-looking values found (redacted excerpts only). The raw bodies are deleted after the scan. |
+| `hooks.ndjson` | Every Claude and Cursor hook decision: the path or command, and whether it was allowed, denied or redacted, with the reason. |
+
+Only Claude's request contents are captured; for the other providers the log shows which hosts they reached, not what they sent.
+
+**Known gaps:**
+- Cursor recursive searches (`grep -r`, `rg`) can surface protected content, since Cursor offers no shell-output redaction.
+- Cursor reads `.cursor/hooks.json` from the enclosing git repository's root, so a workspace folder nested inside another repository is unprotected unless that root carries the hooks too.
+- Claude `sensitivePaths.allow` exemptions do not reach sibling workspace folders.
+- Codex ignores `sensitivePaths.allow` exemptions, and its swarm `codex exec` path has no deny profile.
+- The proxy observes only clients that honour `HTTPS_PROXY`.
 
 Per-crate configuration details: [gaviero-tui](crates/gaviero-tui/README.md#configuration), [gaviero-core](crates/gaviero-core/README.md#configuration), [gaviero-cli](crates/gaviero-cli/README.md#configuration).
 

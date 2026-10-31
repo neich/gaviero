@@ -97,6 +97,12 @@ pub trait AcpObserver: Send + Sync {
     /// Called when a message (user/assistant/system) is complete.
     fn on_message_complete(&self, role: &str, content: &str);
 
+    /// Called when the post-turn egress scan found a secret-looking value in
+    /// a request the provider sent (`crate::egress::bodies`). Default no-op.
+    fn on_egress_warning(&self, message: &str) {
+        let _ = message;
+    }
+
     /// Called when a file proposal is deferred (batch review mode).
     /// The TUI uses this to show a compact inline diff summary during streaming.
     fn on_proposal_deferred(&self, path: &Path, old_content: Option<&str>, new_content: &str);

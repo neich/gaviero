@@ -91,6 +91,13 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
+    fn on_egress_warning(&self, message: &str) {
+        let _ = self.tx.send(Event::EgressWarning {
+            conv_id: self.conv_id.clone(),
+            message: message.to_string(),
+        });
+    }
+
     fn on_background_task_started(&self, task_id: &str, description: &str) {
         let _ = self.tx.send(Event::BackgroundTaskStarted {
             conv_id: self.conv_id.clone(),

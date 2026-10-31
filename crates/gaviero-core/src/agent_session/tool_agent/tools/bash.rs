@@ -47,6 +47,17 @@ impl Tool for BashTool {
             None => return ToolOutcome::error("Bash tool is not configured (missing observer)"),
         };
 
+        // The read rail applies to shell reads too: `cat .env` must not get
+        // around the Read tool's refusal just because `cat` is allowlisted.
+        if let Some(reason) = crate::agent_session::tool_agent::policy::command_protected_path(
+            command,
+            &ctx.workspace_root,
+            &ctx.sensitive,
+            &ctx.workspace_root,
+        ) {
+            return ToolOutcome::error(format!("Blocked: {reason}"));
+        }
+
         if let Err(e) = ctx
             .policy
             .gate_bash(command, ctx.auto_approve, observer)

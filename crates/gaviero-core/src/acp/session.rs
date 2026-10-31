@@ -418,14 +418,18 @@ impl AcpSession {
         if interactive_permissions {
             cmd.arg("--permission-prompt-tool").arg("stdio");
             cmd.arg("--permission-mode").arg("default");
-            // Project/local Claude settings stay loaded on purpose. Gaviero
+            // Setting sources are `user,project` (set below for every
+            // spawn). The project file stays loaded because gaviero
             // translates `mcp.permissions` *and* `agent.permissions.bash`
             // into `.claude/settings.json` (see
-            // `mcp::config_synth::synthesize_for_worktree`), and that file
-            // also carries the operator's own deny rules. Excluding it with
-            // `--setting-sources ""` dropped every allow *and* deny rule, so
-            // routine tools prompted on every turn while the safety denies
-            // silently stopped applying. Claude treats `permissions.allow` as
+            // `mcp::config_synth::synthesize_for_worktree`); its
+            // `permissions` object is owned by gaviero and replaced on every
+            // synth, so operator rules belong in `.gaviero/settings.json`.
+            // The local file (`.claude/settings.local.json`, where "don't
+            // ask again" approvals land) is excluded so it cannot pre-approve
+            // calls gaviero would prompt for. The read policy itself rides
+            // `--settings` (command-line precedence, below) — see
+            // `agent_guard::claude`. Claude treats `permissions.allow` as
             // "skip the prompt", never as a widening of the tool surface, so
             // it cannot override the hard limits `--tools` / `--mcp-config`
             // impose below.
@@ -438,6 +442,9 @@ impl AcpSession {
             .arg(crate::swarm::backend::shared::resolve_claude_cli_model(
                 model,
             ));
+        // User + project settings only: the local file's "don't ask again"
+        // allow rules must not pre-approve calls (see the comment above).
+        cmd.arg("--setting-sources").arg("user,project");
 
         // Session reuse: when a prior session_id is known (captured from the
         // first turn's SystemInit event), resume it so Claude's model keeps
@@ -481,13 +488,21 @@ impl AcpSession {
             cmd.arg("--append-system-prompt").arg(system_prompt);
         }
 
-        // GAVIERO.md in scope: skip Claude's own CLAUDE.md / AGENTS.md
-        // discovery (the caller's system prompt carries GAVIERO.md). A
-        // flag-level settings layer, so project permissions still load.
-        if options.skip_native_instructions {
-            cmd.arg("--settings")
-                .arg(crate::instructions::claude_settings_arg());
-        }
+        // The read policy from `.gaviero/settings.json` (Read denies, the
+        // outside-workspace read block, the Bash output hook), plus — when
+        // GAVIERO.md is in scope — the exclusion of Claude's own CLAUDE.md /
+        // AGENTS.md discovery. One flag-level layer: above project/user
+        // files, so project permissions still load and merge.
+        cmd.arg("--settings").arg(
+            crate::agent_guard::claude::claude_session_settings(
+                cwd,
+                additional_roots,
+                options.skip_native_instructions,
+                crate::agent_guard::claude::read_block_outside(cwd),
+                &crate::mcp::resolver::resolve_cli_binary(),
+            )
+            .to_string(),
+        );
 
         // Interactive chat always exposes AskUserQuestion so clarifying
         // questions ride the same can_use_tool control channel as tool
@@ -589,6 +604,22 @@ impl AcpSession {
         // CLIs that predate the flag (v2.1.211+); an argv flag would fail
         // spawn on older builds.
         cmd.env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
+        // Record what actually leaves for the API: Claude writes each raw
+        // request body under `.gaviero/egress/claude-bodies/` (inside the
+        // read floor), and `egress::bodies` scans then deletes them after
+        // the turn. Exporters stay `none` — `console` would print into the
+        // stream-json stdout gaviero parses. Probed on 2.1.306: file mode
+        // works without any exporter.
+        if crate::egress::capture_claude_bodies(cwd) {
+            cmd.env("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
+                .env("OTEL_LOGS_EXPORTER", "none")
+                .env("OTEL_METRICS_EXPORTER", "none")
+                .env("OTEL_TRACES_EXPORTER", "none")
+                .env(
+                    "OTEL_LOG_RAW_API_BODIES",
+                    format!("file:{}", crate::egress::claude_body_dir(cwd).display()),
+                );
+        }
 
         tracing::info!(
             "Spawning claude: model={}, cwd={}, prompt_len={}, via_tempfile={}",

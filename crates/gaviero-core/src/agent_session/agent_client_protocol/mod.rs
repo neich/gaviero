@@ -1016,7 +1016,21 @@ async fn handle_incoming(
                 .unwrap_or("");
             let abs = resolve_acp_path(session_cwd, workspace_root, raw);
             let rel = rel_to_workspace(workspace_root, &abs);
-            let enforcer = ScopeEnforcer::new(file_scope.clone());
+            // Home-directory credentials only match on the absolute path.
+            if let Some(label) = crate::scope_enforcer::read_floor_match(&abs) {
+                let _ = handle
+                    .respond_error(
+                        req.id,
+                        -32000,
+                        format!("read refused: protected credential/state file ('{label}')"),
+                    )
+                    .await;
+                return;
+            }
+            let enforcer = ScopeEnforcer::with_policy(
+                file_scope.clone(),
+                crate::scope_enforcer::SensitivePolicy::resolve(workspace_root),
+            );
             if let Err(e) = enforcer.check_read(&rel) {
                 let _ = handle
                     .respond_error(req.id, -32000, format!("read refused: {e}"))

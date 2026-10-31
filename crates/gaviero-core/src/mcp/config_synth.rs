@@ -1376,7 +1376,9 @@ fn toml_string_array(items: &[String]) -> String {
 /// Write the appropriate config files into `worktree`. Returns the
 /// paths written. Creates parent directories as needed.
 ///
-/// Skips Claude config if `enabled = false`. Skips Codex config if
+/// With `enabled = false` only the permission policy is written (Codex
+/// execpolicy rules, Claude `.claude/settings.json` permissions, Cursor
+/// `.cursor/cli.json`); no MCP server config. Skips Codex config if
 /// `enabled = false` OR `codex_trust != Granted`.
 pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
@@ -1416,6 +1418,18 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     }
 
     if !synth.enabled {
+        // The permission policy never depends on MCP enablement: a
+        // `--no-mcp` run must still carry `agent.permissions.bash` into
+        // Claude and Cursor. Only the MCP server configs are skipped.
+        write_claude_permissions(synth, &mut written)?;
+        let cursor_dir = synth.worktree.join(".cursor");
+        if !synth.bash.is_empty() || cursor_dir.join("cli.json").exists() {
+            if let Some(cli_path) =
+                synthesize_cursor_cli(&cursor_dir, &cursor_dir.join("mcp.json"), synth)?
+            {
+                written.push(cli_path);
+            }
+        }
         return Ok(written);
     }
 
@@ -1425,20 +1439,7 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     write_if_changed(&claude_path, &claude_body)?;
     written.push(claude_path);
 
-    // Claude permissions: <worktree>/.claude/settings.json — Claude reads
-    // project settings (`permissions.allow/deny`, carrying both the `mcp__…`
-    // rules and the translated shell rules) from this path. Merged so
-    // unrelated settings are preserved. Runs whenever the policy has
-    // something to say *or* a previous synth left rules behind that now need
-    // retracting, so revoking a permission actually revokes it.
-    let claude_perms = claude_settings_permissions(synth);
-    if claude_perms.is_some() || synth.worktree.join(".claude/settings.json").exists() {
-        let perms = claude_perms.unwrap_or_else(|| serde_json::json!({ "allow": [], "deny": [] }));
-        let claude_settings_path = synth.worktree.join(".claude/settings.json");
-        let settings_body = merge_claude_settings_permissions(&claude_settings_path, &perms)?;
-        write_if_changed(&claude_settings_path, &settings_body)?;
-        written.push(claude_settings_path);
-    }
+    write_claude_permissions(synth, &mut written)?;
 
     // Cursor: <worktree>/.cursor/mcp.json — same schema as Claude's
     // `.mcp.json`, so the merge helper handles preserving any user
@@ -1531,6 +1532,24 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
 /// auto-approve) ride argv flags from
 /// [`crate::swarm::backend::cursor::cursor_argv`] instead. This function
 /// replaces the `permissions` object with the current Gaviero policy.
+/// Claude permissions: `<worktree>/.claude/settings.json` — Claude reads
+/// project settings (`permissions.allow/deny`, carrying both the `mcp__…`
+/// rules and the translated shell rules) from this path. Merged so unrelated
+/// settings are preserved. Runs whenever the policy has something to say
+/// *or* a previous synth left rules behind that now need retracting, so
+/// revoking a permission actually revokes it.
+fn write_claude_permissions(synth: &McpConfigSynth, written: &mut Vec<PathBuf>) -> Result<()> {
+    let claude_perms = claude_settings_permissions(synth);
+    let claude_settings_path = synth.worktree.join(".claude/settings.json");
+    if claude_perms.is_some() || claude_settings_path.exists() {
+        let perms = claude_perms.unwrap_or_else(|| serde_json::json!({ "allow": [], "deny": [] }));
+        let settings_body = merge_claude_settings_permissions(&claude_settings_path, &perms)?;
+        write_if_changed(&claude_settings_path, &settings_body)?;
+        written.push(claude_settings_path);
+    }
+    Ok(())
+}
+
 fn synthesize_cursor_cli(
     cursor_dir: &Path,
     mcp_json_path: &Path,
@@ -2141,6 +2160,24 @@ mod tests {
         let files = synthesize_for_worktree(&synth).unwrap();
         assert!(files.is_empty());
         assert!(!dir.path().join(".mcp.json").exists());
+    }
+
+    #[test]
+    fn synth_disabled_still_writes_the_permission_policy() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.enabled = false;
+        synth.bash = bash_fixture();
+        synthesize_for_worktree(&synth).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let deny = json_string_array(&settings["permissions"], "deny");
+        assert!(deny.contains(&"Bash(mkfs.:*)".to_string()), "{deny:?}");
+        assert!(dir.path().join(".cursor/cli.json").is_file());
+        assert!(!dir.path().join(".mcp.json").exists());
+        assert!(!dir.path().join(".cursor/mcp.json").exists());
     }
 
     #[test]

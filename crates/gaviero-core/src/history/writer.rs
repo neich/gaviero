@@ -619,7 +619,24 @@ fn normalize(payload: HistoryKind) -> HistoryKind {
     }
 }
 
+/// Strip secret-looking values from a tool record before it is persisted:
+/// the history log must not become a plaintext copy of what an agent read.
+fn redact_tool_call(c: &mut ToolCall) {
+    if let Some(input) = c.input.as_mut() {
+        crate::secret_scan::redact_json(input);
+    }
+    match &mut c.output {
+        ToolOutput::Full { content, .. } => *content = crate::secret_scan::redact(content).0,
+        ToolOutput::Summary { text } => *text = crate::secret_scan::redact(text).0,
+        ToolOutput::None => {}
+    }
+    if let Some(summary) = c.summary.as_mut() {
+        *summary = crate::secret_scan::redact(summary).0;
+    }
+}
+
 fn normalize_tool_call(c: &mut ToolCall) {
+    redact_tool_call(c);
     if let Some(input) = c.input.take() {
         let text = input.to_string();
         if c.input_tokens_est.is_none() {
@@ -645,6 +662,8 @@ fn normalize_tool_call(c: &mut ToolCall) {
 }
 
 fn normalize_mcp_call(m: &mut McpCall) {
+    crate::secret_scan::redact_json(&mut m.input);
+    crate::secret_scan::redact_json(&mut m.output);
     let in_text = m.input.to_string();
     let out_text = m.output.to_string();
     m.input_tokens_est = estimate_json_text_tokens(&in_text);
@@ -1241,6 +1260,39 @@ mod tests {
                 // Estimated from the untruncated payload.
                 assert!(c.input_tokens_est.unwrap() > HISTORY_MAX_JSON_BYTES / 4);
             }
+            other => panic!("expected tool_call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_redacts_secrets_in_tool_records() {
+        let (_dir, r) = rec();
+        let token = format!("ghp_{}", "a".repeat(36)); // pragma: allowlist secret
+        r.begin_turn("c1", "c1-1", start("a"), false);
+        r.tool_completed(
+            "c1-1",
+            tool_call_record(
+                "Bash",
+                None,
+                None,
+                Some(serde_json::json!({ "command": format!("echo {token}") })),
+                ToolOutput::Full {
+                    content: format!("{token}\n"),
+                    is_error: false,
+                },
+                None,
+            ),
+        );
+        let raw = std::fs::read_to_string(r.path()).unwrap();
+        assert!(!raw.contains(&token), "history kept the secret");
+        let out = reader::read_records(r.path(), true);
+        match &out.records[1].record.payload {
+            HistoryKind::ToolCall(c) => match &c.output {
+                ToolOutput::Full { content, .. } => {
+                    assert!(content.contains("[REDACTED:github-token]"))
+                }
+                other => panic!("expected full output, got {other:?}"),
+            },
             other => panic!("expected tool_call, got {other:?}"),
         }
     }

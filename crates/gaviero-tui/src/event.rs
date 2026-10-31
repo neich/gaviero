@@ -277,6 +277,19 @@ pub enum Event {
     /// The bootstrap could not start the sidecar; `/remote` shows why.
     RemoteUnavailable(crate::app::remote_setup::RemoteUnavailable),
 
+    /// The egress proxy decided a connection (`crate::app::egress`).
+    Egress(gaviero_core::egress::EgressEvent),
+    /// The post-turn egress scan found a secret-looking value in a request a
+    /// provider sent for this conversation.
+    EgressWarning { conv_id: String, message: String },
+    /// `agent.network.mode = "ask"`: may `provider` reach `host`? Answered
+    /// through the active conversation's permission overlay.
+    EgressAsk {
+        provider: String,
+        host: String,
+        respond: tokio::sync::oneshot::Sender<bool>,
+    },
+
     // Internal
     Tick,
 }

@@ -769,7 +769,8 @@ pub fn render_memory_block(
         for m in structured {
             let ns = m.namespace.as_deref().unwrap_or("");
             let score = m.score.unwrap_or(0.0);
-            body.push_str(&format!("{}|{}|s{:.2}\n", ns, m.content, score));
+            let content = crate::secret_scan::redact(&m.content).0;
+            body.push_str(&format!("{}|{}|s{:.2}\n", ns, content, score));
         }
         chunks.push(format!("<project_memory>\n{}</project_memory>", body));
     }
@@ -811,6 +812,23 @@ pub fn request_prompt(request: &CompletionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_memory_block_redacts_secrets() {
+        let selection = crate::context_planner::MemorySelection {
+            id: Some(7),
+            namespace: Some("ws".into()),
+            scope_label: None,
+            score: Some(0.5),
+            trust: None,
+            content: "ci uses AKIAABCDEFGHIJKLMNOP".into(), // pragma: allowlist secret
+            source_hash: None,
+            updated_at: None,
+        };
+        let block = render_memory_block(&[selection]).unwrap();
+        assert!(block.contains("[REDACTED:aws-access-key-id]"), "{block}");
+        assert!(!block.contains("AKIAABCDEFGHIJKLMNOP")); // pragma: allowlist secret
+    }
 
     #[test]
     fn retrieval_stanza_gated_on_live_tools() {

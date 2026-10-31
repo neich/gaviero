@@ -1,7 +1,9 @@
 pub mod acp;
+pub mod agent_guard;
 pub mod agent_session;
 pub mod context_planner;
 pub mod diff_engine;
+pub mod egress;
 pub mod git;
 pub mod git_conflict;
 pub mod history;
@@ -15,6 +17,7 @@ pub mod path_pattern;
 pub mod query_loader;
 pub mod repo_map;
 pub mod scope_enforcer;
+pub mod secret_scan;
 pub mod session_journal;
 pub mod session_state;
 pub mod skills;

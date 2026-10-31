@@ -63,6 +63,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama, DeepSee
 
 ## Rules
 
+- `.gaviero/settings.json` is the only read/network policy source: provider read rules are compiled from it at spawn (`agent_guard`); never author provider permission files by hand — they are replaced.
 - Every file change made during a TUI chat turn is captured in that turn's change set (`turn_capture`) and must be reviewed before the conversation continues. Swarm and CLI writes go through `WriteGatePipeline`. Host-side writes made during a turn (editor saves, review reverts, MCP config synthesis) must be recorded in `TurnCapture::ledger()` or they are attributed to the agent.
 - Never let an MCP tool touch a store directly. Any tool with an effect goes through the writer task or the Write Gate — that is the invariant. A read-only surface is the default posture, not a hard rule: each tool costs ~150–250 prompt tokens on every subprocess turn (provenance: `git show f11eca9:tier-a-part-2-surface.md` §A5), so make it earn that.
 - Never hold a `Mutex` across `.await`, embeddings, or filesystem I/O.

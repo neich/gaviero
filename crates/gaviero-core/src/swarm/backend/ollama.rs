@@ -32,7 +32,9 @@ impl OllamaStreamBackend {
             display_name: format!("ollama:{}", model),
             base_url: base,
             model: model.to_string(),
-            client: reqwest::Client::new(),
+            client: crate::egress::client_builder("ollama")
+                .build()
+                .unwrap_or_default(),
         }
     }
 }

@@ -109,6 +109,27 @@ pub mod settings {
     /// Combined stdout+stderr cap for one in-process shell command (bytes).
     pub const AGENT_PERMISSIONS_BASH_OUTPUT_CAP_BYTES: &str =
         "agent.permissions.bash.outputCapBytes";
+    /// Path globs exempted from the sensitive block-list (never the hard
+    /// floor). Read by [`crate::scope_enforcer::SensitivePolicy::resolve`].
+    pub const AGENT_PERMISSIONS_SENSITIVE_ALLOW: &str = "agent.permissions.sensitivePaths.allow";
+    /// Extra workspace-relative globs agents may never read. Default: none.
+    pub const AGENT_PERMISSIONS_READ_DENY: &str = "agent.permissions.read.deny";
+    /// Refuse agent file reads outside the workspace folders (Claude
+    /// `permissions.blockReadsOutsideWorkingDirectories`). Default: true.
+    pub const AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE: &str =
+        "agent.permissions.read.blockOutsideWorkspace";
+
+    // Egress settings (`crate::egress`)
+    /// `off` | `log` | `ask` | `enforce` for the loopback egress proxy every
+    /// spawned agent and in-process client is routed through. Default `log`.
+    pub const AGENT_NETWORK_MODE: &str = "agent.network.mode";
+    /// Host patterns (`host` or `*.suffix`) that never warn, ask or block.
+    pub const AGENT_NETWORK_ALLOW: &str = "agent.network.allow";
+    /// Seconds an `ask` decision waits before denying. Default 60.
+    pub const AGENT_NETWORK_ASK_TIMEOUT_SECS: &str = "agent.network.askTimeoutSecs";
+    /// Capture Claude's raw API request bodies for the post-turn secret scan
+    /// (only the index and findings are kept). Default true.
+    pub const AGENT_EGRESS_CAPTURE_BODIES: &str = "agent.egress.captureClaudeBodies";
 
     // Memory settings
     /// The namespace to write memories to.
@@ -1510,6 +1531,23 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
             serde_json::json!(bash_policy::DEFAULT_BASH_ALLOWLIST)
         }
         settings::AGENT_PERMISSIONS_BASH_DENYLIST => serde_json::json!([]),
+        settings::AGENT_PERMISSIONS_SENSITIVE_ALLOW => serde_json::json!([]),
+        settings::AGENT_PERMISSIONS_READ_DENY => serde_json::json!([]),
+        settings::AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE => serde_json::json!(true),
+        settings::AGENT_NETWORK_MODE => serde_json::json!("log"),
+        settings::AGENT_NETWORK_ALLOW => serde_json::json!([
+            "*.anthropic.com",
+            "chatgpt.com",
+            "*.chatgpt.com",
+            "api.openai.com",
+            "*.openai.com",
+            "*.cursor.sh",
+            "api.deepseek.com",
+            "context7.com",
+            "*.context7.com"
+        ]),
+        settings::AGENT_NETWORK_ASK_TIMEOUT_SECS => serde_json::json!(60),
+        settings::AGENT_EGRESS_CAPTURE_BODIES => serde_json::json!(true),
         settings::AGENT_PERMISSIONS_BASH_TIMEOUT_SECS => {
             serde_json::json!(bash_policy::DEFAULT_BASH_TIMEOUT_SECS)
         }

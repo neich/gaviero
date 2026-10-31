@@ -483,6 +483,36 @@ pub fn sibling_shim_path() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// `gaviero-cli[.exe]` next to this process (or one level up when this
+/// process is a cargo test binary under `deps/`), when that file exists.
+pub fn sibling_cli_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = if cfg!(windows) {
+        "gaviero-cli.exe"
+    } else {
+        "gaviero-cli"
+    };
+    let candidate = dir.join(name);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if dir.file_name().is_some_and(|n| n == "deps") {
+        let up = dir.parent()?.join(name);
+        return up.is_file().then_some(up);
+    }
+    None
+}
+
+/// The `gaviero-cli` command agent hooks run: the sibling binary (with `/`
+/// separators, which every hook shell accepts) or the bare name on `PATH`.
+pub fn resolve_cli_binary() -> String {
+    match sibling_cli_path() {
+        Some(p) => p.to_string_lossy().replace('\\', "/"),
+        None => "gaviero-cli".to_string(),
+    }
+}
+
 /// Prefer a same-directory shim next to this process when the setting is
 /// still the bare default. An explicit `mcp.gavieroServer.shimBinary` wins.
 pub fn resolve_shim_binary(configured: &str, sibling: Option<PathBuf>) -> String {
@@ -499,6 +529,17 @@ pub fn resolve_shim_binary(configured: &str, sibling: Option<PathBuf>) -> String
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn resolve_cli_binary_names_gaviero_cli() {
+        let bin = resolve_cli_binary();
+        assert!(!bin.is_empty());
+        assert!(
+            bin.ends_with("gaviero-cli") || bin.ends_with("gaviero-cli.exe"),
+            "{bin}"
+        );
+        assert!(!bin.contains('\\'));
+    }
 
     #[test]
     fn resolve_bash_permissions_reads_agent_permissions_bash() {

@@ -34,7 +34,9 @@ impl DeepseekClient {
     pub fn new(cfg: Result<ApiClientConfig>) -> Self {
         Self {
             cfg: cfg.map_err(|e| format!("{e:#}")),
-            http: reqwest::Client::new(),
+            http: crate::egress::client_builder("deepseek")
+                .build()
+                .unwrap_or_default(),
         }
     }
 }

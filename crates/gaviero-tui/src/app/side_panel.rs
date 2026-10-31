@@ -1792,6 +1792,31 @@ fn resolve_at_path(
     None
 }
 
+/// Why an `@` reference or attachment must not be sent to the agent, if it
+/// must not. The policy comes from the `.gaviero/settings.json` of the
+/// member folder holding the file (the longest matching root; workspace
+/// config dirs such as `.gaviero` are skipped since they carry no settings
+/// of their own), else from `fallback_root`.
+fn protected_ref_refusal(
+    abs_path: &std::path::Path,
+    named_roots: &[(String, std::path::PathBuf)],
+    fallback_root: &std::path::Path,
+) -> Option<String> {
+    let root = named_roots
+        .iter()
+        .map(|(_, root)| root.as_path())
+        .filter(|root| {
+            !root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(".gaviero") || n.eq_ignore_ascii_case(".claude"))
+        })
+        .filter(|root| abs_path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .unwrap_or(fallback_root);
+    gaviero_core::scope_enforcer::SensitivePolicy::resolve(root).read_refusal(abs_path, root)
+}
+
 /// Every workspace file `@` completion offers, in the form
 /// [`dispatch_prompt_core`] resolves: root-relative, prefixed with the
 /// folder label in multi-root workspaces. Honors `files.exclude`; capped
@@ -2101,17 +2126,34 @@ pub(crate) fn dispatch_prompt_core(
             .add_system_message(&format!("Skill warning ({}): {}", w.name, w.message));
     }
     let refs = crate::panels::agent_chat::parse_file_references(&task_text);
+    // Protected files never reach the prompt: `.gaviero/settings.json` is the
+    // only way to exempt one, so the refusal is final for this turn.
+    let fallback_root: std::path::PathBuf = focused_folder
+        .clone()
+        .or_else(|| app.workspace.folders().first().map(|f| f.path.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let mut file_refs: Vec<(String, String)> = Vec::new();
     for rel_path in &refs {
-        if let Some(abs_path) = resolve_at_path(rel_path, &named_roots)
-            && let Ok(content) = std::fs::read_to_string(&abs_path)
-        {
+        let Some(abs_path) = resolve_at_path(rel_path, &named_roots) else {
+            continue;
+        };
+        if let Some(reason) = protected_ref_refusal(&abs_path, &named_roots, &fallback_root) {
+            app.chat_state
+                .add_system_message(&format!("Not sent to the agent: {reason}"));
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&abs_path) {
             file_refs.push((rel_path.clone(), content));
         }
     }
 
     let mut cli_file_attachments: Vec<std::path::PathBuf> = Vec::new();
     for attach in &attachments {
+        if let Some(reason) = protected_ref_refusal(&attach.path, &named_roots, &fallback_root) {
+            app.chat_state
+                .add_system_message(&format!("Not sent to the agent: {reason}"));
+            continue;
+        }
         match attach.kind {
             crate::panels::agent_chat::AttachmentKind::Text => {
                 if let Ok(content) = std::fs::read_to_string(&attach.path) {
@@ -3930,6 +3972,36 @@ mod tests {
             gaviero_core::workspace::Workspace::single_folder(dir.to_path_buf()),
             tx,
         )
+    }
+
+    #[test]
+    fn protected_ref_refusal_blocks_env_but_not_readme() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![("w".to_string(), dir.path().to_path_buf())];
+        let env = dir.path().join(".env");
+        let readme = dir.path().join("README.md");
+        assert!(super::protected_ref_refusal(&env, &roots, dir.path()).is_some());
+        assert!(super::protected_ref_refusal(&readme, &roots, dir.path()).is_none());
+    }
+
+    #[test]
+    fn protected_ref_refusal_honours_settings_exemption() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"sensitivePaths":{"allow":[".env"]}}}}"#,
+        )
+        .unwrap();
+        let roots = vec![
+            (".gaviero".to_string(), dir.path().join(".gaviero")),
+            ("w".to_string(), dir.path().to_path_buf()),
+        ];
+        let env = dir.path().join(".env");
+        assert!(super::protected_ref_refusal(&env, &roots, dir.path()).is_none());
+        // The floor is never exempted.
+        let token = dir.path().join(".gaviero/mcp-http-token");
+        assert!(super::protected_ref_refusal(&token, &roots, dir.path()).is_some());
     }
 
     /// `App::new` reads session state from the OS data dir, keyed by a hash of
