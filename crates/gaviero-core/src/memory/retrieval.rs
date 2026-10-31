@@ -612,7 +612,7 @@ fn render_block(
             "- [{}] {}: {}\n",
             format_scope_label(m),
             m.memory_type.as_str(),
-            m.content.trim()
+            crate::secret_scan::redact(m.content.trim()).0
         );
         let hint_len = if emitted.is_empty() { 0 } else { hint.len() };
         if overhead + body.len() + line.len() + hint_len > char_budget && !emitted.is_empty() {
@@ -759,6 +759,19 @@ mod tests {
         let mut open = cfg.clone();
         open.constitution_only = false;
         assert!(admit_constitution(&extracted, &open));
+    }
+
+    #[test]
+    fn render_block_redacts_secrets_in_memory_content() {
+        let kept = vec![scored(
+            1,
+            MemoryType::Decision,
+            MemorySource::LlmAnnotated,
+            "deploy key AKIAABCDEFGHIJKLMNOP lives in vault", // pragma: allowlist secret
+        )];
+        let (block, _, _) = render_block(&kept, 400, false);
+        assert!(block.contains("[REDACTED:aws-access-key-id]"), "{block}");
+        assert!(!block.contains("AKIAABCDEFGHIJKLMNOP")); // pragma: allowlist secret
     }
 
     #[test]

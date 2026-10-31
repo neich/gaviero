@@ -88,7 +88,10 @@ struct ExtractionEnvelope {
 
 /// Build the full prompt string for a transcript.
 pub fn build_prompt(transcript: &str) -> String {
-    PROMPT_V1.replace("{{TRANSCRIPT}}", transcript)
+    // The transcript goes back to the chat model: never resend a secret the
+    // turn happened to surface.
+    let transcript = crate::secret_scan::redact(transcript).0;
+    PROMPT_V1.replace("{{TRANSCRIPT}}", &transcript)
 }
 
 /// Parse an LLM response into a capped, filtered list of extractions.
@@ -239,6 +242,13 @@ fn extract_json_object(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_prompt_redacts_secrets_in_transcript() {
+        let prompt = build_prompt("USER: my key is AKIAABCDEFGHIJKLMNOP\n\nASSISTANT: ok"); // pragma: allowlist secret
+        assert!(prompt.contains("[REDACTED:aws-access-key-id]"));
+        assert!(!prompt.contains("AKIAABCDEFGHIJKLMNOP")); // pragma: allowlist secret
+    }
 
     #[test]
     fn parse_response_happy_path() {

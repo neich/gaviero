@@ -323,7 +323,10 @@ pub fn build_prompt(
     // truncation here rather than at the call site so every caller gets
     // the bound, and so the promise and the mechanism cannot drift apart
     // again.
-    let transcript = truncate_transcript(transcript);
+    // The transcript goes back to the chat model: never resend a secret the
+    // session happened to surface.
+    let redacted = crate::secret_scan::redact(transcript).0;
+    let transcript = truncate_transcript(&redacted);
     let mut body = String::with_capacity(transcript.len() + 2048);
     body.push_str(PROMPT_V5.trim_start());
     body.push_str("\n\nTRANSCRIPT (most recent turns; earlier ones may be elided):\n");
@@ -619,6 +622,13 @@ Hope that helps."#;
     /// C-fix: the header promised truncation that never happened. Prove
     /// the promise is now backed by the mechanism, at the choke point
     /// every caller shares.
+    #[test]
+    fn build_prompt_redacts_secrets_in_transcript() {
+        let body = build_prompt("USER: token AKIAABCDEFGHIJKLMNOP", &[], &[], &[]); // pragma: allowlist secret
+        assert!(body.contains("[REDACTED:aws-access-key-id]"));
+        assert!(!body.contains("AKIAABCDEFGHIJKLMNOP")); // pragma: allowlist secret
+    }
+
     #[test]
     fn build_prompt_bounds_an_oversized_transcript() {
         let huge = "USER: filler line that goes on\n".repeat(4000);
