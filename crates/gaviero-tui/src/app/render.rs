@@ -473,10 +473,21 @@ pub(super) fn render_find_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    if let Some(editor_buf) = app.buffers.get(app.active_buffer) {
-        let total = editor_buf.search_match_count();
+    let counts = if super::editing::preview_owns_find(app) {
+        let matches =
+            crate::panels::chat_markdown::preview_find_matches(&app.preview_lines, &app.find_input.text);
+        let current = app
+            .preview_find_current
+            .and_then(|cur| matches.iter().position(|m| (m.line, m.start) == cur))
+            .map_or(0, |i| i + 1);
+        Some((matches.len(), current))
+    } else {
+        app.buffers
+            .get(app.active_buffer)
+            .map(|b| (b.search_match_count(), b.current_match_index()))
+    };
+    if let Some((total, current)) = counts {
         if total > 0 {
-            let current = editor_buf.current_match_index();
             let indicator = format!(" {}/{} ", current, total);
             let ind_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
             let ind_start = area.right().saturating_sub(indicator.len() as u16);
@@ -1202,6 +1213,21 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         app.preview_viewport_lines,
         scroll,
     );
+
+    if app.find_bar_active && super::editing::preview_owns_find(app) {
+        let matches = chat_markdown::preview_find_matches(&app.preview_lines, &app.find_input.text);
+        chat_markdown::paint_preview_matches(
+            &app.preview_lines,
+            &matches,
+            app.preview_find_current,
+            text_area,
+            frame.buffer_mut(),
+            scroll,
+        );
+        // Preview-only has no source pane to host the bar: it takes the
+        // top border row, so the preview's geometry (and hit-testing) stays put.
+        app.render_find_bar(frame, Rect { height: 1, ..area });
+    }
 }
 
 /// Text width of the preview for an inner rect (one column of padding on each

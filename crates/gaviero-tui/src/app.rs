@@ -202,6 +202,9 @@ pub struct App {
     pub preview_headings: Vec<RenderedHeading>,
     /// Destination under the pointer, if any. Drives hover paint + status bar.
     pub preview_hover_href: Option<String>,
+    /// Current find-bar match in preview-only mode: `(rendered line, char
+    /// offset)` into `preview_lines`. `None` until the first jump.
+    pub preview_find_current: Option<(usize, usize)>,
     /// Last mouse cell, so preview scroll can re-hit-test without a move event.
     pub last_mouse: Option<(u16, u16)>,
     /// Set by handlers after `RenderScheduler` already ran (preview hover).
@@ -531,6 +534,7 @@ impl App {
             preview_lines: Vec::new(),
             preview_headings: Vec::new(),
             preview_hover_href: None,
+            preview_find_current: None,
             last_mouse: None,
             needs_immediate_render: false,
             write_gate,

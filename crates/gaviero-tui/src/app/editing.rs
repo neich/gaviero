@@ -36,30 +36,145 @@ pub(super) fn handle_find_bar_action(app: &mut App, action: Action) {
                 app.update_find_highlight();
             }
         }
-        Action::Enter | Action::CursorDown => {
-            if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                buf.find_next_match();
-            }
-            app.ensure_editor_cursor_visible();
-        }
+        Action::Enter | Action::CursorDown => find_next(app),
         Action::CursorUp => {
+            if preview_owns_find(app) {
+                step_preview_find(app, PreviewFindStep::Prev);
+                return;
+            }
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                 buf.find_prev_match();
             }
             app.ensure_editor_cursor_visible();
         }
-        Action::Quit | Action::FindInBuffer => {
-            app.find_bar_active = false;
-            if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                buf.set_search_highlight(None);
-            }
-        }
+        Action::Quit | Action::FindInBuffer => close_find_bar(app),
         _ => {}
     }
 }
 
+/// Enter / Down in the find bar, and the workspace-search key while it is open.
+pub(super) fn find_next(app: &mut App) {
+    if preview_owns_find(app) {
+        step_preview_find(app, PreviewFindStep::Next);
+        return;
+    }
+    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+        buf.find_next_match();
+    }
+    app.ensure_editor_cursor_visible();
+}
+
+pub(super) fn close_find_bar(app: &mut App) {
+    app.find_bar_active = false;
+    app.preview_find_current = None;
+    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+        buf.set_search_highlight(None);
+    }
+}
+
+/// Whether the find bar searches the rendered preview instead of the source:
+/// only when the preview is all there is on screen.
+pub(super) fn preview_owns_find(app: &App) -> bool {
+    preview_owns_folding(app)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PreviewFindStep {
+    /// The query changed: stay on the current match if it still matches,
+    /// else the next one; with no current match, the first from the top of
+    /// the view down.
+    Refresh,
+    Next,
+    Prev,
+}
+
+/// Pick the match to move to. `current` is the last match jumped to;
+/// `top` is the first preview line on screen. Wraps at both ends.
+pub(super) fn pick_preview_match(
+    matches: &[crate::panels::chat_markdown::PreviewMatch],
+    current: Option<(usize, usize)>,
+    top: usize,
+    step: PreviewFindStep,
+) -> Option<(usize, usize)> {
+    let pos = |m: &crate::panels::chat_markdown::PreviewMatch| (m.line, m.start);
+    let first = matches.first().map(pos)?;
+    let last = matches.last().map(pos)?;
+    let picked = match (step, current) {
+        (PreviewFindStep::Refresh, Some(cur)) => matches.iter().map(pos).find(|&p| p >= cur),
+        (PreviewFindStep::Next, Some(cur)) => matches.iter().map(pos).find(|&p| p > cur),
+        (PreviewFindStep::Prev, Some(cur)) => matches.iter().map(pos).rev().find(|&p| p < cur),
+        (PreviewFindStep::Prev, None) => matches.iter().map(pos).rev().find(|&(l, _)| l < top),
+        (_, None) => matches.iter().map(pos).find(|&(l, _)| l >= top),
+    };
+    Some(picked.unwrap_or(if step == PreviewFindStep::Prev { last } else { first }))
+}
+
+/// Move the preview-only find to a match and scroll it into view.
+fn step_preview_find(app: &mut App, step: PreviewFindStep) {
+    use crate::panels::chat_markdown::preview_find_matches;
+
+    let query = app.find_input.text.clone();
+    let mut matches = preview_find_matches(&app.preview_lines, &query);
+    if matches.is_empty() && unfold_preview_for_query(app, &query) {
+        matches = preview_find_matches(&app.preview_lines, &query);
+    }
+    let picked = pick_preview_match(&matches, app.preview_find_current, app.preview_scroll(), step);
+    app.preview_find_current = picked;
+    let Some((line, _)) = picked else {
+        return;
+    };
+    let top = app.preview_scroll();
+    let rows = app.preview_viewport_lines.max(1);
+    if line < top || line >= top + rows {
+        app.set_preview_scroll(line.saturating_sub(rows / 3));
+        super::render::clamp_preview_scroll(app, app.preview_lines.len());
+    }
+}
+
+/// When `query` only matches inside collapsed preview sections, expand them
+/// all and lay the preview out again. True when that happened.
+fn unfold_preview_for_query(app: &mut App, query: &str) -> bool {
+    use crate::panels::chat_markdown::preview_find_matches;
+
+    let Some(preview) = app.layout.preview_area else {
+        return false;
+    };
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
+    let width = super::render::preview_content_width(inner);
+    let style = app.theme.default_style();
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return false;
+    };
+    if buf.preview_folds.is_empty() {
+        return false;
+    }
+    let expanded = super::render::layout_preview(&buf.text.to_string(), &Default::default(), width, style);
+    if preview_find_matches(&expanded.lines, query).is_empty() {
+        return false;
+    }
+    buf.preview_folds.clear();
+    buf.preview_outline = None;
+    app.preview_line_count = expanded.lines.len();
+    app.preview_lines = expanded.lines;
+    app.preview_headings = expanded.headings;
+    app.status_message = Some((
+        "Expanded collapsed sections to show matches".to_string(),
+        std::time::Instant::now(),
+    ));
+    true
+}
+
 pub(super) fn update_find_highlight(app: &mut App) {
     let query = app.find_input.text.clone();
+    if preview_owns_find(app) {
+        // Keep the source highlight for when the view goes back to split,
+        // but leave the source cursor where it is.
+        if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+            buf.set_search_highlight((!query.is_empty()).then_some(query));
+        }
+        step_preview_find(app, PreviewFindStep::Refresh);
+        return;
+    }
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         if query.is_empty() {
             buf.set_search_highlight(None);
@@ -2531,6 +2646,28 @@ pub(super) fn is_current_buffer_markdown(app: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_preview_match_steps_and_wraps() {
+        use crate::panels::chat_markdown::PreviewMatch;
+        let m = |line, start| PreviewMatch { line, start, end: start + 1 };
+        let matches = [m(2, 0), m(2, 5), m(10, 3), m(40, 0)];
+        let pick = |cur, top, step| pick_preview_match(&matches, cur, top, step);
+
+        // A fresh query starts at the first match on or below the view's top.
+        assert_eq!(pick(None, 5, PreviewFindStep::Refresh), Some((10, 3)));
+        assert_eq!(pick(None, 50, PreviewFindStep::Refresh), Some((2, 0)));
+        // A longer query stays on the current match while it still matches.
+        assert_eq!(pick(Some((2, 5)), 0, PreviewFindStep::Refresh), Some((2, 5)));
+        assert_eq!(pick(Some((2, 6)), 0, PreviewFindStep::Refresh), Some((10, 3)));
+        // Next / previous step within a line too, and wrap at the ends.
+        assert_eq!(pick(Some((2, 0)), 0, PreviewFindStep::Next), Some((2, 5)));
+        assert_eq!(pick(Some((40, 0)), 0, PreviewFindStep::Next), Some((2, 0)));
+        assert_eq!(pick(Some((2, 5)), 0, PreviewFindStep::Prev), Some((2, 0)));
+        assert_eq!(pick(Some((2, 0)), 0, PreviewFindStep::Prev), Some((40, 0)));
+        assert_eq!(pick(None, 20, PreviewFindStep::Prev), Some((10, 3)));
+        assert_eq!(pick_preview_match(&[], None, 0, PreviewFindStep::Next), None);
+    }
 
     fn all_visible() -> PanelVisibility {
         PanelVisibility {

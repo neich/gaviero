@@ -684,6 +684,92 @@ pub fn preview_link_at(
     href_at(line, (col - text_origin_x) as usize)
 }
 
+/// A case-insensitive find match in rendered preview text: `start..end` are
+/// char offsets into [`ChatLine::text`] of `lines[line]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewMatch {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Lowercase one char to one char, so offsets in the folded text are the
+/// offsets in the original.
+fn fold_case(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Every case-insensitive occurrence of `query` in the rendered lines, top to
+/// bottom. Overlapping occurrences are all reported, like the editor's find.
+pub fn preview_find_matches(lines: &[ChatLine], query: &str) -> Vec<PreviewMatch> {
+    let needle: Vec<char> = query.chars().map(fold_case).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (line, l) in lines.iter().enumerate() {
+        let hay: Vec<char> = l.text().chars().map(fold_case).collect();
+        if hay.len() < needle.len() {
+            continue;
+        }
+        for start in 0..=hay.len() - needle.len() {
+            if hay[start..start + needle.len()] == needle[..] {
+                out.push(PreviewMatch {
+                    line,
+                    start,
+                    end: start + needle.len(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Repaint the find matches visible in `area` (same origin as
+/// [`render_lines_to_buffer`]); the match starting at `current` stands out.
+pub fn paint_preview_matches(
+    lines: &[ChatLine],
+    matches: &[PreviewMatch],
+    current: Option<(usize, usize)>,
+    area: Rect,
+    buf: &mut Buffer,
+    scroll_top: usize,
+) {
+    let x_start = area.x.saturating_add(1);
+    for m in matches {
+        if m.line < scroll_top || m.line >= scroll_top + area.height as usize {
+            continue;
+        }
+        let Some(line) = lines.get(m.line) else {
+            continue;
+        };
+        let y = area.y + (m.line - scroll_top) as u16;
+        let col_of = |chars: usize| -> usize {
+            line.text()
+                .chars()
+                .take(chars)
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum()
+        };
+        let style = if current == Some((m.line, m.start)) {
+            Style::default()
+                .fg(theme::PANEL_BG)
+                .bg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(theme::SEARCH_HIGHLIGHT_BG)
+        };
+        for col in col_of(m.start)..col_of(m.end) {
+            let x = x_start as usize + col;
+            if x >= area.right() as usize || y >= buf.area().bottom() {
+                break;
+            }
+            let cell = &mut buf[(x as u16, y)];
+            cell.set_style(cell.style().patch(style));
+        }
+    }
+}
+
 /// First rendered line whose heading slug matches `fragment`, if any.
 pub fn preview_line_for_fragment(lines: &[ChatLine], fragment: &str) -> Option<usize> {
     use crate::editor::markdown::{heading_slug, strip_heading_marker};
@@ -1331,6 +1417,38 @@ mod tests {
         let lines = format_chat_markdown("# Install\n\nbody\n", 40, Style::default());
         assert_eq!(preview_line_for_fragment(&lines, "install"), Some(0));
         assert_eq!(preview_line_for_fragment(&lines, "missing"), None);
+    }
+
+    #[test]
+    fn preview_find_matches_rendered_text_case_insensitively() {
+        // `**bold**` renders without its markers, so the match is on what is shown.
+        let lines = format_chat_markdown("# Título\n\nA **bold** Bold word\n", 40, Style::default());
+        let body = lines.iter().position(|l| l.text().contains("bold")).unwrap();
+        let matches = preview_find_matches(&lines, "BOLD");
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|m| m.line == body && m.end - m.start == 4));
+        let text: Vec<char> = lines[body].text().chars().collect();
+        let first: String = text[matches[0].start..matches[0].end].iter().collect();
+        assert_eq!(first, "bold");
+        // Char offsets, not bytes: the accented heading still matches.
+        assert_eq!(preview_find_matches(&lines, "título").len(), 1);
+        assert!(preview_find_matches(&lines, "").is_empty());
+        assert!(preview_find_matches(&lines, "**").is_empty());
+    }
+
+    #[test]
+    fn paint_preview_matches_styles_only_the_matched_cells() {
+        let lines = vec![ChatLine::single("say hello", Style::default())];
+        let matches = preview_find_matches(&lines, "hello");
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        render_lines_to_buffer(&lines, area, &mut buf, 0, Style::default(), None);
+        paint_preview_matches(&lines, &matches, Some((0, 4)), area, &mut buf, 0);
+        // Text starts one column in; "hello" sits at columns 5..10.
+        assert_eq!(buf[(4, 0)].bg, Style::default().bg.unwrap_or_default());
+        assert_eq!(buf[(5, 0)].bg, theme::ACCENT);
+        assert_eq!(buf[(9, 0)].bg, theme::ACCENT);
+        assert_ne!(buf[(10, 0)].bg, theme::ACCENT);
     }
 
     #[test]

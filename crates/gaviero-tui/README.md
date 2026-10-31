@@ -82,6 +82,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+B / Ctrl+P / Ctrl+J | Toggle file tree / side panel / terminal |
 | Ctrl+S / Ctrl+Z / Ctrl+Y | Save / undo / redo |
 | Ctrl+F / F3 | Find in file / workspace search |
+| Ctrl+F (markdown preview-only, Alt+P) | Find in the rendered preview: the bar takes the preview's top row; Enter / Down / F3 next, Up previous, Esc closes. A match hidden in a collapsed section expands the sections |
 | F5 / F7 | Format buffer / toggle word wrap |
 | F10 / Shift+F10 | Fold block at cursor / fold all — or click the `▾` in the gutter |
 | F10 / Shift+F10 (markdown preview-only, Alt+P) | Fold the `#`–`###` section at the top of the preview / step the outline: `#` only → down to `##` → down to `###` → all expanded. Clicking a heading folds it in split view too |
