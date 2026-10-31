@@ -190,10 +190,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
 
             if app.find_bar_active && key.code == crossterm::event::KeyCode::Esc {
-                app.find_bar_active = false;
-                if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    buf.set_search_highlight(None);
-                }
+                super::editing::close_find_bar(app);
                 return;
             }
 
@@ -2242,15 +2239,13 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 return;
             }
             app.find_bar_active = true;
+            app.preview_find_current = None;
             app.find_input.select_all();
             app.focus = Focus::Editor;
         }
         Action::SearchInWorkspace => {
             if app.find_bar_active {
-                if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    buf.find_next_match();
-                }
-                app.ensure_editor_cursor_visible();
+                super::editing::find_next(app);
                 return;
             }
             app.search_selected_in_workspace();
