@@ -38,7 +38,7 @@ impl ReqwestHttpClient {
     /// drained stalls on delayed ACKs.
     pub fn new() -> Self {
         Self(
-            reqwest::Client::builder()
+            crate::egress::client_builder("mcp-http")
                 .pool_max_idle_per_host(0)
                 .build()
                 .unwrap_or_default(),

@@ -557,6 +557,11 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::RemoteClientDisconnected
         | Event::RemoteStarted(_)
         | Event::RemoteUnavailable(_)
+        // Egress warnings land as system messages; an `ask` is re-raised as
+        // a `PermissionRequest`, which is projected on its own.
+        | Event::Egress(_)
+        | Event::EgressAsk { .. }
+        | Event::EgressWarning { .. }
         | Event::Tick => None,
     }
 }

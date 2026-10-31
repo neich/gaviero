@@ -71,7 +71,7 @@ pub struct Context7DocsTool {
 /// The `reqwest::Client` is built once and shared: it owns the connection pool,
 /// so two tools do not mean two pools.
 pub fn tools(base: &str) -> Vec<Box<dyn Tool>> {
-    let http = reqwest::Client::builder()
+    let http = crate::egress::client_builder("context7")
         .timeout(REQUEST_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());

@@ -33,6 +33,7 @@ mod chat_memory;
 mod commands;
 mod controller;
 mod editing;
+pub(crate) mod egress;
 mod layout;
 mod left_panel;
 mod nav;

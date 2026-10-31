@@ -1726,6 +1726,18 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         // Plan C §2.2: the bootstrap task hands the sidecar over here; this
         // is the only place the handle is installed (invariant 13).
+        Event::Egress(event) => super::egress::on_egress(app, &event),
+        Event::EgressWarning { conv_id, message } => {
+            match app.chat_state.find_conv_idx(&conv_id) {
+                Some(idx) => app.chat_state.add_system_message_at(idx, &message),
+                None => app.chat_state.add_system_message(&message),
+            }
+        }
+        Event::EgressAsk {
+            provider,
+            host,
+            respond,
+        } => super::egress::on_ask(app, provider, host, respond),
         Event::RemoteStarted(started) => {
             app.remote.handle = Some(started.handle.clone());
             app.remote.max_prompt_bytes = started.max_prompt_bytes;

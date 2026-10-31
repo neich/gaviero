@@ -23,7 +23,9 @@ impl OllamaBackend {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
-            client: reqwest::Client::new(),
+            client: crate::egress::client_builder("ollama")
+                .build()
+                .unwrap_or_default(),
         }
     }
 

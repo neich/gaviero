@@ -408,6 +408,44 @@ async fn main() -> Result<()> {
     app.restore_session();
     app.show_settings_errors();
 
+    // Cursor's read policy lives in `.cursor/hooks.json`. Written here, before
+    // any turn starts, so it is a host write and never lands in TURN REVIEW;
+    // the per-spawn call in the Cursor session is then a no-op.
+    {
+        let cli = gaviero_core::mcp::resolver::resolve_cli_binary();
+        for folder in app.workspace.folders() {
+            if let Err(e) = gaviero_core::agent_guard::cursor::ensure_cursor_hooks(&folder.path, &cli)
+            {
+                tracing::warn!(error = %e, "could not write .cursor/hooks.json");
+            }
+        }
+    }
+
+    // Egress proxy (`agent.network.mode`, default `log`): every agent spawn
+    // and in-process HTTP client is routed through it from here on.
+    {
+        let root = app
+            .workspace
+            .folders()
+            .first()
+            .map(|f| f.path.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        crate::app::egress::install(&app, &root, event_loop.tx());
+    }
+
+    // User-level Claude allow rules pre-approve file/shell access and so
+    // bypass gaviero's prompts; `.gaviero/settings.json` deny rules still win.
+    if let Some(home) = dirs::home_dir() {
+        let overlaps = gaviero_core::agent_guard::claude::user_allow_overlaps(&home);
+        if !overlaps.is_empty() {
+            app.chat_state.add_system_message(&format!(
+                "Claude user settings pre-approve: {} — these bypass gaviero's prompts \
+                 (deny rules from .gaviero/settings.json still apply).",
+                overlaps.join(", ")
+            ));
+        }
+    }
+
     // Spawn background memory initialization (non-blocking).
     // Constructs the multi-DB registry: global + workspace + lazy
     // per-folder stores keyed by every folder listed in the workspace.
