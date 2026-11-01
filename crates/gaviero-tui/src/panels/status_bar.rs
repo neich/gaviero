@@ -10,6 +10,9 @@ use crate::theme::Theme;
 
 pub struct StatusBar<'a> {
     pub buffer: Option<&'a EditorBuffer>,
+    /// Label of `buffer`, folder-prefixed when another open file shares its
+    /// relative path.
+    pub buffer_label: &'a str,
     pub theme: &'a Theme,
     pub focus_label: &'a str,
     /// e.g. "claude:sonnet" or "claude:opus|t:25000"
@@ -32,7 +35,7 @@ impl<'a> StatusBar<'a> {
             let left = format!(
                 " {} │ {}{}",
                 self.focus_label,
-                editor_buf.display_name(),
+                self.buffer_label,
                 modified
             );
 

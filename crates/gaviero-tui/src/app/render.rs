@@ -122,11 +122,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.panel_visible.editor {
         let editor_full_area = h_layout[panel_idx];
         let editor_focused = app.focus == Focus::Editor;
-        let editor_title = app
-            .buffers
-            .get(app.active_buffer)
-            .map(|b| b.display_name().to_string())
-            .unwrap_or_else(|| "EDITOR".to_string());
+        let editor_title = active_buffer_label(app).unwrap_or_else(|| "EDITOR".to_string());
         let editor_header_override = app
             .buffers
             .get(app.active_buffer)
@@ -229,10 +225,8 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
 pub(super) fn render_fullscreen(app: &mut App, frame: &mut Frame, area: Rect, panel: Focus) {
     let title = match panel {
         Focus::FileTree => app.left_panel_title(true).to_string(),
-        Focus::Editor => app
-            .buffers
-            .get(app.active_buffer)
-            .map(|b| format!("{} (fullscreen)", b.display_name()))
+        Focus::Editor => active_buffer_label(app)
+            .map(|label| format!("{label} (fullscreen)"))
             .unwrap_or_else(|| "EDITOR (fullscreen)".to_string()),
         Focus::SidePanel => app.side_panel_title(true).to_string(),
         Focus::Terminal => "TERMINAL (fullscreen)".to_string(),
@@ -334,6 +328,98 @@ pub(super) fn current_move_source(app: &App) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Label of every open buffer, in buffer order: its display name, prefixed
+/// `<folder>:` (or `workspace:` for a file under the workspace directory but
+/// outside every folder) when another open buffer has the same relative path
+/// under a different root — `gaviero:settings.json` beside
+/// `gaviero-flutter:settings.json`. Same-name files at different relative
+/// paths, or in the same folder, keep the bare name.
+pub(super) fn buffer_labels(app: &App) -> Vec<String> {
+    let folders: Vec<(String, std::path::PathBuf)> = app
+        .workspace
+        .folders()
+        .iter()
+        .map(|f| (f.display_name().to_string(), f.path.clone()))
+        .collect();
+    let mut roots: Vec<(String, std::path::PathBuf)> = super::side_panel::unique_root_labels(&folders)
+        .into_iter()
+        .zip(folders.into_iter().map(|(_, path)| path))
+        .collect();
+    // `<workspace dir>/.gaviero/settings.json`. Listed after the folders so a
+    // folder that is the workspace directory (single-folder mode) wins.
+    let layer = app.workspace.workspace_layer_path();
+    if let Some(dir) = layer.parent().and_then(std::path::Path::parent) {
+        roots.push(("workspace".to_string(), dir.to_path_buf()));
+    }
+    let entries: Vec<(String, Option<(String, std::path::PathBuf)>)> = app
+        .buffers
+        .iter()
+        .map(|b| {
+            // An explicit tab label (`global:settings.json`) already says
+            // where the file is.
+            let rooted = match (&b.tab_label, &b.path) {
+                (None, Some(path)) => relative_to_root(&roots, path),
+                _ => None,
+            };
+            (b.display_name().to_string(), rooted)
+        })
+        .collect();
+    prefix_shared_relative_paths(&entries)
+}
+
+/// `(root label, path relative to it)` for the deepest root holding `path`;
+/// the first listed wins a tie. Lexical: buffer paths and folder roots are
+/// both canonical already, and render must not touch the filesystem.
+fn relative_to_root(
+    roots: &[(String, std::path::PathBuf)],
+    path: &std::path::Path,
+) -> Option<(String, std::path::PathBuf)> {
+    let mut best: Option<(&str, &std::path::Path, usize)> = None;
+    for (label, root) in roots {
+        if label.is_empty() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let depth = root.components().count();
+        if best.is_none_or(|(_, _, d)| depth > d) {
+            best = Some((label, rel, depth));
+        }
+    }
+    best.map(|(label, rel, _)| (label.to_string(), rel.to_path_buf()))
+}
+
+/// `entries` are `(name, (root, relative path))`. A name gets its `root:`
+/// prefix only when another entry has the same relative path under a
+/// different root.
+fn prefix_shared_relative_paths(
+    entries: &[(String, Option<(String, std::path::PathBuf)>)],
+) -> Vec<String> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, (name, rooted))| {
+            let Some((root, rel)) = rooted else {
+                return name.clone();
+            };
+            let shared = entries.iter().enumerate().any(|(j, (_, other))| {
+                j != i && other.as_ref().is_some_and(|(r, p)| p == rel && r != root)
+            });
+            if shared {
+                format!("{root}:{name}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
+}
+
+/// Label of the active buffer — see [`buffer_labels`].
+pub(super) fn active_buffer_label(app: &App) -> Option<String> {
+    buffer_labels(app).into_iter().nth(app.active_buffer)
+}
+
 /// Tab bar entries for every buffer: diff views orange, the global
 /// settings file violet. Rendering and mouse hit-testing share this so a
 /// relabelled tab is clicked where it is drawn.
@@ -341,7 +427,8 @@ pub(super) fn tab_titles(app: &App) -> Vec<(String, bool, crate::widgets::tabs::
     use crate::widgets::tabs::TabKind;
     app.buffers
         .iter()
-        .map(|b| {
+        .zip(buffer_labels(app))
+        .map(|(b, label)| {
             let kind = if b.diff_view.is_some() {
                 TabKind::DiffView
             } else if b.settings.as_ref().is_some_and(|s| s.global) {
@@ -349,7 +436,7 @@ pub(super) fn tab_titles(app: &App) -> Vec<(String, bool, crate::widgets::tabs::
             } else {
                 TabKind::Normal
             };
-            (b.display_name().to_string(), b.modified, kind)
+            (label, b.modified, kind)
         })
         .collect()
 }
@@ -954,8 +1041,12 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
     };
 
+    let buffer_label = current_buffer
+        .and_then(|_| active_buffer_label(app))
+        .unwrap_or_default();
     let status = StatusBar {
         buffer: current_buffer,
+        buffer_label: &buffer_label,
         theme: &app.theme,
         focus_label,
         model_info: &model_info,
@@ -1419,8 +1510,9 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
     let unsaved: Vec<String> = app
         .buffers
         .iter()
-        .filter(|b| b.modified)
-        .map(|b| b.display_name().to_string())
+        .zip(buffer_labels(app))
+        .filter(|(b, _)| b.modified)
+        .map(|(_, label)| label)
         .collect();
 
     let streaming: Vec<String> = app
