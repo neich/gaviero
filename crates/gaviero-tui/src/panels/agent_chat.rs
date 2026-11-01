@@ -2718,6 +2718,7 @@ impl AgentChatState {
                      /restore <deletion-id>   — Replay a soft-deleted row through the dedup pipeline\n\
                      /restore --since <N minutes|N hours|N days>\n                              — Replay every soft-deletion in the window\n\n\
                      Remote:\n\
+                     /settings [layer]        — Open a settings layer in an editor tab: global (default; $GAVIERO_ROOT/.gaviero/settings.json, shared by every gaviero instance, violet tab), workspace, repo. Keys another layer overrides are struck out; keys overriding a broader layer are amber\n\
                      /remote                  — Pairing QR, relay route, port, token fingerprint\n\
                      /remote hide             — Clear the pairing QR from this transcript\n\
                      /remote rotate           — Invalidate the pairing token\n\n\

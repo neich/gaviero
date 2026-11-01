@@ -334,19 +334,28 @@ pub(super) fn current_move_source(app: &App) -> Option<std::path::PathBuf> {
     }
 }
 
-pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
-    // Buffers opened in diff-view mode are colored orange in the tab bar.
-    let titles: Vec<(String, bool, bool)> = app
-        .buffers
+/// Tab bar entries for every buffer: diff views orange, the global
+/// settings file violet. Rendering and mouse hit-testing share this so a
+/// relabelled tab is clicked where it is drawn.
+pub(super) fn tab_titles(app: &App) -> Vec<(String, bool, crate::widgets::tabs::TabKind)> {
+    use crate::widgets::tabs::TabKind;
+    app.buffers
         .iter()
         .map(|b| {
-            (
-                b.display_name().to_string(),
-                b.modified,
-                b.diff_view.is_some(),
-            )
+            let kind = if b.diff_view.is_some() {
+                TabKind::DiffView
+            } else if b.settings.as_ref().is_some_and(|s| s.global) {
+                TabKind::Global
+            } else {
+                TabKind::Normal
+            };
+            (b.display_name().to_string(), b.modified, kind)
         })
-        .collect();
+        .collect()
+}
+
+pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let titles = tab_titles(app);
     let tab_bar = TabBar {
         titles: &titles,
         active: app.active_buffer,

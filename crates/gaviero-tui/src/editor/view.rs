@@ -14,6 +14,10 @@ const DIFF_ADD_BG: Color = Color::Rgb(40, 65, 42);
 const DIFF_REM_BG: Color = Color::Rgb(65, 40, 40);
 const DIFF_ADD_GUTTER_FG: Color = Color::Rgb(80, 200, 80);
 const DIFF_REM_GUTTER_FG: Color = Color::Rgb(220, 80, 80);
+/// Settings keys a more specific layer overrides: dimmed and struck out.
+const SETTINGS_OVERRIDDEN_FG: Color = Color::Rgb(128, 134, 148);
+/// Settings keys overriding a broader layer: amber, underlined.
+const SETTINGS_OVERRIDES_FG: Color = Color::Rgb(222, 172, 92);
 
 /// Column of the gutter that carries the clickable fold arrow, relative to the
 /// editor area's left edge. The mouse handler hit-tests against this.
@@ -315,6 +319,20 @@ impl<'a> EditorView<'a> {
                 }
             }
 
+            // Settings layer highlights: the key text only, so selection and
+            // search backgrounds still show through.
+            if let Some(overridden) = self.settings_mark_at(line_idx, char_idx) {
+                style = if overridden {
+                    style
+                        .fg(SETTINGS_OVERRIDDEN_FG)
+                        .add_modifier(ratatui::style::Modifier::CROSSED_OUT)
+                } else {
+                    style
+                        .fg(SETTINGS_OVERRIDES_FG)
+                        .add_modifier(ratatui::style::Modifier::UNDERLINED)
+                };
+            }
+
             // Search highlight (orange background for matching chars)
             let in_search_match = self.is_in_search_match(line_idx, char_idx);
             let in_conflict = self.buffer.is_line_in_conflict(line_idx);
@@ -382,6 +400,70 @@ impl<'a> EditorView<'a> {
                 }
             }
         }
+
+        // Settings hint after the last row of the line: which layers the
+        // line's keys override or are overridden by.
+        if segment_end >= self.buffer.line_len(line_idx)
+            && let Some((hint, overridden)) = self.settings_hint(line_idx)
+        {
+            let fg = if overridden {
+                SETTINGS_OVERRIDDEN_FG
+            } else {
+                SETTINGS_OVERRIDES_FG
+            };
+            let style = self
+                .theme
+                .default_style()
+                .fg(fg)
+                .bg(row_bg)
+                .add_modifier(ratatui::style::Modifier::ITALIC);
+            let gap = if self.buffer.fold_marker(line_idx) == FoldMarker::Collapsed {
+                4
+            } else {
+                2
+            };
+            let mut col = visual_col + gap;
+            for ch in hint.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(1);
+                if col >= left_col {
+                    let display_col = (col - left_col) as u16;
+                    if display_col + ch_w as u16 > width {
+                        break;
+                    }
+                    let cell_x = x + display_col;
+                    if cell_x < buf.area().right() {
+                        buf[(cell_x, y)].set_char(ch).set_style(style);
+                    }
+                }
+                col += ch_w;
+            }
+        }
+    }
+
+    /// `Some(overridden)` when `(line, col)` is inside a highlighted settings
+    /// key; `overridden` = a more specific layer overrides it.
+    fn settings_mark_at(&self, line: usize, col: usize) -> Option<bool> {
+        let overlay = self.buffer.settings.as_ref()?;
+        overlay
+            .marks_on(line)
+            .find(|m| col >= m.start_col && col < m.end_col)
+            .map(|m| !m.overridden_by.is_empty())
+    }
+
+    /// The end-of-line note for `line`'s highlighted keys, and whether any of
+    /// them is overridden.
+    fn settings_hint(&self, line: usize) -> Option<(String, bool)> {
+        let overlay = self.buffer.settings.as_ref()?;
+        let marks: Vec<_> = overlay.marks_on(line).collect();
+        if marks.is_empty() {
+            return None;
+        }
+        let hint = marks
+            .iter()
+            .map(|m| m.hint())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Some((hint, marks.iter().any(|m| !m.overridden_by.is_empty())))
     }
 
     fn render_cursor(&self, code_area: Rect, layout: &super::wrap::WrapLayout, buf: &mut RataBuf) {
@@ -531,6 +613,37 @@ mod tests {
         assert_eq!(gutter_width(99), 5);
         assert_eq!(gutter_width(100), 6);
         assert_eq!(gutter_width(1000), 7);
+    }
+
+    #[test]
+    fn settings_marks_strike_the_key_and_print_the_hint() {
+        use gaviero_core::settings_overrides::KeyMark;
+        let mut buffer = Buffer::empty();
+        buffer.text = ropey::Rope::from_str("{
+  \"a\": 1
+}
+");
+        buffer.settings = Some(super::super::buffer::SettingsOverlay {
+            global: true,
+            marks: vec![KeyMark {
+                line: 1,
+                start_col: 2,
+                end_col: 5,
+                path: "a".into(),
+                overrides: vec![],
+                overridden_by: vec!["repo app".into()],
+            }],
+            text_hash: None,
+        });
+        let theme = Theme::builtin_default();
+        let area = Rect::new(0, 0, 60, 4);
+        let mut out = RataBuf::empty(area);
+        EditorView::new(&buffer, &theme, None, false).render(area, &mut out);
+        let row: String = (0..area.width).map(|x| out[(x, 1)].symbol()).collect();
+        assert!(row.contains("\"a\": 1  ← overridden by repo app"), "{row:?}");
+        let key_x = row.find('"').unwrap() as u16;
+        assert!(out[(key_x, 1)].modifier.contains(ratatui::style::Modifier::CROSSED_OUT));
+        assert_eq!(out[(key_x, 1)].fg, SETTINGS_OVERRIDDEN_FG);
     }
 
     #[test]

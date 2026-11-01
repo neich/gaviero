@@ -44,6 +44,7 @@ pub(crate) mod remote_files;
 pub(crate) mod remote_setup;
 mod render;
 mod review;
+mod settings_overlay;
 pub(crate) mod session;
 mod side_panel;
 mod state;
@@ -611,6 +612,9 @@ impl App {
             self.remote.push_frame(frame);
         }
         controller::handle_event(self, event);
+        // Settings-layer highlights for the active buffer: a hash check
+        // unless its text or another layer changed.
+        settings_overlay::sync(self);
         // Single lifecycle hook for the CODE GRAPH panel: a no-op unless the
         // visible panel's source file no longer matches the active buffer.
         self.maybe_refresh_code_graph_panel();

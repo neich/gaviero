@@ -965,7 +965,7 @@ impl Workspace {
     /// `*.gaviero-workspace` that lists the folder ([`SettingsLocation`]),
     /// else the folder's own — so a session that opens one member folder
     /// still gets user → workspace → repo.
-    fn workspace_layer_path(&self) -> PathBuf {
+    pub fn workspace_layer_path(&self) -> PathBuf {
         if self.workspace_path.is_none()
             && let [folder] = self.folders.as_slice()
             && let Some(dir) = SettingsLocation::of(&folder.path).workspace_dir
@@ -1485,7 +1485,7 @@ impl Workspace {
 ///   - nested: `{ "repoMap": { "symbolEnrichment": { "enabled": true } } }`
 ///
 /// An exact flat-key match wins; otherwise descend one segment and recurse.
-fn dot_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+pub fn dot_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
     if let Some(v) = value.get(key) {
         return Some(v);
     }

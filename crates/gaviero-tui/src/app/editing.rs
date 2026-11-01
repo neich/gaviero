@@ -1101,11 +1101,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 return;
             }
             if app.layout.tab_area.contains((col, row).into()) {
-                let titles: Vec<(String, bool, bool)> = app
-                    .buffers
-                    .iter()
-                    .map(|b| (b.display_name().to_string(), b.modified, false))
-                    .collect();
+                let titles = super::render::tab_titles(app);
                 let tab_bar = TabBar {
                     titles: &titles,
                     active: app.active_buffer,
@@ -2508,6 +2504,7 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
 
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;
+            super::settings_overlay::tag_buffer(app, app.active_buffer);
             sync_preview_mode_for_active_buffer(app);
         }
         Err(e) => {
@@ -2602,6 +2599,7 @@ pub(super) fn save_current_buffer(app: &mut App) {
     }
     if let Some(path) = saved {
         super::turn_review::note_host_write(app, &path);
+        super::settings_overlay::after_save(app, &path);
         stage_file_if_conflict_resolved(app, &path);
         app.status_message = Some((
             format!("Saved {}", path.display()),

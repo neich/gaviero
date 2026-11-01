@@ -116,6 +116,8 @@ Settings are loaded in three layers, and each later layer overrides the one befo
 
 Built-in defaults apply to keys no layer sets. Objects merge key by key; any other value, lists included, is replaced whole by the more specific layer. Settings embedded in the `.gaviero-workspace` file itself are not read. Settings gaviero writes for you (such as the Codex trust answer) go to the workspace layer, so a repo file that sets the same key still wins for its folder. Agent policy (`agent.permissions.*`, `agent.network.*`, tools, MCP servers) follows the same order, so a repo's `.gaviero/settings.json` can loosen what the workspace or user file sets.
 
+`/settings` opens the global file in an editor tab labelled `global:settings.json`, drawn in violet because every gaviero instance under your user account reads it (it is created as `{}` when missing). `/settings workspace` and `/settings repo` open the other two layers (`repo` = the active buffer's folder). In any open layer, a key that another layer also sets is highlighted: struck out and grey when a more specific layer overrides it, amber and underlined when it overrides a broader one, with a note at the end of the line naming the layers (`← overridden by repo gaviero`, `overrides global`). Keys are compared by dotted path, nested and flattened (`"a.b": …`) alike; keys inside arrays are not compared. Saving a layer reloads the settings and refreshes the highlights in the other open layers.
+
 ```json
 {
   "editor": { "tabSize": 4, "insertSpaces": true, "wordWrap": false },
