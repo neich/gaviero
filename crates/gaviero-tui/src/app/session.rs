@@ -297,8 +297,9 @@ pub(super) fn try_quit(app: &mut App) {
     let unsaved: Vec<String> = app
         .buffers
         .iter()
-        .filter(|b| b.modified)
-        .map(|b| b.display_name().to_string())
+        .zip(super::render::buffer_labels(app))
+        .filter(|(b, _)| b.modified)
+        .map(|(_, label)| label)
         .collect();
 
     let streaming_agents = app

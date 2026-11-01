@@ -323,6 +323,52 @@ mod tests {
     }
 
     #[test]
+    fn same_relative_paths_in_different_roots_get_a_root_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = workspace_app(dir.path());
+        let roots: Vec<PathBuf> = app.workspace.roots().iter().map(|r| r.to_path_buf()).collect();
+        // Same name, different relative paths: in one folder and across folders.
+        for rel in ["src/mod.rs", "tests/mod.rs"] {
+            let path = roots[0].join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+        std::fs::create_dir_all(roots[1].join("lib")).unwrap();
+        std::fs::write(roots[1].join("lib/mod.rs"), "").unwrap();
+        app.buffers.clear();
+        for path in [
+            app.workspace.workspace_layer_path(),
+            roots[0].join(".gaviero/settings.json"),
+            roots[1].join(".gaviero/settings.json"),
+            roots[0].join("src/mod.rs"),
+            roots[0].join("tests/mod.rs"),
+            roots[1].join("lib/mod.rs"),
+        ] {
+            app.open_file(&path);
+        }
+        assert_eq!(
+            super::super::render::buffer_labels(&app),
+            [
+                "workspace:settings.json",
+                "app:settings.json",
+                "lib:settings.json",
+                "mod.rs",
+                "mod.rs",
+                "mod.rs"
+            ]
+        );
+        // Alone again, a file loses its prefix.
+        app.buffers.truncate(2);
+        assert_eq!(
+            super::super::render::buffer_labels(&app),
+            ["workspace:settings.json", "app:settings.json"]
+        );
+        app.buffers.remove(0);
+        assert_eq!(super::super::render::buffer_labels(&app), ["settings.json"]);
+        cleanup_session(&app);
+    }
+
+    #[test]
     fn the_global_tab_is_labelled_and_violet() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = workspace_app(dir.path());
