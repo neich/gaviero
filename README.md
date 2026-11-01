@@ -108,12 +108,13 @@ gaviero-cli --script review.gaviero --prompt "the auth module"
 
 ## Configuration
 
-Settings cascade (highest priority first):
+Settings are loaded in three layers, and each later layer overrides the one before it, key by key:
 
-1. `.gaviero/settings.json` — project-level
-2. `.gaviero-workspace` file — multi-folder workspace
-3. `~/.gaviero/settings.json` — user defaults (same home-dir path on Windows and Linux). If that file is missing, the previous location is still read (`~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json` on Windows). Set `GAVIERO_ROOT` to share one user directory between gaviero instances: `settings.json`, `secrets.toml` and `skills/` are then read from `$GAVIERO_ROOT/.gaviero` instead of `~/.gaviero`. The workspace/repo `.gaviero/` (beside the `.gaviero-workspace` file, or in the opened folder) is always loaded first and overrides it. Per-machine state (`remote/`, `dsh/`) stays in `~/.gaviero`.
-4. Built-in defaults
+1. **User** — `$GAVIERO_ROOT/.gaviero/settings.json`, or `~/.gaviero/settings.json` when `GAVIERO_ROOT` is unset (same home-dir path on Windows and Linux). `GAVIERO_ROOT` shares one user directory between gaviero instances: `settings.json`, `secrets.toml` and `skills/` are read from there. Per-machine state (`remote/`, `dsh/`) stays in `~/.gaviero`. The old `~/.config/gaviero/settings.json` / `%APPDATA%\gaviero\settings.json` is not read.
+2. **Workspace** — the `.gaviero/settings.json` beside the `*.gaviero-workspace` file. In a single-folder workspace this is the folder's own file, so layers 2 and 3 are the same file.
+3. **Repo** — each workspace folder's own `.gaviero/settings.json`, for that folder.
+
+Built-in defaults apply to keys no layer sets. Objects merge key by key; any other value, lists included, is replaced whole by the more specific layer. Settings embedded in the `.gaviero-workspace` file itself are not read. Settings gaviero writes for you (such as the Codex trust answer) go to the workspace layer, so a repo file that sets the same key still wins for its folder. Agent policy (`agent.permissions.*`, `agent.network.*`, tools, MCP servers) follows the same order, so a repo's `.gaviero/settings.json` can loosen what the workspace or user file sets.
 
 ```json
 {
@@ -155,6 +156,7 @@ Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4
 | `agent.permissions.sensitivePaths.allow` | Path globs exempted from the sensitive-file list (`.env*`, keys, `*.pem`, `.npmrc`, `.docker/config.json`, …). Never exempts the hard floor: agent credentials (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gaviero/remote`, `~/.gaviero/secrets.toml`) and gaviero's own state (`.gaviero/history`, `turns`, `egress`, `remote`, `mcp-http-token`, `memory.db*`, …). | none |
 | `agent.permissions.read.deny` | Extra workspace-relative globs agents may never read. | none |
 | `agent.permissions.read.blockOutsideWorkspace` | Refuse agent file reads outside the workspace folders (Claude `blockReadsOutsideWorkingDirectories`, which also covers Bash; commands Claude cannot analyse, such as `node -e`, prompt instead). | `true` |
+| `agent.permissions.read.extraFolders` | Folders outside the workspace that agents may read but not edit — absolute, `~/…`, or relative to the folder holding `.gaviero/settings.json`. They are not workspace folders: no turn review, indexing, memory scope or `GAVIERO.md` discovery. Entries that don't exist, or that lie inside or contain a workspace folder, are skipped. | none |
 | `agent.network.mode` | `off` · `log` · `ask` · `enforce`. Every agent CLI and gaviero's own HTTP clients go through a loopback CONNECT proxy (no TLS decryption) that records host:port per provider in `.gaviero/egress/connections.ndjson`. `log` warns in chat on hosts not in `agent.network.allow`, `ask` holds the connection for your decision, and `enforce` refuses it. `gaviero-cli` treats `ask` as `enforce`. | `log` |
 | `agent.network.allow` | Host patterns that never warn (`host` or `*.suffix`). | `*.anthropic.com`, `chatgpt.com`, `*.chatgpt.com`, `api.openai.com`, `*.openai.com`, `*.cursor.sh`, `api.deepseek.com`, `context7.com`, `*.context7.com` |
 | `agent.network.askTimeoutSecs` | How long an `ask` waits before denying. | `60` |
@@ -176,7 +178,8 @@ What happens to a command that is available but neither approved nor allow-liste
     "permissions": {
       "read": {
         "deny": ["private/**", "config/prod.yaml"],
-        "blockOutsideWorkspace": true
+        "blockOutsideWorkspace": true,
+        "extraFolders": ["../shared-docs", "~/reference/api-specs"]
       },
       "sensitivePaths": {
         "allow": ["tests/fixtures/**"]
@@ -191,9 +194,11 @@ What happens to a command that is available but neither approved nor allow-liste
 | Your additions | Globs listed in `agent.permissions.read.deny`, relative to the folder | You remove the entry |
 | Built-in sensitive files | `.env` and `.env.*` (templates such as `.env.example` stay readable), `id_rsa`, `id_ed25519`, `id_dsa`, `id_ecdsa`, `.ssh/`, `.aws/`, `credentials`, `.netrc`, `secrets.{toml,yaml,json}`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `.npmrc`, `.pypirc`, `.git-credentials`, `.pgpass`, `.docker/config.json`, `.kube/config` | Yes, with `agent.permissions.sensitivePaths.allow` |
 | Hard floor | `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gaviero/remote`, `~/.gaviero/secrets.toml`, and gaviero's own state: `.gaviero/history`, `turns`, `egress`, `remote`, `mcp-http-token`, `secrets.toml`, `mcp_calls.ndjson`, `memory.db*`, `code_graph.db*` | Never |
-| Outside the workspace | Anything outside the workspace folders, while `agent.permissions.read.blockOutsideWorkspace` is `true` (the default) | Set it to `false` |
+| Outside the workspace | Anything outside the workspace folders, while `agent.permissions.read.blockOutsideWorkspace` is `true` (the default) | Set it to `false`, or list specific folders in `agent.permissions.read.extraFolders` (read-only; the built-in sensitive files and the hard floor stay blocked inside them) |
 
 `.gaviero/settings.json`, `.gaviero/skills/` and `.gaviero/tmp/` stay readable; spilled prompts live in `.gaviero/tmp/`.
+
+These rules come from the same three settings layers as everything else (user, workspace, repo). In a multi-folder workspace the workspace's `.gaviero` folder, beside the `*.gaviero-workspace` file, usually lies outside every workspace folder, so agents get it as a read-only folder (like `agent.permissions.read.extraFolders`) and can check the settings without a permission prompt. Its hard-floor entries stay blocked.
 
 **How each provider gets the policy:**
 
@@ -203,6 +208,8 @@ What happens to a command that is available but neither approved nor allow-liste
 | Cursor | `.cursor/hooks.json`, written in each workspace folder at startup (`beforeReadFile`, `beforeShellExecution` → `gaviero-cli --hook cursor:…`). Cursor's `cli.json` `Read()` denies do not stop reads. |
 | Codex (chat) | A deny-read permission profile in `thread/start`, running under the MXC sandbox on Windows. If Codex cannot enforce it, the session fails closed with an explanation. Shell environment variables named `*KEY*`, `*SECRET*` or `*TOKEN*` are filtered out. |
 | `deepseek:` | Enforced in-process, Bash file arguments included. |
+
+`agent.permissions.read.extraFolders` reaches each provider as: Claude — `--add-dir` per folder plus `Edit(//folder/**)` denies (they cover Edit, Write and MultiEdit, not Bash) and the sensitive-file denies anchored there; Codex chat — a `"read"` entry per folder in the permission profile (sensitive-file globs are not repeated under it); `deepseek:` — Read, Grep and Glob accept paths there, writes stay workspace-only. Every provider is told about the folders and that they are read-only in its system prompt; Cursor and `dsh:` get only that notice. A Bash command that writes into one of these folders is not caught by turn review, which only covers workspace folders.
 
 Gaviero itself refuses to inline a protected `@`-mention or attachment; a chat message says which rule matched. It also redacts secret-looking values from injected memory, memory-extractor transcripts and the history log.
 

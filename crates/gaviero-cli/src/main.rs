@@ -4373,8 +4373,9 @@ fn run_hook(arg: &str) -> Result<()> {
         .read_to_string(&mut raw)
         .context("reading hook input from stdin")?;
     let input: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-    let outcome = hook::handle_hook(provider, event, &input);
-    if let Some(root) = hook::hook_root(provider, &input) {
+    let root = hook::hook_root(provider, &input);
+    let outcome = hook::handle_hook_at(provider, event, &input, root.clone());
+    if let Some(root) = root {
         hook::append_audit(&root, &outcome.audit);
     }
     let mut stdout = std::io::stdout().lock();

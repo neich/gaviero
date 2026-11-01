@@ -493,10 +493,14 @@ impl AcpSession {
         // GAVIERO.md is in scope — the exclusion of Claude's own CLAUDE.md /
         // AGENTS.md discovery. One flag-level layer: above project/user
         // files, so project permissions still load and merge.
+        let read_only_folders =
+            crate::agent_guard::read_only_folders_for(cwd, additional_roots);
+        let read_only_refs: Vec<&Path> = read_only_folders.iter().map(PathBuf::as_path).collect();
         cmd.arg("--settings").arg(
             crate::agent_guard::claude::claude_session_settings(
                 cwd,
                 additional_roots,
+                &read_only_refs,
                 options.skip_native_instructions,
                 crate::agent_guard::claude::read_block_outside(cwd),
                 &crate::mcp::resolver::resolve_cli_binary(),
@@ -577,6 +581,13 @@ impl AcpSession {
             cmd.arg("--add-dir").arg(extra);
         }
 
+        // `agent.permissions.read.extraFolders`: a working directory lets
+        // reads through `blockReadsOutsideWorkingDirectories`; the `Edit`
+        // denies in `--settings` above keep them read-only.
+        for folder in &read_only_folders {
+            cmd.arg("--add-dir").arg(folder);
+        }
+
         // Interactive turns: prompt goes on stdin as a stream-json user
         // message so the control channel stays bidirectional. Auto-approve
         // keeps the classic positional argv prompt (stdin still piped for
@@ -604,6 +615,9 @@ impl AcpSession {
         // CLIs that predate the flag (v2.1.211+); an argv flag would fail
         // spawn on older builds.
         cmd.env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
+        // The `PostToolUse` hook roots its policy and audit log here: the
+        // hook's own `cwd` follows the Bash tool's `cd`.
+        cmd.env(crate::agent_guard::hook::HOOK_ROOT_ENV, cwd);
         // Record what actually leaves for the API: Claude writes each raw
         // request body under `.gaviero/egress/claude-bodies/` (inside the
         // read floor), and `egress::bodies` scans then deletes them after

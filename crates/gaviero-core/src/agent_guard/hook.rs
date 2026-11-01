@@ -81,9 +81,24 @@ pub struct HookOutcome {
     pub audit: Value,
 }
 
-/// The workspace root the event belongs to: Claude's `cwd`; Cursor's first
-/// `workspace_roots` entry, else its `cwd`.
+/// Set on every Claude process gaviero spawns to the session's workspace
+/// root. Claude's hook `cwd` is the Bash tool's current directory, which a
+/// `cd` moves into a subfolder.
+pub const HOOK_ROOT_ENV: &str = "GAVIERO_HOOK_ROOT";
+
+/// The workspace root the event belongs to: for Claude, [`HOOK_ROOT_ENV`]
+/// when set, else [`input_root`].
 pub fn hook_root(provider: HookProvider, input: &Value) -> Option<PathBuf> {
+    let env_root = std::env::var(HOOK_ROOT_ENV).ok().filter(|r| !r.is_empty());
+    match (provider, env_root) {
+        (HookProvider::Claude, Some(root)) => Some(PathBuf::from(root)),
+        _ => input_root(provider, input),
+    }
+}
+
+/// The root named by the event itself: Claude's `cwd`; Cursor's first
+/// `workspace_roots` entry, else its `cwd`.
+pub fn input_root(provider: HookProvider, input: &Value) -> Option<PathBuf> {
     let cwd = input.get("cwd").and_then(Value::as_str);
     let root = match provider {
         HookProvider::Claude => cwd,
@@ -96,8 +111,19 @@ pub fn hook_root(provider: HookProvider, input: &Value) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
-/// Decide one hook event.
+/// Decide one hook event, rooted at [`input_root`].
 pub fn handle_hook(provider: HookProvider, event: HookEvent, input: &Value) -> HookOutcome {
+    handle_hook_at(provider, event, input, input_root(provider, input))
+}
+
+/// Decide one hook event for the workspace at `root` (the CLI passes
+/// [`hook_root`]); `None` passes the event as unrecognized.
+pub fn handle_hook_at(
+    provider: HookProvider,
+    event: HookEvent,
+    input: &Value,
+    root: Option<PathBuf>,
+) -> HookOutcome {
     let tool = input.get("tool_name").and_then(Value::as_str);
     let mut audit = json!({
         "ts": chrono::Utc::now().to_rfc3339(),
@@ -109,7 +135,7 @@ pub fn handle_hook(provider: HookProvider, event: HookEvent, input: &Value) -> H
         "path_or_command": Value::Null,
         "rules": [],
     });
-    let Some(root) = hook_root(provider, input) else {
+    let Some(root) = root else {
         audit["reason"] = json!("unrecognized input");
         return HookOutcome {
             stdout: pass_stdout(provider, event),
@@ -327,6 +353,38 @@ mod tests {
             "tool_input": {"command": "grep -r DUMMY ."},
             "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false},
         })
+    }
+
+    #[test]
+    fn input_root_and_explicit_root() {
+        let input = json!({"cwd": "C:/w/sub", "workspace_roots": ["C:/w"]});
+        assert_eq!(input_root(HookProvider::Claude, &input), Some(PathBuf::from("C:/w/sub")));
+        assert_eq!(input_root(HookProvider::Cursor, &input), Some(PathBuf::from("C:/w")));
+        let out = handle_hook_at(HookProvider::Claude, HookEvent::PostToolUse, &input, None);
+        assert_eq!(out.audit["reason"], "unrecognized input");
+    }
+
+    #[test]
+    fn claude_bash_redaction_uses_the_given_root_after_a_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"deny":["sub/private.txt"]}}}}"#,
+        )
+        .unwrap();
+        let mut input = bash_post(&dir.path().join("sub"), "private.txt:hello\nok.txt:fine");
+        input["tool_input"]["command"] = json!("grep -r hello .");
+        let out = handle_hook_at(
+            HookProvider::Claude,
+            HookEvent::PostToolUse,
+            &input,
+            Some(dir.path().to_path_buf()),
+        );
+        assert_eq!(out.audit["decision"], "redact", "{}", out.audit);
+        assert!(!out.stdout.contains("private.txt:hello"));
+        assert!(out.stdout.contains("ok.txt:fine"));
     }
 
     #[test]

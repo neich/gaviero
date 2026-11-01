@@ -55,7 +55,7 @@ impl Tool for GrepTool {
             None => None,
         };
         let search_root = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => match ctx.confine(p) {
+            Some(p) => match ctx.confine_read(p) {
                 Ok(p) => p,
                 Err(e) => return ToolOutcome::error(e.to_string()),
             },
