@@ -94,12 +94,13 @@ F7 is the reliable word-wrap chord on every host. See [Root README](../../README
 
 ## Configuration
 
-Settings cascade (highest priority first):
+Settings layers, each overriding the one before it key by key:
 
-1. `.gaviero/settings.json`
-2. `.gaviero-workspace` file
-3. `~/.gaviero/settings.json` (same on Windows; falls back to the old XDG/AppData path if missing)
-4. Built-in defaults
+1. User — `$GAVIERO_ROOT/.gaviero/settings.json` (`~/.gaviero/settings.json` when unset; the old XDG/AppData path is not read)
+2. Workspace — `.gaviero/settings.json` beside the `*.gaviero-workspace` file (the folder's own file in single-folder mode)
+3. Repo — each workspace folder's `.gaviero/settings.json`, for that folder
+
+Built-in defaults fill the keys no layer sets. Settings embedded in the `.gaviero-workspace` file are not read.
 
 A settings file that is not valid JSON contributes nothing to the cascade. At startup a modal names the file, line, column, and parser message: `q` quits, `Enter` continues and opens the file with the cursor at the error.
 

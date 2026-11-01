@@ -147,7 +147,7 @@ fn thread_start_params(
         // The read-only sandbox, network and the deny-read profile from
         // `.gaviero/settings.json` all come from this config: Codex rejects
         // a `default_permissions` profile combined with `sandbox` modes.
-        "config": crate::agent_guard::codex::codex_thread_config(cwd, allow_network),
+        "config": crate::agent_guard::codex::codex_thread_config(cwd, additional_roots, allow_network),
         "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }
@@ -162,7 +162,7 @@ fn thread_resume_params(
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
-        "config": crate::agent_guard::codex::codex_thread_config(cwd, allow_network),
+        "config": crate::agent_guard::codex::codex_thread_config(cwd, additional_roots, allow_network),
         "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }

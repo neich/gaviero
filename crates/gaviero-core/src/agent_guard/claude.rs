@@ -71,7 +71,17 @@ pub fn claude_read_rules(workspace_root: &Path, additional_roots: &[&Path]) -> V
         rules.push(format!("Read(~/{tail}/**)"));
     }
     let primary = claude_posix_root(workspace_root);
-    for root in std::iter::once(&primary).chain(roots.iter()) {
+    // The settings file's own `.gaviero` (beside the `*.gaviero-workspace`
+    // file in workspace mode) is readable through `read_only_folders`; its
+    // state floor is denied like every root's.
+    let settings_root = policy
+        .settings_dir()
+        .and_then(Path::parent)
+        .map(claude_posix_root);
+    for root in std::iter::once(&primary)
+        .chain(roots.iter())
+        .chain(settings_root.iter())
+    {
         for (entry, _) in GAVIERO_STATE_FLOOR {
             rules.push(format!("Read(//{root}/.gaviero/{entry})"));
             rules.push(format!("Read(//{root}/.gaviero/{entry}/**)"));
@@ -95,17 +105,38 @@ pub fn claude_read_rules(workspace_root: &Path, additional_roots: &[&Path]) -> V
     rules
 }
 
-/// The full `--settings` JSON for one Claude session.
+/// `Edit(...)` denies that keep each `agent.permissions.read.extraFolders`
+/// entry read-only. Claude applies `Edit` rules to every built-in tool that
+/// edits files (Edit, Write, MultiEdit, NotebookEdit); Bash is not covered.
+pub fn claude_read_only_folder_rules(read_only: &[&Path]) -> Vec<String> {
+    read_only
+        .iter()
+        .map(|folder| format!("Edit(//{}/**)", claude_posix_root(folder)))
+        .collect()
+}
+
+/// The full `--settings` JSON for one Claude session. `read_only` is
+/// [`super::read_only_folders`]: the caller also passes each one as
+/// `--add-dir`, which lets reads through the outside-workspace block, while
+/// these rules refuse edits there and keep the sensitive-file denies.
 pub fn claude_session_settings(
     workspace_root: &Path,
     additional_roots: &[&Path],
+    read_only: &[&Path],
     skip_native_instructions: bool,
     block_outside: bool,
     cli_binary: &str,
 ) -> Value {
+    let anchored: Vec<&Path> = additional_roots
+        .iter()
+        .chain(read_only.iter())
+        .copied()
+        .collect();
+    let mut deny = claude_read_rules(workspace_root, &anchored);
+    deny.extend(claude_read_only_folder_rules(read_only));
     let mut root = json!({
         "permissions": {
-            "deny": claude_read_rules(workspace_root, additional_roots),
+            "deny": deny,
             "blockReadsOutsideWorkingDirectories": block_outside,
         },
         "hooks": {
@@ -133,17 +164,18 @@ pub fn claude_session_settings(
     root
 }
 
-/// `agent.permissions.read.blockOutsideWorkspace` from
-/// `<root>/.gaviero/settings.json`, read directly like
-/// [`SensitivePolicy::resolve`]. Default `true`.
+/// `agent.permissions.read.blockOutsideWorkspace` from the settings
+/// governing `root` ([`crate::workspace::LayeredSettings`]), like
+/// [`SensitivePolicy::resolve`]. Default `true`, and `true` whenever a
+/// settings layer does not parse.
 pub fn read_block_outside(root: &Path) -> bool {
-    std::fs::read_to_string(root.join(".gaviero").join("settings.json"))
-        .ok()
-        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-        .and_then(|doc| {
-            doc.pointer("/agent/permissions/read/blockOutsideWorkspace")
-                .and_then(Value::as_bool)
-        })
+    let settings = crate::workspace::LayeredSettings::for_folder(root);
+    if !settings.broken().is_empty() {
+        return true;
+    }
+    settings
+        .get(crate::workspace::settings::AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE)
+        .and_then(Value::as_bool)
         .unwrap_or(true)
 }
 
@@ -188,7 +220,7 @@ mod tests {
     #[test]
     fn claude_session_settings_denies_env_and_agent_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let v = claude_session_settings(dir.path(), &[], false, true, "gaviero-cli");
+        let v = claude_session_settings(dir.path(), &[], &[], false, true, "gaviero-cli");
         let rules = deny(&v);
         assert!(rules.contains(&"Read(**/.env)".to_string()));
         assert!(rules.contains(&"Read(~/.codex/auth.json)".to_string()));
@@ -202,11 +234,52 @@ mod tests {
     fn claude_session_settings_anchors_state_floor_at_each_root() {
         let dir = tempfile::tempdir().unwrap();
         let sibling = Path::new(r"C:\x\y");
-        let v = claude_session_settings(dir.path(), &[sibling], false, false, "gaviero-cli");
+        let v = claude_session_settings(dir.path(), &[sibling], &[], false, false, "gaviero-cli");
         let rules = deny(&v);
         assert!(rules.contains(&"Read(//c/x/y/.gaviero/history/**)".to_string()));
         assert!(rules.contains(&"Read(//c/x/y/**/.env)".to_string()));
         assert_eq!(v["permissions"]["blockReadsOutsideWorkingDirectories"], false);
+    }
+
+    #[test]
+    fn claude_session_settings_keeps_read_only_folders_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Path::new(r"C:\ref\docs");
+        let v = claude_session_settings(dir.path(), &[], &[docs], false, true, "x");
+        let rules = deny(&v);
+        assert!(rules.contains(&"Edit(//c/ref/docs/**)".to_string()));
+        assert!(rules.contains(&"Read(//c/ref/docs/**/.env)".to_string()));
+        assert!(!rules.iter().any(|r| r.starts_with("Read(//c/ref/docs/**)")));
+    }
+
+    #[test]
+    fn claude_rules_follow_the_workspace_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, app, lib) = crate::agent_guard::tests::workspace_layout(dir.path());
+        std::fs::write(
+            root.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"deny":["root-only/**"],
+                "blockOutsideWorkspace":false}}}}"#,
+        )
+        .unwrap();
+        assert!(!read_block_outside(&app));
+        // The repo layer overrides the workspace layer.
+        std::fs::write(
+            app.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"blockOutsideWorkspace":true}}}}"#,
+        )
+        .unwrap();
+        assert!(read_block_outside(&app));
+
+        let settings_dir = root.join(".gaviero");
+        let v = claude_session_settings(&app, &[&lib], &[&settings_dir], false, true, "x");
+        let rules = deny(&v);
+        let posix = claude_posix_root(&root);
+        assert!(rules.contains(&"Read(root-only/**)".to_string()));
+        assert!(rules.contains(&format!("Edit(//{posix}/.gaviero/**)")));
+        assert!(rules.contains(&format!("Read(//{posix}/.gaviero/history/**)")));
+        assert!(rules.contains(&format!("Read(//{posix}/.gaviero/memory.db*)")));
+        assert!(!rules.contains(&format!("Read(//{posix}/.gaviero/settings.json)")));
     }
 
     #[test]
@@ -220,7 +293,7 @@ mod tests {
                 "read":{"deny":["private/**"]}}}}"#,
         )
         .unwrap();
-        let rules = deny(&claude_session_settings(dir.path(), &[], false, true, "x"));
+        let rules = deny(&claude_session_settings(dir.path(), &[], &[], false, true, "x"));
         assert!(rules.contains(&"Read(!tests/fixtures/**)".to_string()));
         assert!(rules.contains(&"Read(private/**)".to_string()));
     }
@@ -228,7 +301,7 @@ mod tests {
     #[test]
     fn claude_session_settings_wires_the_bash_hook() {
         let dir = tempfile::tempdir().unwrap();
-        let v = claude_session_settings(dir.path(), &[], false, true, "C:/bin/gaviero-cli.exe");
+        let v = claude_session_settings(dir.path(), &[], &[], false, true, "C:/bin/gaviero-cli.exe");
         let hook = &v["hooks"]["PostToolUse"][0];
         assert_eq!(hook["matcher"], "Bash");
         assert_eq!(hook["hooks"][0]["command"], "C:/bin/gaviero-cli.exe");
@@ -242,7 +315,7 @@ mod tests {
     #[test]
     fn claude_session_settings_merges_native_instruction_excludes() {
         let dir = tempfile::tempdir().unwrap();
-        let v = claude_session_settings(dir.path(), &[], true, true, "x");
+        let v = claude_session_settings(dir.path(), &[], &[], true, true, "x");
         assert!(v["claudeMdExcludes"].is_array());
         assert!(v["permissions"]["deny"].is_array());
     }

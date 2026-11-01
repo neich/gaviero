@@ -276,9 +276,11 @@ fn relative_slash(path: &Path, root: &Path) -> String {
 
 /// Workspace-level exemptions from the sensitive block-list.
 ///
-/// Read from `agent.permissions.sensitivePaths.allow` in
-/// `<workspace>/.gaviero/settings.json` — a list of [`crate::path_pattern`]
-/// globs. Empty (the default) makes the block-list absolute.
+/// Read from `agent.permissions.sensitivePaths.allow` in the layered
+/// settings ([`crate::workspace::LayeredSettings`]: `$GAVIERO_ROOT`, then the
+/// workspace, then the repo `.gaviero/settings.json`, the most specific
+/// winning) — a list of [`crate::path_pattern`] globs. Empty (the default)
+/// makes the block-list absolute.
 ///
 /// The escape exists because a repo may legitimately own a `secrets.*` or
 /// `credentials` fixture; without it, the first CI run touching a test corpus
@@ -286,31 +288,54 @@ fn relative_slash(path: &Path, root: &Path) -> String {
 /// on purpose: the agent authoring the plan must not be able to widen its own
 /// access to secrets.
 ///
-/// The same file supplies `agent.permissions.read.deny`: extra globs agents
+/// The same settings supply `agent.permissions.read.deny`: extra globs agents
 /// may never read, on top of the block-list and the hard floor
-/// ([`read_floor_match`]).
+/// ([`read_floor_match`]), and `agent.permissions.read.extraFolders`:
+/// folders outside the workspace agents may read but never write
+/// ([`crate::agent_guard::read_only_folders`]).
 #[derive(Clone, Debug, Default)]
 pub struct SensitivePolicy {
     allow: Vec<String>,
     read_deny: Vec<String>,
+    /// `agent.permissions.read.extraFolders`, resolved to absolute paths.
+    read_folders: Vec<PathBuf>,
     /// Workspace root the policy was resolved for; anchors `read_deny` globs.
     root: Option<PathBuf>,
+    /// The workspace-level `.gaviero` directory, when it holds a
+    /// `settings.json` ([`crate::workspace::settings_root_for`]).
+    settings_dir: Option<PathBuf>,
 }
 
 fn non_blank(list: Vec<String>) -> Vec<String> {
     list.into_iter().filter(|p| !p.trim().is_empty()).collect()
 }
 
-fn string_array(doc: &serde_json::Value, pointer: &str) -> Vec<String> {
-    doc.pointer(pointer)
-        .and_then(|v| v.as_array())
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+/// One `agent.permissions.read.extraFolders` entry as an absolute path:
+/// `~` / `~/x` is the home directory, a relative entry is taken from
+/// `base` (the folder holding the `.gaviero/settings.json` that set it), and `.` / `..` are
+/// resolved without touching the disk.
+fn resolve_read_folder(raw: &str, base: &Path) -> Option<PathBuf> {
+    let raw = raw.trim();
+    let path = if raw == "~" {
+        dirs::home_dir()?
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        dirs::home_dir()?.join(rest)
+    } else if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        base.join(raw)
+    };
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 impl SensitivePolicy {
@@ -332,35 +357,72 @@ impl SensitivePolicy {
         self
     }
 
-    /// Load exemptions and read denies from
-    /// `<workspace>/.gaviero/settings.json`. A missing or unparseable file
-    /// yields [`Self::strict`] — failing closed is the whole point of the
-    /// rail.
+    /// Load exemptions and read denies from the settings governing
+    /// `workspace_root` ([`crate::workspace::LayeredSettings::for_folder`]).
+    /// No settings yields [`Self::strict`]. When any layer does not parse,
+    /// the widening keys (`sensitivePaths.allow`, `read.extraFolders`) are
+    /// dropped and the `read.deny` globs of the readable layers kept —
+    /// failing closed is the whole point of the rail.
     pub fn resolve(workspace_root: &Path) -> Self {
-        let root = Some(workspace_root.to_path_buf());
-        let path = workspace_root.join(".gaviero").join("settings.json");
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            return Self {
-                root,
-                ..Self::strict()
-            };
+        use crate::workspace::settings::{
+            AGENT_PERMISSIONS_READ_DENY as READ_DENY,
+            AGENT_PERMISSIONS_READ_EXTRA_FOLDERS as EXTRA_FOLDERS,
+            AGENT_PERMISSIONS_SENSITIVE_ALLOW as ALLOW,
         };
-        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
-            return Self {
-                root,
-                ..Self::strict()
-            };
+        let settings = crate::workspace::LayeredSettings::for_folder(workspace_root);
+        let list = |key| {
+            non_blank(
+                settings
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
         };
-        Self {
-            allow: non_blank(string_array(&doc, "/agent/permissions/sensitivePaths/allow")),
-            read_deny: non_blank(string_array(&doc, "/agent/permissions/read/deny")),
-            root,
+        // Set even when the file does not parse, so agents can still read it
+        // to find the mistake.
+        let settings_dir = Some(crate::workspace::settings_root_for(workspace_root).join(".gaviero"))
+            .filter(|dir| dir.join("settings.json").is_file());
+        let mut policy = Self {
+            read_deny: list(READ_DENY),
+            root: Some(workspace_root.to_path_buf()),
+            settings_dir,
+            ..Self::strict()
+        };
+        if settings.broken().is_empty() {
+            policy.allow = list(ALLOW);
+            if let Some(base) = settings.defining_base(EXTRA_FOLDERS) {
+                policy.read_folders = list(EXTRA_FOLDERS)
+                    .iter()
+                    .filter_map(|raw| resolve_read_folder(raw, base))
+                    .collect();
+            }
         }
+        policy
+    }
+
+    /// The workspace-level `.gaviero` directory, when it holds a
+    /// `settings.json`. In workspace mode it sits beside the
+    /// `*.gaviero-workspace` file, usually outside every workspace folder.
+    pub fn settings_dir(&self) -> Option<&Path> {
+        self.settings_dir.as_deref()
     }
 
     /// `agent.permissions.read.deny` globs.
     pub fn read_deny(&self) -> &[String] {
         &self.read_deny
+    }
+
+    /// `agent.permissions.read.extraFolders` as absolute paths, unfiltered.
+    /// Sessions use [`crate::agent_guard::read_only_folders`], which keeps
+    /// only existing folders outside the workspace.
+    pub fn read_folders(&self) -> &[PathBuf] {
+        &self.read_folders
     }
 
     /// `agent.permissions.sensitivePaths.allow` globs.
@@ -809,6 +871,78 @@ mod tests {
         assert_eq!(policy.root(), Some(dir.path()));
         let e = ScopeEnforcer::with_policy(scope_with(&[]), policy);
         assert!(e.check_read(&dir.path().join("private/x.md")).is_err());
+    }
+
+    #[test]
+    fn resolve_layers_the_repo_settings_over_the_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root = crate::util::fs::simplify_path(&root);
+        let member = root.join("app");
+        std::fs::create_dir_all(member.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(root.join(".gaviero")).unwrap();
+        std::fs::write(
+            root.join("ws.gaviero-workspace"),
+            serde_json::json!({"folders": [{"path": member}]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"deny":["root-only/**"],
+                "extraFolders":["docs"]}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            member.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"deny":["member-only/**"]}}}}"#,
+        )
+        .unwrap();
+        let policy = SensitivePolicy::resolve(&member);
+        // The repo layer overrides the workspace layer key by key.
+        assert_eq!(policy.read_deny(), ["member-only/**".to_string()]);
+        assert_eq!(policy.root(), Some(member.as_path()));
+        assert_eq!(policy.settings_dir(), Some(root.join(".gaviero").as_path()));
+        // extraFolders are relative to the folder holding the `.gaviero/`
+        // that set them.
+        assert_eq!(policy.read_folders(), [root.join("docs")]);
+    }
+
+    #[test]
+    fn resolve_drops_widening_keys_when_a_layer_is_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::util::fs::simplify_path(&dir.path().canonicalize().unwrap());
+        let member = root.join("app");
+        std::fs::create_dir_all(member.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(root.join(".gaviero")).unwrap();
+        std::fs::write(
+            root.join("ws.gaviero-workspace"),
+            serde_json::json!({"folders": [{"path": member}]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"deny":["private/**"]},
+                "sensitivePaths":{"allow":["**"]}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(member.join(".gaviero/settings.json"), "{ broken").unwrap();
+        let policy = SensitivePolicy::resolve(&member);
+        assert_eq!(policy.read_deny(), ["private/**".to_string()]);
+        assert!(policy.allow_globs().is_empty());
+    }
+
+    #[test]
+    fn resolve_keeps_the_settings_dir_of_an_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{ broken").unwrap();
+        let policy = SensitivePolicy::resolve(dir.path());
+        assert!(policy.read_deny().is_empty());
+        assert_eq!(
+            policy.settings_dir(),
+            Some(dir.path().join(".gaviero").as_path())
+        );
+        assert!(SensitivePolicy::resolve(&dir.path().join("none")).settings_dir().is_none());
     }
 
     #[test]

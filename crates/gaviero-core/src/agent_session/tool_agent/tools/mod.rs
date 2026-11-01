@@ -81,6 +81,18 @@ impl ToolCtx {
         confine(arg, &self.workspace_root, &self.additional_roots)
     }
 
+    /// [`Self::confine`] for the read-only tools: the workspace roots plus
+    /// `agent.permissions.read.extraFolders`. Writes keep using `confine`.
+    pub fn confine_read(&self, arg: &str) -> Result<PathBuf> {
+        let mut roots = self.additional_roots.clone();
+        roots.extend(crate::agent_guard::read_only_folders(
+            &self.sensitive,
+            &self.workspace_root,
+            &self.additional_roots,
+        ));
+        confine(arg, &self.workspace_root, &roots)
+    }
+
     /// The scope + sensitive-path enforcer every fs tool checks against.
     pub fn enforcer(&self) -> ScopeEnforcer {
         ScopeEnforcer::with_policy(self.scope.clone(), self.sensitive.clone())

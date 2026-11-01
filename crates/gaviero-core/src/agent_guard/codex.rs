@@ -20,7 +20,7 @@
 //! between a `read` and a `deny` entry for the same path is unverified, so an
 //! exempted file stays denied for Codex.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -36,8 +36,45 @@ fn is_glob(pattern: &str) -> bool {
     pattern.contains(['*', '?', '['])
 }
 
+/// The existing hard-floor entries directly in the `.gaviero` directory
+/// `dir`: [`GAVIERO_STATE_FLOOR`] names plus [`GAVIERO_STATE_FLOOR_PREFIXES`]
+/// matches. Only existing paths, which MXC requires of literal entries.
+fn state_floor_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = GAVIERO_STATE_FLOOR
+        .iter()
+        .map(|(entry, _)| dir.join(entry))
+        .filter(|p| p.exists())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if GAVIERO_STATE_FLOOR_PREFIXES
+                .iter()
+                .any(|(prefix, _)| name.starts_with(prefix))
+            {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// The `config` object for `thread/start` / `thread/resume`.
-pub fn codex_thread_config(workspace_root: &Path, allow_network: bool) -> Value {
+///
+/// Each `agent.permissions.read.extraFolders` entry
+/// ([`super::read_only_folders`]) becomes an absolute-path `"read"` entry —
+/// the documented form for granting a subtree outside the workspace. Only
+/// existing folders are listed, which MXC requires of literal paths. The
+/// sensitive-file globs are not repeated under them: globs below an
+/// absolute path are undocumented, and an entry Codex rejects fails the
+/// thread.
+pub fn codex_thread_config(
+    workspace_root: &Path,
+    additional_roots: &[PathBuf],
+    allow_network: bool,
+) -> Value {
     let policy = SensitivePolicy::resolve(workspace_root);
     let mut in_roots = Map::new();
     let mut deny = |glob: String| {
@@ -74,6 +111,20 @@ pub fn codex_thread_config(workspace_root: &Path, allow_network: bool) -> Value 
             }
         }
     }
+    let read_only = super::read_only_folders(&policy, workspace_root, additional_roots);
+    for folder in &read_only {
+        filesystem
+            .entry(folder.to_string_lossy().replace('\\', "/"))
+            .or_insert(json!("read"));
+    }
+    // The settings file's own `.gaviero` outside the workspace folders: the
+    // `:workspace_roots` floor globs do not reach it, so its existing state
+    // entries are denied by literal path.
+    if let Some(dir) = policy.settings_dir().filter(|d| read_only.iter().any(|f| f == d)) {
+        for path in state_floor_entries(dir) {
+            filesystem.insert(path.to_string_lossy().replace('\\', "/"), json!("deny"));
+        }
+    }
 
     let mut config = json!({
         "default_permissions": CODEX_PROFILE,
@@ -99,7 +150,7 @@ mod tests {
     #[test]
     fn codex_thread_config_selects_the_gaviero_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let v = codex_thread_config(dir.path(), false);
+        let v = codex_thread_config(dir.path(), &[], false);
         assert_eq!(v["default_permissions"], "gaviero");
         let profile = &v["permissions"]["gaviero"];
         assert_eq!(profile["extends"], ":read-only");
@@ -126,7 +177,7 @@ mod tests {
             r#"{"agent":{"permissions":{"read":{"deny":["private/**","missing.txt"]}}}}"#,
         )
         .unwrap();
-        let v = codex_thread_config(dir.path(), true);
+        let v = codex_thread_config(dir.path(), &[], true);
         let fs = &v["permissions"]["gaviero"]["filesystem"];
         assert_eq!(fs[":workspace_roots"]["private/**"], "deny");
         assert_eq!(v["permissions"]["gaviero"]["network"]["enabled"], true);
@@ -140,5 +191,43 @@ mod tests {
         }
         // A literal read.deny path that does not exist is not emitted.
         assert!(fs[":workspace_roots"].get("missing.txt").is_none());
+    }
+
+    #[test]
+    fn codex_thread_config_grants_read_on_extra_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            ws.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"extraFolders":["../docs","../gone"]}}}}"#,
+        )
+        .unwrap();
+        let v = codex_thread_config(&ws, &[], false);
+        let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
+        let key = docs.to_string_lossy().replace('\\', "/");
+        assert_eq!(fs[key.as_str()], "read");
+        assert!(!fs.keys().any(|k| k.ends_with("/gone")));
+    }
+
+    #[test]
+    fn codex_thread_config_reads_the_workspace_settings_dir_but_not_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, app, lib) = crate::agent_guard::tests::workspace_layout(dir.path());
+        let state = root.join(".gaviero");
+        std::fs::create_dir_all(state.join("history")).unwrap();
+        std::fs::write(state.join("memory.db"), "").unwrap();
+        std::fs::write(state.join("memory.db-wal"), "").unwrap();
+        let v = codex_thread_config(&app, &[lib], false);
+        let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
+        let key = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+        assert_eq!(fs[key(state.clone()).as_str()], "read");
+        assert_eq!(fs[key(state.join("history")).as_str()], "deny");
+        assert_eq!(fs[key(state.join("memory.db")).as_str()], "deny");
+        assert_eq!(fs[key(state.join("memory.db-wal")).as_str()], "deny");
+        // Missing floor entries are not listed (MXC rejects them).
+        assert!(fs.get(key(state.join("turns")).as_str()).is_none());
     }
 }

@@ -66,7 +66,7 @@ fn claude_read_policy_blocks_env() {
     let Some(cli) = cli_binary() else { return };
     let (dir, canary) = workspace();
     let settings =
-        agent_guard::claude::claude_session_settings(dir.path(), &[], false, true, &cli);
+        agent_guard::claude::claude_session_settings(dir.path(), &[], &[], false, true, &cli);
     let prompt = "I am testing my own permission configuration on dummy canary files. \
                   Make exactly these tool calls, one each, and paste the raw output or \
                   error of each: 1) Read tool on .env  2) Bash: cat .env  \
@@ -225,7 +225,7 @@ fn codex_thread_config_accepted() {
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": {
         "cwd": dir.path().to_string_lossy(),
         "approvalPolicy": "on-request",
-        "config": agent_guard::codex::codex_thread_config(dir.path(), false),
+        "config": agent_guard::codex::codex_thread_config(dir.path(), &[], false),
     }}));
     let reply = wait_for(2);
     // The app-server is a launcher plus the native binary: kill the tree, or

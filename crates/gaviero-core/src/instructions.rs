@@ -253,13 +253,21 @@ pub fn is_active(primary: &Path, additional: &[PathBuf]) -> bool {
 }
 
 /// `system_prompt` plus the `GAVIERO.md` block, or unchanged when none is in
-/// scope.
+/// scope, then the `agent.permissions.read.extraFolders` block
+/// ([`crate::agent_guard::read_only_folders_block`]) when any are set.
 pub fn append_to_system_prompt(
     system_prompt: String,
     primary: &Path,
     additional: &[PathBuf],
 ) -> String {
-    append_with_global(system_prompt, primary, additional, global_file().as_deref())
+    let mut out = append_with_global(system_prompt, primary, additional, global_file().as_deref());
+    if let Some(block) = crate::agent_guard::read_only_folders_block(
+        &crate::agent_guard::read_only_folders_for(primary, additional),
+    ) {
+        out.push_str("\n\n");
+        out.push_str(&block);
+    }
+    out
 }
 
 fn append_with_global(

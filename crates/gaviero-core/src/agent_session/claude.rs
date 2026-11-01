@@ -421,6 +421,12 @@ impl ClaudeSession {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&found.render());
         }
+        if let Some(block) = crate::agent_guard::read_only_folders_block(
+            &crate::agent_guard::read_only_folders_for(&self.workspace_root, &self.additional_roots),
+        ) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&block);
+        }
 
         // Build `build_enriched_prompt`-equivalent for file refs + history.
         // `AcpSession::spawn` takes the enriched prompt directly; we pass the

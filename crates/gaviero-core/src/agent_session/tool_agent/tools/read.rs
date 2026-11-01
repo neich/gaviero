@@ -37,7 +37,7 @@ impl Tool for ReadTool {
         let Some(file_path) = args.get("file_path").and_then(|v| v.as_str()) else {
             return ToolOutcome::error("missing required argument 'file_path'");
         };
-        let path = match ctx.confine(file_path) {
+        let path = match ctx.confine_read(file_path) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::error(e.to_string()),
         };
@@ -127,5 +127,59 @@ mod tests {
             .run(json!({ "file_path": "../../etc/passwd" }), &ctx)
             .await;
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn reads_extra_folders_but_writes_stay_confined() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "hello\n").unwrap();
+        std::fs::write(docs.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(
+            ws.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"read":{"extraFolders":["../docs"]}}}}"#,
+        )
+        .unwrap();
+        let ctx = ToolCtx {
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&ws),
+            ..ctx_for(&ws)
+        };
+        let guide = docs.join("guide.md");
+        let out = ReadTool
+            .run(json!({ "file_path": guide.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("hello"));
+        let env = docs.join(".env");
+        let out = ReadTool
+            .run(json!({ "file_path": env.to_string_lossy() }), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(ctx.confine(&guide.to_string_lossy()).is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_the_workspace_settings_file_but_not_its_state() {
+        let dir = tempdir().unwrap();
+        let (root, app, _lib) = crate::agent_guard::tests::workspace_layout(dir.path());
+        std::fs::write(root.join(".gaviero/memory.db"), "x").unwrap();
+        let ctx = ToolCtx {
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&app),
+            ..ctx_for(&app)
+        };
+        let settings = root.join(".gaviero/settings.json");
+        let out = ReadTool
+            .run(json!({ "file_path": settings.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let db = root.join(".gaviero/memory.db");
+        let out = ReadTool
+            .run(json!({ "file_path": db.to_string_lossy() }), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(ctx.confine(&settings.to_string_lossy()).is_err());
     }
 }
