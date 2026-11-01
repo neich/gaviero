@@ -115,6 +115,11 @@ fn is_mcp_command(t: &str) -> bool {
     t == "/mcp" || t.starts_with("/mcp ")
 }
 
+/// `/settings` or `/settings <layer>` — not a longer command name.
+fn is_settings_command(t: &str) -> bool {
+    t == "/settings" || t.starts_with("/settings ")
+}
+
 pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     // Only clear the output text selection on non-selection keypresses.
     // SelectUp/SelectDown extend it; Copy reads it.
@@ -347,6 +352,11 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_forget_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/skills") {
                     handle_skills_command(app);
+                } else if is_settings_command(app.chat_state.text_input.text.trim()) {
+                    let line = app.chat_state.text_input.text.trim().to_string();
+                    app.chat_state.text_input.text.clear();
+                    app.chat_state.text_input.cursor = 0;
+                    super::settings_overlay::handle_settings_command(app, &line);
                 } else if app.chat_state.text_input.text.trim().starts_with("/remote") {
                     let line = app.chat_state.text_input.text.trim().to_string();
                     app.chat_state.add_user_message(&line);

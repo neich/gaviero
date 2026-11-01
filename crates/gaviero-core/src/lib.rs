@@ -20,6 +20,7 @@ pub mod scope_enforcer;
 pub mod secret_scan;
 pub mod session_journal;
 pub mod session_state;
+pub mod settings_overrides;
 pub mod skills;
 pub mod swarm;
 pub mod terminal;

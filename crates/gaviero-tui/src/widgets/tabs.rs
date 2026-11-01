@@ -6,16 +6,30 @@ use ratatui::{
     widgets::Widget,
 };
 
+/// How a tab is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabKind {
+    Normal,
+    /// A read-only diff overlay: orange, to signal it cannot be edited.
+    DiffView,
+    /// The global `$GAVIERO_ROOT/.gaviero/settings.json`, shared by every
+    /// gaviero instance: violet, so an edit there is never mistaken for a
+    /// workspace one.
+    Global,
+}
+
 pub struct TabBar<'a> {
-    /// (name, modified, is_diff_view). `is_diff_view = true` indicates the
-    /// buffer is currently shown as a read-only diff overlay; the tab is
-    /// rendered in orange to signal it cannot be edited.
-    pub titles: &'a [(String, bool, bool)],
+    /// (name, modified, kind).
+    pub titles: &'a [(String, bool, TabKind)],
     pub active: usize,
 }
 
 /// Orange used for read-only diff-view tabs (e.g. git panel diff preview).
 const DIFF_VIEW_FG: Color = Color::Rgb(214, 134, 50);
+/// Violet for the global settings tab, with a tinted background.
+const GLOBAL_FG: Color = Color::Rgb(198, 146, 233);
+const GLOBAL_BG: Color = Color::Rgb(52, 40, 66);
+const GLOBAL_ACTIVE_BG: Color = Color::Rgb(78, 56, 102);
 
 /// The rendered label for a tab and its display width in terminal cells.
 /// Width must be unicode-aware (`'●'` is 3 bytes / 1 cell, CJK chars are
@@ -41,7 +55,7 @@ impl<'a> TabBar<'a> {
         }
 
         let mut x = area.x;
-        for (i, (title, modified, is_diff_view)) in self.titles.iter().enumerate() {
+        for (i, (title, modified, kind)) in self.titles.iter().enumerate() {
             let is_active = i == self.active;
             let (label, label_len) = tab_label(title, *modified);
 
@@ -63,13 +77,20 @@ impl<'a> TabBar<'a> {
                 break;
             }
 
-            let style = if *is_diff_view {
+            let style = if *kind == TabKind::DiffView {
                 let bg = if is_active {
                     Color::Rgb(55, 60, 70)
                 } else {
                     Color::Rgb(35, 39, 46)
                 };
                 let mut s = Style::default().fg(DIFF_VIEW_FG).bg(bg);
+                if is_active {
+                    s = s.add_modifier(Modifier::BOLD);
+                }
+                s
+            } else if *kind == TabKind::Global {
+                let bg = if is_active { GLOBAL_ACTIVE_BG } else { GLOBAL_BG };
+                let mut s = Style::default().fg(GLOBAL_FG).bg(bg);
                 if is_active {
                     s = s.add_modifier(Modifier::BOLD);
                 }

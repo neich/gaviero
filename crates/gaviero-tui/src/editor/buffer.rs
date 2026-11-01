@@ -104,6 +104,26 @@ pub struct DiffView {
     pub original_text: String,
 }
 
+/// The settings layer a buffer holds and its key highlights, computed by
+/// `app::settings_overlay` against the other layers' files on disk.
+#[derive(Clone, Debug, Default)]
+pub struct SettingsOverlay {
+    /// The `$GAVIERO_ROOT/.gaviero/settings.json` shared by every instance.
+    pub global: bool,
+    /// Highlights for the text as of `text_hash`.
+    pub marks: Vec<gaviero_core::settings_overrides::KeyMark>,
+    /// Hash of the text the marks were computed for; `None` forces a
+    /// recompute (another layer changed).
+    pub text_hash: Option<u64>,
+}
+
+impl SettingsOverlay {
+    /// The marks on `line`, in column order.
+    pub fn marks_on(&self, line: usize) -> impl Iterator<Item = &gaviero_core::settings_overrides::KeyMark> {
+        self.marks.iter().filter(move |m| m.line == line)
+    }
+}
+
 pub struct Buffer {
     pub text: Rope,
     pub path: Option<PathBuf>,
@@ -156,6 +176,11 @@ pub struct Buffer {
     pub diff_view: Option<DiffView>,
     /// Git reports this path as unmerged (merge/rebase in progress).
     pub git_unmerged: bool,
+    /// Tab label overriding the file name (`global:settings.json`).
+    pub tab_label: Option<String>,
+    /// Set on a `.gaviero/settings.json` layer: its key highlights against
+    /// the other layers ([`SettingsOverlay`]).
+    pub settings: Option<SettingsOverlay>,
     /// Parsed `<<<<<<<` / `=======` / `>>>>>>>` regions in the buffer text.
     pub conflict_regions: Vec<gaviero_core::git_conflict::ConflictRegion>,
     /// Index into `conflict_regions` for F8 / F9 navigation.
@@ -212,6 +237,8 @@ impl Buffer {
             read_only: false,
             diff_view: None,
             git_unmerged: false,
+            tab_label: None,
+            settings: None,
             conflict_regions: Vec::new(),
             conflict_index: 0,
             folded: BTreeSet::new(),
@@ -331,6 +358,8 @@ impl Buffer {
             read_only: false,
             diff_view: None,
             git_unmerged: false,
+            tab_label: None,
+            settings: None,
             conflict_regions: Vec::new(),
             conflict_index: 0,
             folded: BTreeSet::new(),
@@ -411,6 +440,8 @@ impl Buffer {
                 original_text: original,
             }),
             git_unmerged: false,
+            tab_label: None,
+            settings: None,
             conflict_regions: Vec::new(),
             conflict_index: 0,
             folded: BTreeSet::new(),
@@ -456,8 +487,12 @@ impl Buffer {
         true
     }
 
-    /// Display name for the tab bar.
+    /// Display name for the tab bar: [`Self::tab_label`] when set, else
+    /// the file name.
     pub fn display_name(&self) -> &str {
+        if let Some(label) = &self.tab_label {
+            return label;
+        }
         self.path
             .as_ref()
             .and_then(|p| p.file_name())
