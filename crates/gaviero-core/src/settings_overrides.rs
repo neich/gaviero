@@ -8,6 +8,11 @@
 //! flattened `"a.b"` keys alike). Only keys whose value is not an object are
 //! compared: those are the values a lookup actually returns. Keys inside
 //! arrays are not settings paths and are skipped.
+//!
+//! A `"key+"` adds to `key` rather than replacing it
+//! ([`crate::workspace::layered_value`]): it is compared as `key`, its own
+//! value counts even when it is an object, and the marks say "adds to" /
+//! "extended by" instead of "overrides" / "overridden by".
 
 use serde_json::Value;
 
@@ -32,23 +37,34 @@ pub struct KeyMark {
     pub line: usize,
     pub start_col: usize,
     pub end_col: usize,
+    /// The key as written, `+` included.
     pub path: String,
     /// Broader layers this key overrides (`global`, `workspace`).
     pub overrides: Vec<String>,
     /// More specific layers that override this key (`repo gaviero`, …).
     pub overridden_by: Vec<String>,
+    /// Broader layers this `"key+"` adds to.
+    pub extends: Vec<String>,
+    /// More specific layers that add to this key with `"key+"`.
+    pub extended_by: Vec<String>,
 }
 
 impl KeyMark {
-    /// The end-of-line note: `← overridden by repo gaviero`,
-    /// `overrides global`, or both.
+    /// The end-of-line note, e.g. `← overridden by repo gaviero`,
+    /// `← extended by repo gaviero`, `overrides global`, `adds to global`.
     pub fn hint(&self) -> String {
         let mut parts = Vec::new();
         if !self.overridden_by.is_empty() {
             parts.push(format!("← overridden by {}", self.overridden_by.join(", ")));
         }
+        if !self.extended_by.is_empty() {
+            parts.push(format!("← extended by {}", self.extended_by.join(", ")));
+        }
         if !self.overrides.is_empty() {
             parts.push(format!("overrides {}", self.overrides.join(", ")));
+        }
+        if !self.extends.is_empty() {
+            parts.push(format!("adds to {}", self.extends.join(", ")));
         }
         parts.join(" · ")
     }
@@ -58,26 +74,51 @@ impl KeyMark {
 /// layers, `lower` the more specific ones, each `(label, parsed file)`.
 pub fn override_marks(text: &str, upper: &[(String, Value)], lower: &[(String, Value)]) -> Vec<KeyMark> {
     let sets = |doc: &Value, path: &str| crate::workspace::dot_get(doc, path).is_some();
+    let labels = |layers: &[(String, Value)], path: &str| -> Vec<String> {
+        layers
+            .iter()
+            .filter(|(_, doc)| sets(doc, path))
+            .map(|(label, _)| label.clone())
+            .collect()
+    };
     json_key_spans(text)
         .into_iter()
-        .filter(|span| !span.is_object)
+        // Keys inside a `"key+": { … }` addition are not settings paths.
+        .filter(|span| !span.path.contains("+."))
         .filter_map(|span| {
-            let labels = |layers: &[(String, Value)]| -> Vec<String> {
-                layers
-                    .iter()
-                    .filter(|(_, doc)| sets(doc, &span.path))
-                    .map(|(label, _)| label.clone())
-                    .collect()
+            let (key, appends) = match span.path.strip_suffix('+') {
+                Some(key) => (key.to_string(), true),
+                None => (span.path.clone(), false),
             };
-            let overrides = labels(upper);
-            let overridden_by = labels(lower);
-            (!overrides.is_empty() || !overridden_by.is_empty()).then_some(KeyMark {
+            if span.is_object && !appends {
+                return None;
+            }
+            let plus = format!("{key}+");
+            let mut broader = labels(upper, &key);
+            for label in labels(upper, &plus) {
+                if !broader.contains(&label) {
+                    broader.push(label);
+                }
+            }
+            let (overrides, extends) = if appends {
+                (Vec::new(), broader)
+            } else {
+                (broader, Vec::new())
+            };
+            let overridden_by = labels(lower, &key);
+            let extended_by = labels(lower, &plus);
+            let marked = [&overrides, &extends, &overridden_by, &extended_by]
+                .iter()
+                .any(|l| !l.is_empty());
+            marked.then_some(KeyMark {
                 line: span.line,
                 start_col: span.start_col,
                 end_col: span.end_col,
                 path: span.path,
                 overrides,
                 overridden_by,
+                extends,
+                extended_by,
             })
         })
         .collect()
@@ -290,5 +331,27 @@ mod tests {
         assert_eq!(marks[1].path, "editor.tabSize");
         assert_eq!(marks[1].line, 2);
         assert_eq!(marks[1].hint(), "← overridden by repo app");
+    }
+
+    #[test]
+    fn plus_keys_add_to_and_are_extended_by_other_layers() {
+        // The workspace layer: one plain key, one addition.
+        let text = "{\n  \"mcp\": { \"extraServers\": [] },\n  \"files.exclude+\": { \"target\": true }\n}";
+        let upper = vec![("global".to_string(), json!({"files": {"exclude": {"x": true}}}))];
+        let lower = vec![
+            ("repo app".to_string(), json!({"mcp.extraServers+": [{"name": "a"}]})),
+            ("repo lib".to_string(), json!({"files": {"exclude": {}}})),
+        ];
+        let marks = override_marks(text, &upper, &lower);
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        assert_eq!(marks[0].path, "mcp.extraServers");
+        assert_eq!(marks[0].extended_by, ["repo app"]);
+        assert!(marks[0].overridden_by.is_empty() && marks[0].overrides.is_empty());
+        assert_eq!(marks[0].hint(), "← extended by repo app");
+        // An object-valued addition is marked, and its own keys are not.
+        assert_eq!(marks[1].path, "files.exclude+");
+        assert_eq!(marks[1].extends, ["global"]);
+        assert_eq!(marks[1].overridden_by, ["repo lib"]);
+        assert_eq!(marks[1].hint(), "← overridden by repo lib · adds to global");
     }
 }
