@@ -545,13 +545,19 @@ impl AcpSession {
         // does not bring MCP tools in; only `--mcp-config` does. MCP tools
         // are auto-approved by `--dangerously-skip-permissions` above when
         // `auto_approve` is set (otherwise they surface as permission
-        // prompts, matching built-in tool behaviour). Non-strict on purpose:
-        // the user's own global MCP servers still load alongside. Mirrors how
-        // the Codex backend replays its synthesized `.codex/config.toml`.
+        // prompts, matching built-in tool behaviour). Mirrors how the Codex
+        // backend replays its synthesized `.codex/config.toml`.
+        //
+        // Always strict: every MCP server comes from `.gaviero/settings.json`
+        // via that file, never from the user's `~/.claude.json`, plugins or
+        // claude.ai connectors (verified on 2.1.306: strict drops the
+        // connectors, with or without `--mcp-config`). No file = no MCP.
         let mcp_config_path = cwd.join(".mcp.json");
         if mcp_config_path.is_file() {
             cmd.arg("--mcp-config").arg(&mcp_config_path);
         }
+        cmd.arg("--strict-mcp-config");
+        cmd.env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
 
         if let Some(json) = options.agents_json.as_deref().filter(|s| !s.is_empty()) {
             cmd.arg("--agents").arg(json);

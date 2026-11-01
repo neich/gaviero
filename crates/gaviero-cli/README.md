@@ -110,6 +110,8 @@ Reads the same `.gaviero/settings.json` cascade as the editor (see [gaviero-tui]
 
 Per-tool limits still go through `mcp.permissions` (e.g. `"deny": ["gaviero:memory_flag"]`).
 
+**Only settings.json activates MCP servers.** Agents see gaviero's own server, context7 (`mcp.context7.enabled`, off by default) and `mcp.extraServers` — plus, for one run, `--mcp-url` / `--mcp-stdio` — and nothing else. The server lists in `.mcp.json` and `.cursor/mcp.json` are rewritten from settings (hand-added entries are dropped, other keys kept), and emptied under `--no-mcp`. Servers the vendors would load on their own stay off: Claude runs with `--strict-mcp-config` (no `~/.claude.json`, plugin or claude.ai connector servers), Codex gets `mcp_servers.<name>.enabled=false` for each server in `~/.codex/config.toml` and `features.apps=false`, and Cursor's `~/.cursor/mcp.json` servers are denied (`Mcp(<name>:*)`) in `.cursor/cli.json`.
+
 **MCP extra servers** — merged into every agent worktree (`--mcp-url` overrides same-named entries). Codex receives them (and context7) only with `codexTrust` granted:
 
 ```json

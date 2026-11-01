@@ -105,8 +105,8 @@
 //   Configure the MCP server any one of these ways:
 //     --mcp-url consensus=URL
 //     --var CONSENSUS_MCP_URL=URL
-//     a server entry in <workspace>/.cursor/mcp.json (gaviero-cli
-//     imports it).
+//     an mcp.extraServers entry in .gaviero/settings.json
+//     (.mcp.json / .cursor/mcp.json are not read: gaviero writes them).
 //   (Wuilder URLs need a trailing slash; gaviero-cli adds it for
 //   mcp.wuilder.com.) Cursor agents get `--approve-mcps` and
 //   `--sandbox disabled` plus `.cursor/cli.json` network/MCP
@@ -241,7 +241,7 @@
 //   CONSENSUS_SERVER  — MCP server id agents call tools on.
 //                   (default: consensus)
 //   CONSENSUS_MCP_URL — remote MCP URL for operator setup; may
-//                   also come from --mcp-url or .cursor/mcp.json.
+//                   also come from --mcp-url or mcp.extraServers.
 //   ENABLE_WEB_FALLBACK — allow WebSearch/WebFetch. (default: true;
 //                   set false for an MCP-only panel)
 //
