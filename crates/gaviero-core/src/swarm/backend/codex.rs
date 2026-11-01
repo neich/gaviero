@@ -371,7 +371,7 @@ fn codex_exec_args(
     // as `--config mcp_servers.X.Y=Z` overrides. Codex's CLI only loads
     // `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), never
     // the per-worktree file, so without this step the external MCP
-    // servers Gaviero synthesizes (e.g. Semantic Scholar, context7) are
+    // servers Gaviero synthesizes (e.g. Consensus, context7) are
     // invisible to `codex exec`.
     let codex_config = workspace_root.join(".codex/config.toml");
     for pair in crate::mcp::codex_mcp_overrides_from_config_file(&codex_config) {
@@ -897,7 +897,7 @@ mod tests {
 command = "gaviero-mcp-shim"
 args = ["--socket", "/tmp/mcp.sock"]
 
-[mcp_servers.semantic-scholar]
+[mcp_servers.consensus]
 url = "https://example/mcp/"
 "#,
         )
@@ -916,8 +916,8 @@ url = "https://example/mcp/"
         );
         assert!(
             args.windows(2).any(|w| w[0] == "--config"
-                && w[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#),
-            "missing semantic-scholar.url override in {args:?}",
+                && w[1] == r#"mcp_servers.consensus.url="https://example/mcp/""#),
+            "missing consensus.url override in {args:?}",
         );
     }
 
@@ -935,7 +935,7 @@ url = "https://example/mcp/"
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
-            "[mcp_servers.semantic-scholar]\nurl = \"https://example/mcp/\"\n\n\
+            "[mcp_servers.consensus]\nurl = \"https://example/mcp/\"\n\n\
              [projects.\"/wt\"]\ntrust_level = \"trusted\"\n",
         )
         .unwrap();

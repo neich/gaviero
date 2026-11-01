@@ -596,7 +596,7 @@ mod tests {
             dir.path(),
             r#"{"mcp":{
                 "context7":{"enabled":true},
-                "extraServers":[{"name":"semantic-scholar","url":"https://example.test/mcp"}]
+                "extraServers":[{"name":"consensus","url":"https://example.test/mcp"}]
             }}"#,
         );
 
@@ -605,7 +605,7 @@ mod tests {
         assert!(allowed.context7 && allowed.extra_servers);
         assert_eq!(
             names(&mcp_servers_for_session(dir.path(), allowed)),
-            vec!["context7", "semantic-scholar"]
+            vec!["context7", "consensus"]
         );
 
         // The in-process row allows context7 as a *native* tool (Phase 2d) and
@@ -665,12 +665,12 @@ mod tests {
         write_settings(
             dir.path(),
             r#"{"mcp":{"extraServers":[
-                {"name":"semantic-scholar","url":"https://example.test/mcp"},
+                {"name":"consensus","url":"https://example.test/mcp"},
                 {"name":"local-thing","command":"some-server","args":["--x"]}
             ]}}"#,
         );
         let servers = mcp_servers_for_session(dir.path(), dsh_caps());
-        assert_eq!(names(&servers), vec!["semantic-scholar"]);
+        assert_eq!(names(&servers), vec!["consensus"]);
         assert_eq!(servers[0]["type"], "http");
     }
 
@@ -683,8 +683,8 @@ mod tests {
             dir.path(),
             r#"{"mcp":{
                 "context7":{"enabled":true},
-                "extraServers":[{"name":"semantic-scholar","url":"https://example.test/mcp"}],
-                "permissions":{"deny":["context7:*","semantic-scholar:*"]}
+                "extraServers":[{"name":"consensus","url":"https://example.test/mcp"}],
+                "permissions":{"deny":["context7:*","consensus:*"]}
             }}"#,
         );
         assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
@@ -699,7 +699,7 @@ mod tests {
             dir.path(),
             r#"{"mcp":{
                 "context7":{"enabled":true},
-                "extraServers":[{"name":"semantic-scholar","url":"https://example.test/mcp"}],
+                "extraServers":[{"name":"consensus","url":"https://example.test/mcp"}],
                 "permissions":{"allow":["gaviero:*"]}
             }}"#,
         );

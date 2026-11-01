@@ -2270,7 +2270,7 @@ mod tests {
 command = "gaviero-mcp-shim"
 args = ["--socket", "/tmp/mcp.sock"]
 
-[mcp_servers.semantic-scholar]
+[mcp_servers.consensus]
 url = "https://example/mcp/"
 "#,
         )
@@ -2295,7 +2295,7 @@ url = "https://example/mcp/"
         }));
         assert!(args.windows(2).any(|pair| {
             pair[0] == "--config"
-                && pair[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#
+                && pair[1] == r#"mcp_servers.consensus.url="https://example/mcp/""#
         }));
     }
 

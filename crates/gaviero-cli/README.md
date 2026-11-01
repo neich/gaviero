@@ -68,7 +68,7 @@ gaviero-cli --script examples/scientific_research.gaviero \
   --workflow scientific-research-consensus \
   --prompt "Sparse attention study" \
   --var PLAN_FILE=/path/to/draft-research-plan.md \
-  --mcp-url semantic-scholar=https://YOUR-MCP-ENDPOINT \
+  --mcp-url consensus=https://YOUR-MCP-ENDPOINT \
   --mcp-codex-trust granted
 
 # Store a memory
@@ -115,7 +115,7 @@ Per-tool limits still go through `mcp.permissions` (e.g. `"deny": ["gaviero:memo
 ```json
 {
   "mcp.extraServers": [
-    { "name": "semantic-scholar", "url": "https://YOUR-MCP-ENDPOINT" }
+    { "name": "consensus", "url": "https://YOUR-MCP-ENDPOINT" }
   ],
   "mcp.gavieroServer.codexTrust": "granted"
 }

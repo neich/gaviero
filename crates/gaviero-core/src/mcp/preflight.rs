@@ -236,7 +236,7 @@ pub fn validate_synthesized_cursor_remote_mcp(synth: &McpConfigSynth) -> Result<
     if !has_url {
         bail!(
             ".cursor/mcp.json has no remote url server after synthesis (expected at least one \
-             from --mcp-url or SEMANTIC_SCHOLAR_MCP_URL)",
+             from --mcp-url or CONSENSUS_MCP_URL)",
         );
     }
 
@@ -379,9 +379,9 @@ mod tests {
         use super::super::synthesize_for_worktree;
 
         let dir = tempdir().unwrap();
-        let mut synth = synth_with_extra_url("https://scholar.example/mcp/");
+        let mut synth = synth_with_extra_url("https://consensus.example/mcp/");
         synth.worktree = dir.path().to_path_buf();
-        synth.extra_servers[0].name = "semantic-scholar".into();
+        synth.extra_servers[0].name = "consensus".into();
         synthesize_for_worktree(&synth).unwrap();
         validate_synthesized_cursor_remote_mcp(&synth).unwrap();
     }
@@ -395,10 +395,10 @@ mod tests {
         std::fs::create_dir_all(&cursor_dir).unwrap();
         std::fs::write(
             cursor_dir.join("mcp.json"),
-            r#"{"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"]},"semantic-scholar":{"url":"https://scholar.example/mcp/","headers":{}}}}"#,
+            r#"{"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"]},"consensus":{"url":"https://consensus.example/mcp/","headers":{}}}}"#,
         )
         .unwrap();
-        let mut synth = synth_with_extra_url("https://scholar.example/mcp/");
+        let mut synth = synth_with_extra_url("https://consensus.example/mcp/");
         synth.worktree = dir.path().to_path_buf();
         assert!(validate_synthesized_cursor_remote_mcp(&synth).is_err());
     }
@@ -416,7 +416,7 @@ mod tests {
         // Driven through the real synthesis path so `.cursor/mcp.json` and the
         // `.cursor/cli.json` permission baseline are produced as they are live.
         let dir = tempdir().unwrap();
-        let mut synth = synth_with_extra_url("https://scholar.example/mcp/");
+        let mut synth = synth_with_extra_url("https://consensus.example/mcp/");
         synth.worktree = dir.path().to_path_buf();
         synth.context7.enabled = true;
         synthesize_for_worktree(&synth).unwrap();

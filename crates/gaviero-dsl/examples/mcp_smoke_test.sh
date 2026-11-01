@@ -14,7 +14,7 @@
 #   mcp_smoke_test.sh <server-name> --stdio <command> [args...]
 #
 # Examples:
-#   mcp_smoke_test.sh semantic-scholar https://YOUR-ENDPOINT/
+#   mcp_smoke_test.sh consensus https://YOUR-ENDPOINT/
 #   mcp_smoke_test.sh my-fs --stdio npx -y @modelcontextprotocol/server-filesystem /tmp
 #
 # Env knobs:

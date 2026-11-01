@@ -338,10 +338,10 @@ pub(crate) fn cursor_argv(
         // its own workspace consent at the host layer.
         "--trust".to_string(),
         // Without `--approve-mcps`, remote MCP servers in `.cursor/mcp.json`
-        // (e.g. Semantic Scholar) stay unregistered in `-p` runs — agents
+        // (e.g. Consensus) stay unregistered in `-p` runs — agents
         // report the server id as unavailable. See cursor.com/docs/cli/mcp.
         "--approve-mcps".to_string(),
-        // Streamable HTTP MCP (Wuilder / Semantic Scholar) and WebFetch
+        // Streamable HTTP MCP (Wuilder / Consensus) and WebFetch
         // fallbacks need outbound network. Probed 2026-06: with sandbox
         // enabled, agents report "network calls rejected" even when
         // `.cursor/cli.json` allowlists the MCP host. Gaviero headless runs

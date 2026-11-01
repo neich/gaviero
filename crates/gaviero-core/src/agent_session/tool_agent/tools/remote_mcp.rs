@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn aliases_are_namespaced_and_sanitised() {
         assert_eq!(alias_for("arxiv", "search_papers"), "mcp__arxiv__search_papers");
-        assert_eq!(alias_for("semantic scholar", "get.paper"), "mcp__semantic_scholar__get_paper");
+        assert_eq!(alias_for("consensus research", "get.paper"), "mcp__consensus_research__get_paper");
         let long = alias_for("server", &"x".repeat(100));
         assert_eq!(long.len(), MAX_NAME_LEN);
     }
