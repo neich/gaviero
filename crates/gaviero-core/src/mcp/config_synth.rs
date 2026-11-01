@@ -199,7 +199,7 @@ pub struct ExtraMcpServer {
 /// (`mcp.permissions` in workspace settings) and applied uniformly to
 /// every provider, so MCP permissions are no longer configured separately
 /// per provider. Patterns are `server:tool` globs where each side accepts
-/// `*` wildcards: `gaviero:*`, `context7:*`, `semantic-scholar:get_*`,
+/// `*` wildcards: `gaviero:*`, `context7:*`, `consensus:get_*`,
 /// `*:delete_*`, `*:*`. A bare pattern with no `:` is treated as a server
 /// name with an implicit `:*` tool part.
 ///
@@ -1853,7 +1853,7 @@ mod tests {
             token_path: PathBuf::from("/t"),
         });
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example/mcp".into(),
             },
@@ -1955,9 +1955,9 @@ mod tests {
     fn codex_config_pre_approves_only_gaviero() {
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         let parsed: toml::Value = toml::from_str(&codex_mcp_config_toml(&synth).unwrap()).unwrap();
@@ -1965,7 +1965,7 @@ mod tests {
             parsed["mcp_servers"]["gaviero"]["default_tools_approval_mode"].as_str(),
             Some("approve")
         );
-        for name in ["context7", "semantic-scholar"] {
+        for name in ["context7", "consensus"] {
             assert!(
                 parsed["mcp_servers"][name]
                     .get("default_tools_approval_mode")
@@ -2043,7 +2043,7 @@ mod tests {
         let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
         synth.context7.url = None;
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example.com/mcp/".into(),
             },
@@ -2078,14 +2078,14 @@ mod tests {
     fn cursor_config_omits_gaviero_when_remote_extra_configured() {
         let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example.com/mcp/".into(),
             },
         });
         let body = cursor_mcp_config_json(&synth).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["mcpServers"]["semantic-scholar"].is_object());
+        assert!(v["mcpServers"]["consensus"].is_object());
         assert!(v["mcpServers"].get("gaviero").is_none());
     }
 
@@ -2093,7 +2093,7 @@ mod tests {
     fn cursor_config_url_extra_includes_empty_headers() {
         let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example.com/mcp/".into(),
             },
@@ -2101,10 +2101,10 @@ mod tests {
         let body = cursor_mcp_config_json(&synth).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
-            v["mcpServers"]["semantic-scholar"]["url"].as_str().unwrap(),
+            v["mcpServers"]["consensus"]["url"].as_str().unwrap(),
             "https://example.com/mcp/"
         );
-        assert!(v["mcpServers"]["semantic-scholar"]["headers"].is_object());
+        assert!(v["mcpServers"]["consensus"]["headers"].is_object());
     }
 
     #[test]
@@ -2273,14 +2273,14 @@ mod tests {
         // table gives the host one less surprising failure mode.
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         let body = codex_mcp_config_toml(&synth).unwrap();
         let parsed: toml::Value = toml::from_str(&body).expect("codex config is valid TOML");
-        for name in ["gaviero", "context7", "semantic-scholar"] {
+        for name in ["gaviero", "context7", "consensus"] {
             let server = &parsed["mcp_servers"][name];
             assert_eq!(
                 server["startup_timeout_sec"].as_integer(),
@@ -2307,9 +2307,9 @@ mod tests {
         // shim or `npx` outage doesn't crash the run.
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         synth.extra_servers.push(ExtraMcpServer {
@@ -2323,7 +2323,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&body).expect("codex config is valid TOML");
 
         assert_eq!(
-            parsed["mcp_servers"]["semantic-scholar"]["required"].as_bool(),
+            parsed["mcp_servers"]["consensus"]["required"].as_bool(),
             Some(true),
             "expected `required = true` on user-explicit URL server in {body}",
         );
@@ -2347,21 +2347,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut synth = fixture(dir.path().to_path_buf());
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         synthesize_for_worktree(&synth).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
-            v["mcpServers"]["semantic-scholar"]["url"].as_str().unwrap(),
-            "https://scholar.example/mcp"
+            v["mcpServers"]["consensus"]["url"].as_str().unwrap(),
+            "https://consensus.example/mcp"
         );
         // Claude skips a `url` entry without a `type` discriminator.
         assert_eq!(
-            v["mcpServers"]["semantic-scholar"]["type"]
+            v["mcpServers"]["consensus"]["type"]
                 .as_str()
                 .unwrap(),
             "http"
@@ -2403,11 +2403,11 @@ mod tests {
             "missing wildcard Mcp(*:*); got {allow_strs:?}",
         );
         assert!(
-            allow_strs.contains(&"Mcp(semantic-scholar:*)"),
+            allow_strs.contains(&"Mcp(consensus:*)"),
             "missing per-server Mcp(name:*); got {allow_strs:?}",
         );
-        assert!(allow_strs.contains(&"WebFetch(scholar.example)"));
-        assert!(allow_strs.contains(&"WebFetch(*.scholar.example)"));
+        assert!(allow_strs.contains(&"WebFetch(consensus.example)"));
+        assert!(allow_strs.contains(&"WebFetch(*.consensus.example)"));
         // And — crucially — the old comma shape must NOT leak through.
         assert!(
             !allow_strs.iter().any(|s| s.contains(", ")),
@@ -2438,7 +2438,7 @@ mod tests {
                 "allow": [
                   "Shell(ls)",
                   "Mcp(*, *)",
-                  "Mcp(semantic-scholar, *)"
+                  "Mcp(consensus, *)"
                 ],
                 "deny": []
               }
@@ -2448,9 +2448,9 @@ mod tests {
 
         let mut synth = fixture(dir.path().to_path_buf());
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         synthesize_for_worktree(&synth).unwrap();
@@ -2478,7 +2478,7 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(!allow_strs.contains(&"Shell(ls)"));
-        assert!(allow_strs.contains(&"Mcp(semantic-scholar:*)"));
+        assert!(allow_strs.contains(&"Mcp(consensus:*)"));
         assert!(allow_strs.contains(&"Mcp(*:*)"));
         assert!(
             !allow_strs.iter().any(|s| s.contains(", ")),
@@ -2489,7 +2489,7 @@ mod tests {
     #[test]
     fn host_from_mcp_url_parses_https() {
         assert_eq!(
-            host_from_mcp_url("https://mcp.wuilder.com/semantic-scholar/token/"),
+            host_from_mcp_url("https://mcp.wuilder.com/consensus/token/"),
             Some("mcp.wuilder.com".to_string())
         );
     }
@@ -2912,14 +2912,14 @@ mod tests {
     fn claude_settings_permissions_translates_policy() {
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         synth.permissions = McpPermissions {
-            allow: vec!["gaviero:*".into(), "semantic-scholar:get_*".into()],
-            deny: vec!["semantic-scholar:delete_*".into()],
+            allow: vec!["gaviero:*".into(), "consensus:get_*".into()],
+            deny: vec!["consensus:delete_*".into()],
         };
         let perms = claude_settings_permissions(&synth).expect("policy present");
         let allow: Vec<String> = perms["allow"]
@@ -2935,8 +2935,8 @@ mod tests {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
         assert!(allow.contains(&"mcp__gaviero__*".to_string()));
-        assert!(allow.contains(&"mcp__semantic-scholar__get_*".to_string()));
-        assert!(deny.contains(&"mcp__semantic-scholar__delete_*".to_string()));
+        assert!(allow.contains(&"mcp__consensus__get_*".to_string()));
+        assert!(deny.contains(&"mcp__consensus__delete_*".to_string()));
         // context7 is not in the allowlist, so it is omitted and earns no rule.
         assert!(!allow.iter().any(|s| s.contains("context7")));
     }
@@ -3088,14 +3088,14 @@ mod tests {
     fn codex_config_includes_extra_url_server() {
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         let body = codex_mcp_config_toml(&synth).unwrap();
-        assert!(body.contains("[mcp_servers.semantic-scholar]"));
-        assert!(body.contains("url = \"https://scholar.example/mcp\""));
+        assert!(body.contains("[mcp_servers.consensus]"));
+        assert!(body.contains("url = \"https://consensus.example/mcp\""));
     }
 
     #[test]
@@ -3127,9 +3127,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut synth = fixture(dir.path().to_path_buf());
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
-                url: "https://scholar.example/mcp".into(),
+                url: "https://consensus.example/mcp".into(),
             },
         });
         let codex_dir = dir.path().join(".codex");
@@ -3161,8 +3161,8 @@ mod tests {
         assert!(
             pairs
                 .iter()
-                .any(|p| p == r#"mcp_servers.semantic-scholar.url="https://scholar.example/mcp""#),
-            "missing semantic-scholar.url in {pairs:?}",
+                .any(|p| p == r#"mcp_servers.consensus.url="https://consensus.example/mcp""#),
+            "missing consensus.url in {pairs:?}",
         );
     }
 
@@ -3199,7 +3199,7 @@ mod tests {
         // Remote-only file: still detected.
         std::fs::write(
             codex_dir.join("config.toml"),
-            "[mcp_servers.semantic-scholar]\nurl = \"https://x/mcp/\"\n",
+            "[mcp_servers.consensus]\nurl = \"https://x/mcp/\"\n",
         )
         .unwrap();
         assert!(codex_synth_has_any_mcp(dir.path()));
@@ -3220,7 +3220,7 @@ mod tests {
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
-            "[mcp_servers.semantic-scholar]\nurl = \"https://scholar.example/mcp\"\n",
+            "[mcp_servers.consensus]\nurl = \"https://consensus.example/mcp\"\n",
         )
         .unwrap();
         assert!(codex_synth_has_remote_mcp(dir.path()));
@@ -3296,7 +3296,7 @@ mod tests {
 
         let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example.com/mcp".into(),
             },
@@ -3309,10 +3309,10 @@ mod tests {
             full.contains_key("context7"),
             "fixture must register context7"
         );
-        assert!(full.contains_key("semantic-scholar"));
+        assert!(full.contains_key("consensus"));
         assert!(!gated.contains_key("context7"), "claude: context7 leaked");
         assert!(
-            !gated.contains_key("semantic-scholar"),
+            !gated.contains_key("consensus"),
             "claude: extra leaked"
         );
         assert!(
@@ -3326,10 +3326,10 @@ mod tests {
         let full = managed_cursor_mcp_json_servers_with(&synth, allow).unwrap();
         let gated = managed_cursor_mcp_json_servers_with(&synth, restrict).unwrap();
         assert!(full.contains_key("context7"));
-        assert!(full.contains_key("semantic-scholar"));
+        assert!(full.contains_key("consensus"));
         assert!(!gated.contains_key("context7"), "cursor: context7 leaked");
         assert!(
-            !gated.contains_key("semantic-scholar"),
+            !gated.contains_key("consensus"),
             "cursor: extra leaked"
         );
 
@@ -3338,13 +3338,13 @@ mod tests {
         let full = codex_mcp_config_toml_with(&synth, allow).unwrap();
         let gated = codex_mcp_config_toml_with(&synth, restrict).unwrap();
         assert!(full.contains("[mcp_servers.context7]"));
-        assert!(full.contains("[mcp_servers.semantic-scholar]"));
+        assert!(full.contains("[mcp_servers.consensus]"));
         assert!(
             !gated.contains("[mcp_servers.context7]"),
             "codex: context7 leaked"
         );
         assert!(
-            !gated.contains("[mcp_servers.semantic-scholar]"),
+            !gated.contains("[mcp_servers.consensus]"),
             "codex: extra leaked"
         );
         assert!(gated.contains("[mcp_servers.gaviero]"));
@@ -3365,7 +3365,7 @@ mod tests {
             deny: Vec::new(),
         };
         synth.extra_servers.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://example.com/mcp".into(),
             },
@@ -3375,7 +3375,7 @@ mod tests {
         let expanded = synth_server_names(&synth, "claude");
 
         assert!(declared.contains_key("context7"));
-        assert!(declared.contains_key("semantic-scholar"));
+        assert!(declared.contains_key("consensus"));
         for name in &expanded {
             assert!(
                 declared.contains_key(name),

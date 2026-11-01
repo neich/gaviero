@@ -158,8 +158,8 @@ fn parse_extra_server_object(item: &serde_json::Value) -> Result<ExtraMcpServer>
 
 /// Read remote MCP `url` entries from project-level `.cursor/mcp.json` or
 /// `.mcp.json`. Skips servers Gaviero manages (`gaviero`, `context7`).
-/// Used when operators configure Semantic Scholar in the IDE but omit
-/// `--mcp-url` / `SEMANTIC_SCHOLAR_MCP_URL` on the CLI.
+/// Used when operators configure Consensus in the IDE but omit
+/// `--mcp-url` / `CONSENSUS_MCP_URL` on the CLI.
 pub fn extra_urls_from_project_mcp_json(root: &Path) -> Vec<(String, String)> {
     const MANAGED: &[&str] = &["gaviero", "context7"];
     let mut out = Vec::new();
@@ -611,8 +611,8 @@ mod tests {
 
     #[test]
     fn parse_mcp_url_flag_splits_on_first_equals() {
-        let (name, url) = parse_mcp_url_flag("semantic-scholar=https://example.com/mcp").unwrap();
-        assert_eq!(name, "semantic-scholar");
+        let (name, url) = parse_mcp_url_flag("consensus=https://example.com/mcp").unwrap();
+        assert_eq!(name, "consensus");
         assert_eq!(url, "https://example.com/mcp");
     }
 
@@ -627,14 +627,14 @@ mod tests {
     #[test]
     fn parse_extra_servers_json_accepts_url_and_stdio() {
         let val = serde_json::json!([
-            { "name": "semantic-scholar", "url": "https://scholar.example/mcp" },
+            { "name": "consensus", "url": "https://consensus.example/mcp" },
             { "name": "local", "command": "my-bin", "args": ["--foo"] }
         ]);
         let servers = parse_extra_servers_json(&val).unwrap();
         assert_eq!(servers.len(), 2);
         assert!(matches!(
             &servers[0].transport,
-            ExtraMcpTransport::Url { url } if url == "https://scholar.example/mcp"
+            ExtraMcpTransport::Url { url } if url == "https://consensus.example/mcp"
         ));
         assert!(matches!(
             &servers[1].transport,
@@ -650,12 +650,12 @@ mod tests {
         std::fs::create_dir_all(&cursor_dir).unwrap();
         std::fs::write(
             cursor_dir.join("mcp.json"),
-            r#"{"mcpServers":{"semantic-scholar":{"url":"https://example/mcp/"},"gaviero":{"command":"shim"}}}"#,
+            r#"{"mcpServers":{"consensus":{"url":"https://example/mcp/"},"gaviero":{"command":"shim"}}}"#,
         )
         .unwrap();
         let urls = extra_urls_from_project_mcp_json(dir.path());
         assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0].0, "semantic-scholar");
+        assert_eq!(urls[0].0, "consensus");
         assert_eq!(urls[0].1, "https://example/mcp/");
     }
 
@@ -664,13 +664,13 @@ mod tests {
         let ws = Workspace::single_folder(PathBuf::from("/tmp/ws"));
         let mut merged = extra_servers_from_workspace(&ws, None);
         merged.push(ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://from-settings".into(),
             },
         });
         let cli = vec![ExtraMcpServer {
-            name: "semantic-scholar".into(),
+            name: "consensus".into(),
             transport: ExtraMcpTransport::Url {
                 url: "https://from-cli".into(),
             },

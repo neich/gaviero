@@ -16,7 +16,7 @@
 //   Phase 1 (parallel, one per reviewer): each reviewer reads the
 //     anchor document ({{PLAN_FILE}}) plus any optional local material
 //     under {{DATA_DIR}} / {{LOCAL_LIT_DIR}}, performs extensive
-//     independent literature research (Semantic Scholar MCP and/or web
+//     independent literature research (Consensus MCP and/or web
 //     tools — see "Research channels"), and writes (a) a standalone
 //     conclusion document carrying its own bibliography and (b) a
 //     production summary. Reviewers do NOT read each other's work in
@@ -94,8 +94,8 @@
 //
 // Research channels:
 //
-//   Reviewers prefer the operator-configured Semantic Scholar MCP
-//   server (id {{SEMANTIC_SCHOLAR_SERVER}}) when one is available and
+//   Reviewers prefer the operator-configured Consensus MCP
+//   server (id {{CONSENSUS_SERVER}}) when one is available and
 //   use WebSearch/WebFetch when ENABLE_WEB_FALLBACK=true (the default)
 //   or when no MCP server is configured. Set
 //   `--var ENABLE_WEB_FALLBACK=false` for an MCP-only panel; a
@@ -103,17 +103,17 @@
 //   summary and rely on local material.
 //
 //   Configure the MCP server any one of these ways:
-//     --mcp-url semantic-scholar=URL
-//     --var SEMANTIC_SCHOLAR_MCP_URL=URL
+//     --mcp-url consensus=URL
+//     --var CONSENSUS_MCP_URL=URL
 //     a server entry in <workspace>/.cursor/mcp.json (gaviero-cli
 //     imports it).
 //   (Wuilder URLs need a trailing slash; gaviero-cli adds it for
 //   mcp.wuilder.com.) Cursor agents get `--approve-mcps` and
 //   `--sandbox disabled` plus `.cursor/cli.json` network/MCP
-//   allowlists when a remote Semantic Scholar URL is configured; the
+//   allowlists when a remote Consensus URL is configured; the
 //   synthesized Cursor `.cursor/mcp.json` omits context7 (npx) so the
 //   remote server can register. Agents call tools by server id
-//   `{{SEMANTIC_SCHOLAR_SERVER}}` (default `semantic-scholar`).
+//   `{{CONSENSUS_SERVER}}` (default `consensus`).
 //
 // Roster:
 //
@@ -238,9 +238,9 @@
 //                   reviewer. May be empty or non-existent. (default: data)
 //   LOCAL_LIT_DIR — optional local literature directory, read-only for
 //                   every reviewer. May be empty. (default: literature)
-//   SEMANTIC_SCHOLAR_SERVER  — MCP server id agents call tools on.
-//                   (default: semantic-scholar)
-//   SEMANTIC_SCHOLAR_MCP_URL — remote MCP URL for operator setup; may
+//   CONSENSUS_SERVER  — MCP server id agents call tools on.
+//                   (default: consensus)
+//   CONSENSUS_MCP_URL — remote MCP URL for operator setup; may
 //                   also come from --mcp-url or .cursor/mcp.json.
 //   ENABLE_WEB_FALLBACK — allow WebSearch/WebFetch. (default: true;
 //                   set false for an MCP-only panel)
@@ -291,7 +291,7 @@
 //       --workflow scientific-research-consensus \
 //       --prompt "Sparse attention mechanisms" \
 //       --var PLAN_FILE=/path/to/draft-research-plan.md \
-//       --var SEMANTIC_SCHOLAR_MCP_URL=https://YOUR-MCP-ENDPOINT/ \
+//       --var CONSENSUS_MCP_URL=https://YOUR-MCP-ENDPOINT/ \
 //       --mcp-codex-trust granted
 //
 //   Custom 2-provider panel:
@@ -321,8 +321,8 @@ vars {
     PLAN_FILE                 "research_problem.md"
     DATA_DIR                  "data"
     LOCAL_LIT_DIR             "literature"
-    SEMANTIC_SCHOLAR_SERVER   "semantic-scholar"
-    SEMANTIC_SCHOLAR_MCP_URL  ""
+    CONSENSUS_SERVER   "consensus"
+    CONSENSUS_MCP_URL  ""
     ENABLE_WEB_FALLBACK       "true"
 }
 
@@ -353,8 +353,8 @@ prompt init-body #"
     and never read the label as a hint about scope.
 
     Research channels:
-      - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
-        (operator-configured; remote URL when set: {{SEMANTIC_SCHOLAR_MCP_URL}})
+      - Consensus MCP server id: {{CONSENSUS_SERVER}}
+        (operator-configured; remote URL when set: {{CONSENSUS_MCP_URL}})
       - Web fallback (WebSearch/WebFetch) enabled: {{ENABLE_WEB_FALLBACK}}
 
     Optional local material:
@@ -401,7 +401,7 @@ prompt init-body #"
        inside {{OUT_DIR}}/.
 
     4. Conduct EXTENSIVE current literature research. Prefer the
-       Semantic Scholar MCP server ({{SEMANTIC_SCHOLAR_SERVER}}) when
+       Consensus MCP server ({{CONSENSUS_SERVER}}) when
        its tools are available; use WebSearch/WebFetch when
        ENABLE_WEB_FALLBACK=true (current: {{ENABLE_WEB_FALLBACK}}) or
        when no MCP server is configured. Prioritise:
@@ -492,7 +492,7 @@ prompt init-body #"
       - `## How this version was produced` — state that this is the
         independent first pass (no peer input), which anchor kind you
         detected, and how you approached it.
-      - `## Search strategy` — the search queries, Semantic Scholar
+      - `## Search strategy` — the search queries, Consensus
         MCP tool calls, and discovery paths used, and which channels
         were actually available.
       - `## Problems found` — where the anchor is ambiguous,
@@ -521,7 +521,7 @@ prompt refine-body #"
     and never read the label as a hint about scope.
 
     Research channels:
-      - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
+      - Consensus MCP server id: {{CONSENSUS_SERVER}}
       - Web fallback (WebSearch/WebFetch) enabled: {{ENABLE_WEB_FALLBACK}}
 
     There are {{PEER_COUNT}} other reviewers in this iteration: {{PEER_IDS}}.
@@ -562,7 +562,7 @@ prompt refine-body #"
        them to verify the claims behind each peer's argument.
 
     4. Conduct ADDITIONAL targeted literature research this iteration
-       through the same channels (Semantic Scholar MCP first; web
+       through the same channels (Consensus MCP first; web
        tools per the fallback rules above). Do NOT merely repeat the
        searches from the previous pass. Specifically:
          - Read primary sources peers cited that you did not. If a peer
@@ -710,7 +710,7 @@ prompt refine-body #"
            your conclusion this pass and why. If you copied the
            previous version verbatim, say so here too.
          - `## Research performed this iteration` — the search
-           queries, Semantic Scholar MCP tool calls, and discovery
+           queries, Consensus MCP tool calls, and discovery
            paths used this pass; the new or revalidated sources (one
            line each: title, venue, year, URL or DOI) and which claim
            each supports or weakens; which prior claims this pass

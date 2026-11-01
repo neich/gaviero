@@ -1279,11 +1279,11 @@ fn normalize_remote_mcp_url(url: &str) -> String {
     }
 }
 
-/// Register `SEMANTIC_SCHOLAR_MCP_URL` / `SEMANTIC_SCHOLAR_SERVER` script vars as MCP URLs.
+/// Register `CONSENSUS_MCP_URL` / `CONSENSUS_SERVER` script vars as MCP URLs.
 fn extra_mcp_urls_from_script_vars(vars: &[(String, String)]) -> Vec<(String, String)> {
     let Some(url) = vars
         .iter()
-        .find(|(k, _)| k == "SEMANTIC_SCHOLAR_MCP_URL")
+        .find(|(k, _)| k == "CONSENSUS_MCP_URL")
         .map(|(_, v)| v.as_str())
         .filter(|v| !v.trim().is_empty())
     else {
@@ -1291,10 +1291,10 @@ fn extra_mcp_urls_from_script_vars(vars: &[(String, String)]) -> Vec<(String, St
     };
     let name = vars
         .iter()
-        .find(|(k, _)| k == "SEMANTIC_SCHOLAR_SERVER")
+        .find(|(k, _)| k == "CONSENSUS_SERVER")
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "semantic-scholar".to_string());
+        .unwrap_or_else(|| "consensus".to_string());
     vec![(name, normalize_remote_mcp_url(url))]
 }
 
@@ -1318,7 +1318,7 @@ fn mcp_overrides_from_cli(
         if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
             continue;
         }
-        eprintln!("[mcp] {name}: remote server from SEMANTIC_SCHOLAR_MCP_URL");
+        eprintln!("[mcp] {name}: remote server from CONSENSUS_MCP_URL");
         overrides.extra_urls.push((name, url));
     }
     for raw in &cli.mcp_stdio {
@@ -5626,7 +5626,7 @@ mod tests {
             "--task",
             "x",
             "--mcp-url",
-            "semantic-scholar=https://example/mcp",
+            "consensus=https://example/mcp",
             "--mcp-codex-trust",
             "granted",
         ])
