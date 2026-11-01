@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -1004,50 +1005,29 @@ impl Workspace {
     ///    when `GAVIERO_ROOT` is unset).
     /// 4. Hardcoded defaults.
     ///
+    /// A layer's `"key+"` adds to the value resolved from the broader
+    /// layers instead of replacing it ([`layered_value`]).
+    ///
     /// [`LayeredSettings`] applies the same order without a `Workspace`.
     pub fn resolve_setting(&self, key: &str, root: Option<&Path>) -> serde_json::Value {
-        // 1. Per-folder settings (from cache)
-        if let Some(settings) = self.repo_layer(root)
-            && let Some(val) = dot_get(settings, key)
-        {
-            return val.clone();
-        }
-
-        // 2. Workspace-level settings
-        if let Some(val) = dot_get(&self.workspace_settings, key) {
-            return val.clone();
-        }
-
-        // 3. User-level settings (from cache)
-        if let Some(ref settings) = self.user_settings_cache
-            && let Some(val) = dot_get(settings, key)
-        {
-            return val.clone();
-        }
-
-        // 4. Hardcoded defaults
-        hardcoded_default(key)
+        self.resolve_setting_opt(key, root)
+            .unwrap_or_else(|| hardcoded_default(key))
     }
 
     /// Same cascade as [`Self::resolve_setting`] but without the
     /// hardcoded-default step: `None` when no folder, workspace, or user
-    /// level defines `key`. Lets callers distinguish "unset" from "set to
-    /// the default value" (needed for legacy-key fallbacks).
+    /// level defines `key` (or `key+`). Lets callers distinguish "unset"
+    /// from "set to the default value" (needed for legacy-key fallbacks).
     pub fn resolve_setting_opt(&self, key: &str, root: Option<&Path>) -> Option<serde_json::Value> {
-        if let Some(settings) = self.repo_layer(root)
-            && let Some(val) = dot_get(settings, key)
-        {
-            return Some(val.clone());
-        }
-        if let Some(val) = dot_get(&self.workspace_settings, key) {
-            return Some(val.clone());
-        }
-        if let Some(ref settings) = self.user_settings_cache
-            && let Some(val) = dot_get(settings, key)
-        {
-            return Some(val.clone());
-        }
-        None
+        // Broadest first: user, workspace, repo. In single-folder mode the
+        // workspace and repo layers can be the same file; applying it twice
+        // is harmless because `key+` additions are idempotent.
+        let layers = [
+            self.user_settings_cache.as_ref(),
+            Some(&self.workspace_settings),
+            self.repo_layer(root),
+        ];
+        layered_value(layers.into_iter().flatten(), key).map(Cow::into_owned)
     }
 
     /// Resolve a language-specific setting.
@@ -1494,6 +1474,118 @@ pub fn dot_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_
         return dot_get(value.get(parts[0])?, parts[1]);
     }
     None
+}
+
+/// `key` across settings `layers`, broadest first. The most specific layer
+/// that sets `key` wins, as before; a layer's `"key+"` (nested
+/// `"…": { "lastSegment+": … }` or flattened `"a.b+"`) instead adds to the
+/// value resolved so far — from the broader layers, or the built-in default
+/// when none sets it. A layer may set both: `key` first, then `key+` on top.
+/// See [`append_setting`] for what "adds" means per value type.
+///
+/// Only a lookup of `key` itself sees the addition; a lookup of a child
+/// path (`key.x`) does not descend into `key+`.
+pub fn layered_value<'a, I>(layers: I, key: &str) -> Option<Cow<'a, serde_json::Value>>
+where
+    I: DoubleEndedIterator<Item = &'a serde_json::Value> + Clone,
+{
+    let plus = format!("{key}+");
+    if !layers.clone().any(|doc| dot_get(doc, &plus).is_some()) {
+        return layers.rev().find_map(|doc| dot_get(doc, key)).map(Cow::Borrowed);
+    }
+    let mut acc: Option<serde_json::Value> = None;
+    for doc in layers {
+        if let Some(value) = dot_get(doc, key) {
+            acc = Some(value.clone());
+        }
+        if let Some(addition) = dot_get(doc, &plus) {
+            let base = acc.take().unwrap_or_else(|| hardcoded_default(key));
+            acc = Some(append_setting(base, addition));
+        }
+    }
+    acc.map(Cow::Owned)
+}
+
+/// `base` with a `"key+"` value added:
+/// - list + list: each new entry is appended unless an equal one is already
+///   there; an object entry whose `"name"` matches an existing entry's
+///   replaces it in place (so `mcp.extraServers+` can redefine an
+///   inherited server);
+/// - list + single value: that value is appended the same way;
+/// - object + object: keys are merged, the addition's winning;
+/// - unset (`null`) + anything: the addition, a single value as a
+///   one-element list.
+///
+/// Anything else (adding to a number, string or boolean, or an object to a
+/// list) leaves `base` unchanged. Adding the same value twice is a no-op.
+fn append_setting(base: serde_json::Value, addition: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let additions: &[Value] = match addition {
+        Value::Array(items) => items,
+        Value::Object(_) | Value::Null => &[],
+        single => std::slice::from_ref(single),
+    };
+    match (base, addition) {
+        (base, Value::Null) => base,
+        (Value::Object(mut map), Value::Object(extra)) => {
+            for (k, v) in extra {
+                map.insert(k.clone(), v.clone());
+            }
+            Value::Object(map)
+        }
+        (Value::Null, Value::Object(extra)) => Value::Object(extra.clone()),
+        (Value::Array(mut items), _) => {
+            for item in additions {
+                push_setting_entry(&mut items, item);
+            }
+            Value::Array(items)
+        }
+        (Value::Null, _) => {
+            let mut items = Vec::new();
+            for item in additions {
+                push_setting_entry(&mut items, item);
+            }
+            Value::Array(items)
+        }
+        (base, _) => base,
+    }
+}
+
+fn push_setting_entry(items: &mut Vec<serde_json::Value>, item: &serde_json::Value) {
+    fn name_of(v: &serde_json::Value) -> Option<&str> {
+        v.get("name").and_then(|n| n.as_str()).map(str::trim)
+    }
+    if let Some(name) = name_of(item)
+        && let Some(slot) = items.iter_mut().find(|existing| name_of(existing) == Some(name))
+    {
+        *slot = item.clone();
+        return;
+    }
+    if !items.contains(item) {
+        items.push(item.clone());
+    }
+}
+
+/// Dotted paths of the keys `doc` adds to with `"key+"`, without the `+`.
+fn appended_keys(doc: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(map) = doc.as_object() else {
+        return;
+    };
+    for (k, v) in map {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match path.strip_suffix('+') {
+            Some(key) => {
+                if !out.iter().any(|seen| seen == key) {
+                    out.push(key.to_string());
+                }
+            }
+            None => appended_keys(v, &path, out),
+        }
+    }
 }
 
 fn dot_set(target: &mut serde_json::Value, key: &str, value: serde_json::Value) {
@@ -1978,7 +2070,8 @@ pub fn settings_root_for(folder: &Path) -> PathBuf {
 /// The settings governing `folder`, layered like
 /// [`Workspace::resolve_setting`]: `GAVIERO_ROOT/.gaviero/settings.json`,
 /// then the workspace's, then the repo's; for each key the most specific
-/// layer that sets it wins. Keys are looked up like `resolve_setting`
+/// layer that sets it wins, and a layer's `"key+"` adds to it instead
+/// ([`layered_value`]). Keys are looked up like `resolve_setting`
 /// (`"a.b.c"` matches nested objects and flattened `"a.b"` keys alike). For
 /// the readers that run without a [`Workspace`] (agent read policy, hooks,
 /// spawn-time flags).
@@ -1988,6 +2081,8 @@ pub struct LayeredSettings {
     /// unparseable files are left out.
     layers: Vec<(PathBuf, serde_json::Value)>,
     broken: Vec<PathBuf>,
+    /// The resolved value of every key some layer sets as `"key+"`.
+    appended: HashMap<String, serde_json::Value>,
 }
 
 impl LayeredSettings {
@@ -2011,12 +2106,53 @@ impl LayeredSettings {
                 }
             }
         }
+        let mut keys = Vec::new();
+        for (_, doc) in &out.layers {
+            appended_keys(doc, "", &mut keys);
+        }
+        for key in keys {
+            if let Some(value) = layered_value(out.layers.iter().map(|(_, doc)| doc), &key) {
+                let value = value.into_owned();
+                out.appended.insert(key, value);
+            }
+        }
         out
     }
 
-    /// `key` (`a.b.c`) from the most specific layer that sets it.
+    /// `key` (`a.b.c`) from the most specific layer that sets it, with any
+    /// `"key+"` additions applied.
     pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        if let Some(value) = self.appended.get(key) {
+            return Some(value);
+        }
         self.layers.iter().rev().find_map(|(_, doc)| dot_get(doc, key))
+    }
+
+    /// The entries of the list `key`, each with the folder holding the
+    /// `.gaviero/` of the layer that wrote it — the base for a relative
+    /// path in that entry. Resolved like [`Self::get`]: a layer's `key`
+    /// replaces the list, its `"key+"` appends to it. Entries are not
+    /// deduplicated (the same relative path means different folders in
+    /// different layers). A non-list `key` counts as an empty list.
+    pub fn list_with_bases(&self, key: &str) -> Vec<(&Path, &serde_json::Value)> {
+        let plus = format!("{key}+");
+        let mut out: Vec<(&Path, &serde_json::Value)> = Vec::new();
+        for (base, doc) in &self.layers {
+            if let Some(value) = dot_get(doc, key) {
+                out.clear();
+                if let Some(items) = value.as_array() {
+                    out.extend(items.iter().map(|item| (base.as_path(), item)));
+                }
+            }
+            match dot_get(doc, &plus) {
+                Some(serde_json::Value::Array(items)) => {
+                    out.extend(items.iter().map(|item| (base.as_path(), item)));
+                }
+                Some(serde_json::Value::Null) | None => {}
+                Some(single) => out.push((base.as_path(), single)),
+            }
+        }
+        out
     }
 
     /// The folder holding the `.gaviero/` of the most specific layer that
@@ -2589,6 +2725,101 @@ mod tests {
         let layered = LayeredSettings::from_bases(&[user, ws, repo.clone()]);
         assert_eq!(layered.get("a.z"), Some(&serde_json::json!(2)));
         assert_eq!(layered.broken(), [repo.join(".gaviero/settings.json")]);
+    }
+
+    #[test]
+    fn plus_keys_add_to_the_broader_layers() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let (user, ws, repo) = (
+            dir.path().join("user"),
+            dir.path().join("ws"),
+            dir.path().join("repo"),
+        );
+        write_layer(
+            &user,
+            r#"{"mcp":{"extraServers":[{"name":"a","url":"u1"},{"name":"b","url":"u2"}]},
+                "list":["x"],"obj":{"k":1,"j":1},"n":1,
+                "agent.permissions.read.extraFolders":["u-dir"]}"#,
+        );
+        write_layer(
+            &ws,
+            r#"{"mcp.extraServers+":[{"name":"b","url":"u3"},{"name":"c","url":"u4"}],
+                "list+":"y","obj+":{"j":2},"n+":[5],
+                "agent.network.allow+":["example.com"]}"#,
+        );
+        write_layer(
+            &repo,
+            r#"{"mcp":{"extraServers+":[{"name":"d","command":"x"}]},
+                "list":["z"],"list+":["z","w"],
+                "agent":{"permissions":{"read":{"extraFolders+":["r-dir"]}}}}"#,
+        );
+        let layered = LayeredSettings::from_bases(&[user.clone(), ws.clone(), repo.clone()]);
+        // Appended in order; a same-named entry replaces the inherited one.
+        assert_eq!(
+            layered.get("mcp.extraServers"),
+            Some(&json!([
+                {"name":"a","url":"u1"},
+                {"name":"b","url":"u3"},
+                {"name":"c","url":"u4"},
+                {"name":"d","command":"x"}
+            ]))
+        );
+        // A plain key resets the list; the same layer's `+` then adds,
+        // skipping values already present.
+        assert_eq!(layered.get("list"), Some(&json!(["z", "w"])));
+        assert_eq!(layered.get("obj"), Some(&json!({"k": 1, "j": 2})));
+        // Nothing can be added to a scalar.
+        assert_eq!(layered.get("n"), Some(&json!(1)));
+        // With no layer setting the key, `+` adds to the built-in default.
+        let allow = layered.get(settings::AGENT_NETWORK_ALLOW).unwrap();
+        let allow = allow.as_array().unwrap();
+        assert!(allow.contains(&json!("*.anthropic.com")) && allow.last() == Some(&json!("example.com")));
+        // Entries keep the folder of the layer that wrote them.
+        let folders: Vec<(&Path, &serde_json::Value)> =
+            layered.list_with_bases(settings::AGENT_PERMISSIONS_READ_EXTRA_FOLDERS);
+        assert_eq!(
+            folders,
+            [(user.as_path(), &json!("u-dir")), (repo.as_path(), &json!("r-dir"))]
+        );
+
+    }
+
+    #[test]
+    fn workspace_resolve_setting_applies_plus_keys() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let app = root.join("app");
+        let lib = root.join("lib");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let ws_path = root.join("ws.gaviero-workspace");
+        let doc = json!({"folders": [{"path": app}, {"path": lib}]});
+        fs::write(&ws_path, doc.to_string()).unwrap();
+        write_layer(&root, r#"{"mcp.extraServers+":[{"name":"plus-test-ws","url":"u1"}]}"#);
+        write_layer(&app, r#"{"mcp":{"extraServers+":[{"name":"plus-test-app","url":"u2"}]}}"#);
+        write_layer(&lib, r#"{"mcp.extraServers":[{"name":"plus-test-lib","url":"u3"}]}"#);
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let names = |root: Option<&Path>| -> Vec<String> {
+            ws.resolve_setting(settings::MCP_EXTRA_SERVERS, root)
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s["name"].as_str())
+                .map(str::to_string)
+                .collect()
+        };
+        // The user layer is the real `$GAVIERO_ROOT`, so only the workspace
+        // and repo entries (always last, in order) are checked.
+        let app_names = names(Some(&app));
+        assert!(app_names.ends_with(&["plus-test-ws".into(), "plus-test-app".into()]), "{app_names:?}");
+        let ws_names = names(None);
+        assert!(ws_names.ends_with(&["plus-test-ws".into()]), "{ws_names:?}");
+        // A plain repo key still replaces everything above it.
+        assert_eq!(names(Some(&lib)), ["plus-test-lib"]);
+        assert_eq!(ws.resolve_setting_opt("never.set", Some(&app)), None);
     }
 
     #[test]

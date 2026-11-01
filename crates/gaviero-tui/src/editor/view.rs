@@ -632,6 +632,8 @@ mod tests {
                 path: "a".into(),
                 overrides: vec![],
                 overridden_by: vec!["repo app".into()],
+                extends: vec![],
+                extended_by: vec![],
             }],
             text_hash: None,
         });

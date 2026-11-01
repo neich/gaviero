@@ -396,12 +396,15 @@ impl SensitivePolicy {
         };
         if settings.broken().is_empty() {
             policy.allow = list(ALLOW);
-            if let Some(base) = settings.defining_base(EXTRA_FOLDERS) {
-                policy.read_folders = list(EXTRA_FOLDERS)
-                    .iter()
-                    .filter_map(|raw| resolve_read_folder(raw, base))
-                    .collect();
-            }
+            // Each entry resolves against the layer that wrote it, since
+            // `extraFolders+` can collect entries from several layers.
+            policy.read_folders = settings
+                .list_with_bases(EXTRA_FOLDERS)
+                .into_iter()
+                .filter_map(|(base, raw)| Some((base, raw.as_str()?)))
+                .filter(|(_, raw)| !raw.trim().is_empty())
+                .filter_map(|(base, raw)| resolve_read_folder(raw, base))
+                .collect();
         }
         policy
     }
