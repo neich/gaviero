@@ -191,8 +191,9 @@ impl ClaudeSession {
         }
         let log = root.join(".gaviero").join("egress").join("claude-requests.ndjson");
         let mut seen = std::mem::take(&mut self.egress_seen);
+        let scan_root = root.clone();
         let scanned = tokio::task::spawn_blocking(move || {
-            let rows = crate::egress::bodies::scan_claude_bodies(&dir, &log, &mut seen);
+            let rows = crate::egress::bodies::scan_claude_bodies(&scan_root, &dir, &log, &mut seen);
             (rows, seen)
         })
         .await;
@@ -200,13 +201,36 @@ impl ClaudeSession {
             return;
         };
         self.egress_seen = seen;
-        for row in rows {
+        // Fixture-like findings (allowlist marker, test file, dummy value)
+        // are logged in full but summarised in one line; only unclassified
+        // ones get a warning each.
+        let mut fixtures: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
             for finding in &row.findings {
-                self.observer.on_egress_warning(&format!(
-                    "Egress: a request to Anthropic ({}) contained a value matching '{}': {}",
-                    row.model, finding.rule, finding.excerpt
-                ));
+                if finding.is_unclassified() {
+                    let source = finding
+                        .source
+                        .as_deref()
+                        .map(|s| format!(" (from {s})"))
+                        .unwrap_or_default();
+                    self.observer.on_egress_warning(&format!(
+                        "Egress: a request to Anthropic ({}) contained a value matching '{}'{source}: {}",
+                        row.model, finding.rule, finding.excerpt
+                    ));
+                } else {
+                    *fixtures.entry(finding.classification).or_default() += 1;
+                }
             }
+        }
+        if !fixtures.is_empty() {
+            let total: usize = fixtures.values().sum();
+            let detail: Vec<String> = fixtures.iter().map(|(k, n)| format!("{n} {k}")).collect();
+            self.observer.on_egress_warning(&format!(
+                "Egress: {total} fixture-like secret value(s) sent to Anthropic ({}) — logged in \
+                 .gaviero/egress/claude-requests.ndjson, not shown.",
+                detail.join(", ")
+            ));
         }
     }
 

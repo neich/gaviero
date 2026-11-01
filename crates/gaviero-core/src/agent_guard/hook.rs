@@ -224,7 +224,7 @@ fn cursor_decision(refusal: Option<String>, mut audit: Value) -> HookOutcome {
 
 /// The path part of a `grep`/`rg` style `<path>:<rest>` line, skipping a
 /// Windows drive colon (`C:\…`).
-fn grep_line_path(line: &str) -> Option<&str> {
+pub(crate) fn grep_line_path(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let skip = if bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
