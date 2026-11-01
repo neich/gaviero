@@ -1395,16 +1395,9 @@ fn prepare_mcp_for_swarm(
     };
 
     let repo = host.run_root;
-    let mut overrides = mcp_overrides_from_cli(cli, script_vars)?;
-    for (name, url) in gaviero_core::mcp::extra_urls_from_project_mcp_json(repo) {
-        if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
-            continue;
-        }
-        eprintln!("[mcp] {name}: remote server from project mcp.json");
-        overrides
-            .extra_urls
-            .push((name, normalize_remote_mcp_url(&url)));
-    }
+    // Servers come from settings.json plus this run's explicit flags only —
+    // a project `.mcp.json` / `.cursor/mcp.json` is output, never input.
+    let overrides = mcp_overrides_from_cli(cli, script_vars)?;
     let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(host.endpoint_root);
     let mut synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
     if !synth.enabled {

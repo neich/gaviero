@@ -378,6 +378,12 @@ fn codex_exec_args(
         args.push("--config".to_string());
         args.push(pair);
     }
+    // ...and nothing else: user-level servers and ChatGPT apps stay off, so
+    // every MCP server comes from `.gaviero/settings.json`.
+    for pair in crate::mcp::codex_unmanaged_mcp_overrides(&codex_config) {
+        args.push("--config".to_string());
+        args.push(pair);
+    }
 
     // GAVIERO.md in scope: no AGENTS.md discovery; the system prompt carries
     // GAVIERO.md instead. Before `extra` so a DSL override still wins.
@@ -1018,10 +1024,16 @@ url = "https://example/mcp/"
     fn test_codex_exec_args_skips_mcp_overrides_when_config_missing() {
         let dir = tempfile::tempdir().unwrap();
         let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        // Only disables (user-level servers, if any) — nothing is declared.
         assert!(
-            !args.iter().any(|a| a.starts_with("mcp_servers.")),
-            "expected no mcp_servers overrides when synth file is absent, got {args:?}",
+            !args
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.") && !a.ends_with(".enabled=false")),
+            "expected no mcp_servers declarations when synth file is absent, got {args:?}",
         );
+        assert!(args.windows(2).any(|w| {
+            w[0] == "--config" && w[1] == crate::mcp::config_synth::CODEX_DISABLE_APPS
+        }));
     }
 
     #[test]

@@ -156,43 +156,6 @@ fn parse_extra_server_object(item: &serde_json::Value) -> Result<ExtraMcpServer>
     })
 }
 
-/// Read remote MCP `url` entries from project-level `.cursor/mcp.json` or
-/// `.mcp.json`. Skips servers Gaviero manages (`gaviero`, `context7`).
-/// Used when operators configure Consensus in the IDE but omit
-/// `--mcp-url` / `CONSENSUS_MCP_URL` on the CLI.
-pub fn extra_urls_from_project_mcp_json(root: &Path) -> Vec<(String, String)> {
-    const MANAGED: &[&str] = &["gaviero", "context7"];
-    let mut out = Vec::new();
-    for rel in [".cursor/mcp.json", ".mcp.json"] {
-        let path = root.join(rel);
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-            continue;
-        };
-        let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object()) else {
-            continue;
-        };
-        for (name, entry) in servers {
-            if MANAGED.contains(&name.as_str()) {
-                continue;
-            }
-            let Some(url) = entry.get("url").and_then(|u| u.as_str()).map(str::trim) else {
-                continue;
-            };
-            if url.is_empty() {
-                continue;
-            }
-            if out.iter().any(|(n, _)| n == name) {
-                continue;
-            }
-            out.push((name.clone(), url.to_string()));
-        }
-    }
-    out
-}
-
 fn merge_extra_servers(
     mut base: Vec<ExtraMcpServer>,
     overrides: &[ExtraMcpServer],
@@ -641,22 +604,6 @@ mod tests {
             ExtraMcpTransport::Stdio { command, args }
             if command == "my-bin" && args == &["--foo".to_string()]
         ));
-    }
-
-    #[test]
-    fn extra_urls_from_project_mcp_json_reads_cursor_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let cursor_dir = dir.path().join(".cursor");
-        std::fs::create_dir_all(&cursor_dir).unwrap();
-        std::fs::write(
-            cursor_dir.join("mcp.json"),
-            r#"{"mcpServers":{"consensus":{"url":"https://example/mcp/"},"gaviero":{"command":"shim"}}}"#,
-        )
-        .unwrap();
-        let urls = extra_urls_from_project_mcp_json(dir.path());
-        assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0].0, "consensus");
-        assert_eq!(urls[0].1, "https://example/mcp/");
     }
 
     #[test]

@@ -369,6 +369,11 @@ fn codex_app_server_args(workspace_root: &Path, additional_roots: &[PathBuf]) ->
         args.push("--config".to_string());
         args.push(pair);
     }
+    // Only settings.json servers: user-level servers and ChatGPT apps stay off.
+    for pair in crate::mcp::codex_unmanaged_mcp_overrides(&codex_config) {
+        args.push("--config".to_string());
+        args.push(pair);
+    }
     // GAVIERO.md in scope: no AGENTS.md discovery; `developerInstructions`
     // carries GAVIERO.md instead.
     if crate::instructions::is_active(workspace_root, additional_roots) {
@@ -2300,11 +2305,21 @@ url = "https://example/mcp/"
     }
 
     #[test]
-    fn codex_app_server_args_emit_no_config_when_synth_file_missing() {
+    fn codex_app_server_args_emit_no_server_when_synth_file_missing() {
         let dir = tempfile::tempdir().unwrap();
+        let args = codex_app_server_args(dir.path(), &[]);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.") && !a.ends_with(".enabled=false")),
+            "no server is declared without a synth file: {args:?}"
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--config" && pair[1] == crate::mcp::config_synth::CODEX_DISABLE_APPS
+        }));
         assert_eq!(
-            codex_app_server_args(dir.path(), &[]),
-            vec![
+            args[args.len() - 3..],
+            [
                 "app-server".to_string(),
                 "--listen".to_string(),
                 "stdio://".to_string()

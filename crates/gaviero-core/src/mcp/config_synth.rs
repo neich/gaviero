@@ -19,6 +19,13 @@
 //!
 //! All configs are per-worktree, not per-user, so swarm worktrees
 //! get isolated MCP wiring that cleans up with the worktree itself.
+//!
+//! `.gaviero/settings.json` is the only source of MCP servers. The synth
+//! replaces each file's server list rather than merging into it, and the
+//! spawn sites shut out what the vendors would load on their own: Claude
+//! runs with `--strict-mcp-config` (no user/local/plugin servers, no
+//! claude.ai connectors), Codex gets [`codex_unmanaged_mcp_overrides`], and
+//! Cursor's user-level servers are denied in `.cursor/cli.json`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,8 +125,8 @@ pub const CONTEXT7_REST_BASE: &str = "https://context7.com/api/v1";
 pub struct Context7Config {
     /// When `false`, no context7 entry is written into the Claude
     /// `.mcp.json`, the Codex `config.toml`, the Cursor `.cursor/mcp.json`
-    /// or the dsh `session/new` server list. Existing entries the user
-    /// may have authored manually are preserved by the merge step.
+    /// or the dsh `session/new` server list. A hand-authored `context7`
+    /// entry in those files is dropped too: the synth owns the server list.
     pub enabled: bool,
     /// Remote streamable-HTTP endpoint. **When set — the default — context7
     /// is registered as a `url` entry for every provider**, which is what
@@ -1420,10 +1427,26 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     if !synth.enabled {
         // The permission policy never depends on MCP enablement: a
         // `--no-mcp` run must still carry `agent.permissions.bash` into
-        // Claude and Cursor. Only the MCP server configs are skipped.
+        // Claude and Cursor. No MCP server is declared, and the server
+        // lists a previous synth wrote are emptied (Claude loads `.mcp.json`
+        // whenever it exists, Cursor always reads `.cursor/mcp.json`).
+        retract_mcp_json_servers(&synth.worktree.join(".mcp.json"), &mut written)?;
+        retract_mcp_json_servers(&synth.worktree.join(".cursor/mcp.json"), &mut written)?;
+        let codex_path = synth.worktree.join(".codex").join("config.toml");
+        if std::fs::read_to_string(&codex_path)
+            .is_ok_and(|body| body.starts_with(CODEX_CONFIG_HEADER))
+        {
+            std::fs::remove_file(&codex_path)
+                .with_context(|| format!("removing {}", codex_path.display()))?;
+        }
         write_claude_permissions(synth, &mut written)?;
         let cursor_dir = synth.worktree.join(".cursor");
-        if !synth.bash.is_empty() || cursor_dir.join("cli.json").exists() {
+        let has_user_cursor_servers = cursor_user_mcp_config_path()
+            .is_some_and(|p| !mcp_json_server_names(&p).is_empty());
+        if !synth.bash.is_empty()
+            || has_user_cursor_servers
+            || cursor_dir.join("cli.json").exists()
+        {
             if let Some(cli_path) =
                 synthesize_cursor_cli(&cursor_dir, &cursor_dir.join("mcp.json"), synth)?
             {
@@ -1442,8 +1465,7 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     write_claude_permissions(synth, &mut written)?;
 
     // Cursor: <worktree>/.cursor/mcp.json — same schema as Claude's
-    // `.mcp.json`, so the merge helper handles preserving any user
-    // entries the same way.
+    // `.mcp.json`, and its server list is replaced the same way.
     let cursor_dir = synth.worktree.join(".cursor");
     std::fs::create_dir_all(&cursor_dir)
         .with_context(|| format!("creating {}", cursor_dir.display()))?;
@@ -1560,7 +1582,21 @@ fn synthesize_cursor_cli(
         .keys()
         .cloned()
         .collect();
-    let (perm_allow, perm_deny) = cursor_permission_rules(synth);
+    let (perm_allow, mut perm_deny) = cursor_permission_rules(synth);
+    // Cursor also loads the user's `~/.cursor/mcp.json`, and `--approve-mcps`
+    // (see `cursor_argv`) approves those servers too. A project file cannot
+    // unload them, so every user-level server gaviero did not register is
+    // denied outright: only `.gaviero/settings.json` decides what is callable.
+    let unmanaged_user: Vec<String> = cursor_user_mcp_config_path()
+        .map(|p| mcp_json_server_names(&p))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !registered.contains(name))
+        .collect();
+    if !unmanaged_user.is_empty() {
+        perm_deny.extend(unmanaged_user.iter().map(|s| format!("Mcp({s}:*)")));
+        perm_deny = sorted_unique(perm_deny);
+    }
     // Write cli.json when there's a server to allow-list (remote or stdio),
     // an explicit gaviero permission policy to translate, *or* rules a
     // previous synth left behind that now need retracting. A worktree with
@@ -1656,45 +1692,24 @@ fn synthesize_cursor_cli(
     Ok(Some(cli_path))
 }
 
-/// Merge lean Cursor-managed entries into an existing `.cursor/mcp.json`.
+/// `.cursor/mcp.json` with its `mcpServers` replaced by the Cursor-managed set.
 fn cursor_mcp_json_servers_merged(synth: &McpConfigSynth, path: &Path) -> Result<String> {
-    let managed = managed_cursor_mcp_json_servers(synth)?;
-    let mut root = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-
-    let servers = root
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !servers.is_object() {
-        *servers = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let servers_map = servers.as_object_mut().expect("mcpServers object");
-    // Drop stale managed stdio servers from older gaviero runs (context7
-    // poisons ListMcpResources; gaviero is omitted when URL extras exist).
-    for stale in ["context7", "gaviero"] {
-        if !managed.contains_key(stale) {
-            servers_map.remove(stale);
-        }
-    }
-    for (name, entry) in managed {
-        servers_map.insert(name, entry);
-    }
-
-    serde_json::to_string_pretty(&serde_json::Value::Object(root))
-        .context("serialising merged cursor mcp servers JSON")
+    replace_mcp_json_servers_at_path(path, managed_cursor_mcp_json_servers(synth)?)
 }
 
-/// Merge our gaviero (and optionally context7) entries into an existing
-/// `{"mcpServers":{...}}` document at `path`, preserving any
-/// user-authored entries. Used for `.mcp.json` (Claude).
+/// `.mcp.json` (Claude) with its `mcpServers` replaced by the managed set.
 fn mcp_json_servers_merged(synth: &McpConfigSynth, path: &Path) -> Result<String> {
-    merge_mcp_json_servers_at_path(path, managed_mcp_json_servers(synth)?)
+    replace_mcp_json_servers_at_path(path, managed_mcp_json_servers(synth)?)
 }
 
-fn merge_mcp_json_servers_at_path(
+/// Replace the `mcpServers` object of the `{"mcpServers":{...}}` document at
+/// `path` with `managed`, keeping every other top-level key.
+///
+/// The server list is gaviero's, like the provider `permissions` objects:
+/// every MCP server an agent sees comes from `.gaviero/settings.json`
+/// (`mcp.gavieroServer`, `mcp.context7`, `mcp.extraServers`), so an entry
+/// authored by hand — or left by an older synth — is dropped, not merged.
+fn replace_mcp_json_servers_at_path(
     path: &Path,
     managed: serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
@@ -1703,20 +1718,91 @@ fn merge_mcp_json_servers_at_path(
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-
-    let servers = root
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !servers.is_object() {
-        *servers = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let servers_map = servers.as_object_mut().expect("mcpServers object");
-    for (name, entry) in managed {
-        servers_map.insert(name, entry);
-    }
-
+    root.insert("mcpServers".to_string(), serde_json::Value::Object(managed));
     serde_json::to_string_pretty(&serde_json::Value::Object(root))
-        .context("serialising merged mcp servers JSON")
+        .context("serialising mcp servers JSON")
+}
+
+/// Empty the server list of an existing `.mcp.json` / `.cursor/mcp.json`
+/// when MCP synthesis is off, so a file a previous synth wrote cannot keep
+/// servers alive. A missing file stays missing.
+fn retract_mcp_json_servers(path: &Path, written: &mut Vec<PathBuf>) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let body = replace_mcp_json_servers_at_path(path, serde_json::Map::new())?;
+    write_if_changed(path, &body)?;
+    written.push(path.to_path_buf());
+    Ok(())
+}
+
+/// `$CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME`
+/// is unset or blank — the user layer every `codex` process loads.
+pub fn codex_user_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("config.toml"))
+}
+
+/// `~/.cursor/mcp.json` — the user-level server list every Cursor `agent`
+/// loads next to the project's `.cursor/mcp.json`.
+pub fn cursor_user_mcp_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cursor").join("mcp.json"))
+}
+
+/// `codex --config` pair that turns off Codex's ChatGPT apps (connectors),
+/// which Codex serves as MCP tools without any `mcp_servers` entry.
+pub const CODEX_DISABLE_APPS: &str = "features.apps=false";
+
+/// `--config` pairs that keep Codex from starting an MCP server
+/// `.gaviero/settings.json` did not declare.
+///
+/// Codex merges `--config mcp_servers={}` into the user table instead of
+/// replacing it, so the only way to drop a user-level server for one run is
+/// `mcp_servers.<name>.enabled=false` per server. Every `[mcp_servers.X]` in
+/// the user's `config.toml` (see [`codex_user_config_path`]) that the
+/// synthesized `<worktree>/.codex/config.toml` does not declare is disabled,
+/// and [`CODEX_DISABLE_APPS`] closes the connector path.
+pub fn codex_unmanaged_mcp_overrides(synth_config: &Path) -> Vec<String> {
+    codex_unmanaged_mcp_overrides_with(synth_config, codex_user_config_path().as_deref())
+}
+
+fn codex_unmanaged_mcp_overrides_with(
+    synth_config: &Path,
+    user_config: Option<&Path>,
+) -> Vec<String> {
+    let managed = codex_mcp_server_names(synth_config);
+    let mut out: Vec<String> = user_config
+        .map(codex_mcp_server_names)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !managed.contains(name))
+        .map(|name| format!("mcp_servers.{}.enabled=false", toml_quote_key(&name)))
+        .collect();
+    out.push(CODEX_DISABLE_APPS.to_string());
+    out
+}
+
+/// Server names under `[mcp_servers]` in a Codex `config.toml`; empty when
+/// the file is missing or does not parse.
+fn codex_mcp_server_names(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| body.parse::<toml::Value>().ok())
+        .and_then(|v| v.get("mcp_servers")?.as_table().map(|t| t.keys().cloned().collect()))
+        .unwrap_or_default()
+}
+
+/// Server names under `mcpServers` in a `{"mcpServers":{...}}` file; empty
+/// when the file is missing or does not parse.
+fn mcp_json_server_names(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|v| v.get("mcpServers")?.as_object().map(|m| m.keys().cloned().collect()))
+        .unwrap_or_default()
 }
 
 /// Rendered permission rules for a provider settings file.
@@ -2120,14 +2206,15 @@ mod tests {
     }
 
     #[test]
-    fn merged_cursor_config_preserves_user_servers() {
+    fn cursor_config_replaces_user_servers() {
         let dir = tempdir().unwrap();
         let cursor_path = dir.path().join(".cursor/mcp.json");
         std::fs::create_dir_all(cursor_path.parent().unwrap()).unwrap();
         let existing = serde_json::json!({
             "mcpServers": {
                 "user-cursor-server": { "command": "user-bin", "args": [] }
-            }
+            },
+            "otherKey": true
         });
         std::fs::write(
             &cursor_path,
@@ -2139,9 +2226,11 @@ mod tests {
         synthesize_for_worktree(&synth).unwrap();
         let body = std::fs::read_to_string(&cursor_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // User entry preserved; gaviero added; context7 now present too, as
-        // the same hosted `url` server the other providers register.
-        assert!(v["mcpServers"]["user-cursor-server"].is_object());
+        // Only settings.json servers survive: the hand-authored entry is
+        // dropped, unrelated keys stay, gaviero and context7 (the same hosted
+        // `url` server the other providers register) are written.
+        assert!(v["mcpServers"].get("user-cursor-server").is_none());
+        assert_eq!(v["otherKey"], true);
         assert!(v["mcpServers"]["gaviero"].is_object());
         assert_eq!(
             v["mcpServers"]["context7"]["url"].as_str().unwrap(),
@@ -3099,7 +3188,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_claude_config_preserves_user_servers_and_adds_context7() {
+    fn claude_config_replaces_user_servers_and_adds_context7() {
         let dir = tempdir().unwrap();
         let claude_path = dir.path().join(".mcp.json");
         let existing = serde_json::json!({
@@ -3117,9 +3206,61 @@ mod tests {
         synthesize_for_worktree(&synth).unwrap();
         let body = std::fs::read_to_string(&claude_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["mcpServers"]["user-server"].is_object());
+        assert!(v["mcpServers"].get("user-server").is_none());
         assert!(v["mcpServers"]["gaviero"].is_object());
         assert!(v["mcpServers"]["context7"].is_object());
+    }
+
+    #[test]
+    fn synth_disabled_empties_existing_server_lists() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture(dir.path().to_path_buf());
+        synthesize_for_worktree(&synth).unwrap();
+        assert!(dir.path().join(".codex/config.toml").is_file());
+
+        synth.enabled = false;
+        synthesize_for_worktree(&synth).unwrap();
+        for rel in [".mcp.json", ".cursor/mcp.json"] {
+            let v: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join(rel)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["mcpServers"], serde_json::json!({}), "{rel}");
+        }
+        assert!(!dir.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn codex_unmanaged_overrides_disable_user_servers_not_in_synth() {
+        let dir = tempdir().unwrap();
+        let synth_path = dir.path().join("synth.toml");
+        std::fs::write(
+            &synth_path,
+            "[mcp_servers.gaviero]\ncommand = \"shim\"\n\n[mcp_servers.consensus]\nurl = \"https://x/mcp\"\n",
+        )
+        .unwrap();
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            "model = \"gpt\"\n[mcp_servers.consensus]\nurl = \"https://y\"\n\n\
+             [mcp_servers.github]\ncommand = \"gh-mcp\"\n\n[mcp_servers.\"my.server\"]\nurl = \"https://z\"\n",
+        )
+        .unwrap();
+
+        let out = codex_unmanaged_mcp_overrides_with(&synth_path, Some(&user_path));
+        assert_eq!(
+            out,
+            vec![
+                "mcp_servers.github.enabled=false".to_string(),
+                r#"mcp_servers."my.server".enabled=false"#.to_string(),
+                CODEX_DISABLE_APPS.to_string(),
+            ]
+        );
+        // No user config: only the connector switch.
+        assert_eq!(
+            codex_unmanaged_mcp_overrides_with(&synth_path, None),
+            vec![CODEX_DISABLE_APPS.to_string()]
+        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub use config_synth::{
     ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
     TrustConsent, claude_mcp_config_json, claude_settings_permissions, codex_mcp_config_toml,
     codex_mcp_overrides_from_config_file, codex_synth_has_any_mcp, codex_synth_has_remote_mcp,
-    codex_synth_trusted, host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
+    codex_synth_trusted, codex_unmanaged_mcp_overrides, host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
     synthesize_for_worktree, worktree_has_remote_mcp_urls,
 };
 pub use endpoint_file::{
@@ -119,7 +119,7 @@ pub use reach_probe::{
     classify_verdict, probe_prompt, run_reach_probe,
 };
 pub use resolver::{
-    McpConfigOverrides, extra_servers_from_workspace, extra_urls_from_project_mcp_json,
+    McpConfigOverrides, extra_servers_from_workspace,
     parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_bash_permissions,
     resolve_context7_config, resolve_exposed_tools, resolve_mcp_config_synth,
     resolve_mcp_permissions, resolve_shim_binary, sibling_shim_path,
