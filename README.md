@@ -232,10 +232,21 @@ Gaviero itself refuses to inline a protected `@`-mention or attachment; a chat m
 | File | What it records |
 |---|---|
 | `connections.ndjson` | One row per connection: time, provider (`claude`, `codex`, `agent` for Cursor, `deepseek`, `context7`, …), host, port, decision, bytes up and down, duration. Destinations only: the proxy does not decrypt TLS. |
-| `claude-requests.ndjson` | One row per Claude API request: session, model, size, SHA-256, and any secret-looking values found (redacted excerpts only). The raw bodies are deleted after the scan. |
+| `claude-requests.ndjson` | One row per Claude API request: session, model, size, SHA-256, and any secret-looking values found (redacted excerpts only), each with its `classification` and, when known, the `source` file it was read from. The raw bodies are deleted after the scan. |
 | `hooks.ndjson` | Every Claude and Cursor hook decision: the path or command, and whether it was allowed, denied or redacted, with the reason. |
 
 Only Claude's request contents are captured; for the other providers the log shows which hosts they reached, not what they sent.
+
+**Fixture classification.** Each secret-looking value in a Claude request is traced to the file it came from: the `Read` call behind a tool result, or the `path:` prefix of a `grep` line. It is then classified, checking in this order:
+
+| Classification | When |
+|---|---|
+| `allowlisted` | The value's line carries an allowlist marker: `pragma: allowlist secret`, `gitleaks:allow` or `trufflehog:ignore`. |
+| `test-path` | The source is test code or data: a `tests/`, `test/`, `__tests__/`, `fixtures/`, `testdata/` or `spec/` folder; a name like `*_test.*`, `test_*.py`, `*.test.*`, `*.spec.*` or `conftest.py`; or, in a Rust file, every occurrence sits after `#[cfg(test)]`. |
+| `dummy-pattern` | The value doesn't look random: sequential (`ABCDEFGH…`, `123456…`), repetitive (`aaaa…`, few distinct characters), a placeholder word (`EXAMPLE`, `dummy`, `fake`, `test`, `canary`, …), or a PEM block with a tiny body. |
+| `unclassified` | None of the above. |
+
+Only `unclassified` values get a chat warning each. The others are summed into one line ("N fixture-like secret values … not shown") and kept in full in the log. These signals are hints, not proof: an agent or a planted file can add a marker, so nothing is dropped.
 
 **Known gaps:**
 - Cursor recursive searches (`grep -r`, `rg`) can surface protected content, since Cursor offers no shell-output redaction.
