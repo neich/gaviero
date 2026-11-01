@@ -1083,6 +1083,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             {
                 app.focus = Focus::Terminal;
                 app.terminal_selection.clear();
+                let tab_count = app.terminal_manager.tab_count();
+                if let Some(idx) = super::render::terminal_tab_at(area, tab_count, col, row) {
+                    if let Some(&id) = app.terminal_manager.tab_order().get(idx) {
+                        app.terminal_manager.switch_tab(id);
+                    }
+                    return;
+                }
                 let content_y_start = area.y + 1;
                 if row >= content_y_start && row < area.y + area.height {
                     let vt_row = row - content_y_start;
