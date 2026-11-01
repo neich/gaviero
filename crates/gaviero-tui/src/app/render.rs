@@ -1037,6 +1037,38 @@ pub(super) fn render_panel_header_styled(
     (header_area, content_area)
 }
 
+fn terminal_tab_label(i: usize) -> String {
+    format!(" Term {} ", i + 1)
+}
+
+/// Columns of each terminal tab label in the strip drawn on `area`'s top row
+/// when more than one tab exists: `(index, start, end)`, `end` exclusive and
+/// holding the `│` separator. Labels past the right edge are clipped, not
+/// dropped, so the last span may extend beyond `area`.
+fn terminal_tab_spans(area: Rect, tab_count: usize) -> Vec<(usize, u16, u16)> {
+    let mut x = area.x + 1;
+    (0..tab_count)
+        .map(|i| {
+            let start = x;
+            let end = start.saturating_add(terminal_tab_label(i).chars().count() as u16);
+            x = end.saturating_add(1);
+            (i, start, end)
+        })
+        .collect()
+}
+
+/// The terminal tab whose label sits under `(col, row)`, if the tab strip is
+/// shown (more than one tab) and the point is on a label.
+pub(super) fn terminal_tab_at(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<usize> {
+    if tab_count < 2 || row != area.y || col >= area.x + area.width {
+        return None;
+    }
+    terminal_tab_spans(area, tab_count)
+        .into_iter()
+        .find(|&(_, start, end)| col >= start && col < end)
+        .map(|(i, _, _)| i)
+}
+
 pub(super) fn render_terminal(app: &mut App, frame: &mut Frame, area: Rect) {
     if area.height < 2 {
         return;
@@ -1073,25 +1105,23 @@ pub(super) fn render_terminal(app: &mut App, frame: &mut Frame, area: Rect) {
             }
         }
 
-        let mut x = area.x + 1;
-        for i in 0..tab_count {
-            let label = format!(" Term {} ", i + 1);
+        for (i, start, end) in terminal_tab_spans(area, tab_count) {
             let style = if i == active_idx {
                 active_style
             } else {
                 border_style
             };
-            for ch in label.chars() {
+            let mut x = start;
+            for ch in terminal_tab_label(i).chars() {
                 if x < area.x + area.width && x < buf.area().right() && area.y < buf.area().bottom()
                 {
                     buf[(x, area.y)].set_char(ch).set_style(style);
                 }
                 x += 1;
             }
-            if x < area.x + area.width && x < buf.area().right() {
-                buf[(x, area.y)].set_char('│').set_style(border_style);
+            if end < area.x + area.width && end < buf.area().right() {
+                buf[(end, area.y)].set_char('│').set_style(border_style);
             }
-            x += 1;
         }
     }
 
@@ -2144,6 +2174,30 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_tab_at_maps_label_columns_to_tabs() {
+        let area = Rect::new(10, 20, 60, 8);
+        // " Term 1 " spans 11..19, separator at 19; " Term 2 " spans 20..28.
+        assert_eq!(terminal_tab_at(area, 2, 11, 20), Some(0));
+        assert_eq!(terminal_tab_at(area, 2, 18, 20), Some(0));
+        assert_eq!(terminal_tab_at(area, 2, 19, 20), None);
+        assert_eq!(terminal_tab_at(area, 2, 20, 20), Some(1));
+        assert_eq!(terminal_tab_at(area, 2, 27, 20), Some(1));
+        assert_eq!(terminal_tab_at(area, 2, 28, 20), None);
+        assert_eq!(terminal_tab_at(area, 2, 10, 20), None);
+        // Content rows and the single-tab border are not a tab strip.
+        assert_eq!(terminal_tab_at(area, 2, 12, 21), None);
+        assert_eq!(terminal_tab_at(area, 1, 12, 20), None);
+    }
+
+    #[test]
+    fn terminal_tab_at_ignores_labels_clipped_past_the_area() {
+        let area = Rect::new(0, 0, 12, 4);
+        assert_eq!(terminal_tab_at(area, 3, 5, 0), Some(0));
+        assert_eq!(terminal_tab_at(area, 3, 10, 0), Some(1));
+        assert_eq!(terminal_tab_at(area, 3, 12, 0), None);
+    }
 
     #[test]
     fn preview_layout_maps_folded_lines_to_their_heading() {
