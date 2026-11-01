@@ -326,29 +326,22 @@ pub fn format_mcp_status(root: &Path, endpoint: &str) -> String {
 }
 
 fn read_mcp_status_settings(root: &Path) -> (bool, u32, String, String) {
-    let path = root.join(".gaviero").join("settings.json");
-    let doc = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let doc = crate::workspace::LayeredSettings::for_folder(root);
     let enforce = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, settings::MCP_REACH_ENFORCE))
+        .get(settings::MCP_REACH_ENFORCE)
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let max_age_days = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, settings::MCP_REACH_MAX_AGE_DAYS))
+        .get(settings::MCP_REACH_MAX_AGE_DAYS)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(30)
         .min(u32::MAX as u64) as u32;
     let exposed = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, settings::MCP_GAVIERO_EXPOSED_TOOLS))
+        .get(settings::MCP_GAVIERO_EXPOSED_TOOLS)
         .map(format_exposed_tools)
         .unwrap_or_else(|| crate::mcp::tools::ALL_MCP_TOOLS.join(", "));
     let transport = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, "mcp.gavieroServer.transport"))
+        .get("mcp.gavieroServer.transport")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("stdio")
         .to_string();
@@ -413,33 +406,17 @@ pub fn is_stale_version(recorded: Option<&str>, current: Option<&str>) -> bool {
 }
 
 fn read_reach_settings(root: &Path) -> (bool, u32) {
-    let path = root.join(".gaviero").join("settings.json");
-    let doc = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let doc = crate::workspace::LayeredSettings::for_folder(root);
     let enforce = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, settings::MCP_REACH_ENFORCE))
+        .get(settings::MCP_REACH_ENFORCE)
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let max_age_days = doc
-        .as_ref()
-        .and_then(|d| dot_get(d, settings::MCP_REACH_MAX_AGE_DAYS))
+        .get(settings::MCP_REACH_MAX_AGE_DAYS)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(30)
         .min(u32::MAX as u64) as u32;
     (enforce, max_age_days)
-}
-
-fn dot_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    if let Some(v) = value.get(key) {
-        return Some(v);
-    }
-    let parts: Vec<&str> = key.splitn(2, '.').collect();
-    if parts.len() == 2 {
-        return dot_get(value.get(parts[0])?, parts[1]);
-    }
-    None
 }
 
 #[cfg(test)]

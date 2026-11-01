@@ -102,16 +102,12 @@ impl DshLaunchSpec {
         }
         let settings = read_settings(root);
         let command = settings
-            .get("providers")
-            .and_then(|p| p.get("dsh"))
-            .and_then(|d| d.get("command"))
+            .get("providers.dsh.command")
             .and_then(|c| c.as_str())
             .unwrap_or(DEFAULT_DSH_COMMAND)
             .to_string();
         let args = settings
-            .get("providers")
-            .and_then(|p| p.get("dsh"))
-            .and_then(|d| d.get("args"))
+            .get("providers.dsh.args")
             .and_then(|a| a.as_array())
             .map(|arr| {
                 arr.iter()
@@ -120,17 +116,13 @@ impl DshLaunchSpec {
             })
             .unwrap_or_default();
         let profile = settings
-            .get("providers")
-            .and_then(|p| p.get("dsh"))
-            .and_then(|d| d.get("profile"))
+            .get("providers.dsh.profile")
             .and_then(|p| p.as_str())
             .unwrap_or(DEFAULT_DSH_PROFILE)
             .to_string();
         let credential_source = parse_credential_source(
             settings
-                .get("providers")
-                .and_then(|p| p.get("dsh"))
-                .and_then(|d| d.get("credentialSource"))
+                .get("providers.dsh.credentialSource")
                 .and_then(|c| c.as_str()),
         );
         Self {
@@ -261,12 +253,9 @@ fn split_args(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn read_settings(root: &Path) -> serde_json::Value {
-    let path = root.join(".gaviero").join("settings.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::Value::Null)
+/// The settings governing `root`, layered user → workspace → repo.
+fn read_settings(root: &Path) -> crate::workspace::LayeredSettings {
+    crate::workspace::LayeredSettings::for_folder(root)
 }
 
 static VERSION_CACHE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();

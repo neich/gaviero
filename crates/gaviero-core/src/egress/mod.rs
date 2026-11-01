@@ -286,16 +286,13 @@ pub fn claude_body_dir(root: &Path) -> PathBuf {
     root.join(".gaviero").join("egress").join("claude-bodies")
 }
 
-/// `agent.egress.captureClaudeBodies` from `<root>/.gaviero/settings.json`
-/// (read directly, like the other spawn-time policy readers). Default true.
+/// `agent.egress.captureClaudeBodies` from the settings governing `root`
+/// ([`crate::workspace::LayeredSettings`], like the other spawn-time policy
+/// readers). Default true.
 pub fn capture_claude_bodies(root: &Path) -> bool {
-    std::fs::read_to_string(root.join(".gaviero").join("settings.json"))
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .and_then(|doc| {
-            doc.pointer("/agent/egress/captureClaudeBodies")
-                .and_then(serde_json::Value::as_bool)
-        })
+    crate::workspace::LayeredSettings::for_folder(root)
+        .get("agent.egress.captureClaudeBodies")
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
 }
 

@@ -118,6 +118,11 @@ pub mod settings {
     /// `permissions.blockReadsOutsideWorkingDirectories`). Default: true.
     pub const AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE: &str =
         "agent.permissions.read.blockOutsideWorkspace";
+    /// Folders outside the workspace agents may read but never write
+    /// (absolute, `~/…`, or relative to the folder holding the settings).
+    /// Not workspace folders: no turn capture, indexing or memory scope.
+    /// Read by [`crate::scope_enforcer::SensitivePolicy::resolve`]. Default: none.
+    pub const AGENT_PERMISSIONS_READ_EXTRA_FOLDERS: &str = "agent.permissions.read.extraFolders";
 
     // Egress settings (`crate::egress`)
     /// `off` | `log` | `ask` | `enforce` for the loopback egress proxy every
@@ -520,8 +525,7 @@ pub struct Workspace {
     workspace_path: Option<PathBuf>,
     /// Cached per-folder `.gaviero/settings.json` contents (keyed by folder root).
     folder_settings_cache: HashMap<PathBuf, serde_json::Value>,
-    /// Cached user-level `~/.gaviero/settings.json` (legacy XDG/AppData
-    /// path is read only when that file is missing).
+    /// Cached user-level `$GAVIERO_ROOT/.gaviero/settings.json`.
     user_settings_cache: Option<serde_json::Value>,
     /// Settings files that exist but failed to parse on the last
     /// [`Self::reload_settings_cache`]. Each contributes nothing to the
@@ -916,7 +920,7 @@ impl Workspace {
         // Cache per-folder settings
         self.folder_settings_cache.clear();
         self.settings_errors.clear();
-        let settings_path = self.settings_path();
+        let settings_path = self.workspace_layer_path();
         self.workspace_settings = match std::fs::read_to_string(&settings_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
                 tracing::warn!("Invalid settings at {}: {error}", settings_path.display());
@@ -933,11 +937,9 @@ impl Workspace {
                 None
             }
         };
-        // Member settings and embedded workspace settings are not policy sources
-        // in workspace mode, even when the authoritative file omits a key.
-        if self.workspace_path.is_some() {
-            return;
-        }
+        // Repo layer: each folder's own file overrides the workspace and
+        // user layers for that folder. (Settings embedded in the
+        // `.gaviero-workspace` file are not read.)
         for folder in &self.folders {
             let settings_path = folder.path.join(".gaviero").join("settings.json");
             let Ok(content) = std::fs::read_to_string(&settings_path) else {
@@ -947,7 +949,7 @@ impl Workspace {
                 Ok(val) => {
                     self.folder_settings_cache.insert(folder.path.clone(), val);
                 }
-                // In single-folder mode this is the authoritative file,
+                // In single-folder mode this is also the workspace file,
                 // already recorded above.
                 Err(error) if !self.settings_errors.iter().any(|e| e.path == settings_path) => {
                     self.settings_errors
@@ -958,22 +960,54 @@ impl Workspace {
         }
     }
 
+    /// The workspace layer's file: [`Self::settings_path`] in workspace mode.
+    /// In single-folder mode, the file beside an enclosing
+    /// `*.gaviero-workspace` that lists the folder ([`SettingsLocation`]),
+    /// else the folder's own — so a session that opens one member folder
+    /// still gets user → workspace → repo.
+    fn workspace_layer_path(&self) -> PathBuf {
+        if self.workspace_path.is_none()
+            && let [folder] = self.folders.as_slice()
+            && let Some(dir) = SettingsLocation::of(&folder.path).workspace_dir
+        {
+            return dir.join(".gaviero").join("settings.json");
+        }
+        self.settings_path()
+    }
+
+    /// The repo layer for `root`; in single-folder mode `None` means the
+    /// one folder.
+    fn repo_layer(&self, root: Option<&Path>) -> Option<&serde_json::Value> {
+        let root = match (root, self.workspace_path.as_ref(), self.folders.as_slice()) {
+            (Some(root), _, _) => root,
+            (None, None, [folder]) => folder.path.as_path(),
+            _ => return None,
+        };
+        self.folder_settings_cache.get(root)
+    }
+
     /// Settings files that failed to parse on the last reload, authoritative
     /// file first. Empty when every existing settings file is valid JSON.
     pub fn settings_errors(&self) -> &[SettingsParseError] {
         &self.settings_errors
     }
 
-    /// Resolve a setting using the cascade:
-    /// 1. Workspace root `.gaviero/settings.json` in workspace mode; member
-    ///    files and embedded workspace settings are ignored.
-    /// 2. Per-folder settings in single-folder mode
-    /// 3. User-level `~/.gaviero/settings.json`
-    /// 4. Hardcoded defaults
+    /// Resolve a setting; the first level that defines `key` wins:
+    /// 1. The repo: `<root>/.gaviero/settings.json` of the folder `root`
+    ///    (with `root` `None`: the one folder in single-folder mode, skipped
+    ///    in workspace mode).
+    /// 2. The workspace: `.gaviero/settings.json` beside the
+    ///    `*.gaviero-workspace` file — in single-folder mode the one beside
+    ///    an enclosing workspace file that lists the folder, else the
+    ///    folder's own file.
+    /// 3. The user: `$GAVIERO_ROOT/.gaviero/settings.json` (`~/.gaviero/…`
+    ///    when `GAVIERO_ROOT` is unset).
+    /// 4. Hardcoded defaults.
+    ///
+    /// [`LayeredSettings`] applies the same order without a `Workspace`.
     pub fn resolve_setting(&self, key: &str, root: Option<&Path>) -> serde_json::Value {
         // 1. Per-folder settings (from cache)
-        if let Some(root) = root
-            && let Some(settings) = self.folder_settings_cache.get(root)
+        if let Some(settings) = self.repo_layer(root)
             && let Some(val) = dot_get(settings, key)
         {
             return val.clone();
@@ -1000,8 +1034,7 @@ impl Workspace {
     /// level defines `key`. Lets callers distinguish "unset" from "set to
     /// the default value" (needed for legacy-key fallbacks).
     pub fn resolve_setting_opt(&self, key: &str, root: Option<&Path>) -> Option<serde_json::Value> {
-        if let Some(root) = root
-            && let Some(settings) = self.folder_settings_cache.get(root)
+        if let Some(settings) = self.repo_layer(root)
             && let Some(val) = dot_get(settings, key)
         {
             return Some(val.clone());
@@ -1534,6 +1567,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_PERMISSIONS_SENSITIVE_ALLOW => serde_json::json!([]),
         settings::AGENT_PERMISSIONS_READ_DENY => serde_json::json!([]),
         settings::AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE => serde_json::json!(true),
+        settings::AGENT_PERMISSIONS_READ_EXTRA_FOLDERS => serde_json::json!([]),
         settings::AGENT_NETWORK_MODE => serde_json::json!("log"),
         settings::AGENT_NETWORK_ALLOW => serde_json::json!([
             "*.anthropic.com",
@@ -1808,46 +1842,13 @@ pub fn user_settings_path() -> Option<PathBuf> {
     user_gaviero_dir().map(|dir| dir.join("settings.json"))
 }
 
-/// Former user-settings location (`dirs::config_dir()/gaviero/settings.json`):
-/// `~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json`
-/// on Windows. Read only when [`user_settings_path`] is missing.
-pub fn legacy_user_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("gaviero").join("settings.json"))
-}
-
+/// The user layer ([`user_settings_path`]); `Ok(None)` when it is missing.
+/// The former `dirs::config_dir()/gaviero/settings.json` is never read.
 fn load_user_settings() -> Result<Option<serde_json::Value>, SettingsParseError> {
-    load_user_settings_from(
-        user_settings_path().as_deref(),
-        legacy_user_settings_path().as_deref(),
-    )
-}
-
-/// Canonical file wins if it exists (including unparseable JSON — that is
-/// an `Err`, not a silent legacy fallback). Missing canonical falls back to
-/// the XDG/AppData path so existing installs keep working.
-fn load_user_settings_from(
-    canonical: Option<&Path>,
-    legacy: Option<&Path>,
-) -> Result<Option<serde_json::Value>, SettingsParseError> {
-    if let Some(path) = canonical
-        && path.is_file()
-    {
-        return parse_user_settings_file(path);
+    match user_settings_path() {
+        Some(path) if path.is_file() => parse_user_settings_file(&path),
+        _ => Ok(None),
     }
-    if let Some(path) = legacy
-        && path.is_file()
-    {
-        tracing::warn!(
-            "user settings loaded from legacy path {}; move them to {}",
-            path.display(),
-            canonical.map_or_else(
-                || "~/.gaviero/settings.json".to_string(),
-                |p| p.display().to_string()
-            )
-        );
-        return parse_user_settings_file(path);
-    }
-    Ok(None)
 }
 
 fn parse_user_settings_file(path: &Path) -> Result<Option<serde_json::Value>, SettingsParseError> {
@@ -1899,6 +1900,173 @@ fn extra_root_paths_from_value(val: &serde_json::Value) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(expand_tilde_path)
         .collect()
+}
+
+/// Where the settings governing `folder` live: the directory holding the
+/// nearest `*.gaviero-workspace` file that sits in `folder` or lists a folder
+/// containing it, and the workspace folder (repo) `folder` belongs to. A path
+/// inside `.gaviero/worktrees/` resolves for the folder owning the worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsLocation {
+    /// Directory holding the `*.gaviero-workspace` file, when one applies.
+    pub workspace_dir: Option<PathBuf>,
+    /// The workspace folder containing `folder` (the listed folder, the
+    /// worktree owner, or `folder` itself).
+    pub repo: PathBuf,
+}
+
+impl SettingsLocation {
+    pub fn of(folder: &Path) -> Self {
+        let canonical = canonicalize_path(folder);
+        let owner = strip_worktree_segment(&canonical);
+        let start = owner.clone().unwrap_or(canonical);
+        for dir in start.ancestors() {
+            let files = workspace_files_in(dir);
+            if files.is_empty() {
+                continue;
+            }
+            if dir == start {
+                return Self {
+                    workspace_dir: Some(dir.to_path_buf()),
+                    repo: dir.to_path_buf(),
+                };
+            }
+            if let Some(repo) = files
+                .iter()
+                .find_map(|f| workspace_folder_containing(f, dir, &start))
+            {
+                return Self {
+                    workspace_dir: Some(dir.to_path_buf()),
+                    repo,
+                };
+            }
+        }
+        Self {
+            workspace_dir: None,
+            repo: owner.unwrap_or_else(|| folder.to_path_buf()),
+        }
+    }
+
+    /// The folders whose `.gaviero/settings.json` apply, broadest first:
+    /// [`user_gaviero_root`], the workspace directory, the repo. A folder
+    /// that is two layers at once (single-folder mode) is listed once.
+    pub fn layer_bases(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let candidates = user_gaviero_root()
+            .into_iter()
+            .chain(self.workspace_dir.clone())
+            .chain(std::iter::once(self.repo.clone()));
+        for base in candidates {
+            let key = canonicalize_path(&base);
+            if !out.iter().any(|b| canonicalize_path(b) == key) {
+                out.push(base);
+            }
+        }
+        out
+    }
+}
+
+/// The directory holding the workspace-level `.gaviero/settings.json` for
+/// `folder`: beside the `*.gaviero-workspace` file, else the repo folder
+/// ([`SettingsLocation`]). In workspace mode it usually lies outside every
+/// workspace folder.
+pub fn settings_root_for(folder: &Path) -> PathBuf {
+    let location = SettingsLocation::of(folder);
+    location.workspace_dir.unwrap_or(location.repo)
+}
+
+/// The settings governing `folder`, layered like
+/// [`Workspace::resolve_setting`]: `GAVIERO_ROOT/.gaviero/settings.json`,
+/// then the workspace's, then the repo's; for each key the most specific
+/// layer that sets it wins. Keys are looked up like `resolve_setting`
+/// (`"a.b.c"` matches nested objects and flattened `"a.b"` keys alike). For
+/// the readers that run without a [`Workspace`] (agent read policy, hooks,
+/// spawn-time flags).
+#[derive(Clone, Debug, Default)]
+pub struct LayeredSettings {
+    /// `(folder holding .gaviero/, parsed file)`, broadest first. Missing and
+    /// unparseable files are left out.
+    layers: Vec<(PathBuf, serde_json::Value)>,
+    broken: Vec<PathBuf>,
+}
+
+impl LayeredSettings {
+    pub fn for_folder(folder: &Path) -> Self {
+        Self::from_bases(&SettingsLocation::of(folder).layer_bases())
+    }
+
+    /// Layers read from `<base>/.gaviero/settings.json`, broadest first.
+    pub fn from_bases(bases: &[PathBuf]) -> Self {
+        let mut out = Self::default();
+        for base in bases {
+            let path = base.join(".gaviero").join("settings.json");
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(doc) => out.layers.push((base.clone(), doc)),
+                Err(error) => {
+                    tracing::warn!("Invalid settings at {}: {error}", path.display());
+                    out.broken.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// `key` (`a.b.c`) from the most specific layer that sets it.
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.layers.iter().rev().find_map(|(_, doc)| dot_get(doc, key))
+    }
+
+    /// The folder holding the `.gaviero/` of the most specific layer that
+    /// sets `key` — the base for relative paths in that value.
+    pub fn defining_base(&self, key: &str) -> Option<&Path> {
+        self.layers
+            .iter()
+            .rev()
+            .find(|(_, doc)| dot_get(doc, key).is_some())
+            .map(|(base, _)| base.as_path())
+    }
+
+    /// Settings files that exist but do not parse.
+    pub fn broken(&self) -> &[PathBuf] {
+        &self.broken
+    }
+}
+
+/// `*.gaviero-workspace` files directly in `dir`.
+fn workspace_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "gaviero-workspace") && p.is_file())
+        .collect();
+    files.sort();
+    files
+}
+
+/// The folder listed in the workspace file `file` (in `dir`) that contains
+/// `path`, the deepest when folders nest.
+fn workspace_folder_containing(file: &Path, dir: &Path, path: &Path) -> Option<PathBuf> {
+    let parsed = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|body| serde_json::from_str::<WorkspaceFile>(&body).ok())?;
+    parsed
+        .folders
+        .iter()
+        .map(|f| {
+            canonicalize_path(&if f.path.is_absolute() {
+                f.path.clone()
+            } else {
+                dir.join(&f.path)
+            })
+        })
+        .filter(|folder| path.starts_with(folder))
+        .max_by_key(|folder| folder.as_os_str().len())
 }
 
 fn canonicalize_path(p: &Path) -> PathBuf {
@@ -1958,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_settings_are_authoritative_across_reload_and_save() {
+    fn repo_settings_override_the_workspace_file_across_reload_and_save() {
         let dir = tempfile::tempdir().unwrap();
         let member = dir.path().join("member");
         fs::create_dir_all(member.join(".gaviero")).unwrap();
@@ -1982,40 +2150,42 @@ mod tests {
             r#"{"agent":{"permissions":{"bash":{"allowlist":["flutter"]}}}}"#,
         )
         .unwrap();
+        let allowlist = settings::AGENT_PERMISSIONS_BASH_ALLOWLIST;
         let mut ws = Workspace::load(&ws_path).unwrap();
         assert_eq!(ws.settings_path(), settings_path);
+        // The repo layer wins for its folder; without a folder, the
+        // workspace file applies. Settings embedded in the workspace file
+        // are never read.
+        assert_eq!(
+            ws.resolve_setting(allowlist, Some(&member)),
+            serde_json::json!(["cargo"])
+        );
+        assert_eq!(ws.resolve_setting(allowlist, None), serde_json::json!(["flutter"]));
+        assert_eq!(
+            ws.resolve_setting_opt("memberOnly", Some(&member)),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(ws.resolve_setting_opt("memberOnly", None), None);
         for root in [None, Some(member.as_path())] {
-            assert_eq!(
-                ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root),
-                serde_json::json!(["flutter"])
-            );
-            assert_eq!(
-                ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root),
-                Some(serde_json::json!(["flutter"]))
-            );
-            assert_eq!(ws.resolve_setting_opt("memberOnly", root), None);
             assert_eq!(ws.resolve_setting_opt("embeddedOnly", root), None);
         }
-        ws.save_folder_setting(
-            &member,
-            settings::AGENT_PERMISSIONS_BASH_ALLOWLIST,
-            serde_json::json!([]),
-        )
-        .unwrap();
+        // Saves go to the workspace file; the repo file is left alone and
+        // keeps overriding for its folder.
+        ws.save_folder_setting(&member, allowlist, serde_json::json!([]))
+            .unwrap();
         ws.save().unwrap();
         let mut ws = Workspace::load(&ws_path).unwrap();
+        assert_eq!(ws.resolve_setting(allowlist, None), serde_json::json!([]));
         assert_eq!(
-            ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)),
-            serde_json::json!([])
+            ws.resolve_setting(allowlist, Some(&member)),
+            serde_json::json!(["cargo"])
         );
-        assert_eq!(fs::read_to_string(member_settings).unwrap(), conflicting);
+        assert_eq!(fs::read_to_string(&member_settings).unwrap(), conflicting);
         fs::write(&settings_path, "{}").unwrap();
+        fs::write(&member_settings, "{}").unwrap();
         ws.reload_settings_cache();
         ws.user_settings_cache = None;
-        assert_eq!(
-            ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)),
-            None
-        );
+        assert_eq!(ws.resolve_setting_opt(allowlist, Some(&member)), None);
         fs::remove_file(&settings_path).unwrap();
         ws.ensure_settings();
         assert!(settings_path.exists());
@@ -2157,12 +2327,6 @@ mod tests {
                 .and_then(|n| n.to_str()),
             Some(".gaviero")
         );
-        if let Some(legacy) = legacy_user_settings_path() {
-            assert_ne!(
-                path, legacy,
-                "user settings must not live under dirs::config_dir()"
-            );
-        }
     }
 
     #[test]
@@ -2200,39 +2364,12 @@ mod tests {
     }
 
     #[test]
-    fn user_settings_canonical_wins_over_legacy() {
+    fn malformed_user_settings_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().join("canonical.json");
-        let legacy = dir.path().join("legacy.json");
-        fs::write(&canonical, r#"{ "editor": { "tabSize": 2 } }"#).unwrap();
-        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        let val = load_user_settings_from(Some(&canonical), Some(&legacy))
-            .unwrap()
-            .unwrap();
-        assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(2)));
-    }
-
-    #[test]
-    fn user_settings_falls_back_to_legacy_when_canonical_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("canonical.json");
-        let legacy = dir.path().join("legacy.json");
-        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        let val = load_user_settings_from(Some(&missing), Some(&legacy))
-            .unwrap()
-            .unwrap();
-        assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(8)));
-    }
-
-    #[test]
-    fn user_settings_malformed_canonical_does_not_fall_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().join("canonical.json");
-        let legacy = dir.path().join("legacy.json");
-        fs::write(&canonical, "not json").unwrap();
-        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
-        let err = load_user_settings_from(Some(&canonical), Some(&legacy)).unwrap_err();
-        assert_eq!(err.path, canonical);
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "not json").unwrap();
+        let err = parse_user_settings_file(&path).unwrap_err();
+        assert_eq!(err.path, path);
         assert_eq!(err.line, 1);
     }
 
@@ -2397,6 +2534,144 @@ mod tests {
 
         let ws2 = Workspace::load(&ws_path).unwrap();
         assert_eq!(ws2.roots().len(), 1);
+    }
+
+    #[test]
+    fn settings_root_for_member_folder_is_the_workspace_file_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let member = root.join("app");
+        let other = root.join("other");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let doc = serde_json::json!({"folders": [{"path": member}, {"path": "other"}]});
+        fs::write(root.join("ws.gaviero-workspace"), doc.to_string()).unwrap();
+
+        assert_eq!(settings_root_for(&member), root);
+        // Relative entries resolve against the workspace file's directory.
+        assert_eq!(settings_root_for(&other), root);
+        // A subdirectory (a Bash `cd`) and a worktree resolve the same way.
+        assert_eq!(settings_root_for(&member.join("src")), root);
+        let worktree = member.join(".gaviero").join("worktrees").join("w1");
+        fs::create_dir_all(&worktree).unwrap();
+        assert_eq!(settings_root_for(&worktree), root);
+    }
+
+    fn write_layer(base: &Path, body: &str) {
+        fs::create_dir_all(base.join(".gaviero")).unwrap();
+        fs::write(base.join(".gaviero/settings.json"), body).unwrap();
+    }
+
+    #[test]
+    fn layered_settings_later_layers_override_earlier_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (user, ws, repo) = (
+            dir.path().join("user"),
+            dir.path().join("ws"),
+            dir.path().join("repo"),
+        );
+        write_layer(&user, r#"{"a":{"x":1,"y":1,"z":1},"list":[1],"u":true}"#);
+        write_layer(&ws, r#"{"a.y":2,"a":{"z":2},"list":[2,2]}"#);
+        write_layer(&repo, r#"{"a":{"z":3}}"#);
+        let layered = LayeredSettings::from_bases(&[user.clone(), ws.clone(), repo.clone()]);
+        let get = |k| layered.get(k).cloned();
+        assert_eq!(get("a.x"), Some(serde_json::json!(1)));
+        // A flattened key counts like a nested one.
+        assert_eq!(get("a.y"), Some(serde_json::json!(2)));
+        assert_eq!(get("a.z"), Some(serde_json::json!(3)));
+        assert_eq!(get("list"), Some(serde_json::json!([2, 2])));
+        assert_eq!(layered.defining_base("a.z"), Some(repo.as_path()));
+        assert_eq!(layered.defining_base("a.y"), Some(ws.as_path()));
+        assert_eq!(layered.defining_base("u"), Some(user.as_path()));
+        assert!(layered.broken().is_empty());
+
+        write_layer(&repo, "{ broken");
+        let layered = LayeredSettings::from_bases(&[user, ws, repo.clone()]);
+        assert_eq!(layered.get("a.z"), Some(&serde_json::json!(2)));
+        assert_eq!(layered.broken(), [repo.join(".gaviero/settings.json")]);
+    }
+
+    #[test]
+    fn settings_location_names_the_workspace_and_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let member = root.join("app");
+        fs::create_dir_all(member.join("src")).unwrap();
+        let doc = serde_json::json!({"folders": [{"path": member}]});
+        fs::write(root.join("ws.gaviero-workspace"), doc.to_string()).unwrap();
+        let location = SettingsLocation::of(&member.join("src"));
+        assert_eq!(location.workspace_dir.as_deref(), Some(root.as_path()));
+        assert_eq!(location.repo, member);
+        let bases = location.layer_bases();
+        assert_eq!(&bases[bases.len() - 2..], [root.clone(), member.clone()]);
+    }
+
+    #[test]
+    fn workspace_mode_repo_settings_override_workspace_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let app = root.join("app");
+        let lib = root.join("lib");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let ws_path = root.join("ws.gaviero-workspace");
+        let doc = serde_json::json!({"folders": [{"path": app}, {"path": lib}]});
+        fs::write(&ws_path, doc.to_string()).unwrap();
+        write_layer(&root, r#"{"editor":{"tabSize":4,"insertSpaces":false}}"#);
+        write_layer(&app, r#"{"editor":{"tabSize":2}}"#);
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        assert_eq!(ws.resolve_setting("editor.tabSize", Some(&app)), serde_json::json!(2));
+        assert_eq!(
+            ws.resolve_setting("editor.insertSpaces", Some(&app)),
+            serde_json::json!(false)
+        );
+        assert_eq!(ws.resolve_setting("editor.tabSize", Some(&lib)), serde_json::json!(4));
+        assert_eq!(ws.resolve_setting("editor.tabSize", None), serde_json::json!(4));
+    }
+
+    #[test]
+    fn single_folder_member_still_gets_the_workspace_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let app = root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        let doc = serde_json::json!({"folders": [{"path": app}]});
+        fs::write(root.join("ws.gaviero-workspace"), doc.to_string()).unwrap();
+        write_layer(&root, r#"{"editor":{"tabSize":4},"mcp.extraServers":{"x":{}}}"#);
+        write_layer(&app, r#"{"editor.tabSize":2}"#);
+
+        let ws = Workspace::single_folder(app.clone());
+        for root in [None, Some(app.as_path())] {
+            assert_eq!(ws.resolve_setting("editor.tabSize", root), serde_json::json!(2));
+            assert_eq!(
+                ws.resolve_setting("mcp.extraServers", root),
+                serde_json::json!({"x": {}})
+            );
+        }
+        let layered = LayeredSettings::for_folder(&app);
+        assert_eq!(layered.get("editor.tabSize"), Some(&serde_json::json!(2)));
+        assert_eq!(layered.get("mcp.extraServers"), Some(&serde_json::json!({"x": {}})));
+    }
+
+    #[test]
+    fn settings_root_for_unlisted_folder_is_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_path(dir.path());
+        let listed = root.join("listed");
+        let loose = root.join("loose");
+        fs::create_dir_all(&listed).unwrap();
+        fs::create_dir_all(&loose).unwrap();
+        let doc = serde_json::json!({"folders": [{"path": listed}]});
+        fs::write(root.join("ws.gaviero-workspace"), doc.to_string()).unwrap();
+
+        assert_eq!(settings_root_for(&loose), loose);
+        let worktree = loose.join(".gaviero").join("worktrees").join("w1");
+        fs::create_dir_all(&worktree).unwrap();
+        assert_eq!(settings_root_for(&worktree), loose);
+        // A workspace file inside the folder itself is the one it opens.
+        fs::write(loose.join("own.gaviero-workspace"), r#"{"folders":[]}"#).unwrap();
+        assert_eq!(settings_root_for(&loose), loose);
     }
 
     #[test]
