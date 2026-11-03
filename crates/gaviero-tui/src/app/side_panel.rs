@@ -216,6 +216,19 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                         ));
                     }
                 }
+                // `p`: allow this and every later request until the next
+                // prompt is sent — shell commands included.
+                Action::InsertChar('p') | Action::InsertChar('P') => {
+                    if app.chat_state.grant_active_permission_for_turn_all() {
+                        crate::app::remote::desktop_answer_active_permission(app, true);
+                        app.status_message = Some((
+                            "All permissions allowed until the next prompt \
+                             (/permissions clear revokes)"
+                                .into(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
                 Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
                     crate::app::remote::desktop_answer_active_permission(app, false);
                 }
@@ -2108,8 +2121,10 @@ pub(crate) fn dispatch_prompt_core(
     {
         let conv = &mut app.chat_state.conversations[conv_idx];
         conv.pending_turn_id = Some(turn_id.clone());
-        // "Allow this MCP server for the rest of the prompt" ends here.
+        // "Allow this MCP server for the rest of the prompt" and "allow all
+        // for this prompt" end here.
         conv.turn_allowed_tools.clear();
+        conv.turn_allow_all = false;
         conv.pending_module_path = pending_module_path.clone();
         conv.pending_focused_folder = focused_folder.clone();
         conv.is_streaming = true;
