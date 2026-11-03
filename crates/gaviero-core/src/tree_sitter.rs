@@ -82,6 +82,11 @@ const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
         Some(|| tree_sitter_kotlin_ng::LANGUAGE.into()),
     ),
     (
+        &["ps1", "psm1", "psd1"],
+        "powershell",
+        Some(|| tree_sitter_powershell::LANGUAGE.into()),
+    ),
+    (
         &["gaviero"],
         "gaviero",
         Some(|| tree_sitter_gaviero::LANGUAGE.into()),

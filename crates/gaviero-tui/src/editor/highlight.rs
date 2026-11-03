@@ -62,6 +62,9 @@ fn bundled_highlight_query(lang: &str, _file: &str) -> Result<String> {
         "python" => Ok(include_str!("../../../../queries/python/highlights.scm").to_string()),
         "yaml" => Ok(include_str!("../../../../queries/yaml/highlights.scm").to_string()),
         "kotlin" => Ok(include_str!("../../../../queries/kotlin/highlights.scm").to_string()),
+        "powershell" => {
+            Ok(include_str!("../../../../queries/powershell/highlights.scm").to_string())
+        }
         "gaviero" => Ok(include_str!("../../../../queries/gaviero/highlights.scm").to_string()),
         _ => bail!("no bundled highlights.scm for {}", lang),
     }
@@ -369,6 +372,54 @@ mod tests {
             !spans.is_empty(),
             "should produce highlight spans for Kotlin code"
         );
+    }
+
+    #[test]
+    fn test_powershell_highlight_pipeline() {
+        use crate::theme::Theme;
+
+        for ext in ["ps1", "psm1", "psd1"] {
+            assert_eq!(
+                gaviero_core::tree_sitter::language_name_for_extension(ext),
+                Some("powershell"),
+                "{ext} should map to powershell"
+            );
+        }
+        let lang = gaviero_core::tree_sitter::language_for_extension("ps1")
+            .expect("should have powershell language");
+        let config = load_highlight_config(lang.clone(), "powershell")
+            .expect("should load powershell highlights");
+
+        let mut parser = gaviero_core::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let source = "# Greets a user\nfunction Get-Greeting {\n    param([string]$Name = 'World')\n    if ($Name -eq $null) { return }\n    $msg = \"Hello $Name\"\n    Write-Output $msg -NoEnumerate\n}\n$h = @{ Count = 42 }\nforeach ($i in 1..3) { Get-Greeting -Name $env:USERNAME }\n";
+        let rope = ropey::Rope::from_str(source);
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "powershell source must parse without errors: {}",
+            tree.root_node().to_sexp()
+        );
+
+        let theme = Theme::builtin_default();
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
+        let colored = |text: &str, group: &str| {
+            let start = source.find(text).expect("fixture text");
+            let fg = theme.highlight_style(group).and_then(|s| s.fg);
+            spans.iter().any(|s| {
+                s.start_byte <= start && s.end_byte >= start + text.len() && s.style.fg == fg
+            })
+        };
+        assert!(colored("# Greets a user", "comment"), "comment");
+        assert!(colored("function", "keyword.function"), "function keyword");
+        assert!(colored("Get-Greeting", "function"), "function name");
+        assert!(colored("param", "keyword"), "param keyword");
+        assert!(colored("'World'", "string"), "verbatim string");
+        assert!(colored("$Name", "variable"), "variable");
+        assert!(colored("-eq", "operator"), "comparison operator");
+        assert!(colored("$null", "constant.builtin"), "$null");
+        assert!(colored("Write-Output", "function.call"), "command name");
+        assert!(colored("42", "number"), "number");
     }
 
     #[test]
