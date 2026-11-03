@@ -43,6 +43,7 @@ pub(crate) mod remote;
 pub(crate) mod remote_files;
 pub(crate) mod remote_setup;
 mod render;
+mod restart;
 mod review;
 mod settings_overlay;
 pub(crate) mod session;
@@ -352,6 +353,11 @@ pub struct App {
     /// applied the clipboard contents; a lone leftover `\` (below the
     /// Paste coalescer's `RAW_PASTE_MIN_CHARS` bar) would otherwise append at EOF.
     pub windows_paste_settle_until: Option<std::time::Instant>,
+
+    /// Restart-on-new-build: watches the installed executable and quits to
+    /// restart once idle when a supervisor will relaunch us
+    /// ([`crate::supervisor`], `app/restart.rs`).
+    pub(crate) restart: restart::RestartState,
 }
 
 impl App {
@@ -595,6 +601,7 @@ impl App {
             last_clipboard_image_attach: None,
             last_text_paste: None,
             windows_paste_settle_until: None,
+            restart: restart::RestartState::new(),
         };
         emit_extra_root_skill_warnings(&mut app, &skill_load_warnings);
         turn_review::restore_on_startup(&mut app);
@@ -610,6 +617,15 @@ impl App {
             && let Some(frame) = projection::project_hot_event(self, &event)
         {
             self.remote.push_frame(frame);
+        }
+        // Any user gesture holds off restart-on-new-build for a while.
+        let user_input = match &event {
+            Event::Key(_) | Event::Paste(_) => true,
+            Event::Mouse(m) => !matches!(m.kind, crossterm::event::MouseEventKind::Moved),
+            _ => false,
+        };
+        if user_input {
+            self.restart.note_input();
         }
         controller::handle_event(self, event);
         // Settings-layer highlights for the active buffer: a hash check
@@ -1320,6 +1336,12 @@ impl App {
     }
 
     /// Save session state. Call before quitting.
+    /// The app quit because a new build is installed and a supervisor will
+    /// relaunch it — `main` exits with `supervisor::RESTART_EXIT_CODE`.
+    pub fn restart_requested(&self) -> bool {
+        self.restart.requested
+    }
+
     pub fn save_session(&self) {
         session::save_session(self);
     }

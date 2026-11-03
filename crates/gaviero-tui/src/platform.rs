@@ -154,6 +154,40 @@ pub fn install_console_ctrl_forwarder(
 ) {
 }
 
+/// Supervisor side (`supervisor::supervise`): swallow Ctrl+C / Ctrl+Break
+/// console events so they cannot terminate the parent while its TUI child
+/// owns the keyboard. A handler function rather than
+/// `SetConsoleCtrlHandler(NULL, TRUE)`, whose ignore flag would be inherited
+/// by the child and disable its own forwarder. Close / logoff / shutdown fall
+/// through, so closing the pane still ends both processes.
+#[cfg(windows)]
+pub fn ignore_console_interrupts() {
+    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+
+    unsafe extern "system" fn swallow(ctrl_type: u32) -> BOOL {
+        if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+
+    let ok = unsafe { SetConsoleCtrlHandler(Some(swallow), TRUE) };
+    if ok == 0 {
+        eprintln!(
+            "gaviero: SetConsoleCtrlHandler failed ({}); Ctrl+C may end the supervisor",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Unix: raw mode keeps Ctrl+C from ever becoming SIGINT while the TUI runs.
+#[cfg(not(windows))]
+pub fn ignore_console_interrupts() {}
+
 #[cfg(windows)]
 mod console_ctrl {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
