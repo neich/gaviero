@@ -493,13 +493,24 @@ impl AcpSession {
         // GAVIERO.md is in scope — the exclusion of Claude's own CLAUDE.md /
         // AGENTS.md discovery. One flag-level layer: above project/user
         // files, so project permissions still load and merge.
+        let guard_policy = crate::scope_enforcer::SensitivePolicy::resolve(cwd);
         let read_only_folders =
-            crate::agent_guard::read_only_folders_for(cwd, additional_roots);
+            crate::agent_guard::read_only_folders(&guard_policy, cwd, additional_roots);
         let read_only_refs: Vec<&Path> = read_only_folders.iter().map(PathBuf::as_path).collect();
+        // `agent.permissions.scratchFolders`: writable roots like the
+        // workspace siblings, so the sensitive-file denies are anchored there
+        // too, but no `Edit` deny.
+        let scratch_folders =
+            crate::agent_guard::scratch_folders(&guard_policy, cwd, additional_roots);
+        let writable_roots: Vec<&Path> = additional_roots
+            .iter()
+            .copied()
+            .chain(scratch_folders.iter().map(PathBuf::as_path))
+            .collect();
         cmd.arg("--settings").arg(
             crate::agent_guard::claude::claude_session_settings(
                 cwd,
-                additional_roots,
+                &writable_roots,
                 &read_only_refs,
                 options.skip_native_instructions,
                 crate::agent_guard::claude::read_block_outside(cwd),
@@ -591,6 +602,13 @@ impl AcpSession {
         // reads through `blockReadsOutsideWorkingDirectories`; the `Edit`
         // denies in `--settings` above keep them read-only.
         for folder in &read_only_folders {
+            cmd.arg("--add-dir").arg(folder);
+        }
+
+        // `agent.permissions.scratchFolders`: a working directory with no
+        // `Edit` deny, so reads, writes and Bash `cd` there run without the
+        // outside-working-directory prompt.
+        for folder in &scratch_folders {
             cmd.arg("--add-dir").arg(folder);
         }
 

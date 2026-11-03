@@ -76,21 +76,34 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
-    /// Resolve + confine a path argument to the workspace roots.
+    /// Resolve + confine a path argument to the writable roots: the
+    /// workspace roots plus `agent.permissions.scratchFolders`.
     pub fn confine(&self, arg: &str) -> Result<PathBuf> {
-        confine(arg, &self.workspace_root, &self.additional_roots)
+        let mut roots = self.additional_roots.clone();
+        roots.extend(self.scratch_folders());
+        confine(arg, &self.workspace_root, &roots)
     }
 
-    /// [`Self::confine`] for the read-only tools: the workspace roots plus
+    /// [`Self::confine`] for the read-only tools: the writable roots plus
     /// `agent.permissions.read.extraFolders`. Writes keep using `confine`.
     pub fn confine_read(&self, arg: &str) -> Result<PathBuf> {
         let mut roots = self.additional_roots.clone();
+        roots.extend(self.scratch_folders());
         roots.extend(crate::agent_guard::read_only_folders(
             &self.sensitive,
             &self.workspace_root,
             &self.additional_roots,
         ));
         confine(arg, &self.workspace_root, &roots)
+    }
+
+    /// `agent.permissions.scratchFolders` ([`crate::agent_guard::scratch_folders`]).
+    fn scratch_folders(&self) -> Vec<PathBuf> {
+        crate::agent_guard::scratch_folders(
+            &self.sensitive,
+            &self.workspace_root,
+            &self.additional_roots,
+        )
     }
 
     /// The scope + sensitive-path enforcer every fs tool checks against.

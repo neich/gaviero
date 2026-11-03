@@ -292,13 +292,17 @@ fn relative_slash(path: &Path, root: &Path) -> String {
 /// may never read, on top of the block-list and the hard floor
 /// ([`read_floor_match`]), and `agent.permissions.read.extraFolders`:
 /// folders outside the workspace agents may read but never write
-/// ([`crate::agent_guard::read_only_folders`]).
+/// ([`crate::agent_guard::read_only_folders`]), and
+/// `agent.permissions.scratchFolders`: folders outside the workspace agents
+/// may read and write without review ([`crate::agent_guard::scratch_folders`]).
 #[derive(Clone, Debug, Default)]
 pub struct SensitivePolicy {
     allow: Vec<String>,
     read_deny: Vec<String>,
     /// `agent.permissions.read.extraFolders`, resolved to absolute paths.
     read_folders: Vec<PathBuf>,
+    /// `agent.permissions.scratchFolders`, resolved to absolute paths.
+    scratch_folders: Vec<PathBuf>,
     /// Workspace root the policy was resolved for; anchors `read_deny` globs.
     root: Option<PathBuf>,
     /// The workspace-level `.gaviero` directory, when it holds a
@@ -367,6 +371,7 @@ impl SensitivePolicy {
         use crate::workspace::settings::{
             AGENT_PERMISSIONS_READ_DENY as READ_DENY,
             AGENT_PERMISSIONS_READ_EXTRA_FOLDERS as EXTRA_FOLDERS,
+            AGENT_PERMISSIONS_SCRATCH_FOLDERS as SCRATCH_FOLDERS,
             AGENT_PERMISSIONS_SENSITIVE_ALLOW as ALLOW,
         };
         let settings = crate::workspace::LayeredSettings::for_folder(workspace_root);
@@ -398,15 +403,26 @@ impl SensitivePolicy {
             policy.allow = list(ALLOW);
             // Each entry resolves against the layer that wrote it, since
             // `extraFolders+` can collect entries from several layers.
-            policy.read_folders = settings
-                .list_with_bases(EXTRA_FOLDERS)
-                .into_iter()
-                .filter_map(|(base, raw)| Some((base, raw.as_str()?)))
-                .filter(|(_, raw)| !raw.trim().is_empty())
-                .filter_map(|(base, raw)| resolve_read_folder(raw, base))
-                .collect();
+            let folders = |key| -> Vec<PathBuf> {
+                settings
+                    .list_with_bases(key)
+                    .into_iter()
+                    .filter_map(|(base, raw)| Some((base, raw.as_str()?)))
+                    .filter(|(_, raw)| !raw.trim().is_empty())
+                    .filter_map(|(base, raw)| resolve_read_folder(raw, base))
+                    .collect()
+            };
+            policy.read_folders = folders(EXTRA_FOLDERS);
+            policy.scratch_folders = folders(SCRATCH_FOLDERS);
         }
         policy
+    }
+
+    /// `agent.permissions.scratchFolders` as absolute paths, unfiltered.
+    /// Sessions use [`crate::agent_guard::scratch_folders`], which keeps
+    /// only existing folders outside the workspace.
+    pub fn scratch_folders(&self) -> &[PathBuf] {
+        &self.scratch_folders
     }
 
     /// The workspace-level `.gaviero` directory, when it holds a

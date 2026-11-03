@@ -162,6 +162,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scratch_folders_are_readable_and_writable() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("notes.md"), "hello\n").unwrap();
+        std::fs::write(scratch.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(
+            ws.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"scratchFolders":["../scratch"]}}}"#,
+        )
+        .unwrap();
+        let ctx = ToolCtx {
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&ws),
+            ..ctx_for(&ws)
+        };
+        let notes = scratch.join("notes.md");
+        let out = ReadTool
+            .run(json!({ "file_path": notes.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        // Sensitive files stay blocked inside a scratch folder.
+        let env = scratch.join(".env");
+        let out = ReadTool
+            .run(json!({ "file_path": env.to_string_lossy() }), &ctx)
+            .await;
+        assert!(out.is_error);
+        // Writes are confined to the workspace plus the scratch folder.
+        assert!(ctx.confine(&scratch.join("new/file.rs").to_string_lossy()).is_ok());
+        let elsewhere = dir.path().join("elsewhere.txt");
+        assert!(ctx.confine(&elsewhere.to_string_lossy()).is_err());
+    }
+
+    #[tokio::test]
     async fn reads_the_workspace_settings_file_but_not_its_state() {
         let dir = tempdir().unwrap();
         let (root, app, _lib) = crate::agent_guard::tests::workspace_layout(dir.path());

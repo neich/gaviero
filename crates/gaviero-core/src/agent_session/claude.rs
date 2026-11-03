@@ -421,8 +421,9 @@ impl ClaudeSession {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&found.render());
         }
-        if let Some(block) = crate::agent_guard::read_only_folders_block(
-            &crate::agent_guard::read_only_folders_for(&self.workspace_root, &self.additional_roots),
+        if let Some(block) = crate::agent_guard::outside_folders_prompt(
+            &self.workspace_root,
+            &self.additional_roots,
         ) {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&block);

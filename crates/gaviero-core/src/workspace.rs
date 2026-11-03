@@ -124,6 +124,13 @@ pub mod settings {
     /// Not workspace folders: no turn capture, indexing or memory scope.
     /// Read by [`crate::scope_enforcer::SensitivePolicy::resolve`]. Default: none.
     pub const AGENT_PERMISSIONS_READ_EXTRA_FOLDERS: &str = "agent.permissions.read.extraFolders";
+    /// Scratch folders outside the workspace that agents may read and write
+    /// like a workspace folder, without a permission prompt — for downloaded
+    /// packages, clones, git worktrees and experiments. Paths resolve like
+    /// `read.extraFolders`. Not workspace folders: no turn review, indexing,
+    /// memory scope or `GAVIERO.md` discovery.
+    /// See [`crate::agent_guard::scratch_folders`]. Default: none.
+    pub const AGENT_PERMISSIONS_SCRATCH_FOLDERS: &str = "agent.permissions.scratchFolders";
 
     // Egress settings (`crate::egress`)
     /// `off` | `log` | `ask` | `enforce` for the loopback egress proxy every
@@ -1660,6 +1667,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_PERMISSIONS_READ_DENY => serde_json::json!([]),
         settings::AGENT_PERMISSIONS_READ_BLOCK_OUTSIDE => serde_json::json!(true),
         settings::AGENT_PERMISSIONS_READ_EXTRA_FOLDERS => serde_json::json!([]),
+        settings::AGENT_PERMISSIONS_SCRATCH_FOLDERS => serde_json::json!([]),
         settings::AGENT_NETWORK_MODE => serde_json::json!("log"),
         settings::AGENT_NETWORK_ALLOW => serde_json::json!([
             "*.anthropic.com",
