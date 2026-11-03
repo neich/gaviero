@@ -65,7 +65,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Dependencies
 
-- `tree-sitter 0.25` + 16 grammars (incl. `tree-sitter-gaviero`).
+- `tree-sitter 0.25` + 17 grammars (incl. `tree-sitter-gaviero`, `tree-sitter-powershell`).
 - `git2 0.19` — worktrees, branches, diff.
 - `rusqlite 0.32` (bundled) + `sqlite-vec 0.1.8` — memory store.
 - `ort 2.0.0-rc.12` + `tokenizers 0.21` + `ndarray 0.17` — ONNX inference. `tokenizers` without default `esaxx_fast` (CRT `/MT` vs ort `/MD` on windows-msvc — see [Cargo.toml](Cargo.toml)).

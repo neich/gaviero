@@ -6,6 +6,7 @@ mod notify;
 mod panels;
 mod platform;
 mod setup;
+mod supervisor;
 mod theme;
 mod thinking;
 mod widgets;
@@ -201,8 +202,29 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Restart-on-new-build: the process a user starts supervises the real
+    // TUI and relaunches it in place after a deploy (`supervisor`). It runs
+    // before the runtime, logging, or argument parsing — the child does all
+    // of that.
+    if let Some(code) = supervisor::supervise() {
+        std::process::exit(code);
+    }
+
+    let restart = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run())?;
+    if restart {
+        std::process::exit(supervisor::RESTART_EXIT_CODE);
+    }
+    Ok(())
+}
+
+/// The TUI itself. Returns true when it quit to restart into a newly
+/// installed build.
+async fn run() -> Result<bool> {
     // Write tracing output to a log file (stderr is hidden in TUI mode)
     let log_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -310,7 +332,7 @@ async fn main() -> Result<()> {
                  Gaviero will not start until the upgrade is accepted \
                  or the affected memory.db files are removed."
             );
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -574,5 +596,5 @@ async fn main() -> Result<()> {
     restore_terminal().context("restoring terminal")?;
     terminal.show_cursor().context("showing cursor")?;
 
-    Ok(())
+    Ok(app.restart_requested())
 }

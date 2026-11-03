@@ -1771,6 +1771,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.tick_count = app.chat_state.tick_count.wrapping_add(1);
             }
             session::maybe_persist_composer(app);
+            super::restart::on_tick(app);
         }
     }
 }
