@@ -1418,6 +1418,25 @@ impl AgentChatState {
         }
     }
 
+    /// Record `rule` for the rest of conversation `idx`'s session (the
+    /// remote `a` / `A` answer).
+    pub fn grant_for_session_at(&mut self, idx: usize, rule: String) {
+        if let Some(conv) = self.conversations.get_mut(idx)
+            && !conv.session_allowed_tools.contains(&rule)
+        {
+            conv.session_allowed_tools.push(rule);
+        }
+    }
+
+    /// Allow every later request of conversation `idx` until its next
+    /// prompt (the remote `p` answer). The caller checks
+    /// [`PendingPermission::turn_allow_all_offered`] first.
+    pub fn grant_turn_all_at(&mut self, idx: usize) {
+        if let Some(conv) = self.conversations.get_mut(idx) {
+            conv.turn_allow_all = true;
+        }
+    }
+
     /// Record the `a` / `A` grant for the active conversation's pending
     /// request and return the rule, or `None` when it can't be granted for
     /// the session. Answering the request stays with the caller, through

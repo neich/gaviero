@@ -195,6 +195,61 @@ fn hello_machine_is_optional() {
     );
 }
 
+/// 1.6 `permission_request.grants` round-trips in wire spelling and is
+/// omitted when empty, so the ask fixture (no grants) still re-encodes
+/// byte-identically; every `PermissionGrant` is accepted by
+/// `permission_decision`.
+#[test]
+fn permission_grants_round_trip_and_are_optional() {
+    use gaviero_remote::dto::PermissionGrant;
+    use gaviero_remote::envelope::{ClientFrame, ServerFrame};
+
+    let text = fs::read_to_string(fixture_dir("server").join("permission_request.json")).unwrap();
+    let mut v: Value = serde_json::from_str(&text).unwrap();
+    let env: ServerEnvelope = serde_json::from_value(v.clone()).unwrap();
+    let ServerFrame::PermissionRequest(r) = &env.frame else {
+        panic!("expected permission_request");
+    };
+    assert!(r.grants.is_empty());
+
+    v["payload"]["tool_name"] = Value::from("mcp__flutter__hot_reload");
+    v["payload"].as_object_mut().unwrap().remove("ask");
+    v["payload"]["mcp_server"] = Value::from("flutter");
+    v["payload"]["grants"] = serde_json::json!([
+        "tool_session",
+        "mcp_server_session",
+        "mcp_server_turn",
+        "turn_all"
+    ]);
+    let env: ServerEnvelope = serde_json::from_value(v.clone()).unwrap();
+    let ServerFrame::PermissionRequest(r) = &env.frame else {
+        panic!("expected permission_request");
+    };
+    assert_eq!(
+        r.grants,
+        [
+            PermissionGrant::ToolSession,
+            PermissionGrant::McpServerSession,
+            PermissionGrant::McpServerTurn,
+            PermissionGrant::TurnAll,
+        ]
+    );
+    assert_eq!(serde_json::to_value(&env).unwrap(), v);
+
+    let text = fs::read_to_string(fixture_dir("client").join("permission_decision.json")).unwrap();
+    for grant in ["tool_session", "mcp_server_session", "mcp_server_turn", "turn_all"] {
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v["payload"].as_object_mut().unwrap().remove("answers");
+        v["payload"]["grant"] = Value::from(grant);
+        let env: ClientEnvelope = serde_json::from_value(v.clone()).unwrap();
+        let ClientFrame::PermissionDecision(d) = &env.frame else {
+            panic!("expected permission_decision");
+        };
+        assert!(d.grant.is_some(), "{grant}");
+        assert_eq!(serde_json::to_value(&env).unwrap(), v);
+    }
+}
+
 /// The `GET /v1/instances` body has its own fixture and round-trips.
 #[test]
 fn instances_fixture_round_trips() {

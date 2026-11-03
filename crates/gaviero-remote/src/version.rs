@@ -13,14 +13,17 @@ use serde::{Deserialize, Serialize};
 /// `permission_request.mcp_server` and `permission_decision.grant`. Minor 5
 /// is additive: optional `TurnReviewFile.folder` and
 /// `turn_review_action.folder` (no capability — a client groups by `folder`
-/// when files carry it, and echoes it only then).
+/// when files carry it, and echoes it only then). Minor 6 is additive: the
+/// `permission_grants` capability, optional `permission_request.grants`, and
+/// three more `PermissionGrant` values (`tool_session`,
+/// `mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -37,6 +40,9 @@ pub mod capability {
     /// 1.4: `permission_decision.grant = mcp_server_turn` allows every call
     /// to the request's `mcp_server` for the rest of the current prompt.
     pub const PERMISSION_TURN_GRANT: &str = "permission_turn_grant";
+    /// 1.6: `permission_request.grants` lists every grant the request accepts
+    /// (the desktop's `a` / `A` / `p` answers plus `mcp_server_turn`).
+    pub const PERMISSION_GRANTS: &str = "permission_grants";
 }
 
 /// Why a peer's version is unacceptable.
