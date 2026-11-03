@@ -241,6 +241,18 @@ pub fn session_rules_allow(rules: &[String], tool_name: &str) -> bool {
         })
 }
 
+/// Tool name the egress gateway raises its asks under
+/// ([`crate::app::egress`]). Network policy belongs to
+/// `agent.network.allow` in settings, so "allow all for this prompt" leaves
+/// those asks in place.
+const EGRESS_TOOL_NAME: &str = "Network";
+
+/// Whether a `p` grant (see [`Conversation::turn_allow_all`]) answers a
+/// request for `tool_name`.
+pub fn turn_allow_all_covers(tool_name: &str) -> bool {
+    tool_name != EGRESS_TOOL_NAME
+}
+
 /// A pending permission request from the agent subprocess.
 /// Held in `Conversation::pending_permission` while the user decides.
 pub struct PendingPermission {
@@ -306,6 +318,11 @@ impl PendingPermission {
         } else {
             Some(self.tool_name.clone())
         }
+    }
+
+    /// Whether `p` ("allow all for this prompt") is offered on this request.
+    pub fn turn_allow_all_offered(&self) -> bool {
+        !self.is_ask_user_question() && turn_allow_all_covers(&self.tool_name)
     }
 
     /// Word-wrapped body rows of the overlay: `(text, is_selected_option)`.
@@ -587,6 +604,12 @@ pub struct Conversation {
     /// the current prompt only (the remote "allow this MCP server" answer).
     /// Cleared when the next prompt is dispatched and by `/permissions clear`.
     pub turn_allowed_tools: Vec<String>,
+    /// `p` on a permission prompt: answer every later request of the current
+    /// prompt with allow — `Bash` and `acp` included, unlike the rules above.
+    /// Questions still ask (they need answers), and so do egress `Network`
+    /// asks (settings-owned network policy). Same lifetime as
+    /// `turn_allowed_tools`.
+    pub turn_allow_all: bool,
     /// Turn id assigned when the user message is dispatched. The same id
     /// ties prompt-time injection manifests to the completion extractor.
     pub pending_turn_id: Option<String>,
@@ -692,6 +715,7 @@ impl Conversation {
             pending_permission: None,
             session_allowed_tools: Vec::new(),
             turn_allowed_tools: Vec::new(),
+            turn_allow_all: false,
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -1193,6 +1217,7 @@ impl AgentChatState {
             pending_permission: None,
             session_allowed_tools: Vec::new(),
             turn_allowed_tools: Vec::new(),
+            turn_allow_all: false,
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -1351,9 +1376,26 @@ impl AgentChatState {
     ) -> bool {
         self.conversations.get(idx).is_some_and(|conv| {
             AskUserQuestionState::from_input(input).is_none()
-                && (session_rules_allow(&conv.session_allowed_tools, tool_name)
+                && ((conv.turn_allow_all && turn_allow_all_covers(tool_name))
+                    || session_rules_allow(&conv.session_allowed_tools, tool_name)
                     || session_rules_allow(&conv.turn_allowed_tools, tool_name))
         })
+    }
+
+    /// `p` on the active conversation's pending request: allow every later
+    /// request until the next prompt is dispatched. Returns `false` (and
+    /// grants nothing) when the request doesn't offer it. Answering the
+    /// request stays with the caller, through the shared reducer.
+    pub fn grant_active_permission_for_turn_all(&mut self) -> bool {
+        let conv = self.active_conversation_mut();
+        let offered = conv
+            .pending_permission
+            .as_ref()
+            .is_some_and(PendingPermission::turn_allow_all_offered);
+        if offered {
+            conv.turn_allow_all = true;
+        }
+        offered
     }
 
     /// The `mcp__<server>__*` rule a turn grant on conversation `idx`'s
@@ -2596,14 +2638,23 @@ impl AgentChatState {
                 };
                 let msg = match arg {
                     "" if conv.session_allowed_tools.is_empty()
-                        && conv.turn_allowed_tools.is_empty() =>
+                        && conv.turn_allowed_tools.is_empty()
+                        && !conv.turn_allow_all =>
                     {
                         "No tools allowed for this session. Press `a` on a permission \
-                         prompt to allow that tool, or `A` to allow its whole MCP server."
+                         prompt to allow that tool, `A` to allow its whole MCP server, \
+                         or `p` to allow everything until the next prompt."
                             .to_string()
                     }
                     "" => {
                         let mut sections = Vec::new();
+                        if conv.turn_allow_all {
+                            sections.push(
+                                "Every permission is allowed until the next prompt \
+                                 (questions and network asks still ask)."
+                                    .to_string(),
+                            );
+                        }
                         if !conv.session_allowed_tools.is_empty() {
                             sections.push(format!(
                                 "Allowed for this session (no prompt):\n{}",
@@ -2619,9 +2670,12 @@ impl AgentChatState {
                         format!("{}\n\n/permissions clear revokes them.", sections.join("\n\n"))
                     }
                     "clear" => {
-                        let n = conv.session_allowed_tools.len() + conv.turn_allowed_tools.len();
+                        let n = conv.session_allowed_tools.len()
+                            + conv.turn_allowed_tools.len()
+                            + usize::from(conv.turn_allow_all);
                         conv.session_allowed_tools.clear();
                         conv.turn_allowed_tools.clear();
+                        conv.turn_allow_all = false;
                         format!("Revoked {n} session permission(s); those tools will ask again.")
                     }
                     _ => "Usage: /permissions [clear]".to_string(),
@@ -4751,6 +4805,7 @@ impl AgentChatState {
                     pending_permission: None,
                     session_allowed_tools: Vec::new(),
                     turn_allowed_tools: Vec::new(),
+                    turn_allow_all: false,
                     pending_turn_id: None,
                     pending_module_path: None,
                     pending_focused_folder: None,
@@ -5547,6 +5602,11 @@ impl AgentChatState {
                     hx = write_text(buf, hx, hint_y, x_max, "A", key_style);
                     let label = format!("] All {server} tools ");
                     hx = write_text(buf, hx, hint_y, x_max, &label, text_style);
+                }
+                if perm.turn_allow_all_offered() {
+                    hx = write_text(buf, hx, hint_y, x_max, " [", text_style);
+                    hx = write_text(buf, hx, hint_y, x_max, "p", key_style);
+                    hx = write_text(buf, hx, hint_y, x_max, "] Allow all (this prompt) ", text_style);
                 }
                 write_text(buf, hx, hint_y, x_max, &scroll_hint, muted);
             }
@@ -8469,10 +8529,45 @@ mod tests {
         let mut state = AgentChatState::new();
         park_plain_permission(&mut state, "WebFetch");
         state.grant_active_permission_for_session(false);
+        park_plain_permission(&mut state, "Bash");
+        assert!(state.grant_active_permission_for_turn_all());
         state.text_input.text = "/permissions clear".to_string();
         state.text_input.cursor = state.text_input.text.len();
         assert!(state.process_slash_command());
         assert!(state.active_conversation().session_allowed_tools.is_empty());
+        assert!(!state.active_conversation().turn_allow_all);
+    }
+
+    #[test]
+    fn turn_allow_all_covers_shell_but_not_questions_or_egress() {
+        let mut state = AgentChatState::new();
+        let idx = state.active_conv;
+        let empty = serde_json::json!({});
+        park_plain_permission(&mut state, "Bash");
+        assert!(state.grant_active_permission_for_turn_all());
+        for tool in ["Bash", "acp", "WebFetch", "mcp__context7__query-docs"] {
+            assert!(state.session_allows_at(idx, tool, &empty), "{tool}");
+        }
+        assert!(!state.session_allows_at(idx, "Network", &empty));
+        let question = serde_json::json!({
+            "questions": [{"question": "Which?", "options": [{"label": "A"}]}]
+        });
+        assert!(!state.session_allows_at(idx, "AskUserQuestion", &question));
+        // Per conversation.
+        state.new_conversation();
+        assert!(!state.session_allows_at(state.active_conv, "Bash", &empty));
+    }
+
+    #[test]
+    fn turn_allow_all_is_not_offered_on_questions_or_egress() {
+        let mut state = AgentChatState::new();
+        park_plain_permission(&mut state, "Network");
+        assert!(!state.grant_active_permission_for_turn_all());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let conv_id = state.active_conversation_id().to_string();
+        state.set_pending_permission(&conv_id, ask_permission_with(tx));
+        assert!(!state.grant_active_permission_for_turn_all());
+        assert!(!state.active_conversation().turn_allow_all);
     }
 
     #[test]

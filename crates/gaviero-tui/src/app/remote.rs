@@ -1191,6 +1191,42 @@ mod tests {
         let _ = apply_interrupt(&mut app, &bg, None);
     }
 
+    #[tokio::test]
+    async fn allow_all_answers_every_request_until_the_next_prompt() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let idx = app.chat_state.find_conv_idx(&bg).unwrap();
+        let _first = park_permission(&mut app, &bg, "Bash");
+        app.chat_state.active_conv = idx;
+        assert!(app.chat_state.grant_active_permission_for_turn_all());
+        let id = parked_request_id(&app, &bg).unwrap();
+        apply_permission_decision(&mut app, &id, true, None, None, None, AnsweredBy::Desktop)
+            .expect("allow");
+
+        // Any later shell or tool request: answered without parking.
+        for tool in ["Bash", "acp", "WebFetch"] {
+            let mut rx = park_permission(&mut app, &bg, tool);
+            assert!(parked_request_id(&app, &bg).is_none(), "{tool}");
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(gaviero_core::observer::PermissionDecision::Allow { .. })
+            ));
+        }
+
+        // The next prompt ends the grant.
+        crate::app::side_panel::dispatch_prompt_core(
+            &mut app,
+            &bg,
+            "next prompt".into(),
+            Vec::new(),
+            false,
+        )
+        .expect("prompt must dispatch");
+        let _again = park_permission(&mut app, &bg, "Bash");
+        assert!(parked_request_id(&app, &bg).is_some(), "asks again");
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
     fn desktop_answer_active_permission_for(app: &mut App, request_id: &str) {
         apply_permission_decision(app, request_id, false, None, None, None, AnsweredBy::Desktop)
             .expect("deny");
