@@ -415,7 +415,11 @@ impl CodexAppServerSession {
         let primary_root = normalize_lexically(&args.workspace_root)
             .unwrap_or_else(|| args.workspace_root.clone());
         let mut allowed_roots = vec![primary_root.clone()];
-        for root in &args.additional_roots {
+        // Workspace siblings plus `agent.permissions.scratchFolders`: file
+        // changes are accepted in both.
+        let scratch =
+            crate::agent_guard::scratch_folders_for(&args.workspace_root, &args.additional_roots);
+        for root in args.additional_roots.iter().chain(scratch.iter()) {
             let Some(root) = normalize_lexically(root) else {
                 continue;
             };

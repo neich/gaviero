@@ -112,7 +112,11 @@ pub fn codex_thread_config(
         }
     }
     let read_only = super::read_only_folders(&policy, workspace_root, additional_roots);
-    for folder in &read_only {
+    // Scratch folders get the same sandbox access as the workspace roots
+    // under `:read-only`: readable; shell writes still ask, and file changes
+    // there are accepted by the session's allowed roots.
+    let scratch = super::scratch_folders(&policy, workspace_root, additional_roots);
+    for folder in read_only.iter().chain(scratch.iter()) {
         filesystem
             .entry(folder.to_string_lossy().replace('\\', "/"))
             .or_insert(json!("read"));
@@ -210,6 +214,24 @@ mod tests {
         let key = docs.to_string_lossy().replace('\\', "/");
         assert_eq!(fs[key.as_str()], "read");
         assert!(!fs.keys().any(|k| k.ends_with("/gone")));
+    }
+
+    #[test]
+    fn codex_thread_config_grants_read_on_scratch_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(
+            ws.join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"scratchFolders":["../scratch"]}}}"#,
+        )
+        .unwrap();
+        let v = codex_thread_config(&ws, &[], false);
+        let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
+        let key = scratch.to_string_lossy().replace('\\', "/");
+        assert_eq!(fs[key.as_str()], "read");
     }
 
     #[test]

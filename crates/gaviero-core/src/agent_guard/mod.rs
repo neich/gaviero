@@ -18,6 +18,13 @@
 //! The same list carries the `.gaviero` directory of the settings file
 //! itself when it lies outside every workspace folder (workspace mode), so
 //! an agent can read the policy that governs it without a permission prompt.
+//!
+//! `agent.permissions.scratchFolders` ([`scratch_folders`]) widens the
+//! writable set with folders outside the workspace where the agent works
+//! without prompts — downloads, clones, worktrees, experiments. Same
+//! exclusions as the read-only folders (no turn capture, indexing, memory
+//! scope or `GAVIERO.md`), but reads and writes are both allowed; the
+//! sensitive-file denies still apply inside them.
 
 pub mod claude;
 pub mod codex;
@@ -100,6 +107,107 @@ pub fn read_only_folders(
         out.push(dir);
     }
     out
+}
+
+/// The `agent.permissions.scratchFolders` a session over `workspace_root`
+/// plus `additional_roots` may read and write: existing directories,
+/// deduplicated, that neither lie inside nor contain a workspace folder. An
+/// entry inside one is already writable (and its writes reviewed); an entry
+/// containing one would let writes to that folder escape turn review. An
+/// entry inside a `read.extraFolders` folder is skipped too: the read-only
+/// rule wins there. Each skip logs a warning.
+///
+/// Unlike workspace folders, scratch folders get no turn capture, indexing,
+/// memory scope or `GAVIERO.md` discovery — they hold downloaded packages,
+/// clones and worktrees, which must not steer the agent or flood the review.
+pub fn scratch_folders(
+    policy: &SensitivePolicy,
+    workspace_root: &Path,
+    additional_roots: &[impl AsRef<Path>],
+) -> Vec<PathBuf> {
+    let roots = root_keys(workspace_root, additional_roots);
+    let read_only: Vec<String> = policy.read_folders().iter().map(|f| path_key(f)).collect();
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for folder in policy.scratch_folders() {
+        let key = path_key(folder);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let skip = if !folder.is_dir() {
+            Some("is not a directory")
+        } else if roots.iter().any(|r| within(&key, r) || within(r, &key)) {
+            Some("overlaps a workspace folder")
+        } else if read_only.iter().any(|r| within(&key, r)) {
+            Some("lies inside an agent.permissions.read.extraFolders entry")
+        } else {
+            None
+        };
+        if let Some(reason) = skip {
+            tracing::warn!(
+                target: "agent_guard",
+                folder = %folder.display(),
+                "agent.permissions.scratchFolders entry {reason}; skipped"
+            );
+            continue;
+        }
+        out.push(folder.clone());
+    }
+    out
+}
+
+/// [`scratch_folders`] for the policy governing `workspace_root`
+/// ([`SensitivePolicy::resolve`]).
+pub fn scratch_folders_for(
+    workspace_root: &Path,
+    additional_roots: &[impl AsRef<Path>],
+) -> Vec<PathBuf> {
+    scratch_folders(
+        &SensitivePolicy::resolve(workspace_root),
+        workspace_root,
+        additional_roots,
+    )
+}
+
+/// The system-prompt block naming the scratch folders, or `None` when there
+/// are none.
+pub fn scratch_folders_block(folders: &[PathBuf]) -> Option<String> {
+    if folders.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "<scratch_folders>\n\
+         These folders are outside the workspace and yours to use without asking: \
+         read, create, edit and delete files there, and run commands in them. \
+         Put downloaded packages, cloned repositories, git worktrees, throwaway \
+         scripts and experiments here instead of elsewhere outside the workspace. \
+         Changes here are not part of the user's review, so never use them to \
+         change the workspace itself.\n",
+    );
+    for folder in folders {
+        out.push_str(&format!("- {}\n", folder.display()));
+    }
+    out.push_str("</scratch_folders>");
+    Some(out)
+}
+
+/// The `<read_only_folders>` and `<scratch_folders>` blocks for a session
+/// over `workspace_root` plus `additional_roots`, joined, or `None` when
+/// neither applies.
+pub fn outside_folders_prompt(
+    workspace_root: &Path,
+    additional_roots: &[impl AsRef<Path>],
+) -> Option<String> {
+    let policy = SensitivePolicy::resolve(workspace_root);
+    let blocks: Vec<String> = [
+        read_only_folders_block(&read_only_folders(&policy, workspace_root, additional_roots)),
+        scratch_folders_block(&scratch_folders(&policy, workspace_root, additional_roots)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 /// The policy's `.gaviero` directory, when it exists and neither lies
@@ -227,6 +335,68 @@ pub(crate) mod tests {
         let ws = dir.path().join("ws");
         write_settings(&ws, &[]);
         assert!(read_only_folders_for(&ws, &[] as &[PathBuf]).is_empty());
+    }
+
+    fn write_scratch_settings(root: &Path, read: &[&str], scratch: &[&str]) {
+        std::fs::create_dir_all(root.join(".gaviero")).unwrap();
+        let doc = serde_json::json!({
+            "agent": {"permissions": {
+                "read": {"extraFolders": read},
+                "scratchFolders": scratch,
+            }}
+        });
+        std::fs::write(root.join(".gaviero/settings.json"), doc.to_string()).unwrap();
+    }
+
+    #[test]
+    fn scratch_folders_keep_existing_outside_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        write_scratch_settings(
+            &ws,
+            &[],
+            &[
+                scratch.to_str().unwrap(),
+                "../scratch",         // duplicate
+                "../missing",         // not a directory
+                "sub",                // inside the workspace folder
+                dir.path().to_str().unwrap(), // contains the workspace folder
+                "",
+            ],
+        );
+        assert_eq!(scratch_folders_for(&ws, &[] as &[PathBuf]), vec![scratch.clone()]);
+        // Scratch folders are not read-only folders.
+        assert!(read_only_folders_for(&ws, &[] as &[PathBuf]).is_empty());
+    }
+
+    #[test]
+    fn scratch_folders_skip_entries_inside_read_only_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(docs.join("play")).unwrap();
+        write_scratch_settings(&ws, &["../docs"], &["../docs/play"]);
+        assert!(scratch_folders_for(&ws, &[] as &[PathBuf]).is_empty());
+        assert_eq!(read_only_folders_for(&ws, &[] as &[PathBuf]), vec![docs]);
+    }
+
+    #[test]
+    fn outside_folders_prompt_joins_both_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(outside_folders_prompt(&ws, &[] as &[PathBuf]).is_none());
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scratch")).unwrap();
+        write_scratch_settings(&ws, &["../docs"], &["../scratch"]);
+        let prompt = outside_folders_prompt(&ws, &[] as &[PathBuf]).unwrap();
+        assert!(prompt.starts_with("<read_only_folders>"));
+        assert!(prompt.contains("<scratch_folders>"));
+        assert!(prompt.ends_with("</scratch_folders>"));
     }
 
     #[test]
