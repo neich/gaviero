@@ -143,7 +143,29 @@ pub(crate) fn permission_request_dto(
             .session_rule(true)
             .and_then(|_| crate::panels::agent_chat::mcp_server_of(&perm.tool_name))
             .map(str::to_string),
+        grants: permission_grants_offered(perm),
     }
+}
+
+/// 1.6: the grants `perm` accepts with an allow, in the desktop overlay's
+/// order (`a`, `A`, then the prompt-scoped ones). Same predicates the
+/// overlay and the reducer use, so the phone never offers a grant the
+/// server would refuse.
+pub(crate) fn permission_grants_offered(
+    perm: &crate::panels::agent_chat::PendingPermission,
+) -> Vec<rdto::PermissionGrant> {
+    let mut grants = Vec::new();
+    if perm.session_rule(false).is_some() {
+        grants.push(rdto::PermissionGrant::ToolSession);
+    }
+    if perm.session_rule(true).is_some() {
+        grants.push(rdto::PermissionGrant::McpServerSession);
+        grants.push(rdto::PermissionGrant::McpServerTurn);
+    }
+    if perm.turn_allow_all_offered() {
+        grants.push(rdto::PermissionGrant::TurnAll);
+    }
+    grants
 }
 
 fn hunk_status_dto(status: &gaviero_core::types::HunkStatus) -> rdto::HunkStatus {

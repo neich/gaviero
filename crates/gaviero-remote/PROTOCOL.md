@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.5 (1.0 frozen; 1.1 through 1.5 additive)
+# Gaviero Remote Protocol — v1.6 (1.0 frozen; 1.1 through 1.6 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 5 }
+PROTOCOL_VERSION  = { major: 1, minor: 6 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
@@ -165,7 +165,7 @@ holds the current token.
 | `client_hello` | `{ protocol_version, client_name, client_version }` |
 | `send_prompt` | `{ conv_id, text }` |
 | `slash` | `{ conv_id, line, confirmed }` — `confirmed: true` required for entries in `hello.confirm_required` |
-| `permission_decision` | `{ request_id, allow, answers?, message?, grant? }` — see Permission safety; `grant` since 1.4 (`permission_turn_grant`) |
+| `permission_decision` | `{ request_id, allow, answers?, message?, grant? }` — see Permission safety; `grant` since 1.4 (`permission_turn_grant`), more values since 1.6 (`permission_grants`) |
 | `review_action` | `{ proposal_id, proposal_revision, action, hunk_index? }` — `action ∈ accept_hunk \| reject_hunk \| accept_all \| reject_all \| finalize`; `hunk_index` required for the per-hunk actions |
 | `new_conversation` | `{ }` |
 | `switch_conversation` | `{ conv_id }` |
@@ -199,7 +199,7 @@ close 4006.
 | `streaming_ended` | `{ conv_id, turn_id, cancelled, error?, proposal_count }` |
 | `tool_call_started` | `{ conv_id, turn_id, tool_name }` |
 | `message_complete` | `{ conv_id, message: Message }` |
-| `permission_request` | `{ conv_id, request_id, tool_name, description, input, ask?, mcp_server? }` — `input` is display-only; `mcp_server` since 1.4 |
+| `permission_request` | `{ conv_id, request_id, tool_name, description, input, ask?, mcp_server?, grants? }` — `input` is display-only; `mcp_server` since 1.4; `grants` since 1.6 |
 | `permission_closed` | `{ conv_id, request_id, outcome, answered_by }` — `outcome ∈ allowed \| denied \| superseded \| cancelled`; `answered_by ∈ desktop \| remote \| system` |
 | `proposal_created` | `{ proposal: Proposal }` |
 | `proposal_updated` | `{ proposal: Proposal }` |
@@ -214,8 +214,8 @@ close 4006.
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`. Clients ignore unknown
-entries.
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`. Clients
+ignore unknown entries.
 
 ## DTOs
 
@@ -247,8 +247,10 @@ Message              { seq, role, content, truncated, full_bytes?, tool_calls: [
 CodeBlock            { start_byte, end_byte, language?, truncated, spans: [Span] }
 Span                 { start_byte, end_byte, class }
 
-PermissionRequest    { conv_id, request_id, tool_name, description, input, ask?, mcp_server? }
+PermissionRequest    { conv_id, request_id, tool_name, description, input, ask?, mcp_server?,
+                       grants? }                                 (grants 1.6)
 PermissionGrant      "mcp_server_turn"                                        (1.4)
+                   | "tool_session" | "mcp_server_session" | "turn_all"      (1.6)
 Ask                  { questions: [AskQuestion] }
 AskQuestion          { question, header, multi_select, options: [AskOption] }
 AskOption            { label, description }
@@ -497,6 +499,36 @@ of the current prompt.
 - `grant` with `allow: false`, or on a request without `mcp_server`, is `invalid_payload` and
   leaves the request parked. `permission_closed.outcome` is `allowed` as for a plain allow.
 - The grant never changes what executes: tool inputs are echoed unchanged, as for a plain allow.
+
+## Permission grants (`permission_grants` capability, 1.6)
+
+Servers advertising `permission_grants` accept every standing answer the desktop permission
+overlay offers, and say which ones apply to each request.
+
+- `permission_request.grants` lists the grants this request accepts, in the desktop's display
+  order; absent means none. Clients with this capability offer **exactly** these, beside plain
+  allow and deny, and never derive them from `tool_name` or `mcp_server`. Never present on an
+  `ask` request.
+
+  | grant | desktop key | allows without asking, on this conversation |
+  |---|---|---|
+  | `tool_session` | `a` | this `tool_name`, for the rest of the session |
+  | `mcp_server_session` | `A` | every `mcp__<server>__*` tool, for the rest of the session |
+  | `mcp_server_turn` | — (1.4) | every `mcp__<server>__*` tool, until the next prompt |
+  | `turn_all` | `p` | every later request — shell (`Bash`) and `acp` prompts included — until the next prompt |
+
+- Session grants are never offered on `Bash` or `acp` (a blanket yes); `turn_all` is never
+  offered on an egress `Network` ask (network policy belongs to settings), and a `turn_all`
+  grant still lets questions and `Network` asks through to the user. "Until the next prompt"
+  ends when the conversation's next prompt is dispatched from either side; desktop
+  `/permissions clear` revokes every grant.
+- A `grant` the request does not list, or any `grant` with `allow: false`, is `invalid_payload`
+  and leaves the request parked. `permission_closed.outcome` is `allowed` as for a plain allow;
+  requests answered by a grant produce no `permission_request` frame.
+- A grant never changes what executes: tool inputs are echoed unchanged.
+
+Compatibility: a 1.4/1.5 client ignores `grants` and keeps offering `mcp_server_turn` from
+`mcp_server`, which 1.6 servers still send.
 
 ## Turn review folders (1.5)
 

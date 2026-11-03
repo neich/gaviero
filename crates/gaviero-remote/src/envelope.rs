@@ -108,8 +108,9 @@ pub struct PermissionDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// 1.4 (`permission_turn_grant`): with `allow`, also answer later
-    /// requests covered by the grant without asking. Only valid on a
-    /// request that carries `mcp_server`.
+    /// requests covered by the grant without asking. Only valid when the
+    /// request offers it: `mcp_server_turn` needs `mcp_server`; since 1.6
+    /// (`permission_grants`) any value listed in `permission_request.grants`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<PermissionGrant>,
 }

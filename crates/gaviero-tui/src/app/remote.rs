@@ -351,12 +351,23 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
 
 // ── Permission decisions (§2.2 / §5.3) ──────────────────────────────
 
+/// What a validated `grant` records once the request is answered.
+enum StandingGrant {
+    /// A `session_allowed_tools` rule (`a` / `A`).
+    Session(String),
+    /// A `turn_allowed_tools` rule (`mcp_server_turn`).
+    Turn(String),
+    /// `turn_allow_all` (`p`).
+    TurnAll,
+}
+
 /// Shared permission reducer. Both the desktop y/n keys and remote
 /// `permission_decision` land here; first valid writer wins, the loser
 /// finds no parked request (`stale_request`), and every close emits one
 /// `permission_closed` with `answered_by`.
 ///
-/// `grant` (1.4) also allows the request's whole MCP server until the
+/// `grant` (1.4, widened in 1.6) also records a standing allow — this tool
+/// or its MCP server for the session, the MCP server or everything until the
 /// conversation's next prompt; it is checked before the request is consumed,
 /// so an invalid grant leaves the request parked.
 pub fn apply_permission_decision(
@@ -383,22 +394,42 @@ pub fn apply_permission_decision(
             "no pending permission with that id — the other side answered first",
         ));
     };
-    let turn_rule = match grant {
+    // Resolved before the request is consumed so a refused grant leaves it
+    // parked. Each check is the predicate the desktop overlay offers the key
+    // by (`projection::permission_grants_offered` lists the same ones).
+    let standing = match grant {
         None => None,
-        Some(PermissionGrant::McpServerTurn) => {
-            if !allow {
+        Some(_) if !allow => {
+            return Err(CommandFailure::new(
+                ErrorCode::InvalidPayload,
+                "grant is only valid with allow",
+            ));
+        }
+        Some(grant) => {
+            let pending = app.chat_state.conversations[idx]
+                .pending_permission
+                .as_ref();
+            let standing = match grant {
+                PermissionGrant::ToolSession => pending
+                    .and_then(|p| p.session_rule(false))
+                    .map(StandingGrant::Session),
+                PermissionGrant::McpServerSession => pending
+                    .and_then(|p| p.session_rule(true))
+                    .map(StandingGrant::Session),
+                PermissionGrant::McpServerTurn => {
+                    app.chat_state.turn_grant_rule_at(idx).map(StandingGrant::Turn)
+                }
+                PermissionGrant::TurnAll => pending
+                    .is_some_and(|p| p.turn_allow_all_offered())
+                    .then_some(StandingGrant::TurnAll),
+            };
+            let Some(standing) = standing else {
                 return Err(CommandFailure::new(
                     ErrorCode::InvalidPayload,
-                    "grant is only valid with allow",
-                ));
-            }
-            let Some(rule) = app.chat_state.turn_grant_rule_at(idx) else {
-                return Err(CommandFailure::new(
-                    ErrorCode::InvalidPayload,
-                    "this request is not an MCP tool call that can be granted server-wide",
+                    "this request does not offer that grant",
                 ));
             };
-            Some(rule)
+            Some(standing)
         }
     };
     match app
@@ -406,9 +437,20 @@ pub fn apply_permission_decision(
         .respond_permission_at(idx, allow, answers, message.as_deref())
     {
         Ok(info) => {
-            if let Some(rule) = turn_rule {
-                tracing::info!("Permission rule '{rule}' granted for the rest of the prompt");
-                app.chat_state.grant_for_turn_at(idx, rule);
+            match standing {
+                None => {}
+                Some(StandingGrant::Session(rule)) => {
+                    tracing::info!("Permission rule '{rule}' granted for the session");
+                    app.chat_state.grant_for_session_at(idx, rule);
+                }
+                Some(StandingGrant::Turn(rule)) => {
+                    tracing::info!("Permission rule '{rule}' granted for the rest of the prompt");
+                    app.chat_state.grant_for_turn_at(idx, rule);
+                }
+                Some(StandingGrant::TurnAll) => {
+                    tracing::info!("Every permission granted for the rest of the prompt");
+                    app.chat_state.grant_turn_all_at(idx);
+                }
             }
             let closed = PermissionClosed {
                 conv_id: info.conv_id,
@@ -1224,6 +1266,176 @@ mod tests {
         .expect("prompt must dispatch");
         let _again = park_permission(&mut app, &bg, "Bash");
         assert!(parked_request_id(&app, &bg).is_some(), "asks again");
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    fn projected_request(app: &App, conv_id: &str) -> gaviero_remote::dto::PermissionRequest {
+        app.remote
+            .pending_frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                ServerFrame::PermissionRequest(r) if r.conv_id == conv_id => Some(r.clone()),
+                _ => None,
+            })
+            .expect("the parked request is projected")
+    }
+
+    /// 1.6: each request lists exactly the desktop keys its overlay shows.
+    #[tokio::test]
+    async fn projected_grants_mirror_the_desktop_overlay() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let cases: [(&str, &[PermissionGrant]); 4] = [
+            (
+                "mcp__flutter__hot_reload",
+                &[
+                    PermissionGrant::ToolSession,
+                    PermissionGrant::McpServerSession,
+                    PermissionGrant::McpServerTurn,
+                    PermissionGrant::TurnAll,
+                ],
+            ),
+            ("WebFetch", &[PermissionGrant::ToolSession, PermissionGrant::TurnAll]),
+            ("Bash", &[PermissionGrant::TurnAll]),
+            // Egress asks: `a` as on the desktop, never `p`.
+            ("Network", &[PermissionGrant::ToolSession]),
+        ];
+        for (tool, expected) in cases {
+            let _rx = park_permission(&mut app, &bg, tool);
+            let projected = projected_request(&app, &bg);
+            assert_eq!(projected.tool_name, tool);
+            assert_eq!(projected.grants, expected, "{tool}");
+            desktop_answer_active_permission_for(&mut app, &projected.request_id);
+        }
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    /// Remote `p`: shell and tool requests are answered without parking
+    /// until the next prompt, exactly as the desktop key.
+    #[tokio::test]
+    async fn remote_turn_all_allows_everything_until_the_next_prompt() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let _first = park_permission(&mut app, &bg, "Bash");
+        let id = parked_request_id(&app, &bg).unwrap();
+        let closed = apply_permission_decision(
+            &mut app,
+            &id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::TurnAll),
+            AnsweredBy::Remote,
+        )
+        .expect("turn_all accepted");
+        assert_eq!(closed.outcome, PermissionOutcome::Allowed);
+        for tool in ["Bash", "acp", "mcp__flutter__hot_reload"] {
+            let mut rx = park_permission(&mut app, &bg, tool);
+            assert!(parked_request_id(&app, &bg).is_none(), "{tool}");
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(gaviero_core::observer::PermissionDecision::Allow { .. })
+            ));
+        }
+        // Egress asks stay with settings-owned network policy.
+        let _net = park_permission(&mut app, &bg, "Network");
+        let net_id = parked_request_id(&app, &bg).expect("Network still asks");
+        let err = apply_permission_decision(
+            &mut app,
+            &net_id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::TurnAll),
+            AnsweredBy::Remote,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPayload);
+        desktop_answer_active_permission_for(&mut app, &net_id);
+
+        crate::app::side_panel::dispatch_prompt_core(
+            &mut app,
+            &bg,
+            "next prompt".into(),
+            Vec::new(),
+            false,
+        )
+        .expect("prompt must dispatch");
+        let _again = park_permission(&mut app, &bg, "Bash");
+        assert!(parked_request_id(&app, &bg).is_some(), "asks again");
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+
+    /// Remote `a` / `A`: session rules that outlive the next prompt; `Bash`
+    /// is never session-grantable.
+    #[tokio::test]
+    async fn remote_session_grants_outlive_the_prompt() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let idx = app.chat_state.find_conv_idx(&bg).unwrap();
+
+        let _rx = park_permission(&mut app, &bg, "Bash");
+        let id = parked_request_id(&app, &bg).unwrap();
+        let err = apply_permission_decision(
+            &mut app,
+            &id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::ToolSession),
+            AnsweredBy::Remote,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPayload);
+        assert_eq!(parked_request_id(&app, &bg), Some(id.clone()), "still parked");
+        desktop_answer_active_permission_for(&mut app, &id);
+
+        let _rx = park_permission(&mut app, &bg, "WebFetch");
+        let id = parked_request_id(&app, &bg).unwrap();
+        apply_permission_decision(
+            &mut app,
+            &id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::ToolSession),
+            AnsweredBy::Remote,
+        )
+        .expect("tool_session accepted");
+        let _rx = park_permission(&mut app, &bg, "mcp__flutter__hot_reload");
+        let id = parked_request_id(&app, &bg).unwrap();
+        apply_permission_decision(
+            &mut app,
+            &id,
+            true,
+            None,
+            None,
+            Some(PermissionGrant::McpServerSession),
+            AnsweredBy::Remote,
+        )
+        .expect("mcp_server_session accepted");
+        assert_eq!(
+            app.chat_state.conversations[idx].session_allowed_tools,
+            vec!["WebFetch".to_string(), "mcp__flutter__*".to_string()]
+        );
+
+        crate::app::side_panel::dispatch_prompt_core(
+            &mut app,
+            &bg,
+            "next prompt".into(),
+            Vec::new(),
+            false,
+        )
+        .expect("prompt must dispatch");
+        for tool in ["WebFetch", "mcp__flutter__screenshot"] {
+            let mut rx = park_permission(&mut app, &bg, tool);
+            assert!(parked_request_id(&app, &bg).is_none(), "{tool}");
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(gaviero_core::observer::PermissionDecision::Allow { .. })
+            ));
+        }
         let _ = apply_interrupt(&mut app, &bg, None);
     }
 

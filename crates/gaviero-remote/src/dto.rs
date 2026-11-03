@@ -214,15 +214,30 @@ pub struct PermissionRequest {
     /// can be answered with `grant: mcp_server_turn`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
+    /// 1.6 (`permission_grants`): every `grant` this request accepts with an
+    /// allow, in the desktop's display order. Absent ⇒ none (or an older
+    /// server). Never offered on an `ask` request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<PermissionGrant>,
 }
 
-/// Standing grant attached to an allow (1.4, `permission_turn_grant`).
+/// Standing grant attached to an allow (1.4, `permission_turn_grant`;
+/// the session and `turn_all` values since 1.6, `permission_grants`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionGrant {
+    /// 1.6: this tool, for the rest of the conversation (desktop `a`).
+    ToolSession,
+    /// 1.6: every tool of the request's `mcp_server`, for the rest of the
+    /// conversation (desktop `A`).
+    McpServerSession,
     /// Every tool of the request's `mcp_server`, until the conversation's
     /// next prompt is dispatched.
     McpServerTurn,
+    /// 1.6: every later request of the conversation — shell and `acp`
+    /// prompts included, questions and egress `Network` asks excepted —
+    /// until its next prompt is dispatched (desktop `p`).
+    TurnAll,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
