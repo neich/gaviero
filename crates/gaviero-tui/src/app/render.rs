@@ -65,6 +65,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if app.definition_picker.is_some() {
             super::nav::render_picker(app, frame, size);
         }
+        render_new_build_popup(app, frame, size);
         return;
     }
 
@@ -220,6 +221,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.definition_picker.is_some() {
         super::nav::render_picker(app, frame, size);
     }
+    render_new_build_popup(app, frame, size);
 }
 
 pub(super) fn render_fullscreen(app: &mut App, frame: &mut Frame, area: Rect, panel: Focus) {
@@ -1895,6 +1897,41 @@ pub(super) fn render_syntax_error_dialog(app: &App, frame: &mut Frame, area: Rec
         area,
         &lines,
         "Saved",
+        bg_style,
+        title_style,
+        hint_style,
+    );
+}
+
+/// Render the "new version installed, restart manually" popup
+/// (`app/restart.rs`). Any key dismisses it.
+pub(super) fn render_new_build_popup(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(why) = app.restart.popup() else {
+        return;
+    };
+    // Same fitting as the syntax modal: border + margin columns.
+    let width = (area.width as usize).saturating_sub(8).min(96);
+    let mut lines = Vec::new();
+    for line in super::restart::popup_lines(why) {
+        if line.is_empty() {
+            lines.push(line);
+        } else {
+            lines.extend(wrap_modal_text(&line, width));
+        }
+    }
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let title_style = Style::default()
+        .fg(theme::FOCUS_BORDER)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+    draw_modal_box(
+        frame,
+        area,
+        &lines,
+        // Styles the headline line (`draw_modal_box` matches by prefix).
+        "A new version of gaviero",
         bg_style,
         title_style,
         hint_style,

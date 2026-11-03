@@ -64,6 +64,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 super::session::handle_syntax_error_key(app, &key);
                 return;
             }
+            // "New version installed, restart manually" — informational.
+            if app.restart.popup_open {
+                super::restart::handle_popup_key(app);
+                return;
+            }
             if app.focus == Focus::Terminal
                 && !app.has_active_review()
                 && let Some(inst) = app.terminal_manager.active_instance()
@@ -217,6 +222,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.has_active_review()
                 || app.settings_error_dialog.is_some()
                 || app.syntax_error_dialog.is_some()
+                || app.restart.popup_open
             {
                 return;
             }
@@ -234,7 +240,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_paste(&text);
         }
         Event::Mouse(mouse) => {
-            if app.settings_error_dialog.is_none() && app.syntax_error_dialog.is_none() {
+            if app.settings_error_dialog.is_none()
+                && app.syntax_error_dialog.is_none()
+                && !app.restart.popup_open
+            {
                 app.handle_mouse(mouse);
             }
         }
