@@ -47,6 +47,36 @@ fn kinds(set: &TurnChangeSet) -> Vec<(String, ChangeKind)> {
     set.files.iter().map(|c| (c.rel.clone(), c.kind)).collect()
 }
 
+/// Make the blob store unwritable: a plain file where `objects/` must go.
+fn break_store(w: &Ws) {
+    let objects = w.root.join(".gaviero/turns/objects");
+    let _ = std::fs::remove_dir_all(&objects);
+    std::fs::create_dir_all(objects.parent().unwrap()).unwrap();
+    std::fs::write(&objects, "not a directory").unwrap();
+}
+
+#[test]
+fn begin_fails_when_the_blob_store_cannot_be_written() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    break_store(&w);
+    // An error sends the caller to the Write Gate; an Ok with `a.txt`
+    // missing from the baseline would let edits to it land unreviewed.
+    assert!(w.cap.begin("t1", Some("conv"), w.scope()).is_err());
+}
+
+#[test]
+fn a_store_that_breaks_mid_turn_still_reports_the_change() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    let h = w.cap.begin("t1", Some("conv"), w.scope()).unwrap();
+    w.write("a.txt", "v2\n");
+    break_store(&w);
+    let set = w.cap.end(h, TurnOutcome::Completed).unwrap().set;
+    assert_eq!(kinds(&set), vec![("a.txt".into(), ChangeKind::Modified)]);
+    assert!(set.warnings.iter().any(|m| m.contains("without its content")));
+}
+
 #[test]
 fn detects_add_modify_delete_rename_made_by_anything() {
     let w = ws();
