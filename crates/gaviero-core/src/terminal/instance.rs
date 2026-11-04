@@ -246,6 +246,25 @@ impl TerminalInstance {
         self.shell_state = ShellState::Finished { exit_code };
     }
 
+    /// The most recent distinct commands in this tab's shell history, oldest
+    /// first — what ↑ at its prompt walks through
+    /// ([`super::history::recent_commands`]).
+    ///
+    /// With shell integration the init script points the shell at
+    /// `history_file_for(id)`, overriding any `HISTFILE` a restored session
+    /// carried; without it only `HISTFILE` applies.
+    pub fn recent_commands(&self, limit: usize) -> Vec<String> {
+        let path = if self.shell_config.enable_integration {
+            super::history::history_file_for(&self.id)
+        } else {
+            match self.shell_config.env_overrides.get("HISTFILE") {
+                Some(path) => PathBuf::from(path),
+                None => return Vec::new(),
+            }
+        };
+        super::history::recent_commands(&path, &self.shell_config.shell_type, limit)
+    }
+
     /// Get the last N lines of terminal content as plain text.
     fn recent_output_preview(&self, max_lines: usize) -> String {
         let contents = self.parser.screen().contents();
