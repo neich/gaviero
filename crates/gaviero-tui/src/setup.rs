@@ -1,19 +1,22 @@
 //! First-run setup screen.
 //!
-//! Runs, at every launch, while a folder has no `.gaviero/settings.json` —
-//! or, with `--workspace`, while a directory has no `.gaviero-workspace` file.
+//! Runs, at every launch, while the launch target is unconfigured:
+//! - a folder without `.gaviero/settings.json`;
+//! - a `.gaviero-workspace` file (given directly, or found by `--workspace`)
+//!   without `.gaviero/settings.json` beside it — the workspace layer;
+//! - `--workspace` on a directory without a `.gaviero-workspace` file, which
+//!   first picks the member folders and writes that file.
 //!
-//! Folder mode is one screen with three choices:
-//! 1. **Editor only** (preselected; also Esc) — write nothing and open an
+//! Every mode then offers the same three choices for that one
+//! `.gaviero/settings.json` (the folder's, or the one beside the workspace
+//! file, which every member inherits):
+//! 1. **Editor only** (preselected; also Esc) — write no settings and open an
 //!    editor-only session: explorer, find, editor and terminal; no agents,
 //!    memory or code graph. Settings come from the global file.
 //! 2. **Minimal settings** — `.gaviero/settings.json` containing `{}`.
 //! 3. **Full settings** — `.gaviero/settings.json` as a byte-for-byte copy of
 //!    `$GAVIERO_ROOT/.gaviero/settings.json` as it is right now; when that
 //!    file does not exist, gaviero's built-in full settings instead.
-//!
-//! `--workspace` picks the member folders, then which of 2 / 3 each member's
-//! `.gaviero/settings.json` gets.
 //!
 //! Only the highlighted option's description is drawn, so all three titles
 //! fit even a short terminal pane.
@@ -57,19 +60,35 @@ const SKIP_DIRS: &[&str] = &[
 const MINIMAL_SETTINGS: &str = "{}\n";
 
 /// How the TUI was launched, which decides what the screen offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchMode {
-    /// Single folder — editor only, or `<root>/.gaviero/settings.json`.
+    /// Single folder — settings go to `<root>/.gaviero/settings.json`.
     Folder,
-    /// `--workspace` — writes `<root>/<name>.gaviero-workspace` plus each
-    /// member's `.gaviero/settings.json`.
+    /// `--workspace` on a directory without a workspace file — picks the
+    /// members and writes `<root>/<name>.gaviero-workspace`; settings go to
+    /// `<root>/.gaviero/settings.json`, beside it.
     Workspace,
+    /// An existing `.gaviero-workspace` file — settings go to
+    /// `.gaviero/settings.json` beside it.
+    OpenWorkspace(PathBuf),
+}
+
+impl LaunchMode {
+    /// Pick the mode for a launch: an existing workspace file (given directly
+    /// or found by `--workspace`) wins, then `--workspace`, else folder mode.
+    pub fn for_launch(workspace_file: Option<&Path>, workspace_flag: bool) -> Self {
+        match workspace_file {
+            Some(file) => LaunchMode::OpenWorkspace(file.to_path_buf()),
+            None if workspace_flag => LaunchMode::Workspace,
+            None => LaunchMode::Folder,
+        }
+    }
 }
 
 /// One option on the choice screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
-    /// Write nothing; open an editor-only session. Folder mode only.
+    /// Write no settings; open an editor-only session.
     EditorOnly,
     /// `.gaviero/settings.json` containing `{}`.
     Minimal,
@@ -108,31 +127,32 @@ struct FolderCandidate {
 /// What the screen decided, handed back to `main`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetupOutcome {
-    /// Path of the `.gaviero-workspace` file written, if any. `None` means
-    /// single-folder mode — open the launch directory.
+    /// The `.gaviero-workspace` file to open — the one opened, or the one
+    /// just written. `None` means single-folder mode: open the launch
+    /// directory.
     pub workspace_file: Option<PathBuf>,
     /// Open an editor-only session: no agents, memory, code graph, MCP or
-    /// remote, and nothing written to the folder.
+    /// remote, and no settings written.
     pub editor_only: bool,
 }
 
-impl SetupOutcome {
-    fn editor_only() -> Self {
-        Self {
-            workspace_file: None,
-            editor_only: true,
-        }
-    }
+/// `.gaviero/settings.json` under `dir`.
+fn settings_file(dir: &Path) -> PathBuf {
+    dir.join(".gaviero").join("settings.json")
 }
 
 /// Does this launch target still need the setup screen?
 ///
-/// Folder mode is "configured" once `<root>/.gaviero/settings.json` exists;
-/// workspace mode once any `*.gaviero-workspace` file sits in the directory.
-pub fn needs_setup(root: &Path, mode: LaunchMode) -> bool {
+/// A folder is "configured" once `<root>/.gaviero/settings.json` exists; a
+/// workspace file once `.gaviero/settings.json` sits beside it; `--workspace`
+/// on a directory needs the screen while it has no workspace file at all.
+pub fn needs_setup(root: &Path, mode: &LaunchMode) -> bool {
     match mode {
-        LaunchMode::Folder => !root.join(".gaviero").join("settings.json").exists(),
+        LaunchMode::Folder => !settings_file(root).exists(),
         LaunchMode::Workspace => existing_workspace_file(root).is_none(),
+        LaunchMode::OpenWorkspace(file) => {
+            !settings_file(file.parent().unwrap_or(Path::new("."))).exists()
+        }
     }
 }
 
@@ -153,7 +173,9 @@ pub fn existing_workspace_file(root: &Path) -> Option<PathBuf> {
     matches.into_iter().next()
 }
 
-/// Run the setup screen and write whatever was chosen.
+/// Run the setup screen and write whatever was chosen. `root` is the launch
+/// directory (ignored for [`LaunchMode::OpenWorkspace`], whose directory is
+/// the workspace file's).
 pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
     let mut wizard = Wizard::new(root, mode, gaviero_core::workspace::user_settings_path());
 
@@ -188,7 +210,7 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
     let _ = disable_raw_mode();
 
     match result? {
-        Flow::EditorOnly => Ok(SetupOutcome::editor_only()),
+        Flow::EditorOnly => Ok(wizard.untouched_outcome()),
         _ => wizard.apply(),
     }
 }
@@ -197,9 +219,10 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
     Continue,
-    /// Open editor-only without writing anything.
+    /// Esc: open editor-only without writing anything at all.
     EditorOnly,
-    /// Write the chosen settings.
+    /// Apply the chosen option (editor-only included: with `--workspace` it
+    /// still writes the workspace file the folder step built).
     Apply,
 }
 
@@ -226,6 +249,11 @@ struct Wizard {
 impl Wizard {
     /// `global` is the global settings path; only an existing file counts.
     fn new(root: &Path, mode: LaunchMode, global_path: Option<PathBuf>) -> Self {
+        // An opened workspace file's settings live beside it.
+        let root = match &mode {
+            LaunchMode::OpenWorkspace(file) => file.parent().unwrap_or(root),
+            _ => root,
+        };
         let global = global_path.clone().filter(|p| p.is_file());
         tracing::info!(
             "first-run setup: global settings {} ({})",
@@ -271,15 +299,21 @@ impl Wizard {
     }
 
     /// Options on the choice screen, in display order (the first is
-    /// preselected).
+    /// preselected). The same in every mode.
     fn choices(&self) -> Vec<Choice> {
-        let mut list = Vec::with_capacity(3);
-        if self.mode == LaunchMode::Folder {
-            list.push(Choice::EditorOnly);
+        vec![Choice::EditorOnly, Choice::Minimal, Choice::Full]
+    }
+
+    /// Esc: open editor-only and write nothing — the opened workspace file
+    /// if there is one, else the launch directory as a single folder.
+    fn untouched_outcome(&self) -> SetupOutcome {
+        SetupOutcome {
+            workspace_file: match &self.mode {
+                LaunchMode::OpenWorkspace(file) => Some(file.clone()),
+                _ => None,
+            },
+            editor_only: true,
         }
-        list.push(Choice::Minimal);
-        list.push(Choice::Full);
-        list
     }
 
     fn move_choice(&mut self, delta: isize) {
@@ -291,11 +325,7 @@ impl Wizard {
 
     /// The flow that commits the current choice.
     fn commit(&self) -> Flow {
-        if self.choice == Choice::EditorOnly {
-            Flow::EditorOnly
-        } else {
-            Flow::Apply
-        }
+        Flow::Apply
     }
 
     /// Workspace mode with no sub-directories has nothing to pick, so the
@@ -396,53 +426,65 @@ impl Wizard {
             .join(format!("{}.gaviero-workspace", dir_name(&self.root)))
     }
 
-    /// Folders whose `.gaviero/settings.json` the current choice writes.
-    fn settings_folders(&self) -> Vec<PathBuf> {
-        match self.mode {
-            LaunchMode::Folder => vec![self.root.clone()],
-            LaunchMode::Workspace => self.workspace_members(),
+    /// The one `.gaviero/settings.json` a settings choice writes: the
+    /// folder's own, or the workspace layer beside the workspace file —
+    /// which every member folder inherits.
+    fn settings_target(&self) -> PathBuf {
+        settings_file(&self.root)
+    }
+
+    /// The `.gaviero-workspace` file this launch opens or creates.
+    fn launch_workspace_file(&self) -> Option<PathBuf> {
+        match &self.mode {
+            LaunchMode::Folder => None,
+            LaunchMode::Workspace => Some(self.workspace_file_path()),
+            LaunchMode::OpenWorkspace(file) => Some(file.clone()),
         }
     }
 
-    /// Every `.gaviero/settings.json` the current choice writes.
-    fn settings_targets(&self) -> Vec<PathBuf> {
-        self.settings_folders()
-            .into_iter()
-            .map(|f| f.join(".gaviero").join("settings.json"))
-            .collect()
+    /// Every file the current choice writes, for the confirm list.
+    fn files_written(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if self.mode == LaunchMode::Workspace {
+            files.push(self.workspace_file_path());
+        }
+        if self.choice != Choice::EditorOnly {
+            files.push(self.settings_target());
+        }
+        files
     }
 
     /// Write every file the current choice promises.
     fn apply(&self) -> Result<SetupOutcome> {
-        // The global file is read once, so every member gets the same bytes.
-        let global_bytes = match (self.choice, self.global.as_deref()) {
-            (Choice::EditorOnly, _) => return Ok(SetupOutcome::editor_only()),
-            (Choice::Full, Some(global)) => Some(
-                std::fs::read(global).with_context(|| format!("reading {}", global.display()))?,
-            ),
-            _ => None,
-        };
-        let workspace_file = match self.mode {
-            LaunchMode::Folder => None,
-            LaunchMode::Workspace => {
-                let path = self.workspace_file_path();
-                write_workspace_file(&path, &self.workspace_members())?;
-                Some(path)
+        if self.mode == LaunchMode::Workspace {
+            write_workspace_file(&self.workspace_file_path(), &self.workspace_members())?;
+        }
+        let workspace_file = self.launch_workspace_file();
+        let content: Vec<u8> = match (self.choice, self.global.as_deref()) {
+            (Choice::EditorOnly, _) => {
+                return Ok(SetupOutcome {
+                    workspace_file,
+                    editor_only: true,
+                });
+            }
+            (Choice::Minimal, _) => MINIMAL_SETTINGS.as_bytes().to_vec(),
+            (Choice::Full, Some(global)) => {
+                std::fs::read(global).with_context(|| format!("reading {}", global.display()))?
+            }
+            (Choice::Full, None) => {
+                // A workspace layer names no namespace, so each member keeps
+                // its own (the folder name).
+                let namespace = match self.mode {
+                    LaunchMode::Folder => Some(dir_name(&self.root)),
+                    _ => None,
+                };
+                let mut body =
+                    serde_json::to_string_pretty(&builtin_full_settings(namespace.as_deref()))?;
+                body.push('\n');
+                body.into_bytes()
             }
         };
-        for folder in self.settings_folders() {
-            let content: Vec<u8> = match (&global_bytes, self.choice) {
-                (Some(bytes), _) => bytes.clone(),
-                (None, Choice::Full) => {
-                    let mut body =
-                        serde_json::to_string_pretty(&builtin_full_settings(&dir_name(&folder)))?;
-                    body.push('\n');
-                    body.into_bytes()
-                }
-                (None, _) => MINIMAL_SETTINGS.as_bytes().to_vec(),
-            };
-            write_if_absent(&folder.join(".gaviero").join("settings.json"), &content)?;
-        }
+        write_if_absent(&self.settings_target(), &content)?;
         Ok(SetupOutcome {
             workspace_file,
             editor_only: false,
@@ -467,11 +509,16 @@ impl Wizard {
             Style::default().fg(theme::TEXT_DIM),
         )));
         lines.push(Line::from(Span::styled(
-            match self.mode {
+            match &self.mode {
                 LaunchMode::Folder => {
                     "  No .gaviero/settings.json here. How should gaviero open this folder?"
+                        .to_string()
                 }
-                LaunchMode::Workspace => "  No .gaviero-workspace found — creating one.",
+                LaunchMode::Workspace => "  No .gaviero-workspace found — creating one.".to_string(),
+                LaunchMode::OpenWorkspace(file) => format!(
+                    "  No .gaviero/settings.json beside {}. How should gaviero open this workspace?",
+                    file.file_name().and_then(|n| n.to_str()).unwrap_or("the workspace file")
+                ),
             },
             Style::default().fg(theme::TEXT_DIM),
         )));
@@ -546,7 +593,14 @@ impl Wizard {
                         .to_string(),
                     dim,
                 ),
-                ("Nothing is written to this folder.".to_string(), dim),
+                (
+                    if self.mode == LaunchMode::Workspace {
+                        "Only the .gaviero-workspace file is written; no .gaviero/.".to_string()
+                    } else {
+                        "No .gaviero/ is created; nothing is written.".to_string()
+                    },
+                    dim,
+                ),
                 (format!("Settings come from {inherited}."), dim),
             ],
             Choice::Minimal => vec![
@@ -588,9 +642,9 @@ impl Wizard {
     }
 
     fn render_choices(&self, lines: &mut Vec<Line>) {
-        if self.mode == LaunchMode::Workspace {
+        if self.mode != LaunchMode::Folder {
             lines.push(Line::from(Span::styled(
-                "  Settings for each member folder",
+                "  Workspace settings — every member folder inherits them",
                 Style::default()
                     .fg(theme::TEXT_BRIGHT)
                     .add_modifier(Modifier::BOLD),
@@ -623,7 +677,8 @@ impl Wizard {
             )));
         }
 
-        if self.choice == Choice::EditorOnly {
+        let files = self.files_written();
+        if files.is_empty() {
             return;
         }
         lines.push(Line::from(""));
@@ -631,11 +686,6 @@ impl Wizard {
             "  Writes:",
             Style::default().fg(theme::TEXT_DIM),
         )));
-        let mut files: Vec<PathBuf> = Vec::new();
-        if self.mode == LaunchMode::Workspace {
-            files.push(self.workspace_file_path());
-        }
-        files.extend(self.settings_targets());
         for file in files {
             lines.push(Line::from(Span::styled(
                 format!("    {}", file.display()),
@@ -734,12 +784,13 @@ fn discover_folders(root: &Path) -> Vec<FolderCandidate> {
 }
 
 /// What [`Choice::Full`] writes when there is no global settings file: the
-/// default excludes, layouts and the folder's memory namespace, plus every
-/// agent tool auto-approved with a bash allow/deny list. No `mcp__gaviero`
+/// default excludes, layouts and (for a single folder) its memory namespace,
+/// plus every agent tool auto-approved with a bash allow/deny list. A
+/// workspace layer gets no namespace, so each member keeps its own. No `mcp__gaviero`
 /// entry is needed — gaviero's own MCP server is approved for every provider
 /// by default.
-fn builtin_full_settings(namespace: &str) -> serde_json::Value {
-    serde_json::json!({
+fn builtin_full_settings(namespace: Option<&str>) -> serde_json::Value {
+    let mut settings = serde_json::json!({
         "agent": {
             "availableTools": [
                 "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash",
@@ -798,7 +849,6 @@ fn builtin_full_settings(namespace: &str) -> serde_json::Value {
             "treeAllowList": ["config", "description", "HEAD", "hooks", "info"]
         },
         "memory": {
-            "namespace": namespace,
             "readNamespaces": []
         },
         "panels": {
@@ -811,7 +861,11 @@ fn builtin_full_settings(namespace: &str) -> serde_json::Value {
                 "4": [0, 60, 40]
             }
         }
-    })
+    });
+    if let Some(namespace) = namespace {
+        settings["memory"]["namespace"] = serde_json::json!(namespace);
+    }
+    settings
 }
 
 /// Write `bytes` to `path` unless something is already there.
@@ -870,24 +924,100 @@ mod tests {
     #[test]
     fn needs_setup_folder_mode_tracks_settings_file() {
         let dir = tempdir();
-        assert!(needs_setup(dir.path(), LaunchMode::Folder));
+        assert!(needs_setup(dir.path(), &LaunchMode::Folder));
         std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
         std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
-        assert!(!needs_setup(dir.path(), LaunchMode::Folder));
+        assert!(!needs_setup(dir.path(), &LaunchMode::Folder));
     }
 
     #[test]
     fn needs_setup_workspace_mode_tracks_workspace_file() {
         let dir = tempdir();
-        assert!(needs_setup(dir.path(), LaunchMode::Workspace));
+        assert!(needs_setup(dir.path(), &LaunchMode::Workspace));
         std::fs::write(dir.path().join("anything.gaviero-workspace"), "{}").unwrap();
-        assert!(!needs_setup(dir.path(), LaunchMode::Workspace));
+        assert!(!needs_setup(dir.path(), &LaunchMode::Workspace));
         // A per-folder settings.json alone must not count as a configured
         // workspace — the workspace file is what `--workspace` needs.
         let other = tempdir();
         std::fs::create_dir_all(other.path().join(".gaviero")).unwrap();
         std::fs::write(other.path().join(".gaviero/settings.json"), "{}").unwrap();
-        assert!(needs_setup(other.path(), LaunchMode::Workspace));
+        assert!(needs_setup(other.path(), &LaunchMode::Workspace));
+    }
+
+    /// `<dir>/ws.gaviero-workspace` listing `<dir>/app` (which may have its
+    /// own settings) — the workspace layer is `<dir>/.gaviero/settings.json`.
+    fn workspace_file(dir: &Path) -> PathBuf {
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let file = dir.join("ws.gaviero-workspace");
+        write_workspace_file(&file, &[app]).unwrap();
+        file
+    }
+
+    #[test]
+    fn an_opened_workspace_file_needs_settings_beside_it() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let mode = LaunchMode::for_launch(Some(&file), false);
+        assert_eq!(mode, LaunchMode::OpenWorkspace(file.clone()));
+        assert!(needs_setup(&file, &mode));
+        // A member's own settings do not configure the workspace.
+        std::fs::create_dir_all(dir.path().join("app/.gaviero")).unwrap();
+        std::fs::write(dir.path().join("app/.gaviero/settings.json"), "{}").unwrap();
+        assert!(needs_setup(&file, &mode));
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
+        assert!(!needs_setup(&file, &mode));
+        // `--workspace` finding that file resolves to the same mode.
+        assert_eq!(
+            LaunchMode::for_launch(Some(&file), true),
+            LaunchMode::OpenWorkspace(file)
+        );
+        assert_eq!(LaunchMode::for_launch(None, true), LaunchMode::Workspace);
+        assert_eq!(LaunchMode::for_launch(None, false), LaunchMode::Folder);
+    }
+
+    #[test]
+    fn an_opened_workspace_offers_three_choices_and_writes_beside_the_file() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let global = global_file(dir.path(), GLOBAL);
+
+        let mut wizard = Wizard::new(&file, LaunchMode::OpenWorkspace(file.clone()), Some(global));
+        assert_eq!(wizard.root, dir.path());
+        assert_eq!(wizard.step, Step::Choice);
+        assert_eq!(wizard.choice, Choice::EditorOnly);
+        assert_eq!(wizard.choices().len(), 3);
+        assert_eq!(wizard.handle_key(KeyCode::Char('3')), Flow::Apply);
+        let outcome = wizard.apply().unwrap();
+        assert_eq!(
+            outcome,
+            SetupOutcome {
+                workspace_file: Some(file.clone()),
+                editor_only: false
+            }
+        );
+        assert_eq!(read(dir.path().join(".gaviero/settings.json")), GLOBAL);
+        assert!(!dir.path().join("app/.gaviero").exists());
+    }
+
+    #[test]
+    fn esc_on_an_opened_workspace_opens_it_editor_only_and_writes_nothing() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let mut wizard = Wizard::new(&file, LaunchMode::OpenWorkspace(file.clone()), None);
+        assert_eq!(wizard.handle_key(KeyCode::Esc), Flow::EditorOnly);
+        assert_eq!(
+            wizard.untouched_outcome(),
+            SetupOutcome {
+                workspace_file: Some(file.clone()),
+                editor_only: true
+            }
+        );
+        // Enter on the preselected editor-only option is the same.
+        assert_eq!(wizard.handle_key(KeyCode::Enter), Flow::Apply);
+        assert_eq!(wizard.apply().unwrap(), wizard.untouched_outcome());
+        assert!(!dir.path().join(".gaviero").exists());
     }
 
     #[test]
@@ -1002,14 +1132,16 @@ mod tests {
     #[test]
     fn enter_and_esc_on_the_default_open_editor_only_and_write_nothing() {
         let dir = tempdir();
+        let editor_only = SetupOutcome {
+            workspace_file: None,
+            editor_only: true,
+        };
         let mut wizard = Wizard::new(dir.path(), LaunchMode::Folder, None);
-        assert_eq!(wizard.handle_key(KeyCode::Enter), Flow::EditorOnly);
+        assert_eq!(wizard.handle_key(KeyCode::Enter), Flow::Apply);
+        assert_eq!(wizard.apply().unwrap(), editor_only);
         wizard.handle_key(KeyCode::Down);
         assert_eq!(wizard.handle_key(KeyCode::Esc), Flow::EditorOnly);
-        assert_eq!(
-            Wizard::new(dir.path(), LaunchMode::Folder, None).apply().unwrap(),
-            SetupOutcome::editor_only()
-        );
+        assert_eq!(wizard.untouched_outcome(), editor_only);
         assert!(!dir.path().join(".gaviero").exists());
     }
 
@@ -1056,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mode_has_no_editor_only_option_and_writes_each_member() {
+    fn creating_a_workspace_writes_its_settings_beside_the_workspace_file() {
         let dir = tempdir();
         for name in ["alpha", "beta"] {
             std::fs::create_dir_all(dir.path().join(name).join(".git")).unwrap();
@@ -1067,8 +1199,8 @@ mod tests {
         wizard.folders[1].selected = false; // keep only `alpha`
         wizard.handle_key(KeyCode::Enter);
         assert_eq!(wizard.step, Step::Choice);
-        assert_eq!(wizard.choices(), vec![Choice::Minimal, Choice::Full]);
-        assert_eq!(wizard.handle_key(KeyCode::Char('2')), Flow::Apply);
+        assert_eq!(wizard.choices().len(), 3);
+        assert_eq!(wizard.handle_key(KeyCode::Char('3')), Flow::Apply);
 
         let outcome = wizard.apply().unwrap();
         let ws_path = outcome.workspace_file.expect("workspace file written");
@@ -1080,12 +1212,48 @@ mod tests {
         assert_eq!(doc["folders"].as_array().unwrap().len(), 1);
         assert_eq!(doc["folders"][0]["name"], "alpha");
         assert_eq!(doc["settings"], serde_json::json!({}));
-        assert_eq!(read(dir.path().join("alpha/.gaviero/settings.json")), GLOBAL);
-        assert!(!dir.path().join("beta/.gaviero/settings.json").exists());
+        // One workspace layer beside the file; members inherit it.
+        assert_eq!(read(dir.path().join(".gaviero/settings.json")), GLOBAL);
+        assert!(!dir.path().join("alpha/.gaviero").exists());
+        // So the next launch on that file goes straight to the editor.
+        assert!(!needs_setup(&ws_path, &LaunchMode::OpenWorkspace(ws_path.clone())));
 
         // And the file we just wrote must load back as a real workspace.
         let ws = gaviero_core::workspace::Workspace::load(&ws_path).unwrap();
         assert_eq!(ws.roots().len(), 1);
+    }
+
+    #[test]
+    fn creating_a_workspace_editor_only_writes_just_the_workspace_file() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join("alpha/.git")).unwrap();
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace, None);
+        wizard.handle_key(KeyCode::Enter); // alpha is pre-selected
+        assert_eq!(wizard.handle_key(KeyCode::Char('1')), Flow::Apply);
+        let outcome = wizard.apply().unwrap();
+        assert!(outcome.editor_only);
+        let ws_path = outcome.workspace_file.expect("workspace file written");
+        assert!(ws_path.is_file());
+        assert!(!dir.path().join(".gaviero").exists());
+        // Next launch on that file asks again.
+        assert!(needs_setup(&ws_path, &LaunchMode::OpenWorkspace(ws_path.clone())));
+    }
+
+    #[test]
+    fn builtin_full_settings_name_a_namespace_only_for_a_single_folder() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let mut wizard = Wizard::new(
+            &file,
+            LaunchMode::OpenWorkspace(file.clone()),
+            Some(dir.path().join("nope.json")),
+        );
+        wizard.choice = Choice::Full;
+        wizard.apply().unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&read(dir.path().join(".gaviero/settings.json"))).unwrap();
+        assert!(doc["memory"].get("namespace").is_none());
+        assert!(doc["agent"]["availableTools"].is_array());
     }
 
     #[test]
@@ -1107,10 +1275,10 @@ mod tests {
     #[test]
     fn workspace_apply_falls_back_to_launch_dir_when_no_subfolders() {
         let dir = tempdir();
-        let wizard = Wizard::new(dir.path(), LaunchMode::Workspace, None);
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace, None);
         assert!(!wizard.has_folder_step(), "nothing to pick → skip the step");
         assert_eq!(wizard.step, Step::Choice);
-        assert_eq!(wizard.choice, Choice::Minimal);
+        assert_eq!(wizard.handle_key(KeyCode::Char('2')), Flow::Apply);
 
         let outcome = wizard.apply().unwrap();
         let ws_path = outcome.workspace_file.unwrap();

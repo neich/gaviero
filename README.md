@@ -42,7 +42,7 @@ gaviero --workspace ~/src            # multi-folder workspace built from ~/src
 2. *Minimal settings* — writes `.gaviero/settings.json` containing `{}`, so every setting is inherited from the global file.
 3. *Full settings* — writes `.gaviero/settings.json` as an exact copy of the global file as it is at that moment. The copy includes any `remote.relay.secret`, so the screen warns you not to commit it. Without a global file it writes gaviero's built-in full settings instead (every agent tool auto-approved, a bash allow/deny list, default excludes and layouts) and names the path it looked for.
 
-With `--workspace` the screen first asks which sub-folders join the workspace (git repositories pre-selected), writes `<dirname>.gaviero-workspace`, and gives each member's `.gaviero/settings.json` choice 2 or 3. Existing files are never overwritten.
+Opening a `.gaviero-workspace` file that has no `.gaviero/settings.json` beside it shows the same screen; choices 2 and 3 write that workspace-level file, which every member folder inherits (a member's own `.gaviero/settings.json` still overrides it). With `--workspace` on a directory that has no workspace file yet, the screen first asks which sub-folders join (git repositories pre-selected) and writes `<dirname>.gaviero-workspace` — editor-only then writes only that file. Existing files are never overwritten.
 
 The editor works standalone without AI features. Keybindings, panels, chat commands, and the turn review are documented in [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md).
 
