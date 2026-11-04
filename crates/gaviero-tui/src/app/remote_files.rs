@@ -22,8 +22,9 @@ pub(crate) const SPAN_MAX: usize = 4000;
 /// Binary sniffing window.
 const BINARY_WINDOW: usize = 8192;
 
-/// Label + absolute directory, in listing order.
-fn labelled_roots(app: &crate::app::App) -> Vec<(String, PathBuf)> {
+/// Label + absolute directory, in listing order. Also sent with
+/// `request_terminals` so the phone can shorten shell paths.
+pub(crate) fn labelled_roots(app: &crate::app::App) -> Vec<(String, PathBuf)> {
     let roots = crate::app::side_panel::completion_named_roots(&app.workspace);
     let labels = crate::app::side_panel::unique_root_labels(&roots);
     let mut out: Vec<(String, PathBuf)> = roots

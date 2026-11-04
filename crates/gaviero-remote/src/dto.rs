@@ -17,6 +17,9 @@ pub struct WorkspaceInfo {
     /// Hex workspace identity (first 16 lowercase hex chars of the
     /// canonical-root SHA-256). Never an absolute path.
     pub id: String,
+    /// The root's folder name, unique among the workspaces that started a
+    /// sidecar on this machine: a name another workspace shares gains the
+    /// nearest parent folder that tells them apart (`gaviero (git)`).
     pub display_name: String,
 }
 

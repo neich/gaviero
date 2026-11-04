@@ -170,6 +170,11 @@ pub struct RequestProposal {
 pub struct RequestTerminals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<u64>,
+    /// 1.7 (`shell_history`): also return up to this many of the selected
+    /// tab's most recent distinct shell-history commands as `history`.
+    /// Clamped server-side to 1–500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

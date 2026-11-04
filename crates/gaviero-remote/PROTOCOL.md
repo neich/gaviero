@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.6 (1.0 frozen; 1.1 through 1.6 additive)
+# Gaviero Remote Protocol — v1.7 (1.0 frozen; 1.1 through 1.7 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 6 }
+PROTOCOL_VERSION  = { major: 1, minor: 7 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
@@ -175,7 +175,7 @@ holds the current token.
 | `request_snapshot` | `{ }` |
 | `request_messages` | `{ conv_id, before_seq?, limit }` — `limit` clamped to 1–200; `before_seq` optional since 1.1 (absent ⇒ newest page) |
 | `request_proposal` | `{ proposal_id }` |
-| `request_terminals` | `{ terminal_id? }` — requires `shell_sessions`; lists tabs and reads the selected screen |
+| `request_terminals` | `{ terminal_id?, history? }` — requires `shell_sessions`; lists tabs and reads the selected screen; `history` since 1.7 (`shell_history`) |
 | `terminal_input` | `{ terminal_id, text }` — requires `shell_sessions`; writes UTF-8 input and control keys to the named PTY |
 | `request_file_completions` | `{ query, limit? }` — requires `file_completions`; workspace paths for an `@` reference |
 | `list_directory` | `{ path? }` — requires `file_browser`; absent/empty ⇒ the workspace roots. `path` is an explorer display path `<root-label>/<rel>`. |
@@ -212,9 +212,14 @@ close 4006.
 | `turn_review_pending` / `turn_review_updated` | `{ review: TurnReview }` — 1.2 |
 | `turn_review_resolved` | `{ turn_id, conv_id?, kept, reverted, failed? }` — 1.2 |
 
+`workspace.display_name` (in `hello`, `GET /v1/instances` and relay presence) is the workspace
+root's folder name, unique among the workspaces that started a sidecar on the machine: when two
+share a folder name, each gains the nearest parent folder that tells them apart
+(`gaviero (git)` / `gaviero (Dropbox)`). The desktop decides it at sidecar start.
+
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`. Clients
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`. Clients
 ignore unknown entries.
 
 ## DTOs
@@ -390,18 +395,31 @@ additional client frames on the existing authenticated WebSocket:
 
 * `request_terminals`: `{ "terminal_id": 2 }`. The ID is optional. The completed
   `command_result.result` contains `terminals: [{id, title, cwd, spawned}]`,
-  `selected_id` (nullable), and `screen: {text, rows, cols}` (nullable). Tabs are
+  `selected_id` (nullable), `screen: {text, rows, cols}` (nullable), and
+  `roots: [{label, path}]` — the workspace folders with the explorer's labels
+  and absolute paths, for display only (a client may show cwds and prompt paths
+  relative to them; older servers omit it). Tabs are
   ordered as on the desktop. An absent or removed selection falls back to the
   first existing tab. This request never creates a shell or changes desktop focus.
+  Since 1.7, servers advertising `shell_history` accept an optional
+  `"history": N` (clamped to 1–500): the result then also carries
+  `history: [string]`, the selected tab's most recent distinct commands from
+  its own shell-history file, oldest first — the list ↑ walks at the desktop
+  prompt, so it includes commands typed on the desktop and sent remotely.
+  Multi-line commands are joined with `
+`. Empty when there is no tab or
+  the shell's history is unknown (fish, unsupported shells).
 * `terminal_input`: `{ "terminal_id": 2, "text": "echo hello\r" }`. Writes
   1–4096 UTF-8 bytes to that PTY, spawning an existing lazy tab if necessary.
   Missing tabs, invalid size, and spawn/write failures return `command_error`.
   Completion means the input was written, not that the shell command finished.
 
 The Flutter chat toolbar opens **Shell sessions**. Tabs select independently of
-the desktop; Enter submits a command, Type sends text without Enter, and the key
-bar provides Ctrl+C, Esc, Tab, arrows, and Backspace. Tab sends any draft first,
-allowing shell completion. Other control keys act immediately on the PTY.
+the desktop. The screen is read-only output; every command is composed in the
+input box. ↑/↓ recall the tab's shell history into the box (from `history`, or
+from commands sent in this session on servers without `shell_history`), where it
+is edited before Enter sends it with ``. Ctrl+C and Esc are the only keys sent
+straight to the PTY.
 The screen polls at 750 ms while visible in the foreground, with at most one
 request outstanding. It shows the current terminal viewport as plain text
 (up to 16,384 Unicode characters), without ANSI styling or scrollback history;
