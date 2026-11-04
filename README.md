@@ -40,7 +40,7 @@ gaviero --workspace ~/src            # multi-folder workspace built from ~/src
 
 1. *Editor only* (preselected; Esc picks it too) — nothing is written to the folder. You get the explorer, find, the editor and the terminal; there is no side panel, agent, memory or code graph. Settings come from the global `$GAVIERO_ROOT/.gaviero/settings.json` (or the built-in defaults).
 2. *Minimal settings* — writes `.gaviero/settings.json` containing `{}`, so every setting is inherited from the global file.
-3. *Copy global settings* — writes `.gaviero/settings.json` as an exact copy of the global file as it is at that moment. Offered only when the global file exists. The copy includes any `remote.relay.secret`, so the screen warns you not to commit it.
+3. *Full settings* — writes `.gaviero/settings.json` as an exact copy of the global file as it is at that moment. The copy includes any `remote.relay.secret`, so the screen warns you not to commit it. Without a global file it writes gaviero's built-in full settings instead (every agent tool auto-approved, a bash allow/deny list, default excludes and layouts) and names the path it looked for.
 
 With `--workspace` the screen first asks which sub-folders join the workspace (git repositories pre-selected), writes `<dirname>.gaviero-workspace`, and gives each member's `.gaviero/settings.json` choice 2 or 3. Existing files are never overwritten.
 
