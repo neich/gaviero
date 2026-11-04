@@ -249,18 +249,14 @@ async fn run() -> Result<bool> {
         .with_context(|| format!("resolving path: {}", cli.path.display()))?;
 
     // Launch dispatch. An explicit `*.gaviero-workspace` argument always wins.
-    // `--workspace` on a directory reuses the workspace file already inside it;
-    // when there is none — or, in plain folder mode, when there is no
-    // `.gaviero/settings.json` — the setup screen runs before the editor: it
-    // writes the settings chosen there, or opens an editor-only session.
+    // `--workspace` on a directory reuses the workspace file already inside it.
+    // The setup screen runs before the editor while the target is
+    // unconfigured — a folder without `.gaviero/settings.json`, a workspace
+    // file without one beside it, or `--workspace` with no workspace file
+    // yet: it writes the settings chosen there, or opens an editor-only session.
     let is_workspace_file = path
         .extension()
         .is_some_and(|ext| ext == "gaviero-workspace");
-    let launch_mode = if cli.workspace {
-        setup::LaunchMode::Workspace
-    } else {
-        setup::LaunchMode::Folder
-    };
 
     let mut workspace_file: Option<PathBuf> = if is_workspace_file {
         Some(path.clone())
@@ -269,17 +265,14 @@ async fn run() -> Result<bool> {
     } else {
         None
     };
+    let launch_mode = setup::LaunchMode::for_launch(workspace_file.as_deref(), cli.workspace);
     // Editor-only: explorer, find, editor and terminal; no agents, memory,
-    // code graph, MCP or remote, and nothing written into the folder.
+    // code graph, MCP or remote, and no settings written.
     let mut editor_only = false;
 
     // Skip the setup screen without a TTY (piped stdin, CI): it needs raw
     // mode, and built-in defaults still give a working session.
-    if workspace_file.is_none()
-        && !is_workspace_file
-        && setup::needs_setup(&path, launch_mode)
-        && std::io::stdin().is_terminal()
-    {
+    if setup::needs_setup(&path, &launch_mode) && std::io::stdin().is_terminal() {
         let outcome = setup::run(&path, launch_mode)?;
         workspace_file = outcome.workspace_file;
         editor_only = outcome.editor_only;
