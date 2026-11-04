@@ -375,15 +375,20 @@ async fn run() -> Result<bool> {
     // inside synchronous file-tree + git-status refresh.
     let watcher_excludes = app::parse_exclude_patterns(&workspace, None);
     let mut watch_paths: Vec<PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
-    let global_skills = gaviero_core::skills::SkillCatalog::global_skills_dir();
-    if global_skills.is_dir() {
-        watch_paths.push(global_skills);
-    }
-    // Workspace-level skills sit beside the workspace file, outside the
-    // member folders in multi-folder mode.
-    let workspace_skills = workspace.gaviero_dir().join("skills");
-    if workspace_skills.is_dir() && !roots.iter().any(|r| workspace_skills.starts_with(r)) {
-        watch_paths.push(workspace_skills);
+    // Global and workspace-level skills (the latter beside the workspace
+    // file, outside the member folders). Either `skills/` may not exist yet:
+    // then its `.gaviero/` is watched, so creating it later still triggers a
+    // catalog rebuild.
+    for skills_dir in [
+        gaviero_core::skills::SkillCatalog::global_skills_dir(),
+        workspace.workspace_skills_dir(),
+    ] {
+        if let Some(watch) = skills_watch_path(&skills_dir)
+            && !roots.iter().any(|r| watch.starts_with(r))
+            && !watch_paths.contains(&watch)
+        {
+            watch_paths.push(watch);
+        }
     }
     let watch_refs: Vec<&std::path::Path> = watch_paths.iter().map(|p| p.as_path()).collect();
     let _file_watcher = event_loop
@@ -503,6 +508,19 @@ async fn run() -> Result<bool> {
     terminal.show_cursor().context("showing cursor")?;
 
     Ok(app.restart_requested())
+}
+
+/// What to watch for a `.gaviero/skills` directory: the directory itself,
+/// else its `.gaviero/` parent so the directory's later creation is seen,
+/// else nothing.
+fn skills_watch_path(skills_dir: &std::path::Path) -> Option<PathBuf> {
+    if skills_dir.is_dir() {
+        return Some(skills_dir.to_path_buf());
+    }
+    skills_dir
+        .parent()
+        .filter(|p| p.is_dir())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Agent-side startup, skipped in an editor-only session: the Cursor hook

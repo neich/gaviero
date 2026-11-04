@@ -983,6 +983,20 @@ impl Workspace {
         self.settings_path()
     }
 
+    /// Workspace-level skills: `skills/` in the same `.gaviero/` as the
+    /// workspace settings layer ([`Self::workspace_layer_path`]) — beside the
+    /// workspace file, also when the workspace lists a single folder or a
+    /// member folder is opened on its own. In plain single-folder mode it is
+    /// the folder's own `.gaviero/skills`.
+    pub fn workspace_skills_dir(&self) -> PathBuf {
+        let layer = self.workspace_layer_path();
+        layer
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.gaviero_dir())
+            .join("skills")
+    }
+
     /// The repo layer for `root`; in single-folder mode `None` means the
     /// one folder.
     fn repo_layer(&self, root: Option<&Path>) -> Option<&serde_json::Value> {
