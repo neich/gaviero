@@ -1663,23 +1663,8 @@ pub(super) fn handle_skills_command(app: &mut App) {
             );
         }
     } else {
-        let skills = app.skill_catalog.all_skills();
-        let body = if skills.is_empty() {
-            "No skills found. Add skill folders under `.gaviero/skills/<name>/SKILL.md` (repo, workspace, or `~/.gaviero/skills/`), or set `skills.extraRoots` (e.g. `~/.claude/skills`).".to_string()
-        } else {
-            skills
-                .iter()
-                .map(|s| {
-                    format!(
-                        "- {} [{}] — {}",
-                        s.name,
-                        app.skill_catalog.source_label(s),
-                        s.description
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        // Loaded skills, every folder scanned, and what failed to load.
+        let body = app.skill_catalog.report();
         app.chat_state.add_system_message(&body);
     }
 

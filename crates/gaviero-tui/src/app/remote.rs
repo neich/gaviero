@@ -756,25 +756,7 @@ pub fn apply_remote_slash(
         // Same catalog listing the desktop's bare `/skills` produces
         // (`side_panel::handle_skills_command`); semantic search stays
         // desktop-only for now (it spawns an embedder query).
-        let skills = app.skill_catalog.all_skills();
-        let listing = if skills.is_empty() {
-            "No skills found. Add skill folders under `.gaviero/skills/<name>/SKILL.md` \
-             (repo, workspace, or `~/.gaviero/skills/`)."
-                .to_string()
-        } else {
-            skills
-                .iter()
-                .map(|s| {
-                    format!(
-                        "- {} [{}] — {}",
-                        s.name,
-                        app.skill_catalog.source_label(s),
-                        s.description
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let listing = app.skill_catalog.report();
         app.chat_state.add_user_message_at(idx, line);
         app.chat_state.add_system_message_at(idx, &listing);
     } else if command == "/mcp" {
