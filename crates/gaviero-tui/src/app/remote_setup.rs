@@ -126,7 +126,25 @@ pub struct RemoteConfig {
     pub machine_state_dir: Option<PathBuf>,
     pub token_scope: TokenScope,
     pub workspace_id: String,
+    /// The root's folder name from [`resolve_config`]; made unique on the
+    /// machine by [`with_unique_name`] before it is shown or advertised.
     pub workspace_display_name: String,
+    /// First workspace root (the identity behind `workspace_id`).
+    pub workspace_root: PathBuf,
+}
+
+/// Replace the plain folder name with the machine-unique one
+/// ([`super::remote_names`]). Read-only: `/remote` uses it to show the name
+/// the running sidecar advertises.
+pub fn with_unique_name(mut config: RemoteConfig) -> RemoteConfig {
+    if let Some(machine) = &config.machine_state_dir {
+        config.workspace_display_name = super::remote_names::unique_name(
+            machine,
+            &config.workspace_id,
+            &config.workspace_root,
+        );
+    }
+    config
 }
 
 /// Why the sidecar is unavailable — every variant is actionable.
@@ -298,10 +316,8 @@ pub fn resolve_config(workspace: &Workspace) -> Result<RemoteConfig, RemoteUnava
         machine_state_dir,
         token_scope: TokenScope::parse(get(settings::REMOTE_TOKEN_SCOPE).as_str().unwrap_or("")),
         workspace_id,
-        workspace_display_name: root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "workspace".to_string()),
+        workspace_display_name: super::remote_names::base_name(&root),
+        workspace_root: root,
     })
 }
 
@@ -628,6 +644,7 @@ pub async fn start(
                 gaviero_remote::version::capability::TURN_REVIEW.to_string(),
                 gaviero_remote::version::capability::PERMISSION_TURN_GRANT.to_string(),
                 gaviero_remote::version::capability::PERMISSION_GRANTS.to_string(),
+                gaviero_remote::version::capability::SHELL_HISTORY.to_string(),
             ],
             machine: Some(gaviero_remote::dto::MachineInfo {
                 host: config.machine_host.clone(),
@@ -726,6 +743,12 @@ async fn bootstrap_inner(
     if !config.enabled {
         return Err(RemoteUnavailable::Disabled);
     }
+    // Record this workspace before reading the others, so two instances
+    // starting together cannot both miss each other and share a name.
+    if let Some(machine) = &config.machine_state_dir {
+        super::remote_names::record(machine, &config.workspace_id, &config.workspace_root);
+    }
+    let config = with_unique_name(config);
     ensure_certificate(&config).await?;
     let availability = check_availability(&config)?;
     let token = load_or_create_token(&config).map_err(RemoteUnavailable::Token)?;
@@ -820,7 +843,7 @@ pub fn handle_remote_command(app: &mut App, line: &str) {
         .to_ascii_lowercase();
 
     let config = match resolve_config(&app.workspace) {
-        Ok(c) => c,
+        Ok(c) => with_unique_name(c),
         Err(e) => {
             app.chat_state.add_system_message(&format!("Remote: {e}"));
             return;

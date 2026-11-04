@@ -17,13 +17,15 @@ use serde::{Deserialize, Serialize};
 /// `permission_grants` capability, optional `permission_request.grants`, and
 /// three more `PermissionGrant` values (`tool_session`,
 /// `mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.
+/// Minor 7 is additive: the `shell_history` capability and optional
+/// `request_terminals.history`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -43,6 +45,9 @@ pub mod capability {
     /// 1.6: `permission_request.grants` lists every grant the request accepts
     /// (the desktop's `a` / `A` / `p` answers plus `mcp_server_turn`).
     pub const PERMISSION_GRANTS: &str = "permission_grants";
+    /// 1.7: `request_terminals.history` returns the selected tab's recent
+    /// shell-history commands.
+    pub const SHELL_HISTORY: &str = "shell_history";
 }
 
 /// Why a peer's version is unacceptable.

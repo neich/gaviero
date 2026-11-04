@@ -124,7 +124,7 @@
         ]
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -241,6 +241,15 @@
       },
       "RequestTerminals": {
         "properties": {
+          "history": {
+            "description": "1.7 (`shell_history`): also return up to this many of the selected\ntab's most recent distinct shell-history commands as `history`.\nClamped server-side to 1–500.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "terminal_id": {
             "format": "uint64",
             "minimum": 0,
@@ -794,7 +803,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -818,6 +827,7 @@
       "WorkspaceInfo": {
         "properties": {
           "display_name": {
+            "description": "The root's folder name, unique among the workspaces that started a\nsidecar on this machine: a name another workspace shares gains the\nnearest parent folder that tells them apart (`gaviero (git)`).",
             "type": "string"
           },
           "id": {
@@ -864,7 +874,7 @@
   "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 6
+    "minor": 7
   },
   "server_envelope": {
     "$defs": {
@@ -1810,7 +1820,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -2245,6 +2255,7 @@
       "WorkspaceInfo": {
         "properties": {
           "display_name": {
+            "description": "The root's folder name, unique among the workspaces that started a\nsidecar on this machine: a name another workspace shares gains the\nnearest parent folder that tells them apart (`gaviero (git)`).",
             "type": "string"
           },
           "id": {

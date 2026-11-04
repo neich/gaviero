@@ -136,7 +136,10 @@ impl Default for RemoteState {
 }
 
 /// On-demand screen projection. Mobile selection never changes desktop focus.
-fn terminal_snapshot(app: &App, requested: Option<u64>) -> serde_json::Value {
+/// With `history` (1.7 `shell_history`), also the selected tab's recent
+/// shell-history commands, oldest first — the phone edits and recalls in its
+/// own input box, so it needs the list ↑ would walk at the desktop prompt.
+fn terminal_snapshot(app: &App, requested: Option<u64>, history: Option<u32>) -> serde_json::Value {
     let manager = &app.terminal_manager;
     let selected = requested
         .map(gaviero_core::terminal::TerminalId::from_raw)
@@ -164,7 +167,28 @@ fn terminal_snapshot(app: &App, requested: Option<u64>) -> serde_json::Value {
         let contents: String = screen.contents().chars().take(16384).collect();
         serde_json::json!({ "text": contents, "rows": inst.rows, "cols": inst.cols })
     });
-    serde_json::json!({ "terminals": tabs, "selected_id": selected.map(|id| id.raw()), "screen": screen })
+    // Workspace roots with the explorer's labels, so a client can show cwds
+    // and prompt paths relative to them. Display-only; never used to resolve.
+    let roots: Vec<_> = crate::app::remote_files::labelled_roots(app)
+        .into_iter()
+        .map(|(label, path)| {
+            serde_json::json!({ "label": label, "path": path.to_string_lossy() })
+        })
+        .collect();
+    let mut result = serde_json::json!({
+        "terminals": tabs,
+        "selected_id": selected.map(|id| id.raw()),
+        "screen": screen,
+        "roots": roots,
+    });
+    if let Some(limit) = history {
+        let commands = selected
+            .and_then(|id| manager.instance(id))
+            .map(|inst| inst.recent_commands(limit.clamp(1, 500) as usize))
+            .unwrap_or_default();
+        result["history"] = serde_json::json!(commands);
+    }
+    result
 }
 
 /// `@` completion for the phone composer: the same file list and matcher
@@ -284,7 +308,7 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             }
             ClientFrame::RequestTerminals(r) => Ok((
                 CommandStatus::Completed,
-                Some(terminal_snapshot(app, r.terminal_id)),
+                Some(terminal_snapshot(app, r.terminal_id, r.history)),
             )),
             ClientFrame::TerminalInput(input) => {
                 if input.text.is_empty() || input.text.len() > 4096 {
@@ -952,18 +976,25 @@ mod tests {
                 id: second,
                 data: "hello café".as_bytes().to_vec(),
             });
-        let snapshot = terminal_snapshot(&app, Some(second.raw()));
+        let snapshot = terminal_snapshot(&app, Some(second.raw()), None);
         assert_eq!(snapshot["selected_id"], second.raw());
         assert_eq!(snapshot["terminals"].as_array().unwrap().len(), 2);
         assert_eq!(snapshot["screen"]["text"], "hello café");
+        let roots = snapshot["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!(!roots[0]["label"].as_str().unwrap().is_empty());
+        assert_eq!(roots[0]["path"], dir.path().to_string_lossy().as_ref());
         assert_eq!(app.terminal_manager.active_tab(), Some(first));
         app.terminal_manager.close_tab(second);
         assert_eq!(
-            terminal_snapshot(&app, Some(second.raw()))["selected_id"],
+            terminal_snapshot(&app, Some(second.raw()), None)["selected_id"],
             first.raw()
         );
         app.terminal_manager.close_tab(first);
-        assert!(terminal_snapshot(&app, None)["selected_id"].is_null());
+        assert!(terminal_snapshot(&app, None, None)["selected_id"].is_null());
+        // History only when asked; no tab means an empty list, not an error.
+        assert!(snapshot.get("history").is_none());
+        assert_eq!(terminal_snapshot(&app, None, Some(50))["history"], serde_json::json!([]));
     }
 
     #[test]
