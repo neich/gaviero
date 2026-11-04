@@ -52,7 +52,6 @@ impl SkillCatalog {
             .unwrap_or_else(|| PathBuf::from("."));
         let canon_ws = canonicalize_path(&workspace_root);
         let folders = workspace.folders();
-        let single_folder = folders.len() <= 1;
 
         for folder in folders {
             let folder_canon = canonicalize_path(&folder.path);
@@ -64,15 +63,15 @@ impl SkillCatalog {
             catalog.scan_dir(&skills_dir, SCOPE_REPO, &mut warnings);
         }
 
-        // Workspace-level skills live in the main `.gaviero/` beside the
-        // workspace file, the same directory as the workspace settings.
-        if !single_folder {
-            let ws_skills = workspace.gaviero_dir().join("skills");
-            let ws_canon = canonicalize_path(&ws_skills);
-            if !native_skills_dirs.contains(&ws_canon) {
-                native_skills_dirs.push(ws_canon);
-                catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
-            }
+        // Workspace-level skills live beside the workspace settings layer:
+        // next to the workspace file, whatever its folder count, and also
+        // for a member folder opened on its own. In plain single-folder mode
+        // that is the folder's own dir, already scanned as repo scope.
+        let ws_skills = workspace.workspace_skills_dir();
+        let ws_canon = canonicalize_path(&ws_skills);
+        if !native_skills_dirs.contains(&ws_canon) {
+            native_skills_dirs.push(ws_canon);
+            catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
         }
 
         if global_dir.is_dir() {
@@ -498,6 +497,43 @@ mod tests {
         assert!(warnings.is_empty());
         let skill = catalog.resolve(None, "lint", None).unwrap();
         assert_eq!(skill.scope_level, SCOPE_REPO);
+        assert_eq!(catalog.all_skills().len(), 1, "scanned once, not also as workspace");
+    }
+
+    /// `<tmp>/ws.gaviero-workspace` listing only `<tmp>/app`, with a skill
+    /// in `<tmp>/.gaviero/skills`.
+    fn one_member_workspace(tmp: &Path) -> (PathBuf, PathBuf) {
+        let app = tmp.join("app");
+        fs::create_dir_all(&app).unwrap();
+        let file = tmp.join("ws.gaviero-workspace");
+        fs::write(
+            &file,
+            serde_json::json!({ "folders": [{ "path": app }] }).to_string(),
+        )
+        .unwrap();
+        write_skill(&tmp.join(".gaviero").join("skills"), "shared", "Workspace skill");
+        (file, app)
+    }
+
+    #[test]
+    fn a_one_folder_workspace_still_gets_its_workspace_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _app) = one_member_workspace(tmp.path());
+        let ws = Workspace::load(&file).unwrap();
+        let (catalog, warnings) = SkillCatalog::scan(&ws, Path::new("/nonexistent"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let shared = catalog.resolve(None, "shared", None).expect("workspace skill found");
+        assert_eq!(shared.scope_level, SCOPE_WORKSPACE);
+    }
+
+    #[test]
+    fn a_member_folder_opened_alone_gets_the_workspace_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_file, app) = one_member_workspace(tmp.path());
+        let ws = Workspace::single_folder(app);
+        let (catalog, _) = SkillCatalog::scan(&ws, Path::new("/nonexistent"));
+        let shared = catalog.resolve(None, "shared", None).expect("workspace skill found");
+        assert_eq!(shared.scope_level, SCOPE_WORKSPACE);
     }
 
     #[test]
