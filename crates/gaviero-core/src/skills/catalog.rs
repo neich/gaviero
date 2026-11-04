@@ -25,6 +25,20 @@ pub struct SkillCatalog {
     folder_index: HashMap<PathBuf, String>,
     /// Canonical extra-root path → derived source label (`claude`, `codex`, …).
     extra_root_index: HashMap<PathBuf, String>,
+    /// Every directory the scan looked in, in scan order — for `/skills`.
+    scanned: Vec<ScannedDir>,
+    /// Skills that were found but not loaded, with the reason.
+    warnings: Vec<SkillWarning>,
+}
+
+/// One directory [`SkillCatalog::scan`] looked in.
+#[derive(Debug, Clone)]
+pub struct ScannedDir {
+    /// `repo <folder>`, `workspace`, `global`, or `extra <label>`.
+    pub scope: String,
+    pub path: PathBuf,
+    /// The directory existed when scanned.
+    pub exists: bool,
 }
 
 impl SkillCatalog {
@@ -41,6 +55,8 @@ impl SkillCatalog {
             by_name: HashMap::new(),
             folder_index: HashMap::new(),
             extra_root_index: HashMap::new(),
+            scanned: Vec::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let mut native_skills_dirs: Vec<PathBuf> = Vec::new();
@@ -60,6 +76,7 @@ impl SkillCatalog {
                 .insert(folder_canon.clone(), folder.display_name().to_string());
             let skills_dir = folder.path.join(".gaviero").join("skills");
             native_skills_dirs.push(canonicalize_path(&skills_dir));
+            catalog.note_scanned(format!("repo {}", folder.display_name()), &skills_dir);
             catalog.scan_dir(&skills_dir, SCOPE_REPO, &mut warnings);
         }
 
@@ -71,12 +88,17 @@ impl SkillCatalog {
         let ws_canon = canonicalize_path(&ws_skills);
         if !native_skills_dirs.contains(&ws_canon) {
             native_skills_dirs.push(ws_canon);
+            catalog.note_scanned("workspace".to_string(), &ws_skills);
             catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
         }
 
-        if global_dir.is_dir() {
-            native_skills_dirs.push(canonicalize_path(global_dir));
-            catalog.scan_dir(global_dir, SCOPE_GLOBAL, &mut warnings);
+        let global_canon = canonicalize_path(global_dir);
+        if !native_skills_dirs.contains(&global_canon) {
+            catalog.note_scanned("global".to_string(), global_dir);
+            if global_dir.is_dir() {
+                native_skills_dirs.push(global_canon);
+                catalog.scan_dir(global_dir, SCOPE_GLOBAL, &mut warnings);
+            }
         }
 
         if workspace.skill_extra_roots_is_malformed(None) {
@@ -94,7 +116,61 @@ impl SkillCatalog {
         // Suppress unused variable warning — canon_ws used in tests / future aliasing checks.
         let _ = canon_ws;
 
+        catalog.warnings = warnings.clone();
         (catalog, warnings)
+    }
+
+    fn note_scanned(&mut self, scope: String, path: &Path) {
+        self.scanned.push(ScannedDir {
+            scope,
+            path: path.to_path_buf(),
+            exists: path.is_dir(),
+        });
+    }
+
+    /// Every directory the scan looked in, in scan order.
+    pub fn scanned_dirs(&self) -> &[ScannedDir] {
+        &self.scanned
+    }
+
+    /// Skills found but not loaded (and `skills.extraRoots` problems).
+    pub fn warnings(&self) -> &[SkillWarning] {
+        &self.warnings
+    }
+
+    /// The `/skills` listing: loaded skills, then where the scan looked and
+    /// what it could not load — enough to debug a missing skill remotely.
+    pub fn report(&self) -> String {
+        let mut out = String::new();
+        let skills = self.all_skills();
+        if skills.is_empty() {
+            out.push_str("No skills loaded.\n");
+        } else {
+            for s in skills {
+                out.push_str(&format!(
+                    "- {} [{}] — {}\n",
+                    s.name,
+                    self.source_label(s),
+                    s.description
+                ));
+            }
+        }
+        out.push_str("\nSkill folders (`<name>/SKILL.md` inside each):\n");
+        for dir in &self.scanned {
+            out.push_str(&format!(
+                "- {}: {}{}\n",
+                dir.scope,
+                dir.path.display(),
+                if dir.exists { "" } else { " (does not exist)" }
+            ));
+        }
+        if !self.warnings.is_empty() {
+            out.push_str("\nNot loaded:\n");
+            for w in &self.warnings {
+                out.push_str(&format!("- {}: {}\n", w.name, w.message));
+            }
+        }
+        out.trim_end().to_string()
     }
 
     fn scan_extra_roots(
@@ -116,6 +192,7 @@ impl SkillCatalog {
                 Ok(_) => {
                     let label =
                         unique_extra_label(extra_root_label(root), self.extra_root_index.values());
+                    self.note_scanned(format!("extra {label}"), root);
                     self.extra_root_index.insert(canon, label);
                     self.scan_dir(root, SCOPE_EXTRA_ROOT, warnings);
                 }
@@ -141,14 +218,15 @@ impl SkillCatalog {
             if folder_name.starts_with('.') {
                 continue;
             }
-            let skill_md = folder.join("SKILL.md");
-            if !skill_md.is_file() {
+            // `SKILL.md` in any letter case: on a case-sensitive filesystem
+            // a `skill.md` would otherwise be invisible.
+            let Some(skill_md) = find_skill_md(&folder) else {
                 warnings.push(SkillWarning {
                     name: folder_name.to_string(),
                     message: format!("skill folder {} is missing SKILL.md", folder.display()),
                 });
                 continue;
-            }
+            };
             let contents = match std::fs::read_to_string(&skill_md) {
                 Ok(c) => c,
                 Err(e) => {
@@ -168,7 +246,10 @@ impl SkillCatalog {
                         .or_default()
                         .push(skill);
                 }
-                Err(w) => warnings.push(w),
+                Err(w) => warnings.push(SkillWarning {
+                    message: format!("{} ({})", w.message, skill_md.display()),
+                    ..w
+                }),
             }
         }
     }
@@ -374,6 +455,24 @@ impl SkillCatalog {
     }
 }
 
+/// `<folder>/SKILL.md`, matched case-insensitively; the exact name wins.
+fn find_skill_md(folder: &Path) -> Option<PathBuf> {
+    let exact = folder.join("SKILL.md");
+    if exact.is_file() {
+        return Some(exact);
+    }
+    std::fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("SKILL.md"))
+        })
+}
+
 fn canonicalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -513,6 +612,58 @@ mod tests {
         .unwrap();
         write_skill(&tmp.join(".gaviero").join("skills"), "shared", "Workspace skill");
         (file, app)
+    }
+
+    /// The reported remote layout: `<ws>/x.gaviero-workspace` over `a/` and
+    /// `b/` (no `.gaviero` in either), skills in `<ws>/.gaviero/skills`,
+    /// written by other tools — BOM, lowercase file name, nested metadata.
+    #[test]
+    fn workspace_skills_in_foreign_formats_load_and_failures_are_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path();
+        for m in ["a", "b"] {
+            fs::create_dir_all(ws_dir.join(m)).unwrap();
+        }
+        let file = ws_dir.join("x.gaviero-workspace");
+        fs::write(
+            &file,
+            serde_json::json!({ "folders": [{ "path": ws_dir.join("a") }, { "path": ws_dir.join("b") }] })
+                .to_string(),
+        )
+        .unwrap();
+        let skills = ws_dir.join(".gaviero").join("skills");
+        let bom = skills.join("bom-skill");
+        fs::create_dir_all(&bom).unwrap();
+        fs::write(
+            bom.join("SKILL.md"),
+            "\u{feff}---\r\nname: bom-skill\r\ndescription: Saved by a Windows editor\r\n---\r\nBody\r\n",
+        )
+        .unwrap();
+        let lower = skills.join("lower");
+        fs::create_dir_all(&lower).unwrap();
+        fs::write(
+            lower.join("skill.md"),
+            "---\nname: lower\ndescription: >\n  Folded\n  description\nmetadata:\n  name: x\n---\nBody\n",
+        )
+        .unwrap();
+        let broken = skills.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("SKILL.md"), "no frontmatter\n").unwrap();
+
+        let ws = Workspace::load(&file).unwrap();
+        let (catalog, _) = SkillCatalog::scan(&ws, &tmp.path().join("global"));
+        let bom_skill = catalog.resolve(None, "bom-skill", None).expect("BOM skill loads");
+        assert_eq!(bom_skill.scope_level, SCOPE_WORKSPACE);
+        assert_eq!(bom_skill.description, "Saved by a Windows editor");
+        let lower = catalog.resolve(None, "lower", None).expect("skill.md loads");
+        assert_eq!(lower.description, "Folded description");
+        assert!(catalog.resolve(None, "broken", None).is_none());
+
+        let report = catalog.report();
+        assert!(report.contains("- bom-skill [workspace]"), "{report}");
+        assert!(report.contains(&format!("workspace: {}", skills.display())), "{report}");
+        assert!(report.contains("(does not exist)"), "member dirs are listed as missing: {report}");
+        assert!(report.contains("- broken: missing or empty description"), "{report}");
     }
 
     #[test]

@@ -1549,11 +1549,20 @@ fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
 }
 
 fn emit_extra_root_skill_warnings(app: &mut App, warnings: &[gaviero_core::skills::SkillWarning]) {
+    let mut unloaded = 0;
     for w in warnings {
         if w.name == gaviero_core::skills::EXTRA_ROOT_WARNING_NAME {
             app.chat_state
                 .add_system_message(&format!("Skill warning ({}): {}", w.name, w.message));
+        } else {
+            unloaded += 1;
         }
+    }
+    // A skill that fails to parse is otherwise only in the log.
+    if unloaded > 0 {
+        app.chat_state.add_system_message(&format!(
+            "{unloaded} skill(s) could not be loaded — /skills shows which and why."
+        ));
     }
 }
 

@@ -59,9 +59,13 @@ pub fn valid_stem(stem: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Skill name from a `…/<name>/SKILL.md` path.
+/// Skill name from a `…/<name>/SKILL.md` path (`SKILL.md` in any case).
 pub fn skill_name_from_path(path: &Path) -> Option<&str> {
-    if path.file_name().and_then(|f| f.to_str()) != Some("SKILL.md") {
+    if !path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| f.eq_ignore_ascii_case("SKILL.md"))
+    {
         return None;
     }
     path.parent()
