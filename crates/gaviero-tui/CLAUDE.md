@@ -15,9 +15,11 @@ cargo run -p gaviero-tui -- name.gaviero-workspace
 cargo run -p gaviero-tui -- --workspace path/to/dir   # multi-folder from a directory
 ```
 
-Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspace` → `Workspace::load`; `--workspace <dir>` → the `*.gaviero-workspace` already in `<dir>`, else one the setup wizard writes ([src/main.rs](src/main.rs)).
+Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspace` → `Workspace::load`; `--workspace <dir>` → the `*.gaviero-workspace` already in `<dir>`, else one the setup screen writes ([src/main.rs](src/main.rs)).
 
-**First-run setup** ([src/setup.rs](src/setup.rs)) runs *before* the editor, owning its own raw-mode session so the C1 consent prompt after it still reads plain stdin. Triggers when the target has no `.gaviero/settings.json` (folder mode) or no `*.gaviero-workspace` (`--workspace`), and never without a TTY. Steps: agent profile (full / restricted — restricted drops `Bash` from `agent.availableTools`), workspace members (`--workspace` only), provider configs (yes grants `mcp.gavieroServer.codexTrust`, which adds context7 / `mcp.extraServers` to `.codex/config.toml` — gaviero's own server is declared and pre-approved for every provider without it), confirm. Existing files are never overwritten.
+**First-run setup** ([src/setup.rs](src/setup.rs)) runs *before* the editor, owning its own raw-mode session so the C1 consent prompt after it still reads plain stdin. Triggers at every launch while the target has no `.gaviero/settings.json` (folder mode) or no `*.gaviero-workspace` (`--workspace`), and never without a TTY. Folder mode is one screen: editor-only (preselected, also Esc; writes nothing), minimal (`{}`), or a byte-for-byte copy of the global settings file (only when it exists; warns when it carries `remote.relay.secret`). `--workspace`: member folders, then minimal / copy for each member. Existing files are never overwritten.
+
+**Editor-only session:** `App::enter_editor_only` (before the event loop) empties `graph_services` so nothing lazily creates `code_graph.db`; `main` skips `start_agent_services` (Cursor hooks, egress, memory → MCP, code graph, remote), the `.cursorignore` sync and the C1 probe. `App::enforce_editor_only` runs after every event and after `restore_session`: side panel hidden, focus never `SidePanel`, left panel only explorer / FIND. `controller::editor_only_blocks` refuses side-panel, CHANGES, graph and agent actions with a status message. Slash commands are unreachable (they live in the chat input).
 
 ## Architecture
 
@@ -25,7 +27,7 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 - [`event.rs`](src/event.rs) — crossterm / notify / tick / observer events; Windows paste-burst coalescer.
 - [`keymap.rs`](src/keymap.rs) — Ctrl = editor, Alt = workspace. **F7** = word-wrap primary (`Alt+Shift+Z` fallback — NVIDIA steals plain `Alt+Z`). `Ctrl+Up/Down` when hosts steal `Alt+arrows`. `Ctrl+Alt+Left/Right` resize explorer/editor/side widths (`Alt+Left/Right` reserved for tmux/psmux).
 - [`platform.rs`](src/platform.rs) — all platform quirks (ConPTY mouse, AltGr, Ctrl+C forwarder). New quirks go here, not inline.
-- [`setup.rs`](src/setup.rs) — pre-TUI first-run wizard; writes `.gaviero/settings.json`, the `.gaviero-workspace` file, and (opt-in) the Claude/Codex/Cursor MCP configs. Runs before `App` exists, so it holds no `App` state.
+- [`setup.rs`](src/setup.rs) — pre-TUI first-run screen; editor-only, or writes `.gaviero/settings.json` (`{}` or a copy of the global file) and, with `--workspace`, the `.gaviero-workspace` file. Runs before `App` exists, so it holds no `App` state.
 - [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap, [`fold`](src/editor/fold.rs).
 - [`panels/`](src/panels) — file tree, agent chat, history ([`history_panel.rs`](src/panels/history_panel.rs), `Alt+h`), git, terminal, search, memory, status bar.
 - [`widgets/`](src/widgets), [`theme.rs`](src/theme.rs).

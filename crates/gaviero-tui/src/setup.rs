@@ -1,12 +1,21 @@
-//! First-run setup wizard.
+//! First-run setup screen.
 //!
-//! Runs when a folder — or, with `--workspace`, a directory that has no
-//! `.gaviero-workspace` file yet — carries no Gaviero configuration. It asks
-//! for an agent profile, optionally which sub-folders join the workspace, and
-//! whether to write the Claude / Codex / Cursor MCP configs, then materializes
-//! `.gaviero/settings.json` (and the workspace file) before the editor starts.
+//! Runs, at every launch, while a folder has no `.gaviero/settings.json` —
+//! or, with `--workspace`, while a directory has no `.gaviero-workspace` file.
 //!
-//! The wizard owns its own terminal session: raw mode + the alternate screen
+//! Folder mode is one screen with three choices:
+//! 1. **Editor only** (preselected; also Esc) — write nothing and open an
+//!    editor-only session: explorer, find, editor and terminal; no agents,
+//!    memory or code graph. Settings come from the global file.
+//! 2. **Minimal settings** — `.gaviero/settings.json` containing `{}`.
+//! 3. **Copy global settings** — `.gaviero/settings.json` as a byte-for-byte
+//!    copy of `$GAVIERO_ROOT/.gaviero/settings.json` as it is right now.
+//!    Offered only when that file exists.
+//!
+//! `--workspace` picks the member folders, then which of 2 / 3 each member's
+//! `.gaviero/settings.json` gets.
+//!
+//! The screen owns its own terminal session: raw mode + the alternate screen
 //! are entered and left inside [`run`], so the caller gets a pristine terminal
 //! back. That matters because the C1 memory-migration consent prompt that runs
 //! after it reads plain stdin.
@@ -41,56 +50,47 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// How the TUI was launched, which decides whether the wizard asks for
-/// workspace members and what it writes at the end.
+/// Exact content of the "minimal settings" file.
+const MINIMAL_SETTINGS: &str = "{}\n";
+
+/// How the TUI was launched, which decides what the screen offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchMode {
-    /// Single folder — writes `<root>/.gaviero/settings.json`.
+    /// Single folder — editor only, or `<root>/.gaviero/settings.json`.
     Folder,
-    /// `--workspace` — additionally writes `<root>/<name>.gaviero-workspace`.
+    /// `--workspace` — writes `<root>/<name>.gaviero-workspace` plus each
+    /// member's `.gaviero/settings.json`.
     Workspace,
 }
 
-/// Agent capability preset chosen on the first step.
+/// One option on the choice screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Profile {
-    /// Everything on: shell plus the full edit tool surface, auto-approved.
-    Full,
-    /// No shell at all — the agent can read, search, and propose edits, but
-    /// `Bash` is absent from the tool surface entirely.
-    Restricted,
+enum Choice {
+    /// Write nothing; open an editor-only session. Folder mode only.
+    EditorOnly,
+    /// `.gaviero/settings.json` containing `{}`.
+    Minimal,
+    /// `.gaviero/settings.json` copied byte for byte from the global file.
+    CopyGlobal,
 }
 
-impl Profile {
+impl Choice {
     fn title(self) -> &'static str {
         match self {
-            Profile::Full => "Full capabilities",
-            Profile::Restricted => "Restricted (no shell)",
-        }
-    }
-
-    fn detail(self) -> &'static str {
-        match self {
-            Profile::Full => {
-                "Read/Glob/Grep, Write/Edit/MultiEdit and Bash, all auto-approved. \
-                 Shell runs under an allow/deny list. Same shape as the gaviero repo itself."
-            }
-            Profile::Restricted => {
-                "Read/Glob/Grep and Write/Edit/MultiEdit, auto-approved. Bash is not \
-                 offered to the agent at all, so no command can run. File edits still \
-                 pass through the Write Gate for review."
-            }
+            Choice::EditorOnly => "Editor only",
+            Choice::Minimal => "Minimal settings",
+            Choice::CopyGlobal => "Copy global settings",
         }
     }
 }
 
-/// Which wizard screen is on-stage.
+/// Which screen is on-stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
-    Profile,
+    /// Workspace members (`--workspace` with sub-directories only).
     Folders,
-    Providers,
-    Confirm,
+    /// The settings choice.
+    Choice,
 }
 
 /// A candidate workspace member found under the launch directory.
@@ -101,17 +101,27 @@ struct FolderCandidate {
     selected: bool,
 }
 
-/// What the wizard decided, handed back to `main` so it can build the
-/// `Workspace` and (optionally) write provider configs.
+/// What the screen decided, handed back to `main`.
+#[derive(Debug, PartialEq, Eq)]
 pub struct SetupOutcome {
-    /// Path of the `.gaviero-workspace` file the wizard created, if any.
-    /// `None` means single-folder mode — open the launch directory.
+    /// Path of the `.gaviero-workspace` file written, if any. `None` means
+    /// single-folder mode — open the launch directory.
     pub workspace_file: Option<PathBuf>,
-    /// User asked for Claude / Codex / Cursor MCP configs to be written.
-    pub init_providers: bool,
+    /// Open an editor-only session: no agents, memory, code graph, MCP or
+    /// remote, and nothing written to the folder.
+    pub editor_only: bool,
 }
 
-/// Does this launch target still need first-run setup?
+impl SetupOutcome {
+    fn editor_only() -> Self {
+        Self {
+            workspace_file: None,
+            editor_only: true,
+        }
+    }
+}
+
+/// Does this launch target still need the setup screen?
 ///
 /// Folder mode is "configured" once `<root>/.gaviero/settings.json` exists;
 /// workspace mode once any `*.gaviero-workspace` file sits in the directory.
@@ -139,20 +149,18 @@ pub fn existing_workspace_file(root: &Path) -> Option<PathBuf> {
     matches.into_iter().next()
 }
 
-/// Run the wizard. Returns `None` when the user cancelled (Esc on the first
-/// screen) — the caller then opens the folder with built-in defaults and
-/// writes nothing.
-pub fn run(root: &Path, mode: LaunchMode) -> Result<Option<SetupOutcome>> {
-    let mut wizard = Wizard::new(root, mode);
+/// Run the setup screen and write whatever was chosen.
+pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
+    let mut wizard = Wizard::new(root, mode, gaviero_core::workspace::user_settings_path());
 
-    enable_raw_mode().context("enabling raw mode for setup wizard")?;
+    enable_raw_mode().context("enabling raw mode for setup screen")?;
     let mut stdout = std::io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
         let _ = disable_raw_mode();
-        return Err(e).context("entering alternate screen for setup wizard");
+        return Err(e).context("entering alternate screen for setup screen");
     }
 
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<Flow> {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).context("creating setup terminal")?;
         loop {
@@ -165,65 +173,29 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<Option<SetupOutcome>> {
             }
             match wizard.handle_key(key.code) {
                 Flow::Continue => {}
-                Flow::Cancel => return Ok(false),
-                Flow::Apply => return Ok(true),
+                done => return Ok(done),
             }
         }
     })();
 
     // Restore the terminal on every path before reporting anything, so an
-    // error message from the wizard lands on a usable screen.
+    // error message lands on a usable screen.
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 
-    if !result? {
-        return Ok(None);
+    match result? {
+        Flow::EditorOnly => Ok(SetupOutcome::editor_only()),
+        _ => wizard.apply(),
     }
-    wizard.apply().map(Some)
-}
-
-/// Write the Claude / Codex / Cursor MCP configs for every workspace root.
-///
-/// All folders share the primary root's endpoint — one gaviero process serves
-/// the whole workspace — and Codex trust is granted, which is what makes
-/// `.codex/config.toml` get written at all. Best-effort: a failing folder is
-/// logged and the rest still run.
-pub fn synthesize_provider_configs(workspace: &gaviero_core::workspace::Workspace) -> Vec<PathBuf> {
-    use gaviero_core::mcp;
-
-    let roots: Vec<PathBuf> = workspace.roots().iter().map(|r| r.to_path_buf()).collect();
-    let Some(primary) = roots.first() else {
-        return Vec::new();
-    };
-    let endpoint = mcp::McpEndpoint::for_workspace(primary);
-
-    let mut written = Vec::new();
-    for root in &roots {
-        let overrides = mcp::McpConfigOverrides {
-            codex_trust: Some(mcp::TrustConsent::Granted),
-            ..Default::default()
-        };
-        let synth = mcp::resolve_mcp_config_synth(workspace, root, endpoint.clone(), &overrides);
-        match mcp::synthesize_for_worktree(&synth) {
-            Ok(paths) => written.extend(paths),
-            Err(e) => tracing::warn!(
-                target: "mcp_server",
-                error = %e,
-                root = %root.display(),
-                "first-run provider config synthesis failed"
-            ),
-        }
-    }
-    // Cursor's only bypass is `.cursorignore`. One decision per workspace, so
-    // a GAVIERO.md in one folder also covers the others.
-    written.extend(gaviero_core::instructions::sync_cursorignore_roots(&roots));
-    written
 }
 
 /// What `handle_key` asks the event loop to do next.
+#[derive(Debug, PartialEq, Eq)]
 enum Flow {
     Continue,
-    Cancel,
+    /// Open editor-only without writing anything.
+    EditorOnly,
+    /// Write the chosen settings.
     Apply,
 }
 
@@ -231,30 +203,84 @@ struct Wizard {
     root: PathBuf,
     mode: LaunchMode,
     step: Step,
-    profile: Profile,
+    choice: Choice,
     folders: Vec<FolderCandidate>,
     folder_cursor: usize,
-    init_providers: bool,
+    /// The global settings file, when it exists — the source of
+    /// [`Choice::CopyGlobal`].
+    global: Option<PathBuf>,
+    /// The global file holds a non-empty `remote.relay.secret`, which a copy
+    /// would carry into the folder.
+    global_has_secret: bool,
     /// Inline complaint shown under the current step (e.g. "select a folder").
     notice: Option<String>,
 }
 
 impl Wizard {
-    fn new(root: &Path, mode: LaunchMode) -> Self {
+    /// `global` is the global settings path; only an existing file counts.
+    fn new(root: &Path, mode: LaunchMode, global: Option<PathBuf>) -> Self {
+        let global = global.filter(|p| p.is_file());
+        let global_has_secret = global
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| {
+                gaviero_core::workspace::dot_get(&doc, "remote.relay.secret")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            });
         let folders = if mode == LaunchMode::Workspace {
             discover_folders(root)
         } else {
             Vec::new()
         };
-        Self {
+        let mut wizard = Self {
             root: root.to_path_buf(),
             mode,
-            step: Step::Profile,
-            profile: Profile::Full,
+            step: Step::Choice,
+            choice: Choice::Minimal,
             folders,
             folder_cursor: 0,
-            init_providers: true,
+            global,
+            global_has_secret,
             notice: None,
+        };
+        wizard.step = if wizard.has_folder_step() {
+            Step::Folders
+        } else {
+            Step::Choice
+        };
+        wizard.choice = wizard.choices()[0];
+        wizard
+    }
+
+    /// Options on the choice screen, in display order (the first is
+    /// preselected).
+    fn choices(&self) -> Vec<Choice> {
+        let mut list = Vec::with_capacity(3);
+        if self.mode == LaunchMode::Folder {
+            list.push(Choice::EditorOnly);
+        }
+        list.push(Choice::Minimal);
+        if self.global.is_some() {
+            list.push(Choice::CopyGlobal);
+        }
+        list
+    }
+
+    fn move_choice(&mut self, delta: isize) {
+        let list = self.choices();
+        let at = list.iter().position(|c| *c == self.choice).unwrap_or(0);
+        let next = (at as isize + delta).clamp(0, list.len() as isize - 1) as usize;
+        self.choice = list[next];
+    }
+
+    /// The flow that commits the current choice.
+    fn commit(&self) -> Flow {
+        if self.choice == Choice::EditorOnly {
+            Flow::EditorOnly
+        } else {
+            Flow::Apply
         }
     }
 
@@ -271,32 +297,6 @@ impl Wizard {
     fn handle_key(&mut self, code: KeyCode) -> Flow {
         self.notice = None;
         match self.step {
-            Step::Profile => match code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.profile = Profile::Full;
-                    Flow::Continue
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.profile = Profile::Restricted;
-                    Flow::Continue
-                }
-                KeyCode::Char('1') => {
-                    self.profile = Profile::Full;
-                    self.advance();
-                    Flow::Continue
-                }
-                KeyCode::Char('2') => {
-                    self.profile = Profile::Restricted;
-                    self.advance();
-                    Flow::Continue
-                }
-                KeyCode::Enter => {
-                    self.advance();
-                    Flow::Continue
-                }
-                KeyCode::Esc => Flow::Cancel,
-                _ => Flow::Continue,
-            },
             Step::Folders => match code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.folder_cursor = self.folder_cursor.saturating_sub(1);
@@ -326,69 +326,42 @@ impl Wizard {
                         self.notice =
                             Some("Select at least one folder (Space toggles).".to_string());
                     } else {
-                        self.advance();
+                        self.step = Step::Choice;
                     }
                     Flow::Continue
                 }
-                KeyCode::Esc => {
-                    self.step = Step::Profile;
-                    Flow::Continue
-                }
+                // Nothing written: open the directory editor-only.
+                KeyCode::Esc => Flow::EditorOnly,
                 _ => Flow::Continue,
             },
-            Step::Providers => match code {
+            Step::Choice => match code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.init_providers = true;
+                    self.move_choice(-1);
                     Flow::Continue
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.init_providers = false;
+                    self.move_choice(1);
                     Flow::Continue
                 }
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.init_providers = true;
-                    self.advance();
+                KeyCode::Char(c @ '1'..='9') => {
+                    let pick = c as usize - '1' as usize;
+                    match self.choices().get(pick).copied() {
+                        Some(choice) => {
+                            self.choice = choice;
+                            self.commit()
+                        }
+                        None => Flow::Continue,
+                    }
+                }
+                KeyCode::Enter => self.commit(),
+                KeyCode::Esc if self.has_folder_step() => {
+                    self.step = Step::Folders;
                     Flow::Continue
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.init_providers = false;
-                    self.advance();
-                    Flow::Continue
-                }
-                KeyCode::Enter => {
-                    self.advance();
-                    Flow::Continue
-                }
-                KeyCode::Esc => {
-                    self.step = if self.has_folder_step() {
-                        Step::Folders
-                    } else {
-                        Step::Profile
-                    };
-                    Flow::Continue
-                }
-                _ => Flow::Continue,
-            },
-            Step::Confirm => match code {
-                KeyCode::Enter => Flow::Apply,
-                KeyCode::Esc => {
-                    self.step = Step::Providers;
-                    Flow::Continue
-                }
-                KeyCode::Char('q') | KeyCode::Char('Q') => Flow::Cancel,
+                KeyCode::Esc => Flow::EditorOnly,
                 _ => Flow::Continue,
             },
         }
-    }
-
-    fn advance(&mut self) {
-        self.step = match self.step {
-            Step::Profile if self.has_folder_step() => Step::Folders,
-            Step::Profile => Step::Providers,
-            Step::Folders => Step::Providers,
-            Step::Providers => Step::Confirm,
-            Step::Confirm => Step::Confirm,
-        };
     }
 
     /// Folders that will end up in the workspace file. Falls back to the
@@ -409,41 +382,46 @@ impl Wizard {
             .join(format!("{}.gaviero-workspace", dir_name(&self.root)))
     }
 
-    /// Write every file the wizard promised on the confirm screen.
+    /// Every `.gaviero/settings.json` the current choice writes.
+    fn settings_targets(&self) -> Vec<PathBuf> {
+        let folders = match self.mode {
+            LaunchMode::Folder => vec![self.root.clone()],
+            LaunchMode::Workspace => self.workspace_members(),
+        };
+        folders
+            .into_iter()
+            .map(|f| f.join(".gaviero").join("settings.json"))
+            .collect()
+    }
+
+    /// Write every file the current choice promises.
     fn apply(&self) -> Result<SetupOutcome> {
-        match self.mode {
-            LaunchMode::Folder => {
-                let mut settings = base_settings(&dir_name(&self.root));
-                merge_into(
-                    &mut settings,
-                    profile_settings(self.profile, self.init_providers),
-                );
-                write_json_if_absent(&self.root.join(".gaviero").join("settings.json"), &settings)?;
-                Ok(SetupOutcome {
-                    workspace_file: None,
-                    init_providers: self.init_providers,
-                })
+        let content: Vec<u8> = match self.choice {
+            Choice::EditorOnly => return Ok(SetupOutcome::editor_only()),
+            Choice::Minimal => MINIMAL_SETTINGS.as_bytes().to_vec(),
+            Choice::CopyGlobal => {
+                let global = self
+                    .global
+                    .as_deref()
+                    .context("no global settings.json to copy")?;
+                std::fs::read(global).with_context(|| format!("reading {}", global.display()))?
             }
+        };
+        let workspace_file = match self.mode {
+            LaunchMode::Folder => None,
             LaunchMode::Workspace => {
-                let members = self.workspace_members();
-                // Profile settings live at workspace level so every folder
-                // inherits one policy; each folder keeps its own namespace.
-                let workspace_settings = profile_settings(self.profile, self.init_providers);
                 let path = self.workspace_file_path();
-                write_workspace_file(&path, &members, &workspace_settings)?;
-                for member in &members {
-                    let settings = base_settings(&dir_name(member));
-                    write_json_if_absent(
-                        &member.join(".gaviero").join("settings.json"),
-                        &settings,
-                    )?;
-                }
-                Ok(SetupOutcome {
-                    workspace_file: Some(path),
-                    init_providers: self.init_providers,
-                })
+                write_workspace_file(&path, &self.workspace_members())?;
+                Some(path)
             }
+        };
+        for target in self.settings_targets() {
+            write_if_absent(&target, &content)?;
         }
+        Ok(SetupOutcome {
+            workspace_file,
+            editor_only: false,
+        })
     }
 
     // ── Rendering ──────────────────────────────────────────────
@@ -465,20 +443,18 @@ impl Wizard {
         )));
         lines.push(Line::from(Span::styled(
             match self.mode {
-                LaunchMode::Folder => "  No configuration found — creating one.".to_string(),
-                LaunchMode::Workspace => {
-                    "  No .gaviero-workspace found — creating one.".to_string()
+                LaunchMode::Folder => {
+                    "  No .gaviero/settings.json here. How should gaviero open this folder?"
                 }
+                LaunchMode::Workspace => "  No .gaviero-workspace found — creating one.",
             },
             Style::default().fg(theme::TEXT_DIM),
         )));
         lines.push(Line::from(""));
 
         match self.step {
-            Step::Profile => self.render_profile(&mut lines),
             Step::Folders => self.render_folders(&mut lines, inner.height),
-            Step::Providers => self.render_providers(&mut lines),
-            Step::Confirm => self.render_confirm(&mut lines),
+            Step::Choice => self.render_choices(&mut lines),
         }
 
         if let Some(notice) = &self.notice {
@@ -506,28 +482,82 @@ impl Wizard {
         );
     }
 
-    fn footer(&self) -> &'static str {
+    fn footer(&self) -> String {
         match self.step {
-            Step::Profile => "↑/↓ choose · 1/2 pick directly · Enter next · Esc skip setup",
-            Step::Folders => "↑/↓ move · Space toggle · a all/none · Enter next · Esc back",
-            Step::Providers => "↑/↓ or y/n choose · Enter next · Esc back",
-            Step::Confirm => "Enter write these files · Esc back · q skip setup",
+            Step::Folders => {
+                "↑/↓ move · Space toggle · a all/none · Enter next · Esc editor only".to_string()
+            }
+            Step::Choice => {
+                let esc = if self.has_folder_step() {
+                    "Esc back"
+                } else {
+                    "Esc editor only"
+                };
+                format!(
+                    "↑/↓ choose · 1-{} pick · Enter open · {esc}",
+                    self.choices().len()
+                )
+            }
         }
     }
 
-    fn render_profile(&self, lines: &mut Vec<Line>) {
-        lines.push(Line::from(Span::styled(
-            "  Agent profile",
-            Style::default()
-                .fg(theme::TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        for (idx, profile) in [Profile::Full, Profile::Restricted].iter().enumerate() {
-            let active = *profile == self.profile;
+    /// Detail lines under one option.
+    fn choice_detail(&self, choice: Choice) -> Vec<(String, ratatui::style::Color)> {
+        let global = match &self.global {
+            Some(path) => path.display().to_string(),
+            None => "built-in defaults (no global settings.json)".to_string(),
+        };
+        let dim = theme::TEXT_DIM;
+        match choice {
+            Choice::EditorOnly => vec![
+                (
+                    "Explorer, find, editor and terminal. No agents, memory or code graph;"
+                        .to_string(),
+                    dim,
+                ),
+                ("nothing is written to this folder.".to_string(), dim),
+                (format!("Settings: {global}"), dim),
+            ],
+            Choice::Minimal => vec![
+                (
+                    "Writes .gaviero/settings.json containing {}. Every setting is inherited"
+                        .to_string(),
+                    dim,
+                ),
+                (format!("from {global}."), dim),
+            ],
+            Choice::CopyGlobal => {
+                let mut lines = vec![(
+                    format!("Writes .gaviero/settings.json as an exact copy of {global}."),
+                    dim,
+                )];
+                if self.global_has_secret {
+                    lines.push((
+                        "⚠ The copy includes remote.relay.secret — do not commit .gaviero/settings.json."
+                            .to_string(),
+                        theme::WARNING,
+                    ));
+                }
+                lines
+            }
+        }
+    }
+
+    fn render_choices(&self, lines: &mut Vec<Line>) {
+        if self.mode == LaunchMode::Workspace {
+            lines.push(Line::from(Span::styled(
+                "  Settings for each member folder",
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+        }
+        for (idx, choice) in self.choices().iter().enumerate() {
+            let active = *choice == self.choice;
             let marker = if active { "▸" } else { " " };
             lines.push(Line::from(Span::styled(
-                format!("  {marker} {}. {}", idx + 1, profile.title()),
+                format!("  {marker} {}. {}", idx + 1, choice.title()),
                 Style::default()
                     .fg(if active {
                         theme::ACCENT
@@ -540,11 +570,37 @@ impl Wizard {
                         Modifier::empty()
                     }),
             )));
+            for (text, color) in self.choice_detail(*choice) {
+                lines.push(Line::from(Span::styled(
+                    format!("       {text}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+
+        if self.choice == Choice::EditorOnly {
+            return;
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Writes:",
+            Style::default().fg(theme::TEXT_DIM),
+        )));
+        let mut files: Vec<PathBuf> = Vec::new();
+        if self.mode == LaunchMode::Workspace {
+            files.push(self.workspace_file_path());
+        }
+        files.extend(self.settings_targets());
+        for file in files {
             lines.push(Line::from(Span::styled(
-                format!("       {}", profile.detail()),
-                Style::default().fg(theme::TEXT_DIM),
+                format!("    {}", file.display()),
+                Style::default().fg(theme::CODE_GREEN),
             )));
         }
+        lines.push(Line::from(Span::styled(
+            "  Existing files are never overwritten.",
+            Style::default().fg(theme::TEXT_DIM),
+        )));
     }
 
     fn render_folders(&self, lines: &mut Vec<Line>, height: u16) {
@@ -593,112 +649,6 @@ impl Wizard {
             )));
         }
     }
-
-    fn render_providers(&self, lines: &mut Vec<Line>) {
-        lines.push(Line::from(Span::styled(
-            "  Coding-agent configuration",
-            Style::default()
-                .fg(theme::TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Writes .mcp.json, .claude/settings.json, .cursor/mcp.json and",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  .codex/config.toml so Claude Code, Cursor and Codex can reach",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Gaviero's read-only MCP tools. Codex needs trust granted here;",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  answering no defers that to the first swarm run.",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-        lines.push(Line::from(""));
-        for (yes, label) in [
-            (true, "Yes — set up Claude, Codex and Cursor now"),
-            (false, "No — configure them later"),
-        ] {
-            let active = yes == self.init_providers;
-            let marker = if active { "▸" } else { " " };
-            lines.push(Line::from(Span::styled(
-                format!("  {marker} {label}"),
-                Style::default()
-                    .fg(if active {
-                        theme::ACCENT
-                    } else {
-                        theme::TEXT_FG
-                    })
-                    .add_modifier(if active {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            )));
-        }
-    }
-
-    fn render_confirm(&self, lines: &mut Vec<Line>) {
-        lines.push(Line::from(Span::styled(
-            "  Ready to write",
-            Style::default()
-                .fg(theme::TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  Profile: {}", self.profile.title()),
-            Style::default().fg(theme::TEXT_FG),
-        )));
-
-        let mut files: Vec<String> = Vec::new();
-        match self.mode {
-            LaunchMode::Folder => {
-                files.push(format!(
-                    "{}",
-                    self.root.join(".gaviero/settings.json").display()
-                ));
-            }
-            LaunchMode::Workspace => {
-                files.push(format!("{}", self.workspace_file_path().display()));
-                for member in self.workspace_members() {
-                    files.push(format!(
-                        "{}",
-                        member.join(".gaviero/settings.json").display()
-                    ));
-                }
-            }
-        }
-        if self.init_providers {
-            let targets: Vec<PathBuf> = match self.mode {
-                LaunchMode::Folder => vec![self.root.clone()],
-                LaunchMode::Workspace => self.workspace_members(),
-            };
-            for target in targets {
-                files.push(format!(
-                    "{}{}{{.mcp.json, .claude/, .cursor/, .codex/}}",
-                    target.display(),
-                    std::path::MAIN_SEPARATOR
-                ));
-            }
-        }
-
-        lines.push(Line::from(""));
-        for file in files {
-            lines.push(Line::from(Span::styled(
-                format!("    {file}"),
-                Style::default().fg(theme::CODE_GREEN),
-            )));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Existing files are never overwritten.",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-    }
 }
 
 // ── Filesystem helpers ─────────────────────────────────────────
@@ -738,129 +688,8 @@ fn discover_folders(root: &Path) -> Vec<FolderCandidate> {
     folders
 }
 
-/// The profile-independent block: the same defaults `Workspace::ensure_settings`
-/// writes, so a wizard-created file is indistinguishable from the implicit one.
-fn base_settings(namespace: &str) -> serde_json::Value {
-    serde_json::json!({
-        "files": {
-            "exclude": {
-                ".DS_Store": true,
-                ".cache": true,
-                ".gradle": true,
-                ".idea": true,
-                ".mvn": true,
-                ".mypy_cache": true,
-                ".next": true,
-                ".nuxt": true,
-                ".parcel-cache": true,
-                ".pytest_cache": true,
-                ".tox": true,
-                ".venv": true,
-                "Thumbs.db": true,
-                "__pycache__": true,
-                "build": true,
-                "coverage": true,
-                "dist": true,
-                "node_modules": true,
-                "out": true,
-                "target": true,
-                "venv": true
-            }
-        },
-        "git": {
-            "treeAllowList": ["config", "description", "HEAD", "hooks", "info"]
-        },
-        "memory": {
-            "namespace": namespace,
-            "readNamespaces": []
-        },
-        "panels": {
-            "fileTree": { "width": 25 },
-            "sidePanel": { "width": 50 },
-            "layouts": {
-                "1": [15, 60, 25],
-                "2": [15, 40, 45],
-                "3": [0, 100, 0],
-                "4": [0, 60, 40]
-            }
-        }
-    })
-}
-
-/// The agent + MCP block that differs per profile.
-///
-/// Both profiles keep the destructive-command denylist: on `Restricted` it is
-/// dead weight while `Bash` is absent from `availableTools`, but it means
-/// adding the tool back later does not silently arrive without guardrails.
-fn profile_settings(profile: Profile, codex_trust_granted: bool) -> serde_json::Value {
-    let denylist = serde_json::json!([
-        "terraform destroy",
-        "npm publish",
-        "git push --force",
-        "git push -f",
-        "chmod 777",
-        "mkfs.",
-        "dd if="
-    ]);
-
-    let agent = match profile {
-        // No `mcp__gaviero` entry: gaviero's own MCP server is approved for
-        // every provider by default (`mcp.gavieroServer.enabled` turns it off).
-        Profile::Full => serde_json::json!({
-            "availableTools": [
-                "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash",
-                "AskUserQuestion"
-            ],
-            "approvedTools": [
-                "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash",
-                "AskUserQuestion"
-            ],
-            "permissions": {
-                "bash": {
-                    "denylist": denylist,
-                    "allowlist": [
-                        "cargo check", "cargo test", "cargo build", "cargo clippy",
-                        "git status", "git diff", "git log", "git show",
-                        "ls", "cat ", "rg ", "grep ", "find ", "head ", "tail ",
-                        "wc ", "pwd", "echo "
-                    ]
-                }
-            }
-        }),
-        Profile::Restricted => serde_json::json!({
-            "availableTools": [
-                "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
-                "AskUserQuestion"
-            ],
-            "approvedTools": [
-                "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
-                "AskUserQuestion"
-            ],
-            "permissions": {
-                "bash": { "denylist": denylist }
-            }
-        }),
-    };
-
-    let mut out = serde_json::json!({ "agent": agent });
-    if codex_trust_granted {
-        out["mcp"] = serde_json::json!({ "gavieroServer": { "codexTrust": "granted" } });
-    }
-    out
-}
-
-/// Shallow merge of top-level keys — the two settings blocks never overlap,
-/// so a per-key overwrite is enough.
-fn merge_into(target: &mut serde_json::Value, source: serde_json::Value) {
-    let (Some(target), serde_json::Value::Object(source)) = (target.as_object_mut(), source) else {
-        return;
-    };
-    for (key, value) in source {
-        target.insert(key, value);
-    }
-}
-
-fn write_json_if_absent(path: &Path, value: &serde_json::Value) -> Result<()> {
+/// Write `bytes` to `path` unless something is already there.
+fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -868,25 +697,21 @@ fn write_json_if_absent(path: &Path, value: &serde_json::Value) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     tracing::info!("first-run setup wrote {}", path.display());
     Ok(())
 }
 
 /// Write the `.gaviero-workspace` file. Folder paths are absolute: they are
 /// used as roots verbatim by `Workspace::load`, which never resolves them
-/// against the workspace file's directory.
-fn write_workspace_file(
-    path: &Path,
-    members: &[PathBuf],
-    settings: &serde_json::Value,
-) -> Result<()> {
+/// against the workspace file's directory. `settings` stays empty — settings
+/// embedded in the workspace file are not read.
+fn write_workspace_file(path: &Path, members: &[PathBuf]) -> Result<()> {
     let folders: Vec<serde_json::Value> = members
         .iter()
         .map(|p| serde_json::json!({ "path": p, "name": dir_name(p) }))
         .collect();
-    let doc = serde_json::json!({ "folders": folders, "settings": settings });
+    let doc = serde_json::json!({ "folders": folders, "settings": {} });
     let body = serde_json::to_string_pretty(&doc)?;
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     tracing::info!("first-run setup wrote {}", path.display());
@@ -899,6 +724,21 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A global settings file with arbitrary formatting (to prove the copy
+    /// is byte-exact) and a relay secret.
+    const GLOBAL: &str =
+        "{\n  \"remote\": {\"relay\": {\"host\": \"r.example\", \"secret\": \"s3cret\"}},\n  \"agent\":{\"model\":\"claude:opus\"}\n}\n";
+
+    fn global_file(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("global-settings.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn read(path: PathBuf) -> String {
+        std::fs::read_to_string(path).unwrap()
     }
 
     #[test]
@@ -952,60 +792,99 @@ mod tests {
     }
 
     #[test]
-    fn restricted_profile_drops_bash_from_the_tool_surface() {
-        let full = profile_settings(Profile::Full, false);
-        let restricted = profile_settings(Profile::Restricted, false);
-
-        let tools = |v: &serde_json::Value, key: &str| -> Vec<String> {
-            v["agent"][key]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t.as_str().unwrap().to_string())
-                .collect()
-        };
-        assert!(tools(&full, "availableTools").contains(&"Bash".to_string()));
-        assert!(tools(&full, "approvedTools").contains(&"Bash".to_string()));
-        assert!(!tools(&restricted, "availableTools").contains(&"Bash".to_string()));
-        assert!(!tools(&restricted, "approvedTools").contains(&"Bash".to_string()));
-        // Edits stay on the surface in both — the Write Gate reviews them.
-        assert!(tools(&restricted, "availableTools").contains(&"Edit".to_string()));
-        // The denylist survives so re-adding Bash is not unguarded.
-        assert!(restricted["agent"]["permissions"]["bash"]["denylist"].is_array());
-    }
-
-    #[test]
-    fn codex_trust_is_granted_only_when_providers_are_initialized() {
-        assert_eq!(
-            profile_settings(Profile::Full, true)["mcp"]["gavieroServer"]["codexTrust"],
-            serde_json::json!("granted")
-        );
-        assert!(profile_settings(Profile::Full, false).get("mcp").is_none());
-    }
-
-    #[test]
-    fn folder_apply_writes_merged_settings() {
+    fn folder_mode_preselects_editor_only_and_offers_copy_only_with_a_global_file() {
         let dir = tempdir();
-        let wizard = Wizard::new(dir.path(), LaunchMode::Folder);
-        let outcome = wizard.apply().unwrap();
-        assert!(outcome.workspace_file.is_none());
+        let without = Wizard::new(dir.path(), LaunchMode::Folder, None);
+        assert_eq!(without.choice, Choice::EditorOnly);
+        assert_eq!(without.choices(), vec![Choice::EditorOnly, Choice::Minimal]);
 
-        let body = std::fs::read_to_string(dir.path().join(".gaviero/settings.json")).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(doc["memory"]["namespace"], dir_name(dir.path()).as_str());
-        assert!(doc["files"]["exclude"]["target"].as_bool().unwrap());
-        assert!(doc["agent"]["availableTools"].is_array());
+        // A path that does not exist counts as no global file.
+        let missing = Wizard::new(
+            dir.path(),
+            LaunchMode::Folder,
+            Some(dir.path().join("nope.json")),
+        );
+        assert_eq!(missing.choices().len(), 2);
+
+        let global = global_file(dir.path(), GLOBAL);
+        let with = Wizard::new(dir.path(), LaunchMode::Folder, Some(global));
+        assert_eq!(
+            with.choices(),
+            vec![Choice::EditorOnly, Choice::Minimal, Choice::CopyGlobal]
+        );
+        assert!(with.global_has_secret);
     }
 
     #[test]
-    fn workspace_apply_writes_file_and_per_folder_settings() {
+    fn enter_and_esc_on_the_default_open_editor_only_and_write_nothing() {
+        let dir = tempdir();
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Folder, None);
+        assert_eq!(wizard.handle_key(KeyCode::Enter), Flow::EditorOnly);
+        wizard.handle_key(KeyCode::Down);
+        assert_eq!(wizard.handle_key(KeyCode::Esc), Flow::EditorOnly);
+        assert_eq!(
+            Wizard::new(dir.path(), LaunchMode::Folder, None).apply().unwrap(),
+            SetupOutcome::editor_only()
+        );
+        assert!(!dir.path().join(".gaviero").exists());
+    }
+
+    #[test]
+    fn minimal_writes_an_empty_object() {
+        let dir = tempdir();
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Folder, None);
+        assert_eq!(wizard.handle_key(KeyCode::Char('2')), Flow::Apply);
+        assert_eq!(wizard.choice, Choice::Minimal);
+        let outcome = wizard.apply().unwrap();
+        assert!(!outcome.editor_only);
+        assert!(outcome.workspace_file.is_none());
+        assert_eq!(read(dir.path().join(".gaviero/settings.json")), "{}\n");
+    }
+
+    #[test]
+    fn copy_is_byte_for_byte_including_the_relay_secret() {
+        let dir = tempdir();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = global_file(dir.path(), GLOBAL);
+        let mut wizard = Wizard::new(&root, LaunchMode::Folder, Some(global));
+        assert_eq!(wizard.handle_key(KeyCode::Char('3')), Flow::Apply);
+        wizard.apply().unwrap();
+        assert_eq!(read(root.join(".gaviero/settings.json")), GLOBAL);
+    }
+
+    #[test]
+    fn copy_of_a_global_file_without_secret_has_no_warning() {
+        let dir = tempdir();
+        let global = global_file(dir.path(), "{\"remote\":{\"relay\":{\"secret\":\"  \"}}}");
+        let wizard = Wizard::new(dir.path(), LaunchMode::Folder, Some(global));
+        assert!(!wizard.global_has_secret);
+    }
+
+    #[test]
+    fn write_if_absent_never_clobbers() {
+        let dir = tempdir();
+        let path = dir.path().join(".gaviero/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"mine\":true}").unwrap();
+        write_if_absent(&path, b"{}\n").unwrap();
+        assert_eq!(read(path), "{\"mine\":true}");
+    }
+
+    #[test]
+    fn workspace_mode_has_no_editor_only_option_and_writes_each_member() {
         let dir = tempdir();
         for name in ["alpha", "beta"] {
             std::fs::create_dir_all(dir.path().join(name).join(".git")).unwrap();
         }
-        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace);
-        wizard.profile = Profile::Restricted;
+        let global = global_file(dir.path(), GLOBAL);
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace, Some(global));
+        assert_eq!(wizard.step, Step::Folders);
         wizard.folders[1].selected = false; // keep only `alpha`
+        wizard.handle_key(KeyCode::Enter);
+        assert_eq!(wizard.step, Step::Choice);
+        assert_eq!(wizard.choices(), vec![Choice::Minimal, Choice::CopyGlobal]);
+        assert_eq!(wizard.handle_key(KeyCode::Char('2')), Flow::Apply);
 
         let outcome = wizard.apply().unwrap();
         let ws_path = outcome.workspace_file.expect("workspace file written");
@@ -1013,14 +892,11 @@ mod tests {
             ws_path.file_name().unwrap().to_str().unwrap(),
             format!("{}.gaviero-workspace", dir_name(dir.path()))
         );
-
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&ws_path).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&read(ws_path.clone())).unwrap();
         assert_eq!(doc["folders"].as_array().unwrap().len(), 1);
         assert_eq!(doc["folders"][0]["name"], "alpha");
-        // Profile lives at workspace level, namespaces stay per folder.
-        assert!(doc["settings"]["agent"]["availableTools"].is_array());
-        assert!(dir.path().join("alpha/.gaviero/settings.json").exists());
+        assert_eq!(doc["settings"], serde_json::json!({}));
+        assert_eq!(read(dir.path().join("alpha/.gaviero/settings.json")), GLOBAL);
         assert!(!dir.path().join("beta/.gaviero/settings.json").exists());
 
         // And the file we just wrote must load back as a real workspace.
@@ -1029,61 +905,33 @@ mod tests {
     }
 
     #[test]
-    fn workspace_apply_falls_back_to_launch_dir_when_no_subfolders() {
-        let dir = tempdir();
-        let wizard = Wizard::new(dir.path(), LaunchMode::Workspace);
-        assert!(!wizard.has_folder_step(), "nothing to pick → skip the step");
-
-        let outcome = wizard.apply().unwrap();
-        let ws_path = outcome.workspace_file.unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&ws_path).unwrap()).unwrap();
-        assert_eq!(doc["folders"].as_array().unwrap().len(), 1);
-        assert!(dir.path().join(".gaviero/settings.json").exists());
-    }
-
-    #[test]
-    fn write_json_if_absent_never_clobbers() {
-        let dir = tempdir();
-        let path = dir.path().join(".gaviero/settings.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{\"mine\":true}").unwrap();
-        write_json_if_absent(&path, &serde_json::json!({"mine": false})).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"mine\":true}");
-    }
-
-    #[test]
-    fn wizard_flow_skips_folder_step_in_folder_mode() {
-        let dir = tempdir();
-        let mut wizard = Wizard::new(dir.path(), LaunchMode::Folder);
-        wizard.handle_key(KeyCode::Enter);
-        assert_eq!(wizard.step, Step::Providers);
-        wizard.handle_key(KeyCode::Enter);
-        assert_eq!(wizard.step, Step::Confirm);
-        assert!(matches!(wizard.handle_key(KeyCode::Enter), Flow::Apply));
-    }
-
-    #[test]
-    fn folder_step_requires_a_selection() {
+    fn workspace_esc_goes_back_then_opens_editor_only() {
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join("plain")).unwrap();
-        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace);
-        wizard.handle_key(KeyCode::Enter); // profile → folders
-        assert_eq!(wizard.step, Step::Folders);
-
+        let mut wizard = Wizard::new(dir.path(), LaunchMode::Workspace, None);
         wizard.handle_key(KeyCode::Enter); // nothing selected
         assert_eq!(wizard.step, Step::Folders);
         assert!(wizard.notice.is_some());
-
         wizard.handle_key(KeyCode::Char(' '));
         wizard.handle_key(KeyCode::Enter);
-        assert_eq!(wizard.step, Step::Providers);
+        assert_eq!(wizard.step, Step::Choice);
+        assert_eq!(wizard.handle_key(KeyCode::Esc), Flow::Continue);
+        assert_eq!(wizard.step, Step::Folders);
+        assert_eq!(wizard.handle_key(KeyCode::Esc), Flow::EditorOnly);
     }
 
     #[test]
-    fn esc_on_first_step_cancels_setup() {
+    fn workspace_apply_falls_back_to_launch_dir_when_no_subfolders() {
         let dir = tempdir();
-        let mut wizard = Wizard::new(dir.path(), LaunchMode::Folder);
-        assert!(matches!(wizard.handle_key(KeyCode::Esc), Flow::Cancel));
+        let wizard = Wizard::new(dir.path(), LaunchMode::Workspace, None);
+        assert!(!wizard.has_folder_step(), "nothing to pick → skip the step");
+        assert_eq!(wizard.step, Step::Choice);
+        assert_eq!(wizard.choice, Choice::Minimal);
+
+        let outcome = wizard.apply().unwrap();
+        let ws_path = outcome.workspace_file.unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&read(ws_path)).unwrap();
+        assert_eq!(doc["folders"].as_array().unwrap().len(), 1);
+        assert_eq!(read(dir.path().join(".gaviero/settings.json")), "{}\n");
     }
 }

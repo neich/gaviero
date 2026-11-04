@@ -359,6 +359,11 @@ pub struct App {
     /// restart once idle when a supervisor will relaunch us
     /// ([`crate::supervisor`], `app/restart.rs`).
     pub(crate) restart: restart::RestartState,
+    /// Editor-only session (first-run choice for a folder without
+    /// `.gaviero/settings.json`): explorer, find, editor and terminal only.
+    /// The side panel and the agent-review left modes stay hidden, and no
+    /// agent, memory, code-graph, MCP or remote service is started.
+    pub(crate) editor_only: bool,
 }
 
 impl App {
@@ -603,10 +608,40 @@ impl App {
             last_text_paste: None,
             windows_paste_settle_until: None,
             restart: restart::RestartState::new(),
+            editor_only: false,
         };
         emit_extra_root_skill_warnings(&mut app, &skill_load_warnings);
         turn_review::restore_on_startup(&mut app);
         app
+    }
+
+    /// Switch this session to editor-only. Call before the event loop
+    /// starts: the code graph is emptied so nothing (file watcher, panel,
+    /// MCP warmup) can lazily start a writer that creates `.gaviero/`.
+    pub fn enter_editor_only(&mut self) {
+        self.editor_only = true;
+        self.graph_services = gaviero_core::repo_map::GraphServices::new(Vec::new());
+        self.pending_turn_reviews.clear();
+        self.enforce_editor_only();
+    }
+
+    /// Keep an editor-only session inside its surface: whatever an action,
+    /// a layout preset or a restored session asked for, the side panel stays
+    /// hidden and the left panel shows only the explorer or FIND.
+    pub(crate) fn enforce_editor_only(&mut self) {
+        if !self.editor_only {
+            return;
+        }
+        self.panel_visible.side_panel = false;
+        if self.focus == Focus::SidePanel {
+            self.focus = Focus::Editor;
+        }
+        if !matches!(
+            self.left_panel,
+            LeftPanelMode::FileTree | LeftPanelMode::Search
+        ) {
+            self.left_panel = LeftPanelMode::FileTree;
+        }
     }
 
     /// Handle an incoming event.
@@ -629,6 +664,7 @@ impl App {
             self.restart.note_input();
         }
         controller::handle_event(self, event);
+        self.enforce_editor_only();
         // Settings-layer highlights for the active buffer: a hash check
         // unless its text or another layer changed.
         settings_overlay::sync(self);

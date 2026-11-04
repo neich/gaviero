@@ -1785,7 +1785,35 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
     }
 }
 
+/// Actions an editor-only session refuses: everything that opens the side
+/// panel, the CHANGES left mode, or reaches the (absent) code graph or agent.
+fn editor_only_blocks(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ToggleSidePanel
+            | Action::FocusSidePanel
+            | Action::SetLeftModeChanges
+            | Action::SetSideModeChat
+            | Action::SetSideModeHistory
+            | Action::SetSideModeGit
+            | Action::SetSideModeMemory
+            | Action::SetSideModeGraph
+            | Action::ShowSymbolGraph
+            | Action::GoToDefinition
+            | Action::ToggleAutoApprove
+    )
+}
+
 pub(super) fn handle_action(app: &mut App, action: Action) {
+    if app.editor_only && editor_only_blocks(&action) {
+        app.status_message = Some((
+            "Editor-only session: agents, memory, code graph and the side panel are off \
+             (relaunch and pick a settings option to enable them)"
+                .to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
     // While a review is pending, review-specific actions take priority; layout
     // presets (Alt+5..9, Alt+0) still apply so the user can widen the diff pane.
     // All other actions are swallowed so the terminal, editor, and side panels
@@ -2318,5 +2346,69 @@ mod reranker_notice_tests {
             reranker_fallback_notice("minilm", Some("download failed"))
                 .is_some_and(|m| m.contains("download failed"))
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_only_tests {
+    use super::*;
+
+    fn editor_only_app(root: &std::path::Path) -> App {
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Workspace::single_folder(root.to_path_buf()), tx);
+        app.enter_editor_only();
+        app
+    }
+
+    #[test]
+    fn side_panel_actions_are_refused_and_nothing_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor_only_app(dir.path());
+        for action in [
+            Action::ToggleSidePanel,
+            Action::FocusSidePanel,
+            Action::SetSideModeChat,
+            Action::SetSideModeGit,
+            Action::SetSideModeGraph,
+            Action::SetLeftModeChanges,
+            Action::ShowSymbolGraph,
+        ] {
+            handle_action(&mut app, action.clone());
+            assert!(!app.panel_visible.side_panel, "{action:?} opened the side panel");
+            assert_ne!(app.focus, Focus::SidePanel, "{action:?} focused the side panel");
+            assert!(app.status_message.is_some());
+        }
+        // Explorer and FIND still work.
+        handle_action(&mut app, Action::SetLeftModeFind);
+        assert_eq!(app.left_panel, LeftPanelMode::Search);
+        handle_action(&mut app, Action::SetLeftModeExplorer);
+        assert_eq!(app.left_panel, LeftPanelMode::FileTree);
+
+        assert!(!dir.path().join(".gaviero").exists());
+    }
+
+    #[test]
+    fn any_event_puts_a_restored_side_panel_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor_only_app(dir.path());
+        // As a restored session or a layout preset might leave it.
+        app.panel_visible.side_panel = true;
+        app.focus = Focus::SidePanel;
+        app.left_panel = LeftPanelMode::TurnReview;
+        app.handle_event(Event::Tick);
+        assert!(!app.panel_visible.side_panel);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.left_panel, LeftPanelMode::FileTree);
+    }
+
+    #[test]
+    fn a_normal_session_is_not_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Workspace::single_folder(dir.path().to_path_buf()), tx);
+        handle_action(&mut app, Action::FocusSidePanel);
+        assert!(app.panel_visible.side_panel);
+        assert_eq!(app.focus, Focus::SidePanel);
     }
 }

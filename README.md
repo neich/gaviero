@@ -36,7 +36,13 @@ gaviero /path/to/project.gaviero-workspace   # multi-folder workspace
 gaviero --workspace ~/src            # multi-folder workspace built from ~/src
 ```
 
-**First run.** Opening a folder with no Gaviero configuration starts a short setup wizard before the editor. It asks for an agent profile — *full capabilities* (shell plus the edit tools, auto-approved, allow/deny-listed) or *restricted* (identical minus `Bash`, which is never offered to the agent) — and whether to write the Claude, Codex and Cursor MCP configs. With `--workspace` it also asks which sub-folders join the workspace (git repositories pre-selected) and writes `<dirname>.gaviero-workspace`. Esc on the first screen skips setup and opens the folder with built-in defaults; existing files are never overwritten.
+**First run.** Opening a folder that has no `.gaviero/settings.json` shows a setup screen before the editor, at every launch until the folder has one. It offers three choices:
+
+1. *Editor only* (preselected; Esc picks it too) — nothing is written to the folder. You get the explorer, find, the editor and the terminal; there is no side panel, agent, memory or code graph. Settings come from the global `$GAVIERO_ROOT/.gaviero/settings.json` (or the built-in defaults).
+2. *Minimal settings* — writes `.gaviero/settings.json` containing `{}`, so every setting is inherited from the global file.
+3. *Copy global settings* — writes `.gaviero/settings.json` as an exact copy of the global file as it is at that moment. Offered only when the global file exists. The copy includes any `remote.relay.secret`, so the screen warns you not to commit it.
+
+With `--workspace` the screen first asks which sub-folders join the workspace (git repositories pre-selected), writes `<dirname>.gaviero-workspace`, and gives each member's `.gaviero/settings.json` choice 2 or 3. Existing files are never overwritten.
 
 The editor works standalone without AI features. Keybindings, panels, chat commands, and the turn review are documented in [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md).
 
