@@ -251,8 +251,8 @@ async fn run() -> Result<bool> {
     // Launch dispatch. An explicit `*.gaviero-workspace` argument always wins.
     // `--workspace` on a directory reuses the workspace file already inside it;
     // when there is none — or, in plain folder mode, when there is no
-    // `.gaviero/settings.json` — the first-run wizard runs before the editor
-    // and writes the configuration it collects.
+    // `.gaviero/settings.json` — the setup screen runs before the editor: it
+    // writes the settings chosen there, or opens an editor-only session.
     let is_workspace_file = path
         .extension()
         .is_some_and(|ext| ext == "gaviero-workspace");
@@ -269,18 +269,20 @@ async fn run() -> Result<bool> {
     } else {
         None
     };
-    let mut init_providers = false;
+    // Editor-only: explorer, find, editor and terminal; no agents, memory,
+    // code graph, MCP or remote, and nothing written into the folder.
+    let mut editor_only = false;
 
-    // Skip the wizard without a TTY (piped stdin, CI): it needs raw mode, and
-    // built-in defaults still give a working session.
+    // Skip the setup screen without a TTY (piped stdin, CI): it needs raw
+    // mode, and built-in defaults still give a working session.
     if workspace_file.is_none()
         && !is_workspace_file
         && setup::needs_setup(&path, launch_mode)
         && std::io::stdin().is_terminal()
-        && let Some(outcome) = setup::run(&path, launch_mode)?
     {
+        let outcome = setup::run(&path, launch_mode)?;
         workspace_file = outcome.workspace_file;
-        init_providers = outcome.init_providers;
+        editor_only = outcome.editor_only;
     }
 
     let workspace = match &workspace_file {
@@ -291,7 +293,7 @@ async fn run() -> Result<bool> {
     // Cursor has no flag to switch its instruction files off; its only bypass
     // is `.cursorignore`. Sync it before the first agent can spawn, whichever
     // setup path this launch took.
-    {
+    if !editor_only {
         let roots: Vec<std::path::PathBuf> = workspace
             .roots()
             .iter()
@@ -302,20 +304,12 @@ async fn run() -> Result<bool> {
         }
     }
 
-    if init_providers {
-        let written = setup::synthesize_provider_configs(&workspace);
-        tracing::info!(
-            "first-run setup wrote {} agent config file(s)",
-            written.len()
-        );
-    }
-
     // C1: prompt the user for consent on a pending typed-stores
     // migration BEFORE entering raw mode. If the user declines, exit
     // cleanly without taking the snapshot or migrating. The plan's
     // anti-pattern explicitly forbids silent migration here — a yes/no
     // stdin prompt is the minimum non-silent surface.
-    {
+    if !editor_only {
         let workspace_root = workspace
             .roots()
             .first()
@@ -422,14 +416,113 @@ async fn run() -> Result<bool> {
 
     // Application state
     let mut app = App::new(workspace, event_tx);
+    if editor_only {
+        app.enter_editor_only();
+    }
 
     // Wire the terminal manager's bounded event channel into the TUI's unified channel
     let terminal_rx = app.terminal_manager.take_event_rx();
     event_loop.spawn_terminal_bridge(terminal_rx);
 
     app.restore_session();
+    // A restored session may have the side panel open or focused.
+    app.enforce_editor_only();
     app.show_settings_errors();
 
+    if !editor_only {
+        start_agent_services(&mut app, &event_loop, workspace_for_memory, memory_root, embedder_name);
+    }
+
+    // Main loop — drain all pending events before each render to reduce latency.
+    // Without draining, each event triggers a full redraw; during streaming bursts
+    // this means the MessageComplete event sits behind many intermediate events,
+    // each causing an unnecessary render. Draining processes them all at once,
+    // so the UI jumps straight to the final state.
+    //
+    // Render is gated on `needs_render`: chat stream events update state
+    // immediately, but expensive Agent Chat repainting is coalesced to a small
+    // budget. Most non-chat events still draw immediately.
+    let mut render_scheduler = RenderScheduler::new();
+    let mut needs_render = true;
+    loop {
+        if app.needs_full_redraw {
+            terminal.clear()?;
+            app.needs_full_redraw = false;
+            needs_render = true;
+        }
+        if needs_render {
+            terminal.draw(|frame| app.render(frame))?;
+            render_scheduler.record_render(&app);
+            needs_render = false;
+        }
+
+        // Block until at least one event arrives
+        if let Some(event) = event_rx.recv().await {
+            if render_scheduler.should_render(&event, &app) {
+                needs_render = true;
+            }
+            app.handle_event(event);
+            if app.take_needs_immediate_render() {
+                needs_render = true;
+            }
+        }
+
+        // Drain any additional events that arrived while we were rendering/handling.
+        // Cap at 64 to avoid starving the renderer if events come faster than we
+        // can process them (e.g., rapid file-watcher events).
+        for _ in 0..64 {
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    if render_scheduler.should_render(&event, &app) {
+                        needs_render = true;
+                    }
+                    app.handle_event(event);
+                    if app.take_needs_immediate_render() {
+                        needs_render = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    // Tell the remote client we're going away (close 4007) before the
+    // socket dies with the process.
+    if let Some(handle) = app.remote.handle.take() {
+        let _ = handle.try_send(gaviero_remote::server::HubInput::Shutdown);
+    }
+
+    // Save session state before exit. Panel widths/heights and the chat
+    // composer (input height + unsent draft) ride along in the same
+    // `state.json` write (see `app/session.rs`).
+    app.save_session();
+    // Land queued turn-review saves/archives, or a finished review would
+    // reopen as pending next launch.
+    app.turn_capture.flush();
+
+    // Explicit call so errors are reported on the happy path (the guard will
+    // run it again, but that's harmless — the calls are idempotent).
+    restore_terminal().context("restoring terminal")?;
+    terminal.show_cursor().context("showing cursor")?;
+
+    Ok(app.restart_requested())
+}
+
+/// Agent-side startup, skipped in an editor-only session: the Cursor hook
+/// file, the egress proxy, the memory bootstrap (which brings up the MCP
+/// server and provider configs on `MemoryReady`), the live code graph and
+/// the remote sidecar.
+fn start_agent_services(
+    app: &mut App,
+    event_loop: &EventLoop,
+    workspace_for_memory: gaviero_core::workspace::Workspace,
+    memory_root: Option<PathBuf>,
+    embedder_name: String,
+) {
     // Cursor's read policy lives in `.cursor/hooks.json`. Written here, before
     // any turn starts, so it is a host write and never lands in TURN REVIEW;
     // the per-spawn call in the Cursor session is then a no-op.
@@ -519,82 +612,4 @@ async fn run() -> Result<bool> {
         app.workspace.clone(),
         event_loop.tx(),
     ));
-
-    // Main loop — drain all pending events before each render to reduce latency.
-    // Without draining, each event triggers a full redraw; during streaming bursts
-    // this means the MessageComplete event sits behind many intermediate events,
-    // each causing an unnecessary render. Draining processes them all at once,
-    // so the UI jumps straight to the final state.
-    //
-    // Render is gated on `needs_render`: chat stream events update state
-    // immediately, but expensive Agent Chat repainting is coalesced to a small
-    // budget. Most non-chat events still draw immediately.
-    let mut render_scheduler = RenderScheduler::new();
-    let mut needs_render = true;
-    loop {
-        if app.needs_full_redraw {
-            terminal.clear()?;
-            app.needs_full_redraw = false;
-            needs_render = true;
-        }
-        if needs_render {
-            terminal.draw(|frame| app.render(frame))?;
-            render_scheduler.record_render(&app);
-            needs_render = false;
-        }
-
-        // Block until at least one event arrives
-        if let Some(event) = event_rx.recv().await {
-            if render_scheduler.should_render(&event, &app) {
-                needs_render = true;
-            }
-            app.handle_event(event);
-            if app.take_needs_immediate_render() {
-                needs_render = true;
-            }
-        }
-
-        // Drain any additional events that arrived while we were rendering/handling.
-        // Cap at 64 to avoid starving the renderer if events come faster than we
-        // can process them (e.g., rapid file-watcher events).
-        for _ in 0..64 {
-            match event_rx.try_recv() {
-                Ok(event) => {
-                    if render_scheduler.should_render(&event, &app) {
-                        needs_render = true;
-                    }
-                    app.handle_event(event);
-                    if app.take_needs_immediate_render() {
-                        needs_render = true;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-
-    // Tell the remote client we're going away (close 4007) before the
-    // socket dies with the process.
-    if let Some(handle) = app.remote.handle.take() {
-        let _ = handle.try_send(gaviero_remote::server::HubInput::Shutdown);
-    }
-
-    // Save session state before exit. Panel widths/heights and the chat
-    // composer (input height + unsent draft) ride along in the same
-    // `state.json` write (see `app/session.rs`).
-    app.save_session();
-    // Land queued turn-review saves/archives, or a finished review would
-    // reopen as pending next launch.
-    app.turn_capture.flush();
-
-    // Explicit call so errors are reported on the happy path (the guard will
-    // run it again, but that's harmless — the calls are idempotent).
-    restore_terminal().context("restoring terminal")?;
-    terminal.show_cursor().context("showing cursor")?;
-
-    Ok(app.restart_requested())
 }

@@ -193,7 +193,11 @@ impl TurnCapture {
                     e.rel = o.rel.clone();
                     e
                 }
-                None => match self.capture(o, started_ns, &mut budget) {
+                // A store that cannot be written fails the whole turn bracket,
+                // before any state changes: the caller then falls back to the
+                // Write Gate. Skipping the file instead would drop it from the
+                // baseline and let the agent's edits to it land unreviewed.
+                None => match self.capture(o, started_ns, &mut budget)? {
                     Some(e) => e,
                     None => continue,
                 },
@@ -271,8 +275,26 @@ impl TurnCapture {
                 budget.files += 1;
                 continue;
             }
-            let Some(after) = self.capture(o, scan_ns, &mut budget) else {
-                continue;
+            let after = match self.capture(o, scan_ns, &mut budget) {
+                Ok(Some(after)) => after,
+                Ok(None) => continue,
+                // The store broke mid-turn. The change must still reach the
+                // review — listed by hash, without content to diff or revert.
+                Err(e) => {
+                    let Ok(hash) = hash_file(&o.path) else {
+                        continue;
+                    };
+                    warnings.push(format!("{e:#}; listed without its content"));
+                    Entry {
+                        root: o.root.clone(),
+                        rel: o.rel.clone(),
+                        size: o.size,
+                        mtime_ns: o.mtime_ns,
+                        sha256: Some(hash),
+                        stored: false,
+                        racy: o.mtime_ns >= scan_ns - RACY_WINDOW_NS,
+                    }
+                }
             };
             budget.files += 1;
             if after.stored {
@@ -410,12 +432,14 @@ impl TurnCapture {
             }
     }
 
-    /// Hash (and store, under the caps) one observed file.
-    fn capture(&self, o: &Observed, scan_ns: i64, budget: &mut Budget) -> Option<Entry> {
+    /// Hash (and store, under the caps) one observed file. `Ok(None)` skips a
+    /// file that vanished or cannot be read; `Err` means the blob store
+    /// itself cannot be written.
+    fn capture(&self, o: &Observed, scan_ns: i64, budget: &mut Budget) -> Result<Option<Entry>> {
         let racy = o.mtime_ns >= scan_ns - RACY_WINDOW_NS;
         if budget.files >= BASELINE_MAX_FILES || budget.stored_bytes >= BASELINE_MAX_BYTES {
             budget.capped = true;
-            return Some(Entry {
+            return Ok(Some(Entry {
                 root: o.root.clone(),
                 rel: o.rel.clone(),
                 size: o.size,
@@ -423,18 +447,17 @@ impl TurnCapture {
                 sha256: None,
                 stored: false,
                 racy,
-            });
+            }));
         }
         if o.size <= MAX_BLOB_BYTES {
-            let bytes = std::fs::read(&o.path).ok()?;
-            let hash = match self.store.put(&bytes) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("turn capture: storing {} failed: {e:#}", o.path.display());
-                    return None;
-                }
+            let Ok(bytes) = std::fs::read(&o.path) else {
+                return Ok(None);
             };
-            Some(Entry {
+            let hash = self
+                .store
+                .put(&bytes)
+                .with_context(|| format!("turn capture: storing {}", o.path.display()))?;
+            Ok(Some(Entry {
                 root: o.root.clone(),
                 rel: o.rel.clone(),
                 size: bytes.len() as u64,
@@ -442,10 +465,12 @@ impl TurnCapture {
                 sha256: Some(hash),
                 stored: true,
                 racy,
-            })
+            }))
         } else {
-            let hash = hash_file(&o.path).ok()?;
-            Some(Entry {
+            let Ok(hash) = hash_file(&o.path) else {
+                return Ok(None);
+            };
+            Ok(Some(Entry {
                 root: o.root.clone(),
                 rel: o.rel.clone(),
                 size: o.size,
@@ -453,7 +478,7 @@ impl TurnCapture {
                 sha256: Some(hash),
                 stored: false,
                 racy,
-            })
+            }))
         }
     }
 
