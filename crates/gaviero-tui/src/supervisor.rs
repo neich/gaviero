@@ -39,6 +39,11 @@ const CHILD_ENV: &str = "GAVIERO_SUPERVISED";
 /// Run the TUI directly, without a supervisor parent.
 const OPT_OUT_ENV: &str = "GAVIERO_NO_SUPERVISOR";
 
+/// Set on the TUI child: a file, private to this supervisor, where the child
+/// records answers to launch prompts so a restart reuses them instead of
+/// stopping at the prompt again ([`recall_launch_choice`]).
+const LAUNCH_STATE_ENV: &str = "GAVIERO_LAUNCH_STATE";
+
 /// How long to wait for the executable to reappear: an installer moves the
 /// old file aside before the new one is in place.
 const EXE_WAIT: Duration = Duration::from_secs(30);
@@ -68,18 +73,19 @@ pub fn supervise() -> Option<i32> {
     }
     let exe = std::env::current_exe().ok()?;
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let launch_state = launch_state_path();
 
     // The child owns the keyboard. A Ctrl+C / Ctrl+Break console event must
     // not kill this parent out from under it (closing the window still does).
     crate::platform::ignore_console_interrupts();
 
-    loop {
+    let code = loop {
         let started = Instant::now();
-        let status = match run_child(&exe, &args) {
+        let status = match run_child(&exe, &args, launch_state.as_deref()) {
             Ok(status) => status,
             Err(e) => {
                 eprintln!("gaviero: could not start {}: {e}", exe.display());
-                return Some(1);
+                break 1;
             }
         };
         match status.code() {
@@ -89,22 +95,87 @@ pub fn supervise() -> Option<i32> {
                     std::thread::sleep(RESTART_BACKOFF);
                 }
             }
-            Some(code) => return Some(code),
+            Some(code) => break code,
             // Killed by a signal (Unix): report failure like a shell would.
-            None => return Some(1),
+            None => break 1,
         }
+    };
+    if let Some(path) = &launch_state {
+        let _ = std::fs::remove_file(path);
     }
+    Some(code)
 }
 
-fn run_child(exe: &Path, args: &[OsString]) -> std::io::Result<ExitStatus> {
+/// This supervisor's launch-state file: under the cache dir, keyed by pid.
+/// A stale file left by a killed supervisor whose pid is later reused is
+/// harmless — every record names the launch path it answers for.
+fn launch_state_path() -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("gaviero");
+    Some(dir.join(format!("launch-{}.state", std::process::id())))
+}
+
+fn run_child(exe: &Path, args: &[OsString], launch_state: Option<&Path>) -> std::io::Result<ExitStatus> {
     let deadline = Instant::now() + EXE_WAIT;
     loop {
-        match Command::new(exe).args(args).env(CHILD_ENV, "1").status() {
+        let mut cmd = Command::new(exe);
+        cmd.args(args).env(CHILD_ENV, "1");
+        if let Some(path) = launch_state {
+            cmd.env(LAUNCH_STATE_ENV, path);
+        }
+        match cmd.status() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(500));
             }
             other => return other,
         }
+    }
+}
+
+/// The answer this supervisor's earlier child gave for `launch` (the
+/// resolved launch path), if any. `None` outside a supervisor.
+pub fn recall_launch_choice(launch: &Path) -> Option<crate::setup::FolderLaunch> {
+    let state = std::env::var_os(LAUNCH_STATE_ENV)?;
+    read_launch_choice(Path::new(&state), launch)
+}
+
+/// Record the answer for `launch` so a restart under this supervisor reuses
+/// it. A no-op outside a supervisor; failures only cost a repeated prompt.
+pub fn remember_launch_choice(launch: &Path, choice: &crate::setup::FolderLaunch) {
+    if let Some(state) = std::env::var_os(LAUNCH_STATE_ENV) {
+        write_launch_choice(Path::new(&state), launch, choice);
+    }
+}
+
+fn read_launch_choice(state: &Path, launch: &Path) -> Option<crate::setup::FolderLaunch> {
+    use crate::setup::FolderLaunch;
+    let text = std::fs::read_to_string(state).ok()?;
+    let mut lines = text.lines();
+    if Path::new(lines.next()?) != launch {
+        return None;
+    }
+    match lines.next()? {
+        "folder" => Some(FolderLaunch::Folder),
+        "workspace" => {
+            let file = PathBuf::from(lines.next()?);
+            file.is_file().then_some(FolderLaunch::Workspace(file))
+        }
+        _ => None,
+    }
+}
+
+fn write_launch_choice(state: &Path, launch: &Path, choice: &crate::setup::FolderLaunch) {
+    use crate::setup::FolderLaunch;
+    let body = match choice {
+        FolderLaunch::Folder => format!("{}\nfolder\n", launch.display()),
+        FolderLaunch::Workspace(file) => {
+            format!("{}\nworkspace\n{}\n", launch.display(), file.display())
+        }
+    };
+    if let Some(dir) = state.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(state, body) {
+        tracing::warn!("could not record launch choice in {}: {e}", state.display());
     }
 }
 
@@ -278,5 +349,32 @@ mod tests {
         };
         assert!(!watch.poll(Instant::now()));
         assert!(!watch.ready());
+    }
+
+    #[test]
+    fn a_launch_choice_round_trips_only_for_its_own_launch_path() {
+        use crate::setup::FolderLaunch;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("cache").join("launch-1.state");
+        let launch = dir.path().join("parent");
+        let ws_file = dir.path().join("parent.gaviero-workspace");
+        std::fs::write(&ws_file, "{}").unwrap();
+
+        assert_eq!(read_launch_choice(&state, &launch), None, "nothing recorded");
+
+        write_launch_choice(&state, &launch, &FolderLaunch::Workspace(ws_file.clone()));
+        assert_eq!(
+            read_launch_choice(&state, &launch),
+            Some(FolderLaunch::Workspace(ws_file.clone()))
+        );
+        assert_eq!(read_launch_choice(&state, &dir.path().join("other")), None);
+
+        write_launch_choice(&state, &launch, &FolderLaunch::Folder);
+        assert_eq!(read_launch_choice(&state, &launch), Some(FolderLaunch::Folder));
+
+        // A workspace file deleted since the answer no longer applies.
+        write_launch_choice(&state, &launch, &FolderLaunch::Workspace(ws_file.clone()));
+        std::fs::remove_file(&ws_file).unwrap();
+        assert_eq!(read_launch_choice(&state, &launch), None);
     }
 }

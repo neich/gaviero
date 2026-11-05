@@ -679,11 +679,102 @@ pub(super) fn git_head_content(app: &App, rel_path: &str) -> Option<String> {
     entry.repo.head_file_content(rel_path).ok()
 }
 
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The git repositories the GIT panel offers, in folder order: for each
+/// workspace folder, the repo containing it, then each repo cloned directly
+/// inside it (`gaviero_core::git::discover_folder_repos`). A plain folder
+/// holding several clones therefore gets one tab per clone without being
+/// opened as a workspace. A repo reached from two folders is listed once.
+///
+/// Tab names: the folder's name for the repo containing the folder, the
+/// clone's folder-relative path otherwise — prefixed with the folder name
+/// when the workspace has more than one folder.
+pub(super) fn scan_git_repos(workspace: &Workspace) -> Vec<GitRepoEntry> {
+    let multi = workspace.folders().len() > 1;
+    let mut out: Vec<GitRepoEntry> = Vec::new();
+    for folder in workspace.folders() {
+        let excludes = parse_exclude_patterns(workspace, Some(&folder.path));
+        let skip = |name: &str| {
+            crate::event::ALWAYS_SKIP_COMPONENTS.contains(&name)
+                || matches_exclude(name, &excludes)
+        };
+        let folder_canon = canonical_or_self(&folder.path);
+        for repo in gaviero_core::git::discover_folder_repos(&folder.path, skip) {
+            let Some(workdir) = repo.workdir().map(canonical_or_self) else {
+                continue;
+            };
+            if out.iter().any(|e| e.workdir == workdir) {
+                continue;
+            }
+            let name = match workdir.strip_prefix(&folder_canon) {
+                Ok(rel) if !rel.as_os_str().is_empty() => {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if multi {
+                        format!("{}/{}", folder.display_name(), rel)
+                    } else {
+                        rel
+                    }
+                }
+                // The folder itself, or a repo enclosing it.
+                _ => folder.display_name().to_string(),
+            };
+            out.push(GitRepoEntry {
+                name,
+                workdir,
+                repo,
+            });
+        }
+    }
+    out
+}
+
+/// The repository owning `path` (the deepest working directory containing
+/// it) and the `/`-separated path relative to that working directory — the
+/// form libgit2 expects. `None` when no listed repo contains `path`.
+pub(super) fn git_repo_for_path<'a>(
+    repos: &'a [GitRepoEntry],
+    path: &Path,
+) -> Option<(&'a GitRepoEntry, String)> {
+    let canon = std::fs::canonicalize(path).ok().or_else(|| {
+        // Deleted file: canonicalize the parent and re-attach the name.
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(parent.join(path.file_name()?))
+    })?;
+    repos
+        .iter()
+        .filter(|e| canon.starts_with(&e.workdir))
+        .max_by_key(|e| e.workdir.components().count())
+        .and_then(|e| {
+            let rel = canon.strip_prefix(&e.workdir).ok()?;
+            Some((e, rel.to_string_lossy().replace('\\', "/")))
+        })
+}
+
+/// Re-run repo discovery (a clone added or removed since startup) and keep
+/// the active tab on the same repository when it still exists.
+pub(super) fn rescan_git_repos(app: &mut App) {
+    let active = app
+        .git_repos
+        .get(app.git_panel.active_repo)
+        .map(|e| e.workdir.clone());
+    app.git_repos = scan_git_repos(&app.workspace);
+    if let Some(active) = active
+        && let Some(idx) = app.git_repos.iter().position(|e| e.workdir == active)
+    {
+        app.git_panel.active_repo = idx;
+    }
+}
+
 pub(super) fn refresh_git_panel(app: &mut App) {
     let names: Vec<String> = app.git_repos.iter().map(|e| e.name.clone()).collect();
     app.git_panel.set_repo_tabs(names);
     if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
         app.git_panel.refresh(&entry.repo);
+    } else {
+        app.git_panel.show_no_repository();
     }
 }
 
@@ -697,6 +788,7 @@ pub(super) fn sync_git_panel_entry(app: &mut App) -> bool {
     let entered = shown && app.focus == Focus::SidePanel;
     let refresh = (shown && !app.git_panel_shown) || (entered && !app.git_panel_entered);
     if refresh {
+        rescan_git_repos(app);
         refresh_git_panel(app);
     }
     app.git_panel_shown = shown;
@@ -4172,6 +4264,64 @@ mod tests {
         app.focus = Focus::SidePanel;
         assert!(super::sync_git_panel_entry(&mut app));
         assert!(unstaged(&app).contains(&"b.txt".to_string()), "{:?}", unstaged(&app));
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn plain_folder_of_clones_gets_one_git_tab_per_clone() {
+        use crate::app::state::{Focus, SidePanelMode};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["app", "lib"] {
+            git2::Repository::init(dir.path().join(name)).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("lib/new.rs"), "fn x() {}").unwrap();
+        let mut app = chat_app(dir.path());
+        // TMP may sit inside a checkout; keep only the repos under `dir`.
+        let dir_canon = std::fs::canonicalize(dir.path()).unwrap();
+        app.git_repos.retain(|e| e.workdir.starts_with(&dir_canon));
+        let names: Vec<&str> = app.git_repos.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["app", "lib"]);
+
+        // Files route to the clone that owns them, with a workdir-relative path.
+        let (entry, rel) =
+            super::git_repo_for_path(&app.git_repos, &dir.path().join("lib/new.rs")).unwrap();
+        assert_eq!((entry.name.as_str(), rel.as_str()), ("lib", "new.rs"));
+        assert!(super::git_repo_for_path(&app.git_repos, &dir.path().join("docs/x.md")).is_none());
+
+        // The panel shows a tab per clone and cycles into the second one.
+        app.panel_visible.side_panel = true;
+        app.side_panel = SidePanelMode::GitPanel;
+        app.focus = Focus::Editor;
+        super::refresh_git_panel(&mut app);
+        assert_eq!(app.git_panel.repo_tabs, ["app", "lib"]);
+        app.git_panel.cycle_repo(1);
+        super::refresh_git_panel(&mut app);
+        let unstaged: Vec<&str> = app.git_panel.unstaged.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(unstaged, ["new.rs"]);
+
+        // CHANGES spans every clone and labels entries with the repo name.
+        app.refresh_git_changes();
+        let labels: Vec<String> = app
+            .changes_state
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.label.clone())
+            .collect();
+        assert_eq!(labels, ["lib/new.rs"]);
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn folder_without_any_repo_says_so_in_the_git_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = chat_app(dir.path());
+        app.git_repos.clear(); // TMP may sit inside a checkout
+        super::refresh_git_panel(&mut app);
+        assert!(app.git_panel.repo_tabs.is_empty());
+        assert!(app.git_panel.error_message.is_some());
         cleanup_session(dir.path());
     }
 

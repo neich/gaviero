@@ -69,6 +69,9 @@ const DIFF_GUTTER_WIDTH: u16 = 5;
 /// One git repo + its display name (workspace folder name).
 pub struct GitRepoEntry {
     pub name: String,
+    /// Canonical working directory — the key for routing a file to the
+    /// repository that owns it (`App::git_repo_for_path`).
+    pub workdir: std::path::PathBuf,
     pub repo: gaviero_core::git::GitRepo,
 }
 
@@ -438,20 +441,9 @@ impl App {
         }
         let skill_catalog = Arc::new(skill_catalog);
 
-        // Open git repos for git panel (M4): one per workspace folder root that
-        // is a git repository. In single-folder mode this collapses to one entry.
-        let git_repos: Vec<GitRepoEntry> = workspace
-            .folders()
-            .iter()
-            .filter_map(|f| {
-                gaviero_core::git::GitRepo::open(&f.path)
-                    .ok()
-                    .map(|repo| GitRepoEntry {
-                        name: f.display_name().to_string(),
-                        repo,
-                    })
-            })
-            .collect();
+        // Git repos for the git panel: per workspace folder, the repo that
+        // contains it plus any repos cloned directly inside it.
+        let git_repos = side_panel::scan_git_repos(&workspace);
 
         // Primary workspace root for code-graph context (first root).
         let graph_workspace_root = workspace.roots().first().map(|p| p.to_path_buf());

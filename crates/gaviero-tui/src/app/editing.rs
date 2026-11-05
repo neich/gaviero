@@ -2488,17 +2488,8 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
                 }
                 buf.indent_query = app.indent_query_cache.get_or_load(lang_name, language);
             }
-            let git_unmerged = app
-                .workspace
-                .roots()
-                .first()
-                .and_then(|root| {
-                    path.strip_prefix(root).ok().and_then(|rel| {
-                        gaviero_core::git::GitRepo::open(root)
-                            .ok()
-                            .and_then(|repo| repo.is_path_unmerged(rel.to_str()?).ok())
-                    })
-                })
+            let git_unmerged = super::side_panel::git_repo_for_path(&app.git_repos, &path)
+                .and_then(|(entry, rel)| entry.repo.is_path_unmerged(&rel).ok())
                 .unwrap_or(false);
             buf.refresh_conflict_metadata(git_unmerged);
 
@@ -2610,17 +2601,11 @@ pub(super) fn save_current_buffer(app: &mut App) {
 }
 
 fn stage_file_if_conflict_resolved(app: &mut App, path: &std::path::Path) {
-    let root = match app.workspace.roots().first() {
-        Some(r) => r.to_path_buf(),
-        None => return,
-    };
-    let rel = match path.strip_prefix(&root).ok().and_then(|p| p.to_str()) {
-        Some(r) => r,
-        None => return,
-    };
-    let Ok(repo) = gaviero_core::git::GitRepo::open(&root) else {
+    let Some((entry, rel)) = super::side_panel::git_repo_for_path(&app.git_repos, path) else {
         return;
     };
+    let rel = rel.as_str();
+    let repo = &entry.repo;
     let Ok(true) = repo.is_path_unmerged(rel) else {
         return;
     };

@@ -34,7 +34,10 @@ gaviero                              # current directory
 gaviero /path/to/repo                # single-folder workspace
 gaviero /path/to/project.gaviero-workspace   # multi-folder workspace
 gaviero --workspace ~/src            # multi-folder workspace built from ~/src
+gaviero --folder ~/src               # plain folder, even if ~/src holds a workspace file
 ```
+
+A plain `gaviero <dir>` on a directory that holds a `.gaviero-workspace` file asks whether to open that workspace instead (memory, code graph and member settings differ between the two); `--folder` skips the question.
 
 **First run.** Opening a folder that has no `.gaviero/settings.json` shows a setup screen before the editor, at every launch until the folder has one. It offers three choices:
 

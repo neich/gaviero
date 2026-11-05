@@ -21,11 +21,14 @@ Binary name: `gaviero`.
 gaviero                                        # current directory
 gaviero /path/to/repo                          # single-folder workspace
 gaviero /path/to/workspace.gaviero-workspace   # multi-folder workspace
+gaviero --folder /path/to/dir                  # plain folder, even if it holds a workspace file
 ```
+
+Opening a directory that holds a `.gaviero-workspace` file asks first whether to open that workspace (preselected) or the directory as a plain folder (Esc). A plain folder keeps its own memory, code graph and turn history under its `.gaviero/` and ignores the members' `.gaviero/settings.json`. `--folder` skips the question, `--workspace` opens the workspace directly, and a restart onto a new build reuses the answer.
 
 In a folder without `.gaviero/settings.json` — or a `.gaviero-workspace` file without one beside it — a setup screen offers an editor-only session (nothing written), a minimal `{}` settings file, or full settings — a copy of the global `$GAVIERO_ROOT/.gaviero/settings.json` (built-in full settings when it does not exist).
 
-**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+H (history), Alt+G (git), Alt+M (memory), Alt+R (code graph for the active file). **Code graph:** F12 / Alt+. / Ctrl+click go to the definition under the cursor (a visible CODE GRAPH panel follows the jump); Alt+S shows the CODE GRAPH panel for the symbol under the cursor without leaving the editor. The panel scrolls with the wheel once focused (click it or Alt+3) and has a scrollbar you can click or drag. **Left panel:** Alt+E (explorer), Alt+F (find — Tab switches between file contents and file names; gitignored folders are skipped), Alt+C (changes).
+**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+H (history), Alt+G (git — one tab per repository: the one containing each opened folder plus every repository cloned directly inside it, so a plain folder of clones works without a workspace file; Alt+O/I switch tabs while the panel is focused), Alt+M (memory), Alt+R (code graph for the active file). **Code graph:** F12 / Alt+. / Ctrl+click go to the definition under the cursor (a visible CODE GRAPH panel follows the jump); Alt+S shows the CODE GRAPH panel for the symbol under the cursor without leaving the editor. The panel scrolls with the wheel once focused (click it or Alt+3) and has a scrollbar you can click or drag. **Left panel:** Alt+E (explorer), Alt+F (find — Tab switches between file contents and file names; gitignored folders are skipped), Alt+C (changes).
 
 ## Examples
 

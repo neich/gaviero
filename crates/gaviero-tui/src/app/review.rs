@@ -1556,29 +1556,39 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
 }
 
 pub(super) fn refresh_git_changes(app: &mut App) {
-    let root = match app.workspace.roots().first() {
-        Some(r) => r.to_path_buf(),
-        None => {
-            app.changes_state = None;
-            return;
-        }
-    };
-    let repo = match gaviero_core::git::GitRepo::open(&root) {
-        Ok(r) => r,
-        Err(_) => {
-            app.changes_state = None;
-            return;
-        }
-    };
-    let entries = match repo.file_status() {
-        Ok(e) => e,
-        Err(_) => {
-            app.changes_state = None;
-            return;
-        }
-    };
+    // Every repo the GIT panel lists — a plain folder holding several clones
+    // shows the changes of all of them.
+    let multi = app.git_repos.len() > 1;
+    let mut git_entries: Vec<ChangesEntry> = Vec::new();
+    for repo_entry in &app.git_repos {
+        git_entries.extend(git_changes_for_repo(repo_entry, multi));
+    }
 
-    let workdir = repo.workdir().unwrap_or(&root).to_path_buf();
+    if git_entries.is_empty() {
+        app.changes_state = None;
+        return;
+    }
+
+    app.changes_state = Some(ChangesState {
+        entries: git_entries,
+        selected_index: 0,
+        scroll_offset: 0,
+        diff_scroll: 0,
+        cached_diff: Vec::new(),
+        cached_diff_index: usize::MAX,
+        cached_highlights: None,
+    });
+}
+
+fn git_changes_for_repo(repo_entry: &super::GitRepoEntry, multi: bool) -> Vec<ChangesEntry> {
+    let repo = &repo_entry.repo;
+    let Ok(entries) = repo.file_status() else {
+        return Vec::new();
+    };
+    let workdir = repo
+        .workdir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo_entry.workdir.clone());
 
     let unmerged: std::collections::HashSet<String> = repo
         .unmerged_paths()
@@ -1586,7 +1596,7 @@ pub(super) fn refresh_git_changes(app: &mut App) {
         .into_iter()
         .collect();
 
-    let git_entries: Vec<ChangesEntry> = entries
+    entries
         .into_iter()
         .filter(|e| !e.staged)
         .map(|e| {
@@ -1630,8 +1640,15 @@ pub(super) fn refresh_git_changes(app: &mut App) {
                 (additions, deletions)
             };
 
+            let label = if multi {
+                format!("{}/{}", repo_entry.name, e.path)
+            } else {
+                e.path.clone()
+            };
             ChangesEntry {
                 rel_path: e.path,
+                repo_workdir: repo_entry.workdir.clone(),
+                label,
                 abs_path,
                 status_char: e.status.marker(),
                 additions,
@@ -1639,22 +1656,7 @@ pub(super) fn refresh_git_changes(app: &mut App) {
                 is_conflict,
             }
         })
-        .collect();
-
-    if git_entries.is_empty() {
-        app.changes_state = None;
-        return;
-    }
-
-    app.changes_state = Some(ChangesState {
-        entries: git_entries,
-        selected_index: 0,
-        scroll_offset: 0,
-        diff_scroll: 0,
-        cached_diff: Vec::new(),
-        cached_diff_index: usize::MAX,
-        cached_highlights: None,
-    });
+        .collect()
 }
 
 pub(super) fn handle_changes_action(app: &mut App, action: &Action) -> bool {
@@ -1904,11 +1906,11 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
                 cs.cached_highlights = highlights;
                 return;
             }
-            let root = app.workspace.roots().first().map(|r| r.to_path_buf());
-            let old_content = root
-                .as_ref()
-                .and_then(|r| gaviero_core::git::GitRepo::open(r).ok())
-                .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
+            let old_content = app
+                .git_repos
+                .iter()
+                .find(|r| r.workdir == entry.repo_workdir)
+                .and_then(|r| r.repo.head_file_content(&entry.rel_path).ok())
                 .unwrap_or_default();
             let (lang_name, language) = language_for_path(&entry.abs_path);
             Some((
@@ -1973,10 +1975,10 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
     let header = if entry.is_conflict {
         format!(
             " {}  (merge conflict — Enter: edit  F8/F9: jump) ",
-            entry.rel_path
+            entry.label
         )
     } else {
-        format!(" {} ", entry.rel_path)
+        format!(" {} ", entry.label)
     };
     let header_style = Style::default()
         .fg(if entry.is_conflict {
