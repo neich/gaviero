@@ -100,6 +100,16 @@ impl GitPanelState {
         self.close_branch_picker();
     }
 
+    /// Clear the panel when no folder holds or contains a repository.
+    pub fn show_no_repository(&mut self) {
+        self.unstaged.clear();
+        self.staged.clear();
+        self.branches.clear();
+        self.current_branch.clear();
+        self.error_message =
+            Some("no git repository in this folder or its direct subfolders".to_string());
+    }
+
     /// Reload file status and branch info from the repository.
     pub fn refresh(&mut self, repo: &GitRepo) {
         self.error_message = None;

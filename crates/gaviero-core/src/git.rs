@@ -54,6 +54,56 @@ pub struct BranchEntry {
     pub is_remote: bool,
 }
 
+// ── Repository discovery ───────────────────────────────────
+
+/// The repositories an opened folder covers: the one containing `folder`
+/// (found upward, like [`GitRepo::open`]), then each direct child directory
+/// that is the top of its own repository (holds a `.git` directory or file —
+/// clones, linked worktrees, submodules), sorted by name. A folder that is
+/// not a repository but holds several clones yields one entry per clone.
+///
+/// Children whose name is hidden (`.`-prefixed) or for which `skip_child`
+/// returns true are not inspected. Repositories already listed (same
+/// working directory) are not repeated.
+pub fn discover_folder_repos(folder: &Path, skip_child: impl Fn(&str) -> bool) -> Vec<GitRepo> {
+    let mut out: Vec<GitRepo> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut push = |repo: GitRepo, out: &mut Vec<GitRepo>| {
+        let Some(workdir) = repo.workdir() else {
+            return; // bare repository: nothing to show
+        };
+        let key = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(repo);
+        }
+    };
+
+    if let Ok(repo) = GitRepo::open(folder) {
+        push(repo, &mut out);
+    }
+
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return out;
+    };
+    let mut children: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            (!name.starts_with('.') && !skip_child(&name)).then(|| (name, e.path()))
+        })
+        .filter(|(_, path)| path.join(".git").exists())
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, path) in children {
+        if let Ok(repo) = GitRepo::open_exact(&path) {
+            push(repo, &mut out);
+        }
+    }
+    out
+}
+
 // ── GitRepo ────────────────────────────────────────────────
 
 /// A handle to a git repository.
@@ -65,6 +115,14 @@ impl GitRepo {
     /// Open an existing repository at the given path (or search upward).
     pub fn open(path: &Path) -> Result<Self> {
         let repo = git2::Repository::discover(path)
+            .with_context(|| format!("opening git repo at {}", path.display()))?;
+        Ok(Self { repo })
+    }
+
+    /// Open the repository whose working directory is exactly `path` (no
+    /// upward search). `path` must hold a `.git` directory or file.
+    pub fn open_exact(path: &Path) -> Result<Self> {
+        let repo = git2::Repository::open(path)
             .with_context(|| format!("opening git repo at {}", path.display()))?;
         Ok(Self { repo })
     }
@@ -1177,6 +1235,67 @@ mod tests {
         let (dir, _repo) = init_test_repo();
         let opened = GitRepo::open(dir.path());
         assert!(opened.is_ok());
+    }
+
+    fn workdir_names(repos: &[GitRepo]) -> Vec<String> {
+        repos
+            .iter()
+            .map(|r| {
+                r.workdir()
+                    .and_then(|w| w.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn discover_folder_repos_lists_child_clones_of_a_plain_folder() {
+        let parent = TempDir::new().unwrap();
+        for name in ["beta", "alpha"] {
+            git2::Repository::init(parent.path().join(name)).unwrap();
+        }
+        std::fs::create_dir_all(parent.path().join("notes")).unwrap();
+        git2::Repository::init(parent.path().join(".hidden")).unwrap();
+        git2::Repository::init(parent.path().join("node_modules")).unwrap();
+
+        let repos = discover_folder_repos(parent.path(), |n| n == "node_modules");
+        // TMP may itself sit inside a checkout, whose repo would come first.
+        let parent_canon = std::fs::canonicalize(parent.path()).unwrap();
+        let children: Vec<GitRepo> = repos
+            .into_iter()
+            .filter(|r| {
+                std::fs::canonicalize(r.workdir().unwrap())
+                    .unwrap()
+                    .starts_with(&parent_canon)
+            })
+            .collect();
+        assert_eq!(workdir_names(&children), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn discover_folder_repos_puts_the_folder_repo_first() {
+        let (dir, _repo) = init_test_repo();
+        git2::Repository::init(dir.path().join("vendored")).unwrap();
+
+        let repos = discover_folder_repos(dir.path(), |_| false);
+        assert_eq!(repos.len(), 2);
+        let first = std::fs::canonicalize(repos[0].workdir().unwrap()).unwrap();
+        assert_eq!(first, std::fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(workdir_names(&repos)[1], "vendored");
+    }
+
+    #[test]
+    fn discover_folder_repos_finds_the_enclosing_repo_of_a_subfolder() {
+        let (dir, _repo) = init_test_repo();
+        let sub = dir.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let repos = discover_folder_repos(&sub, |_| false);
+        assert_eq!(repos.len(), 1);
+        let workdir = std::fs::canonicalize(repos[0].workdir().unwrap()).unwrap();
+        assert_eq!(workdir, std::fs::canonicalize(dir.path()).unwrap());
     }
 
     #[test]

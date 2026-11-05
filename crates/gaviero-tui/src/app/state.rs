@@ -87,7 +87,14 @@ pub struct BatchReviewState {
 
 #[derive(Clone, Debug)]
 pub struct ChangesEntry {
+    /// Path relative to `repo_workdir` (the form libgit2 expects).
     pub rel_path: String,
+    /// Canonical working directory of the repo the entry comes from — the
+    /// CHANGES list spans every repo in `App::git_repos`.
+    pub repo_workdir: PathBuf,
+    /// Header label: `rel_path`, prefixed with the repo tab name when more
+    /// than one repo is listed.
+    pub label: String,
     pub abs_path: PathBuf,
     pub status_char: char,
     pub additions: usize,
