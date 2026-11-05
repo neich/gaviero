@@ -6030,6 +6030,12 @@ pub fn parse_skill_invocations(
                 i += consumed;
                 continue;
             }
+            // `$5`, `$100`: a dollar amount, not a mistyped skill.
+            if name.starts_with(|c: char| c.is_ascii_digit()) && qualifier.is_none() {
+                out.push('$');
+                i += 1;
+                continue;
+            }
             warnings.push(gaviero_core::skills::SkillWarning {
                 name: name.to_string(),
                 message: "unknown skill".to_string(),
@@ -6056,9 +6062,12 @@ fn count_backslashes(bytes: &[u8], dollar_pos: usize) -> (usize, usize) {
     (count, pos)
 }
 
+/// A skill name may start with a digit (`304-spring-security`), matching the
+/// catalog's `valid_stem`. A digit-led `$…` that names no skill is left as
+/// plain text without a warning, so `$5.00` and `$100` stay amounts.
 fn is_name_char(c: char, first: bool) -> bool {
     if first {
-        c.is_ascii_alphabetic() || c == '_'
+        c.is_ascii_alphanumeric() || c == '_'
     } else {
         c.is_ascii_alphanumeric() || c == '_' || c == '-'
     }
@@ -6527,6 +6536,31 @@ mod tests {
         assert!(resolved.is_empty());
         assert!(warnings.is_empty());
         assert_eq!(cleaned, "cost is $5.00 today");
+    }
+
+    #[test]
+    fn parse_skill_invocations_name_may_start_with_a_digit() {
+        let (catalog, _tmp) = test_skill_catalog(
+            "304-frameworks-spring-boot-security",
+            "Secure it.",
+            "Spring Boot security guidelines",
+        );
+        let (cleaned, resolved, warnings) = parse_skill_invocations(
+            "$304-frameworks-spring-boot-security review the login flow",
+            &catalog,
+            None,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "304-frameworks-spring-boot-security");
+        assert!(!cleaned.contains("$304"));
+
+        // An unknown digit-led `$…` is plain text, not an unknown skill.
+        let (cleaned, resolved, warnings) =
+            parse_skill_invocations("budget $100 and $3-4 days", &catalog, None);
+        assert!(resolved.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(cleaned, "budget $100 and $3-4 days");
     }
 
     #[test]

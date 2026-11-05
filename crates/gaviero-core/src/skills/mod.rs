@@ -243,6 +243,24 @@ mod tests {
         );
     }
 
+    /// jabrena/plinth `skills/304-frameworks-spring-boot-security/SKILL.md`
+    /// (frontmatter verbatim): digit-led name, long one-line description
+    /// with colons and dashes, `license`, nested `metadata`.
+    #[test]
+    fn plinth_spring_security_skill_parses() {
+        let path = Path::new("skills/304-frameworks-spring-boot-security/SKILL.md");
+        let src = "---\n\
+name: 304-frameworks-spring-boot-security\n\
+description: Use when you need to design, review, or improve security in Spring Boot applications \u{2014} including SecurityFilterChain, OAuth2/JWT resource server patterns, form login basics, method security (@PreAuthorize), CSRF and CORS for APIs. This should trigger for requests such as Add Spring Boot security support; Review Spring Boot security configuration. Part of Plinth Toolkit\n\
+license: Apache-2.0\n\
+metadata:\n  author: Juan Antonio Bre\u{f1}a Moral\n  version: 0.19.0\n\
+---\n# Spring Boot Security Guidelines\n";
+        let skill = parse_skill(path, src).unwrap();
+        assert_eq!(skill.name, "304-frameworks-spring-boot-security");
+        assert!(skill.description.starts_with("Use when you need to design"));
+        assert!(skill.body.starts_with("# Spring Boot Security Guidelines"));
+    }
+
     fn write_skill(root: &Path, name: &str, paths: &str, body: &str) {
         let dir = root.join(".gaviero").join("skills").join(name);
         std::fs::create_dir_all(&dir).unwrap();
