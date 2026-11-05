@@ -22,7 +22,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use app::App;
@@ -46,6 +46,11 @@ struct Cli {
     /// to include and writes `<dirname>.gaviero-workspace`.
     #[arg(long)]
     workspace: bool,
+
+    /// Open PATH as a plain folder even when it holds a
+    /// `*.gaviero-workspace` file, without asking.
+    #[arg(long, conflicts_with = "workspace")]
+    folder: bool,
 }
 
 /// C1: synchronous yes/no prompt on stdin/stderr asking the user to
@@ -222,6 +227,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A plain directory launch (`gaviero <dir>`, no `--workspace` / `--folder`)
+/// whose directory holds a `.gaviero-workspace` file: ask whether to open
+/// that workspace instead. Opening the folder splits memory, code graph and
+/// settings from the workspace's, so it should be a choice, not an accident.
+/// Returns the workspace file to open, or `None` for the plain folder.
+///
+/// A restart under the supervisor reuses the earlier answer. Without a TTY
+/// the folder opens as asked, with a warning in the log.
+fn folder_launch_workspace(path: &Path) -> Result<Option<PathBuf>> {
+    use setup::FolderLaunch;
+    let Some(file) = setup::existing_workspace_file(path) else {
+        return Ok(None);
+    };
+    let choice = match supervisor::recall_launch_choice(path) {
+        Some(choice) => choice,
+        None if std::io::stdin().is_terminal() => {
+            let choice = setup::ask_folder_launch(path, &file)?;
+            supervisor::remember_launch_choice(path, &choice);
+            choice
+        }
+        None => {
+            tracing::warn!(
+                "{} holds {}; opening it as a plain folder (no TTY to ask). \
+                 Memory, code graph and settings are separate from the workspace's.",
+                path.display(),
+                file.display()
+            );
+            FolderLaunch::Folder
+        }
+    };
+    Ok(match choice {
+        FolderLaunch::Workspace(file) => Some(file),
+        FolderLaunch::Folder => None,
+    })
+}
+
 /// The TUI itself. Returns true when it quit to restart into a newly
 /// installed build.
 async fn run() -> Result<bool> {
@@ -262,8 +303,10 @@ async fn run() -> Result<bool> {
         Some(path.clone())
     } else if cli.workspace {
         setup::existing_workspace_file(&path)
-    } else {
+    } else if cli.folder {
         None
+    } else {
+        folder_launch_workspace(&path)?
     };
     let launch_mode = setup::LaunchMode::for_launch(workspace_file.as_deref(), cli.workspace);
     // Editor-only: explorer, find, editor and terminal; no agents, memory,

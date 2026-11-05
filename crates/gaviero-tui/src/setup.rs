@@ -178,7 +178,36 @@ pub fn existing_workspace_file(root: &Path) -> Option<PathBuf> {
 /// the workspace file's).
 pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
     let mut wizard = Wizard::new(root, mode, gaviero_core::workspace::user_settings_path());
+    match run_screen(&mut wizard)? {
+        Flow::EditorOnly => Ok(wizard.untouched_outcome()),
+        _ => wizard.apply(),
+    }
+}
 
+/// A full-screen, pre-editor screen driven by [`run_screen`].
+trait Screen {
+    type Out;
+    fn draw(&self, frame: &mut Frame);
+    /// `Some` ends the screen with that result.
+    fn key(&mut self, code: KeyCode) -> Option<Self::Out>;
+}
+
+impl Screen for Wizard {
+    type Out = Flow;
+    fn draw(&self, frame: &mut Frame) {
+        self.render(frame);
+    }
+    fn key(&mut self, code: KeyCode) -> Option<Flow> {
+        match self.handle_key(code) {
+            Flow::Continue => None,
+            done => Some(done),
+        }
+    }
+}
+
+/// Run `screen` in its own raw-mode + alternate-screen session and hand the
+/// terminal back pristine, so plain-stdin prompts after it still work.
+fn run_screen<S: Screen>(screen: &mut S) -> Result<S::Out> {
     enable_raw_mode().context("enabling raw mode for setup screen")?;
     let mut stdout = std::io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
@@ -186,20 +215,19 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
         return Err(e).context("entering alternate screen for setup screen");
     }
 
-    let result = (|| -> Result<Flow> {
+    let result = (|| -> Result<S::Out> {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).context("creating setup terminal")?;
         loop {
-            terminal.draw(|frame| wizard.render(frame))?;
+            terminal.draw(|frame| screen.draw(frame))?;
             let TermEvent::Key(key) = event::read()? else {
                 continue;
             };
             if key.kind == KeyEventKind::Release {
                 continue;
             }
-            match wizard.handle_key(key.code) {
-                Flow::Continue => {}
-                done => return Ok(done),
+            if let Some(out) = screen.key(key.code) {
+                return Ok(out);
             }
         }
     })();
@@ -208,10 +236,190 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<SetupOutcome> {
     // error message lands on a usable screen.
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
+    result
+}
 
-    match result? {
-        Flow::EditorOnly => Ok(wizard.untouched_outcome()),
-        _ => wizard.apply(),
+// ── Folder that holds a workspace file ─────────────────────────
+
+/// How to open a directory launch whose directory holds a
+/// `.gaviero-workspace` file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderLaunch {
+    /// Open that workspace file instead (multi-folder mode).
+    Workspace(PathBuf),
+    /// Open the directory as a plain single folder, as asked.
+    Folder,
+}
+
+/// Ask whether `gaviero <dir>` should open the `.gaviero-workspace` file
+/// found in `<dir>` or the directory itself. Needs a TTY.
+pub fn ask_folder_launch(root: &Path, workspace_file: &Path) -> Result<FolderLaunch> {
+    let mut prompt = WorkspacePrompt::new(root, workspace_file);
+    run_screen(&mut prompt)
+}
+
+/// The two-option screen behind [`ask_folder_launch`]. Opening the workspace
+/// is preselected; Esc opens the folder exactly as the command asked.
+struct WorkspacePrompt {
+    root: PathBuf,
+    workspace_file: PathBuf,
+    /// 0 = workspace, 1 = plain folder.
+    cursor: usize,
+}
+
+impl WorkspacePrompt {
+    fn new(root: &Path, workspace_file: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            workspace_file: workspace_file.to_path_buf(),
+            cursor: 0,
+        }
+    }
+
+    fn pick(&self, idx: usize) -> FolderLaunch {
+        if idx == 0 {
+            FolderLaunch::Workspace(self.workspace_file.clone())
+        } else {
+            FolderLaunch::Folder
+        }
+    }
+
+    fn file_name(&self) -> String {
+        self.workspace_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("the workspace file")
+            .to_string()
+    }
+
+    /// Member folders listed in the workspace file (empty if unreadable).
+    fn member_names(&self) -> Vec<String> {
+        gaviero_core::workspace::Workspace::load(&self.workspace_file)
+            .map(|ws| {
+                ws.folders()
+                    .iter()
+                    .map(|f| f.display_name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Screen for WorkspacePrompt {
+    type Out = FolderLaunch;
+
+    fn key(&mut self, code: KeyCode) -> Option<FolderLaunch> {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = 0;
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cursor = 1;
+                None
+            }
+            KeyCode::Char('1') => Some(self.pick(0)),
+            KeyCode::Char('2') => Some(self.pick(1)),
+            KeyCode::Enter => Some(self.pick(self.cursor)),
+            KeyCode::Esc => Some(FolderLaunch::Folder),
+            _ => None,
+        }
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let block = Block::default()
+            .title(" Gaviero — workspace found ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::FOCUS_BORDER))
+            .style(Style::default().bg(theme::PANEL_BG).fg(theme::TEXT_FG));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let dim = Style::default().fg(theme::TEXT_DIM);
+        let file_name = self.file_name();
+        let members = self.member_names();
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(format!("  {}", self.root.display()), dim)),
+            Line::from(Span::styled(
+                format!("  This folder holds {file_name}. Open the workspace instead?"),
+                dim,
+            )),
+            Line::from(""),
+        ];
+        let titles = [
+            format!("Open workspace {file_name}"),
+            "Open this folder as a plain folder".to_string(),
+        ];
+        for (idx, title) in titles.iter().enumerate() {
+            let active = idx == self.cursor;
+            let marker = if active { "▸" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!("  {marker} {}. {title}", idx + 1),
+                Style::default()
+                    .fg(if active { theme::ACCENT } else { theme::TEXT_FG })
+                    .add_modifier(if active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )));
+        }
+        lines.push(Line::from(""));
+        let detail: Vec<(String, ratatui::style::Color)> = if self.cursor == 0 {
+            let mut d = vec![(
+                "Each member keeps its own memory, code graph and .gaviero/settings.json."
+                    .to_string(),
+                theme::TEXT_DIM,
+            )];
+            if !members.is_empty() {
+                d.push((format!("Members: {}", members.join(", ")), theme::TEXT_DIM));
+            }
+            d
+        } else {
+            vec![
+                (
+                    "Memory, code graph and turn history go to this folder's own .gaviero/,"
+                        .to_string(),
+                    theme::WARNING,
+                ),
+                (
+                    "separate from the workspace's — memories do not carry over either way."
+                        .to_string(),
+                    theme::WARNING,
+                ),
+                (
+                    "Member folders' .gaviero/settings.json files are not applied.".to_string(),
+                    theme::WARNING,
+                ),
+                (
+                    "The GIT panel still shows a tab per repository inside the folder."
+                        .to_string(),
+                    theme::TEXT_DIM,
+                ),
+            ]
+        };
+        for (text, color) in detail {
+            lines.push(Line::from(Span::styled(
+                format!("    {text}"),
+                Style::default().fg(color),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ↑/↓ choose · 1-2 pick · Enter open · Esc plain folder · `gaviero --folder` skips this",
+            dim,
+        )));
+
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: inner.height.saturating_sub(1),
+            },
+        );
     }
 }
 
@@ -942,6 +1150,53 @@ mod tests {
         std::fs::create_dir_all(other.path().join(".gaviero")).unwrap();
         std::fs::write(other.path().join(".gaviero/settings.json"), "{}").unwrap();
         assert!(needs_setup(other.path(), &LaunchMode::Workspace));
+    }
+
+    #[test]
+    fn workspace_prompt_preselects_the_workspace_and_esc_keeps_the_folder() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let mut prompt = WorkspacePrompt::new(dir.path(), &file);
+        assert_eq!(prompt.member_names(), ["app"]);
+
+        assert_eq!(
+            prompt.key(KeyCode::Enter),
+            Some(FolderLaunch::Workspace(file.clone()))
+        );
+        assert_eq!(prompt.key(KeyCode::Down), None);
+        assert_eq!(prompt.key(KeyCode::Enter), Some(FolderLaunch::Folder));
+        assert_eq!(prompt.key(KeyCode::Char('k')), None);
+        assert_eq!(
+            prompt.key(KeyCode::Enter),
+            Some(FolderLaunch::Workspace(file.clone()))
+        );
+        assert_eq!(prompt.key(KeyCode::Char('2')), Some(FolderLaunch::Folder));
+        assert_eq!(
+            prompt.key(KeyCode::Char('1')),
+            Some(FolderLaunch::Workspace(file))
+        );
+        assert_eq!(prompt.key(KeyCode::Esc), Some(FolderLaunch::Folder));
+        assert_eq!(prompt.key(KeyCode::Char('x')), None);
+    }
+
+    #[test]
+    fn workspace_prompt_draws_both_options_and_the_folder_warning() {
+        let dir = tempdir();
+        let file = workspace_file(dir.path());
+        let mut prompt = WorkspacePrompt::new(dir.path(), &file);
+        let render = |prompt: &WorkspacePrompt| -> String {
+            let backend = ratatui::backend::TestBackend::new(110, 20);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| prompt.draw(f)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content().iter().map(|c| c.symbol()).collect()
+        };
+        let screen = render(&prompt);
+        assert!(screen.contains("Open workspace ws.gaviero-workspace"), "{screen}");
+        assert!(screen.contains("Open this folder as a plain folder"));
+        assert!(screen.contains("Members: app"));
+        prompt.key(KeyCode::Down);
+        assert!(render(&prompt).contains("memories do not carry over"));
     }
 
     /// `<dir>/ws.gaviero-workspace` listing `<dir>/app` (which may have its
