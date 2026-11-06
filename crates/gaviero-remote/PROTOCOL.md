@@ -487,6 +487,13 @@ explorer and `@` completion use, each `{ name, path, is_dir: true }` where `path
 path in a listing is the label plus `/` plus the relative path (one namespace for single- and
 multi-root workspaces; the client never joins paths itself).
 
+One exception: following a relative Markdown link (`../README.md`, `/docs/x.md`) needs the
+document's own path, so the client resolves it — against the open file's folder, `..` never
+climbing above that file's root label. Chat links have no document, so they are read from the
+workspace root: a first segment naming a root label picks it, otherwise the first root. The result
+is an ordinary `read_file` path and passes the same server-side path rules below; a wrong join can
+only fail, never reach outside the workspace.
+
 `list_directory` result:
 
 ```json
