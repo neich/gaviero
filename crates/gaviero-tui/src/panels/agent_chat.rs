@@ -4251,24 +4251,11 @@ impl AgentChatState {
         if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::SkillRef {
             return;
         }
-        let prefix = &self.autocomplete.query;
-        let hits = catalog.complete(prefix, active_repo_id);
-        let mut by_name: std::collections::HashMap<&str, Vec<&gaviero_core::skills::Skill>> =
-            std::collections::HashMap::new();
-        for skill in &hits {
-            by_name.entry(&skill.name).or_default().push(*skill);
-        }
-        self.autocomplete.matches = hits
-            .iter()
-            .map(|skill| {
-                let siblings = by_name
-                    .get(skill.name.as_str())
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                skill_autocomplete_insert(catalog, skill, siblings)
-            })
-            .take(10)
-            .collect();
+        self.autocomplete.matches =
+            match_skills(catalog, &self.autocomplete.query, active_repo_id, 10)
+                .into_iter()
+                .map(|(insert, _)| insert)
+                .collect();
         if self.autocomplete.selected >= self.autocomplete.matches.len() {
             self.autocomplete.selected = 0;
         }
@@ -6180,6 +6167,33 @@ fn try_parse_invocation(text: &str, dollar: usize) -> Option<ParsedInvocation<'_
         raw_args,
         consumed,
     })
+}
+
+/// `$` completion matches: catalog skills whose name starts with `prefix`,
+/// in the catalog's ranking, each with its insertion text. Shared by the
+/// desktop popup and remote `request_skill_completions`.
+pub fn match_skills<'a>(
+    catalog: &'a gaviero_core::skills::SkillCatalog,
+    prefix: &str,
+    active_repo_id: Option<&str>,
+    limit: usize,
+) -> Vec<(String, &'a gaviero_core::skills::Skill)> {
+    let hits = catalog.complete(prefix, active_repo_id);
+    let mut by_name: std::collections::HashMap<&str, Vec<&gaviero_core::skills::Skill>> =
+        std::collections::HashMap::new();
+    for skill in &hits {
+        by_name.entry(&skill.name).or_default().push(*skill);
+    }
+    hits.iter()
+        .take(limit)
+        .map(|skill| {
+            let siblings = by_name
+                .get(skill.name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            (skill_autocomplete_insert(catalog, skill, siblings), *skill)
+        })
+        .collect()
 }
 
 /// Build the insertion text for a skill autocomplete selection.
