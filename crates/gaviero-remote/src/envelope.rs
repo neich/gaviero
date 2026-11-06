@@ -37,6 +37,8 @@ pub enum ClientFrame {
     ReadFile(ReadFile),
     /// 1.2 (`turn_review`).
     TurnReviewAction(TurnReviewAction),
+    /// 1.8 (`skill_completions`): catalog skills for a `$skill` invocation.
+    RequestSkillCompletions(RequestSkillCompletions),
 }
 
 impl ClientFrame {
@@ -61,6 +63,7 @@ impl ClientFrame {
         "list_directory",
         "read_file",
         "turn_review_action",
+        "request_skill_completions",
     ];
 }
 
@@ -187,6 +190,16 @@ pub struct TerminalInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestFileCompletions {
     /// Text typed after `@`, without the `@`. Limited to 1024 bytes.
+    pub query: String,
+    /// Clamped server-side to 1–50; absent ⇒ 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RequestSkillCompletions {
+    /// Skill-name prefix typed after `$`, without the `$`. Limited to 1024
+    /// bytes. Empty lists every skill.
     pub query: String,
     /// Clamped server-side to 1–50; absent ⇒ 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]

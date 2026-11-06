@@ -645,6 +645,7 @@ pub async fn start(
                 gaviero_remote::version::capability::PERMISSION_TURN_GRANT.to_string(),
                 gaviero_remote::version::capability::PERMISSION_GRANTS.to_string(),
                 gaviero_remote::version::capability::SHELL_HISTORY.to_string(),
+                gaviero_remote::version::capability::SKILL_COMPLETIONS.to_string(),
             ],
             machine: Some(gaviero_remote::dto::MachineInfo {
                 host: config.machine_host.clone(),

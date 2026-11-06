@@ -1764,18 +1764,23 @@ pub(super) fn handle_skills_command(app: &mut App) {
     app.chat_state.text_input.cursor = 0;
 }
 
+/// Repo whose skills rank first in `$` completion: the folder holding the
+/// active buffer. Shared by the desktop popup and remote completions.
+pub(crate) fn skill_completion_repo_id(app: &App) -> Option<String> {
+    app.buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.as_deref())
+        .and_then(|p| app.workspace.folder_for_path(p))
+        .map(gaviero_core::memory::scope::hash_path)
+}
+
 pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     if !app.chat_state.autocomplete.active {
         return;
     }
 
     if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::SkillRef {
-        let active_repo_id = app
-            .buffers
-            .get(app.active_buffer)
-            .and_then(|b| b.path.as_deref())
-            .and_then(|p| app.workspace.folder_for_path(p))
-            .map(gaviero_core::memory::scope::hash_path);
+        let active_repo_id = skill_completion_repo_id(app);
         app.chat_state
             .update_skill_autocomplete_matches(&app.skill_catalog, active_repo_id.as_deref());
         return;
