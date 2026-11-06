@@ -18,14 +18,15 @@ use serde::{Deserialize, Serialize};
 /// three more `PermissionGrant` values (`tool_session`,
 /// `mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.
 /// Minor 7 is additive: the `shell_history` capability and optional
-/// `request_terminals.history`.
+/// `request_terminals.history`. Minor 8 is additive: the `skill_completions`
+/// capability and the `request_skill_completions` client frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -48,6 +49,9 @@ pub mod capability {
     /// 1.7: `request_terminals.history` returns the selected tab's recent
     /// shell-history commands.
     pub const SHELL_HISTORY: &str = "shell_history";
+    /// 1.8: `request_skill_completions` lists catalog skills for a `$skill`
+    /// invocation.
+    pub const SKILL_COMPLETIONS: &str = "skill_completions";
 }
 
 /// Why a peer's version is unacceptable.

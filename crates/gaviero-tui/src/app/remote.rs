@@ -210,6 +210,44 @@ fn file_completions(
     Ok(serde_json::json!({ "query": query, "files": matches }))
 }
 
+/// `$` completion for the phone composer (1.8): the same catalog, matcher and
+/// insertion text as the desktop popup, so an accepted skill resolves in
+/// `send_prompt`. Names and descriptions only — never skill bodies.
+fn skill_completions(
+    app: &App,
+    query: &str,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, CommandFailure> {
+    if query.len() > 1024 {
+        return Err(CommandFailure::new(
+            ErrorCode::InvalidPayload,
+            "completion query exceeds 1024 bytes",
+        ));
+    }
+    let limit = limit.unwrap_or(10).clamp(1, 50) as usize;
+    let repo_id = crate::app::side_panel::skill_completion_repo_id(app);
+    let skills: Vec<_> = crate::panels::agent_chat::match_skills(
+        &app.skill_catalog,
+        query,
+        repo_id.as_deref(),
+        limit,
+    )
+    .into_iter()
+    .map(|(insert, skill)| {
+        let mut entry = serde_json::json!({
+            "insert": insert,
+            "name": skill.name,
+            "description": skill.description,
+        });
+        if let Some(hint) = &skill.argument_hint {
+            entry["argument_hint"] = serde_json::json!(hint);
+        }
+        entry
+    })
+    .collect();
+    Ok(serde_json::json!({ "query": query, "skills": skills }))
+}
+
 impl RemoteState {
     /// Current freshness token for a proposal.
     pub fn proposal_revision(&self, proposal_id: u64) -> u64 {
@@ -327,6 +365,8 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 }
             }
             ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
+                .map(|result| (CommandStatus::Completed, Some(result))),
+            ClientFrame::RequestSkillCompletions(r) => skill_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
             // 1.3 (`file_browser`): read-only workspace browsing.
             ClientFrame::ListDirectory(r) => {
@@ -1022,6 +1062,66 @@ mod tests {
             panic!("expected command_result");
         };
         assert_eq!(one.result.unwrap()["files"].as_array().unwrap().len(), 1);
+
+        assert!(matches!(
+            request(&"a".repeat(1025), None),
+            Some(ServerFrame::CommandError(_))
+        ));
+    }
+
+    #[test]
+    fn remote_skill_completions_use_the_desktop_matcher_and_clamp() {
+        use gaviero_remote::envelope::RequestSkillCompletions;
+        let (dir, mut app) = two_tab_app();
+        for (name, front) in [
+            ("review", "description: Review the diff\narguments: [target]\nargument-hint: <path>\n"),
+            ("release", "description: Cut a release\n"),
+            ("lint", "description: Run the linter\n"),
+        ] {
+            let skill_dir = dir.path().join(".gaviero/skills").join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), format!("---\n{front}---\nbody\n")).unwrap();
+        }
+        let (catalog, _) =
+            gaviero_core::skills::SkillCatalog::scan(&app.workspace, std::path::Path::new("/nonexistent"));
+        app.skill_catalog = std::sync::Arc::new(catalog);
+        let mut request = |query: &str, limit: Option<u32>| {
+            handle_remote_command(
+                &mut app,
+                ClientEnvelope {
+                    version: gaviero_remote::version::PROTOCOL_VERSION,
+                    instance_id: Some("test".into()),
+                    command_id: format!("skills-{query}-{limit:?}"),
+                    frame: ClientFrame::RequestSkillCompletions(RequestSkillCompletions {
+                        query: query.to_string(),
+                        limit,
+                    }),
+                },
+                131072,
+            );
+            app.remote.pending_frames.pop()
+        };
+
+        let Some(ServerFrame::CommandResult(done)) = request("re", None) else {
+            panic!("expected command_result");
+        };
+        let result = done.result.unwrap();
+        assert_eq!(result["query"], "re");
+        let mut skills = result["skills"].as_array().unwrap().clone();
+        skills.sort_by_key(|s| s["name"].as_str().unwrap().to_string());
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["insert"], "$release");
+        assert_eq!(skills[0]["description"], "Cut a release");
+        assert!(skills[0].get("argument_hint").is_none());
+        // Argument-taking skills insert `()`, exactly like the desktop popup.
+        assert_eq!(skills[1]["insert"], "$review()");
+        assert_eq!(skills[1]["argument_hint"], "<path>");
+        assert!(skills[1].get("body").is_none(), "bodies never leave the desktop");
+
+        let Some(ServerFrame::CommandResult(one)) = request("", Some(0)) else {
+            panic!("expected command_result");
+        };
+        assert_eq!(one.result.unwrap()["skills"].as_array().unwrap().len(), 1);
 
         assert!(matches!(
             request(&"a".repeat(1025), None),

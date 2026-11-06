@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.7 (1.0 frozen; 1.1 through 1.7 additive)
+# Gaviero Remote Protocol — v1.8 (1.0 frozen; 1.1 through 1.8 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -181,6 +181,7 @@ holds the current token.
 | `list_directory` | `{ path? }` — requires `file_browser`; absent/empty ⇒ the workspace roots. `path` is an explorer display path `<root-label>/<rel>`. |
 | `read_file` | `{ path }` — requires `file_browser`; reads one regular UTF-8 file, read-only. |
 | `turn_review_action` | `{ turn_id, action, path?, folder? }` — requires `turn_review` (1.2); see §1.2 additions; `folder` since 1.5 (§Turn review folders) |
+| `request_skill_completions` | `{ query, limit? }` — requires `skill_completions` (1.8); catalog skills for a `$skill` invocation |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -219,7 +220,7 @@ share a folder name, each gains the nearest parent folder that tells them apart
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`. Clients
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`; 1.8 adds `skill_completions`. Clients
 ignore unknown entries.
 
 ## DTOs
@@ -451,6 +452,29 @@ as a desktop prompt does. The Flutter composer opens suggestions when the caret
 sits in an `@` token that starts the text or follows whitespace, debounces
 typing, keeps one request in flight, and on tap replaces the token with
 `@<path> `. Older servers receive no completion requests.
+
+## Skill completions (`skill_completions` capability, 1.8)
+
+Servers advertising `skill_completions` answer `request_skill_completions`:
+`{ "query": "rev", "limit": 10 }`. `query` is the skill-name prefix after `$`
+(without the `$`, at most 1024 bytes, else `invalid_payload`); `limit` is
+clamped to 1–50 and defaults to 10. The completed `command_result.result` is
+`{ query, skills: [{ insert, name, description, argument_hint? }] }` — `query`
+echoed so the client can drop stale replies.
+
+`skills` come from the same catalog, matcher and ranking as the desktop `$`
+popup: a case-sensitive name-prefix match, the desktop's focused folder's repo
+skills first. `insert` is exactly what the desktop inserts — `$name`,
+`$label/name` when two scopes define the same name, plus `()` when the skill
+takes arguments. An empty query lists every skill up to `limit`.
+
+Completion is read-only and reveals names and descriptions, never skill
+bodies. A skill reaches the agent only through `send_prompt`, which resolves
+`$skill` invocations exactly as a desktop prompt does. The Flutter composer
+uses the desktop trigger — a `$` that starts the text or follows whitespace
+and is not escaped, with at least two characters typed and no space between it
+and the caret — and on tap replaces the token with `insert` plus a space.
+Older servers receive no skill completion requests.
 
 ## File browser (`file_browser` capability)
 
