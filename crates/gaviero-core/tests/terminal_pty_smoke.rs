@@ -16,7 +16,10 @@ async fn named_shell_input_runs_on_background_tab_without_switching_desktop() {
     let mut manager = TerminalManager::new(TerminalConfig::default());
     let mut events = manager.take_event_rx();
     let desktop = manager.create_tab_lazy(dir.path());
-    let remote = manager.create_tab(dir.path()).unwrap();
+    // A restored tab the desktop never focused: the remote view starts it.
+    let remote = manager.create_tab_lazy(dir.path());
+    manager.ensure_spawned(remote).unwrap();
+    assert!(manager.instance(remote).unwrap().spawned);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv())

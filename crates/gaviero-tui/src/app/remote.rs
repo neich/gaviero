@@ -139,12 +139,35 @@ impl Default for RemoteState {
 /// With `history` (1.7 `shell_history`), also the selected tab's recent
 /// shell-history commands, oldest first — the phone edits and recalls in its
 /// own input box, so it needs the list ↑ would walk at the desktop prompt.
-fn terminal_snapshot(app: &App, requested: Option<u64>, history: Option<u32>) -> serde_json::Value {
-    let manager = &app.terminal_manager;
-    let selected = requested
+/// The tab a `request_terminals` shows: the requested one while it exists,
+/// else the first.
+fn selected_terminal(
+    manager: &gaviero_core::terminal::TerminalManager,
+    requested: Option<u64>,
+) -> Option<gaviero_core::terminal::TerminalId> {
+    requested
         .map(gaviero_core::terminal::TerminalId::from_raw)
         .filter(|id| manager.instance(*id).is_some())
-        .or_else(|| manager.tab_order().first().copied());
+        .or_else(|| manager.tab_order().first().copied())
+}
+
+/// Restored tabs are lazy: their shell starts when the desktop first focuses
+/// them. A phone viewing one starts it here (without moving desktop focus),
+/// so the client mirrors a live prompt instead of a dead blank screen, and
+/// its first input reaches a shell that is already up rather than racing the
+/// shell's startup handshake.
+fn start_selected_terminal(app: &mut App, requested: Option<u64>) -> Result<(), CommandFailure> {
+    let Some(id) = selected_terminal(&app.terminal_manager, requested) else {
+        return Ok(());
+    };
+    app.terminal_manager.ensure_spawned(id).map_err(|e| {
+        CommandFailure::new(ErrorCode::InternalError, format!("unable to start the shell: {e:#}"))
+    })
+}
+
+fn terminal_snapshot(app: &App, requested: Option<u64>, history: Option<u32>) -> serde_json::Value {
+    let manager = &app.terminal_manager;
+    let selected = selected_terminal(manager, requested);
     let tabs: Vec<_> = manager
         .tab_order()
         .iter()
@@ -344,10 +367,12 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 app.remote.snapshot_dirty = true;
                 Ok((CommandStatus::Completed, None))
             }
-            ClientFrame::RequestTerminals(r) => Ok((
-                CommandStatus::Completed,
-                Some(terminal_snapshot(app, r.terminal_id, r.history)),
-            )),
+            ClientFrame::RequestTerminals(r) => start_selected_terminal(app, r.terminal_id).map(|()| {
+                (
+                    CommandStatus::Completed,
+                    Some(terminal_snapshot(app, r.terminal_id, r.history)),
+                )
+            }),
             ClientFrame::TerminalInput(input) => {
                 if input.text.is_empty() || input.text.len() > 4096 {
                     Err(CommandFailure::new(

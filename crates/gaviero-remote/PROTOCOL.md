@@ -401,7 +401,11 @@ additional client frames on the existing authenticated WebSocket:
   and absolute paths, for display only (a client may show cwds and prompt paths
   relative to them; older servers omit it). Tabs are
   ordered as on the desktop. An absent or removed selection falls back to the
-  first existing tab. This request never creates a shell or changes desktop focus.
+  first existing tab. This request never creates a tab or changes desktop focus,
+  but it starts the selected tab's shell when that tab is still lazy (restored
+  from the last session and never focused on the desktop), so the client mirrors
+  a live prompt and its first input reaches a running shell. A shell that fails
+  to start returns `command_error` (`internal_error`).
   Since 1.7, servers advertising `shell_history` accept an optional
   `"history": N` (clamped to 1–500): the result then also carries
   `history: [string]`, the selected tab's most recent distinct commands from

@@ -186,14 +186,28 @@ impl TerminalManager {
         self.terminals.get(&id)
     }
 
-    /// Send input to a named tab without changing desktop focus.
-    pub fn write_input_to(&mut self, id: TerminalId, data: &[u8]) -> Result<()> {
+    /// Start a named lazy tab's shell without changing desktop focus. The
+    /// tab is first sized to the current viewport, as `switch_tab` would,
+    /// so the desktop sees no resize when it later focuses it.
+    pub fn ensure_spawned(&mut self, id: TerminalId) -> Result<()> {
+        let (rows, cols) = (self.viewport_rows, self.viewport_cols);
         let instance = self
             .terminals
             .get_mut(&id)
             .context("unknown shell session")?;
-        instance.spawn(self.event_tx.clone())?;
-        instance
+        if !instance.spawned {
+            instance.resize(rows, cols);
+            instance.spawn(self.event_tx.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Send input to a named tab without changing desktop focus.
+    pub fn write_input_to(&mut self, id: TerminalId, data: &[u8]) -> Result<()> {
+        self.ensure_spawned(id)?;
+        self.terminals
+            .get_mut(&id)
+            .context("unknown shell session")?
             .try_write_input(data)
             .context("failed to write shell input")
     }
