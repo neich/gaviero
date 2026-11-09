@@ -60,7 +60,6 @@ client codex_probe {
 client cursor_probe {
     model "cursor:composer-2.5"
     privacy public
-    effort low
 }
 
 // ── Probe prompt (shared) ────────────────────────────────────────────────────

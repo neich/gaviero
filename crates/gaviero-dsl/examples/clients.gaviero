@@ -25,18 +25,30 @@ client sonnet {
     effort medium
 }
 
-client codex-5-5 {
-    model "codex:gpt-5.5"
+client codex-6-1-sol {
+    model "codex:gpt-6.1-sol"
     privacy public
-    // gpt-5.5 ceiling is xhigh; high is the everyday default.
+    // Codex's latest workhorse (catalog priority 1).
     effort high
+}
+
+client codex-6-1-terra {
+    model "codex:gpt-6.1-terra"
+    privacy public
+    effort high
+}
+
+client codex-6-luna {
+    model "codex:gpt-6-luna"
+    privacy public
+    // Luna tops out at max; it has no `ultra`.
+    effort medium
 }
 
 client codex-6-astra {
     model "codex:gpt-6-astra"
     privacy public
-    // Current Codex flagship (catalog priority 1). Needs Codex CLI >= 0.153;
-    // older clients are served a catalog without it.
+    // Codex's frontier model. Older CLIs are served a catalog without it.
     effort high
 }
 
@@ -62,7 +74,6 @@ client codex-5-6-luna {
 client composer {
     model "cursor:composer-2.5"
     privacy public
-    effort medium
 }
 
 client grok {
@@ -70,7 +81,6 @@ client grok {
     // current grok generation — use the full id.
     model "cursor:grok-4.7-high"
     privacy public
-    effort high
 }
 
 client dsh {
