@@ -1058,7 +1058,7 @@ workflow run {
     ) -> (App, mpsc::UnboundedReceiver<Event>) {
         let script_dir = dir.join(".gaviero/dsl/report");
         std::fs::create_dir_all(&script_dir).unwrap();
-        std::fs::write(script_dir.join("DSL.gaviero"), SCRIPT).unwrap();
+        std::fs::write(script_dir.join("report.gaviero"), SCRIPT).unwrap();
         std::fs::write(
             dir.join(".gaviero/settings.json"),
             serde_json::json!({
@@ -1205,7 +1205,7 @@ workflow run {
 
         open_filled_form(&mut app);
         std::fs::write(
-            root.join(".gaviero/dsl/report/DSL.gaviero"),
+            root.join(".gaviero/dsl/report/report.gaviero"),
             "agent writer { client missing prompt \"x\" }\n",
         )
         .unwrap();

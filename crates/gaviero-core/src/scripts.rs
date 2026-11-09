@@ -1,4 +1,4 @@
-//! Catalog of named workflow scripts: `.gaviero/dsl/<name>/DSL.gaviero`.
+//! Catalog of named workflow scripts: `.gaviero/dsl/<name>/<name>.gaviero`.
 //!
 //! Discovery, scopes and name resolution are those of skills
 //! ([`crate::scoped_folders`]). A script is listed without being compiled:
@@ -19,8 +19,12 @@ use crate::workspace::Workspace;
 
 /// Directory under `.gaviero/` holding one folder per script.
 pub const SCRIPTS_SUBDIR: &str = "dsl";
-/// The script inside each folder, matched case-insensitively.
-pub const SCRIPT_FILE: &str = "DSL.gaviero";
+
+/// The main script of the folder called `name`, matched case-insensitively.
+/// Any other file in the folder is only reachable through `include`.
+pub fn script_file_name(name: &str) -> String {
+    format!("{name}.gaviero")
+}
 
 /// A script found by [`ScriptCatalog::scan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,9 +102,10 @@ impl ScriptCatalog {
                 self.warnings.push(warn("invalid script name charset".into()));
                 continue;
             }
-            let Some(source_path) = find_entry_file(&folder, SCRIPT_FILE) else {
+            let file_name = script_file_name(name);
+            let Some(source_path) = find_entry_file(&folder, &file_name) else {
                 self.warnings.push(warn(format!(
-                    "script folder {} is missing {SCRIPT_FILE}",
+                    "script folder {} is missing {file_name}",
                     folder.display()
                 )));
                 continue;
@@ -213,7 +218,7 @@ mod tests {
     fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
         let dir = root.join(".gaviero").join(SCRIPTS_SUBDIR).join(name);
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(SCRIPT_FILE);
+        let path = dir.join(script_file_name(name));
         fs::write(&path, body).unwrap();
         path
     }
@@ -262,7 +267,27 @@ mod tests {
 
         assert!(catalog.complete("", None).is_empty());
         assert_eq!(catalog.warnings().len(), 1);
-        assert!(catalog.warnings()[0].message.contains(SCRIPT_FILE));
+        assert!(catalog.warnings()[0].message.contains("empty.gaviero"));
+    }
+
+    #[test]
+    fn only_the_file_named_after_the_folder_is_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".gaviero/dsl/audit");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("DSL.gaviero"), "agent a { }\n").unwrap();
+        fs::write(dir.join("helpers.gaviero"), "agent b { }\n").unwrap();
+
+        let ws = Workspace::single_folder(tmp.path().to_path_buf());
+        let catalog = scan(&ws, Path::new("/nonexistent"));
+        assert!(catalog.complete("", None).is_empty());
+        assert!(catalog.warnings()[0].message.contains("audit.gaviero"));
+
+        let main = dir.join("audit.gaviero");
+        fs::write(&main, "agent a { }\n").unwrap();
+        let catalog = scan(&ws, Path::new("/nonexistent"));
+        assert_eq!(catalog.complete("", None).len(), 1, "one script per folder");
+        assert_eq!(catalog.resolve(None, "audit", None).unwrap().source_path, main);
     }
 
     #[test]
@@ -270,7 +295,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".gaviero/dsl/lower");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("dsl.gaviero"), "agent a { }\n").unwrap();
+        fs::write(dir.join("LOWER.gaviero"), "agent a { }\n").unwrap();
 
         let ws = Workspace::single_folder(tmp.path().to_path_buf());
         assert!(scan(&ws, Path::new("/nonexistent")).resolve(None, "lower", None).is_some());
@@ -283,7 +308,11 @@ mod tests {
         let repo_path = write_script(repo.path(), "review", "// description: repo\n");
         let global_dir = global.path().join("dsl");
         fs::create_dir_all(global_dir.join("review")).unwrap();
-        fs::write(global_dir.join("review").join(SCRIPT_FILE), "// description: global\n").unwrap();
+        fs::write(
+            global_dir.join("review").join(script_file_name("review")),
+            "// description: global\n",
+        )
+        .unwrap();
 
         let ws = Workspace::single_folder(repo.path().to_path_buf());
         let catalog = scan(&ws, &global_dir);
@@ -325,7 +354,7 @@ mod tests {
     #[test]
     fn rebuild_predicate_matches_only_the_script_folders() {
         assert!(ScriptCatalog::needs_rebuild(Path::new(
-            "/p/.gaviero/dsl/x/DSL.gaviero"
+            "/p/.gaviero/dsl/x/x.gaviero"
         )));
         assert!(!ScriptCatalog::needs_rebuild(Path::new(
             "/p/.gaviero/skills/x/SKILL.md"

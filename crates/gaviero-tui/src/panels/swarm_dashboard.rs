@@ -1103,7 +1103,7 @@ impl SwarmDashboardState {
         } else if filtered {
             " No script matches."
         } else {
-            " No scripts yet. Add <name>/DSL.gaviero under:"
+            " No scripts yet. Add <name>/<name>.gaviero under:"
         };
         put(buf, list.x, y, right, message, fg(theme::TEXT_DIM));
         y += 1;
@@ -1694,7 +1694,7 @@ mod tests {
             name: "audit".into(),
             source: "repo".into(),
             description: None,
-            path: PathBuf::from("/x/DSL.gaviero"),
+            path: PathBuf::from("/x/audit.gaviero"),
             owner: None,
         }
     }
@@ -2123,7 +2123,7 @@ mod tests {
         let mut dash = SwarmDashboardState::new();
         dash.picker.searched = vec!["/w/.gaviero/dsl".to_string()];
         let empty = render_rows(&mut dash, 60, 10).join("\n");
-        assert!(empty.contains("DSL.gaviero"), "{empty}");
+        assert!(empty.contains("<name>/<name>.gaviero"), "{empty}");
         assert!(empty.contains("/w/.gaviero/dsl"), "{empty}");
 
         dash.picker.rows = vec![row()];
