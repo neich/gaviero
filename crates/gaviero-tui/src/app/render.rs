@@ -123,7 +123,10 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.panel_visible.editor {
         let editor_full_area = h_layout[panel_idx];
         let editor_focused = app.focus == Focus::Editor;
-        let editor_title = active_buffer_label(app).unwrap_or_else(|| "EDITOR".to_string());
+        // The header draws one leading space before the title.
+        let editor_title_room = (editor_full_area.width as usize).saturating_sub(1);
+        let editor_title = active_buffer_header_title(app, editor_title_room)
+            .unwrap_or_else(|| "EDITOR".to_string());
         let editor_header_override = app
             .buffers
             .get(app.active_buffer)
@@ -227,9 +230,13 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
 pub(super) fn render_fullscreen(app: &mut App, frame: &mut Frame, area: Rect, panel: Focus) {
     let title = match panel {
         Focus::FileTree => app.left_panel_title(true).to_string(),
-        Focus::Editor => active_buffer_label(app)
-            .map(|label| format!("{label} (fullscreen)"))
-            .unwrap_or_else(|| "EDITOR (fullscreen)".to_string()),
+        Focus::Editor => {
+            const SUFFIX: &str = " (fullscreen)";
+            let room = (area.width as usize).saturating_sub(1 + SUFFIX.len());
+            active_buffer_header_title(app, room)
+                .map(|label| format!("{label}{SUFFIX}"))
+                .unwrap_or_else(|| format!("EDITOR{SUFFIX}"))
+        }
         Focus::SidePanel => app.side_panel_title(true).to_string(),
         Focus::Terminal => "TERMINAL (fullscreen)".to_string(),
     };
@@ -339,6 +346,25 @@ pub(super) fn current_move_source(app: &App) -> Option<std::path::PathBuf> {
 /// `gaviero-flutter:settings.json`. Same-name files at different relative
 /// paths, or in the same folder, keep the bare name.
 pub(super) fn buffer_labels(app: &App) -> Vec<String> {
+    let roots = label_roots(app);
+    let entries: Vec<(String, Option<(String, std::path::PathBuf)>)> = app
+        .buffers
+        .iter()
+        .map(|b| {
+            // An explicit tab label (`global:settings.json`) already says
+            // where the file is.
+            let rooted = match (&b.tab_label, &b.path) {
+                (None, Some(path)) => relative_to_root(&roots, path),
+                _ => None,
+            };
+            (b.display_name().to_string(), rooted)
+        })
+        .collect();
+    prefix_shared_relative_paths(&entries)
+}
+
+/// `(label, directory)` of every root a buffer's path is shown relative to.
+fn label_roots(app: &App) -> Vec<(String, std::path::PathBuf)> {
     let folders: Vec<(String, std::path::PathBuf)> = app
         .workspace
         .folders()
@@ -355,20 +381,7 @@ pub(super) fn buffer_labels(app: &App) -> Vec<String> {
     if let Some(dir) = layer.parent().and_then(std::path::Path::parent) {
         roots.push(("workspace".to_string(), dir.to_path_buf()));
     }
-    let entries: Vec<(String, Option<(String, std::path::PathBuf)>)> = app
-        .buffers
-        .iter()
-        .map(|b| {
-            // An explicit tab label (`global:settings.json`) already says
-            // where the file is.
-            let rooted = match (&b.tab_label, &b.path) {
-                (None, Some(path)) => relative_to_root(&roots, path),
-                _ => None,
-            };
-            (b.display_name().to_string(), rooted)
-        })
-        .collect();
-    prefix_shared_relative_paths(&entries)
+    roots
 }
 
 /// `(root label, path relative to it)` for the deepest root holding `path`;
@@ -422,6 +435,47 @@ fn prefix_shared_relative_paths(
 /// Label of the active buffer — see [`buffer_labels`].
 pub(super) fn active_buffer_label(app: &App) -> Option<String> {
     buffer_labels(app).into_iter().nth(app.active_buffer)
+}
+
+/// Title of the header above the editor: the active buffer's label with its
+/// file name widened to the path inside the workspace, in at most `max_chars`.
+/// A multi-folder workspace always names the folder (`repo:src/main.rs`); a
+/// single folder keeps only the prefix its label already has. Files outside
+/// every root and explicitly labelled tabs keep their label.
+pub(super) fn active_buffer_header_title(app: &App, max_chars: usize) -> Option<String> {
+    let label = active_buffer_label(app)?;
+    let buffer = app.buffers.get(app.active_buffer)?;
+    let rooted = match (&buffer.tab_label, &buffer.path) {
+        (None, Some(path)) => relative_to_root(&label_roots(app), path),
+        _ => None,
+    };
+    let title = match rooted {
+        Some((root, rel)) => {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if app.workspace.folders().len() > 1 {
+                format!("{root}:{rel}")
+            } else {
+                let prefix = label.strip_suffix(buffer.display_name()).unwrap_or_default();
+                format!("{prefix}{rel}")
+            }
+        }
+        None => label,
+    };
+    Some(keep_path_tail(&title, max_chars))
+}
+
+/// Clip `title` from the left: the file name is the end of the path, and the
+/// header would otherwise cut it off first.
+fn keep_path_tail(title: &str, max_chars: usize) -> String {
+    let len = title.chars().count();
+    if len <= max_chars {
+        return title.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let tail: String = title.chars().skip(len + 1 - max_chars).collect();
+    format!("…{tail}")
 }
 
 /// Tab bar entries for every buffer: diff views orange, the global
@@ -2325,6 +2379,14 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_path_tail_clips_from_the_left_only_when_needed() {
+        assert_eq!(keep_path_tail("src/app/render.rs", 17), "src/app/render.rs");
+        assert_eq!(keep_path_tail("src/app/render.rs", 8), "…nder.rs");
+        assert_eq!(keep_path_tail("src/app/render.rs", 1), "…");
+        assert_eq!(keep_path_tail("src/app/render.rs", 0), "");
+    }
 
     #[test]
     fn terminal_tab_at_maps_label_columns_to_tabs() {

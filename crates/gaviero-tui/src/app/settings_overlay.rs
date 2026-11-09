@@ -369,6 +369,50 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_header_shows_the_path_inside_the_workspace() {
+        use super::super::render::{active_buffer_header_title, buffer_labels};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = workspace_app(dir.path());
+        let roots: Vec<PathBuf> = app.workspace.roots().iter().map(|r| r.to_path_buf()).collect();
+        for root in &roots {
+            std::fs::create_dir_all(root.join("src/deep")).unwrap();
+            std::fs::write(root.join("src/deep/mod.rs"), "").unwrap();
+        }
+        app.buffers.clear();
+
+        app.open_file(&roots[0].join("src/deep/mod.rs"));
+        assert_eq!(active_buffer_header_title(&app, 200).unwrap(), "app:src/deep/mod.rs");
+        // The tab keeps the short name; only the header widens.
+        assert_eq!(buffer_labels(&app), ["mod.rs"]);
+
+        app.open_file(&roots[1].join("src/deep/mod.rs"));
+        assert_eq!(active_buffer_header_title(&app, 200).unwrap(), "lib:src/deep/mod.rs");
+
+        // Too narrow: the file name survives, the start of the path goes.
+        assert_eq!(active_buffer_header_title(&app, 8).unwrap(), "…/mod.rs");
+        cleanup_session(&app);
+    }
+
+    #[test]
+    fn a_single_folder_header_has_no_folder_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = gaviero_core::util::fs::canonicalize_simplified(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/mod.rs"), "").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Workspace::single_folder(root.clone()), tx);
+        app.buffers.clear();
+
+        app.open_file(&root.join("src/mod.rs"));
+        assert_eq!(
+            super::super::render::active_buffer_header_title(&app, 200).unwrap(),
+            "src/mod.rs"
+        );
+        cleanup_session(&app);
+    }
+
+    #[test]
     fn the_global_tab_is_labelled_and_violet() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = workspace_app(dir.path());
