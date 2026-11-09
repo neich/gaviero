@@ -684,7 +684,7 @@ fn update_docs_tiers_file_overrides_profile() {
         .into_iter()
         .find(|u| u.id == "inventory")
         .expect("inventory");
-    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-5.5"));
+    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-6.1-sol"));
 }
 
 #[test]

@@ -1793,6 +1793,11 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::Effort {
+        app.chat_state.update_effort_autocomplete_matches();
+        return;
+    }
+
     if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::DetachName {
         app.chat_state.update_detach_autocomplete_matches();
         return;
@@ -2447,7 +2452,13 @@ pub(crate) fn dispatch_prompt_core(
         Vec::new()
     };
 
-    let effort = app.chat_state.effective_effort_at(conv_idx).to_string();
+    // The last gate: a saved conversation or a settings default can still
+    // pair an effort with a model that lacks it.
+    let effort = gaviero_core::swarm::backend::effort::fit_effort(
+        app.chat_state.effective_model_at(conv_idx),
+        app.chat_state.effective_effort_at(conv_idx),
+    )
+    .to_string();
     let max_tokens = app.chat_state.agent_settings.max_tokens;
     // Per-conversation persistent flag OR the desktop's consumed one-shot.
     let auto_approve = app.chat_state.conversations[conv_idx].auto_approve || one_shot_auto_approve;

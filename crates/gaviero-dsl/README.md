@@ -103,7 +103,7 @@ Canonical form is `provider:model`. Bare names are rejected at dispatch.
 | Provider | Examples |
 |---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:claude-fable-5-1`, `claude:claude-opus-5-5` |
-| Codex | `codex:gpt-6-astra`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`, `codex:gpt-5.5` |
+| Codex | `codex:gpt-6.1-sol`, `codex:gpt-6-astra`, `codex:gpt-6.1-terra`, `codex:gpt-6-sol`, `codex:gpt-6-luna`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` |
 | Cursor | `cursor:composer-2.5`, `cursor:grok-4.7-high` (ids embed effort — see `agent --list-models`) |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` (legacy: `deepseek:deepseek-v4-flash`) |
@@ -139,7 +139,7 @@ A profile says what each tier means. It holds only `client` and `tier` declarati
 
 ```gaviero
 // .gaviero/dsl/profiles/mixed.gaviero
-client terra { model "codex:gpt-5.6-terra" effort medium }
+client terra { model "codex:gpt-6.1-terra" effort medium }
 client opus  { model "claude:opus"         effort high }
 
 tier medium terra
@@ -163,6 +163,8 @@ The TUI's SWARM form offers the same choice in a **Profile** selector.
 | Agent says `client <name>` | Untouched — a concrete client is a deliberate pin |
 | A client in the profile is marked `default` | Used by agents that bind neither client nor tier |
 | A tier nothing binds | Compile error |
+
+`effort` names are checked at compile time, so a misspelling is an error listing the valid names. A model + effort pair the model cannot run stops the run before any agent starts; `auto` and `off` suit every model. Each profile client sets both together, so changing profile keeps the pair valid. Cursor takes no `effort`: pick a model id that has the level in it (`cursor:grok-4.7-high`).
 
 A profile's clients are private to it, so they cannot clash with the script's, and a tier fixes model, effort and privacy together: `tier:high@low` is an error.
 

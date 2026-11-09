@@ -526,9 +526,10 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             continuity_mode: ContinuityMode::ProcessBound,
             supports_tool_use: true,
             supports_native_resume: true,
-            max_context_tokens: None,
-            // tool_use + unknown (None) context ⇒ Strong (derive treats an
-            // unknown window as not-small).
+            max_context_tokens: Some(crate::swarm::backend::codex::codex_context_window(
+                &spec.model,
+            )),
+            // tool_use + a large window ⇒ Strong (matches BootstrapTier::derive).
             bootstrap_tier: BootstrapTier::Strong,
             mcp_transport: caps.transport,
             context7_allowed: caps.context7,
@@ -547,10 +548,10 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             continuity_mode: ContinuityMode::StatelessReplay,
             supports_tool_use: true,
             supports_native_resume: false,
-            // M0 Finding I: Codex backend doesn't surface usage today;
-            // value is informational until M8/M9 wire budgeting.
-            max_context_tokens: None,
-            // tool_use + unknown (None) context ⇒ Strong.
+            max_context_tokens: Some(crate::swarm::backend::codex::codex_context_window(
+                &spec.model,
+            )),
+            // tool_use + a large window ⇒ Strong (matches BootstrapTier::derive).
             bootstrap_tier: BootstrapTier::Strong,
             mcp_transport: caps.transport,
             context7_allowed: caps.context7,
@@ -1019,14 +1020,14 @@ mod tests {
         assert_eq!(deepseek.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(deepseek.supports_tool_use);
         assert!(!deepseek.supports_native_resume);
-        assert_eq!(deepseek.max_context_tokens, Some(1_000_000));
+        assert_eq!(deepseek.max_context_tokens, Some(1_048_576));
 
         let dsh = build_provider_profile(&ModelSpec::parse("dsh:deepseek-v4-flash"), &runtime);
         assert_eq!(dsh.provider, "dsh");
         assert_eq!(dsh.continuity_mode, ContinuityMode::ProcessBound);
         assert!(dsh.supports_tool_use);
         assert!(dsh.supports_native_resume);
-        assert_eq!(dsh.max_context_tokens, Some(1_000_000));
+        assert_eq!(dsh.max_context_tokens, Some(1_048_576));
 
         let bare = build_provider_profile(&ModelSpec::parse("haiku"), &runtime);
         assert_eq!(bare.continuity_mode, ContinuityMode::NativeResume);

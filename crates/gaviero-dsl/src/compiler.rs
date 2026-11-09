@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use miette::NamedSource;
 
+use gaviero_core::swarm::backend::effort::{is_known_effort, known_effort_names};
 use gaviero_core::swarm::models::{AgentBackend, WorkUnit};
 use gaviero_core::swarm::plan::{CompiledPlan, ConsensusMode, LoopConfig, LoopUntilCondition};
 use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
@@ -125,6 +126,18 @@ pub fn compile_ast_with_sources(
                 script_vars.extend(pairs.clone());
             }
             Item::Client(c) => {
+                if let Some((effort, span)) = &c.effort
+                    && !is_known_effort(effort)
+                {
+                    errors.push(DslError::Compile {
+                        src: src_for(c.file_id),
+                        span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+                        reason: format!(
+                            "unknown effort `{effort}`; use one of: {}",
+                            known_effort_names()
+                        ),
+                    });
+                }
                 if client_map.insert(c.name.as_str(), c).is_some() {
                     errors.push(DslError::Compile {
                         src: src_for(c.file_id),
@@ -1690,6 +1703,26 @@ mod tests {
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].model.as_deref(), Some("opus"));
         assert_eq!(units[0].effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn a_misspelled_effort_is_a_compile_error() {
+        let src = r#"
+            client deep { model "claude:opus" effort hgih default }
+            agent a { prompt "p" }
+        "#;
+        let error = format!("{:?}", crate::compile(src, "t.gaviero", None, None).unwrap_err());
+        assert!(error.contains("unknown effort `hgih`"), "{error}");
+        assert!(error.contains("xhigh"), "lists the valid names: {error}");
+    }
+
+    #[test]
+    fn a_real_level_the_model_lacks_still_compiles() {
+        let src = r#"
+            client fast { model "dsh:deepseek-flash" effort xhigh default }
+            agent a { prompt "p" }
+        "#;
+        crate::compile(src, "t.gaviero", None, None).unwrap();
     }
 
     #[test]

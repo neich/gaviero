@@ -52,6 +52,7 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 ## Rules
 
 - **Never extend the AST without updating [`ast.rs`](src/ast.rs).** Drift between AST and parser is the top DSL bug source.
+- **`effort` is checked twice** ([`swarm/backend/effort.rs`](../gaviero-core/src/swarm/backend/effort.rs)): a misspelled name fails compilation (`is_known_effort`), and a wrong model + effort pair fails `preflight_plan_models` before any agent starts. Pairs are checked on the agents a run uses, so an unused client in a shared pool blocks nothing.
 - **Tier-override files contain `tier` lines only** ([`tiers.rs`](src/tiers.rs)). Reject other items with a diagnostic.
 - **Profiles are closed model tables** ([`profile.rs`](src/profile.rs)): only `client` and `tier`, tiers point at the profile's own clients, and those clients are renamed on merge so they can never collide with the script's.
 - **`tier:<name>` is a model-spec form, not a provider.** It is accepted only where `workflow_params` reads a model (`param`, roster entries, `--param`), and cannot be combined with effort, privacy or extra.

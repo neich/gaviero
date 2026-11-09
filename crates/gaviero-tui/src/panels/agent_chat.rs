@@ -136,6 +136,8 @@ pub enum AutocompleteMode {
     SkillRef,
     /// `/model <provider:model>` argument — provider prefix and model names.
     ModelSpec,
+    /// `/effort <level>` argument — the levels the current model offers.
+    Effort,
 }
 
 /// Autocomplete state for @file references or /attach|/detach arguments.
@@ -1288,10 +1290,8 @@ impl AgentChatState {
                     options.push(spec);
                 }
             }
-            // Codex has no CLI discovery — pin the documented aliases so
-            // `/model` Available and Tab completion always offer them.
-            for alias in gaviero_core::swarm::backend::shared::CODEX_MODEL_ALIASES {
-                let spec = format!("codex:{alias}");
+            // The installed CLI's catalog, or the static list if it can't be asked.
+            for spec in gaviero_core::acp::session::discover_codex_model_options() {
                 if !options.iter().any(|opt| opt == &spec) {
                     options.push(spec);
                 }
@@ -2054,8 +2054,9 @@ impl AgentChatState {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
                          claude:claude-fable-5-1, claude:claude-opus-5-5, \
-                         codex:gpt-6-astra, codex:gpt-5.6-sol, codex:gpt-5.6-terra, \
-                         codex:gpt-5.6-luna, codex:gpt-5.5, \
+                         codex:gpt-6.1-sol, codex:gpt-6-astra, codex:gpt-6.1-terra, \
+                         codex:gpt-6-sol, codex:gpt-6-luna, codex:gpt-5.6-sol, \
+                         codex:gpt-5.6-terra, codex:gpt-5.6-luna, \
                          cursor:composer-2.5, cursor:grok-4.7-high, \
                          ollama:qwen2.5-coder:7b"
                             .to_string()
@@ -2078,37 +2079,41 @@ impl AgentChatState {
                     {
                         self.add_system_message_at(idx, &format!("Invalid model spec: {err:#}"));
                     } else {
+                        use gaviero_core::swarm::backend::effort::{effort_problem, fit_effort};
+                        let wanted = self.effective_effort_at(idx).to_string();
+                        let mut message = format!("Model set to: {model}");
+                        // Keep the pair valid: the new model may lack this level.
+                        if let Some(problem) = effort_problem(&model, &wanted) {
+                            let fitted = fit_effort(&model, &wanted);
+                            self.conversations[idx].effort_override = Some(fitted.to_string());
+                            message.push_str(&format!("\nEffort changed to `{fitted}`: {problem}"));
+                        }
                         self.conversations[idx].model_override = Some(model.clone());
                         self.conversations[idx].bump_revision();
-                        self.add_system_message_at(idx, &format!("Model set to: {}", model));
+                        self.add_system_message_at(idx, &message);
                     }
                 }
                 true
             }
             "/thinking" | "/effort" => {
                 if arg.is_empty() {
-                    let current = self.effective_effort_at(idx);
-                    self.add_system_message_at(
-                        idx,
-                        &format!(
-                            "Effort level: {}.\n\
-                         Usage: /effort <off|auto|low|medium|high|xhigh|max|ultra>\n\
-                         Applies to Claude, Codex, and dsh sessions (Ollama ignores it).\n\
-                         On `dsh:`: non-`off`/`auto` maps to ACP thinking=on when the agent exposes it.\n\
-                         `xhigh` applies on Opus 4.7 (falls back to `high` on older \
-                         Claude models). On Codex: `xhigh`/`max`/`ultra` forward for \
-                         GPT-5.6 Sol/Terra; Luna caps at `max`; older models at `xhigh`.\n\
-                         `off`/`auto` omit the reasoning hint entirely.\n\
-                         `max`/`ultra` are session-only on Claude.",
-                            current
-                        ),
+                    let model = self.effective_model_at(idx);
+                    let message = format!(
+                        "Effort level: {}.\n\
+                         Usage: /effort <level>\n\
+                         {model}: {}\n\
+                         `off`/`auto` omit the reasoning hint entirely.",
+                        self.effective_effort_at(idx),
+                        gaviero_core::swarm::backend::effort::effort_summary(model),
                     );
+                    self.add_system_message_at(idx, &message);
                 } else {
                     let level = match arg {
                         "off" | "0" | "none" => "off",
                         "auto" => "auto",
                         "low" | "l" => "low",
                         "medium" | "med" | "m" => "medium",
+                        "minimal" => "minimal",
                         "high" | "h" => "high",
                         "xhigh" | "xh" => "xhigh",
                         "max" => "max",
@@ -2116,14 +2121,24 @@ impl AgentChatState {
                         _ => {
                             self.add_system_message_at(
                                 idx,
-                                "Invalid effort level. Use: off, auto, low, medium, high, xhigh, max, ultra",
+                                &format!(
+                                    "Invalid effort level. Use: {}",
+                                    gaviero_core::swarm::backend::effort::known_effort_names()
+                                ),
                             );
                             return true;
                         }
                     };
+                    if let Some(problem) = gaviero_core::swarm::backend::effort::effort_problem(
+                        self.effective_model_at(idx),
+                        level,
+                    ) {
+                        self.add_system_message_at(idx, &format!("Effort not changed: {problem}"));
+                        return true;
+                    }
                     self.conversations[idx].effort_override = Some(level.to_string());
                     self.conversations[idx].bump_revision();
-                    self.add_system_message_at(idx, &format!("Effort level set to: {}", level));
+                    self.add_system_message_at(idx, &format!("Effort level set to: {level}"));
                 }
                 true
             }
@@ -4152,6 +4167,20 @@ impl AgentChatState {
             return;
         }
 
+        // ── /effort <level> completion ───────────────────────────────────
+        for command in ["/effort ", "/thinking "] {
+            if let Some(rest) = before_cursor.strip_prefix(command)
+                && !rest.contains(char::is_whitespace)
+            {
+                self.autocomplete.active = true;
+                self.autocomplete.mode = AutocompleteMode::Effort;
+                self.autocomplete.at_pos = command.len();
+                self.autocomplete.query = rest.to_string();
+                self.autocomplete.selected = 0;
+                return;
+            }
+        }
+
         // ── /attach <path> completion ────────────────────────────────────
         //
         // Only kicks in on a single-line input starting with `/attach `
@@ -4275,11 +4304,26 @@ impl AgentChatState {
         }
     }
 
+    /// Update `/effort` autocomplete matches from the current model.
+    pub fn update_effort_autocomplete_matches(&mut self) {
+        if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::Effort {
+            return;
+        }
+        self.autocomplete.matches = gaviero_core::swarm::backend::effort::effort_completions(
+            self.effective_model(),
+            &self.autocomplete.query,
+        );
+        if self.autocomplete.selected >= self.autocomplete.matches.len() {
+            self.autocomplete.selected = 0;
+        }
+    }
+
     /// Update autocomplete matches from a list of workspace file paths.
     pub fn update_autocomplete_matches(&mut self, all_files: &[String]) {
         if !self.autocomplete.active
             || self.autocomplete.mode == AutocompleteMode::SkillRef
             || self.autocomplete.mode == AutocompleteMode::ModelSpec
+            || self.autocomplete.mode == AutocompleteMode::Effort
             || self.autocomplete.mode == AutocompleteMode::DetachName
         {
             return;
@@ -4303,7 +4347,10 @@ impl AgentChatState {
         let anchor = self.autocomplete.at_pos;
 
         let cursor_byte = self.text_input.cursor_byte_offset();
-        let after_cursor = if self.autocomplete.mode == AutocompleteMode::ModelSpec {
+        let after_cursor = if matches!(
+            self.autocomplete.mode,
+            AutocompleteMode::ModelSpec | AutocompleteMode::Effort
+        ) {
             // A model spec is a single whitespace-free token spanning to the
             // end of the line. Accepting with the cursor mid-token must
             // replace the *whole* token, so drop the remainder of it that
@@ -4337,7 +4384,7 @@ impl AgentChatState {
                 self.text_input.text.push_str(&path);
                 self.text_input.text.push(' ');
             }
-            AutocompleteMode::ModelSpec => {
+            AutocompleteMode::ModelSpec | AutocompleteMode::Effort => {
                 self.text_input.text.push_str(&path);
             }
         }
@@ -5770,7 +5817,8 @@ impl AgentChatState {
                 AutocompleteMode::FileRef => format!(" @{}", path),
                 AutocompleteMode::AttachPath
                 | AutocompleteMode::DetachName
-                | AutocompleteMode::ModelSpec => {
+                | AutocompleteMode::ModelSpec
+                | AutocompleteMode::Effort => {
                     format!(" {}", path)
                 }
                 AutocompleteMode::SkillRef => path.clone(),
@@ -7021,8 +7069,10 @@ mod tests {
     }
 
     #[test]
-    fn process_slash_command_effort_help_mentions_dsh() {
+    fn process_slash_command_effort_help_lists_the_models_levels() {
         let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].model_override = Some("dsh:deepseek-flash".to_string());
         state.text_input.text = "/effort".to_string();
         state.text_input.cursor = state.text_input.text.len();
 
@@ -7032,7 +7082,80 @@ mod tests {
             .messages
             .last()
             .expect("help message");
-        assert!(last.content.contains("dsh"), "{}", last.content);
+        assert!(last.content.contains("low, high, max"), "{}", last.content);
+    }
+
+    #[test]
+    fn effort_argument_completes_the_current_models_levels() {
+        let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].model_override = Some("dsh:deepseek-flash".to_string());
+        state.text_input.text = "/effort h".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.update_effort_autocomplete_matches();
+
+        assert!(state.autocomplete.active);
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::Effort);
+        assert_eq!(state.autocomplete.matches, ["high"]);
+
+        state.accept_autocomplete();
+        assert_eq!(state.text_input.text, "/effort high");
+    }
+
+    #[test]
+    fn effort_the_model_lacks_is_refused() {
+        let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].model_override = Some("dsh:deepseek-flash".to_string());
+        state.conversations[active].effort_override = Some("high".to_string());
+        state.text_input.text = "/effort medium".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations[active].effort_override.as_deref(), Some("high"));
+        let last = state.conversations[active].messages.last().unwrap();
+        assert!(last.content.contains("no `medium` effort"), "{}", last.content);
+    }
+
+    #[test]
+    fn switching_model_moves_an_effort_the_new_model_lacks() {
+        let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].effort_override = Some("medium".to_string());
+        state.text_input.text = "/model dsh:deepseek-flash".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations[active].effort_override.as_deref(), Some("high"));
+        let last = state.conversations[active].messages.last().unwrap();
+        assert!(last.content.contains("Effort changed to `high`"), "{}", last.content);
+    }
+
+    #[test]
+    fn switching_to_cursor_clears_the_effort_level() {
+        let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].effort_override = Some("high".to_string());
+        state.text_input.text = "/model cursor:composer-2.5".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations[active].effort_override.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn switching_model_leaves_a_valid_effort_alone() {
+        let mut state = AgentChatState::new();
+        let active = state.active_conv;
+        state.conversations[active].effort_override = Some("high".to_string());
+        state.text_input.text = "/model dsh:deepseek-flash".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        assert!(state.process_slash_command());
+        assert_eq!(state.conversations[active].effort_override.as_deref(), Some("high"));
+        let last = state.conversations[active].messages.last().unwrap();
+        assert!(!last.content.contains("Effort changed"), "{}", last.content);
     }
 
     #[test]
@@ -7921,17 +8044,18 @@ mod tests {
         // The static fallback is the planner's profile table (DeepSeek: 1M).
         assert_eq!(
             state.context_limit_tokens_for("dsh:deepseek-v4-pro"),
-            1_000_000
+            1_048_576
         );
         assert_eq!(
             state.context_limit_tokens_for("deepseek:deepseek-v4-pro"),
-            1_000_000
+            1_048_576
         );
         assert_eq!(
             state.context_limit_tokens_for("ollama:qwen2.5-coder:7b"),
             8_192
         );
-        assert_eq!(state.context_limit_tokens_for("codex:gpt-5.6-sol"), 200_000);
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-5.6-sol"), 272_000);
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-6.1-sol"), 500_000);
         assert_eq!(
             state.context_limit_tokens_for("claude:sonnet[1m]"),
             1_000_000

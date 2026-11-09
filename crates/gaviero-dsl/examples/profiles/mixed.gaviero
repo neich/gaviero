@@ -1,7 +1,7 @@
 // Model profile: tiers spread across providers.
 
 client flash { model "dsh:deepseek-flash"  privacy public effort high }
-client terra { model "codex:gpt-5.6-terra" privacy public effort medium }
+client terra { model "codex:gpt-6.1-terra" privacy public effort medium }
 client opus  { model "claude:opus"         privacy public effort high }
 client fable { model "claude:fable"        privacy public effort max }
 

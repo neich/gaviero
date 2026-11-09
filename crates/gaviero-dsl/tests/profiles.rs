@@ -260,8 +260,8 @@ fn shipped_profiles_drive_the_agnostic_example_through_params_and_roster() {
     let script = examples().join("tiered_review.gaviero");
     let expectations = [
         ("claude", "claude:haiku", "claude:sonnet", "claude:opus", "claude:fable"),
-        ("codex", "codex:gpt-5.6-luna", "codex:gpt-5.6-terra", "codex:gpt-5.6-sol", "codex:gpt-6-astra"),
-        ("mixed", "dsh:deepseek-flash", "codex:gpt-5.6-terra", "claude:opus", "claude:fable"),
+        ("codex", "codex:gpt-6-luna", "codex:gpt-6.1-terra", "codex:gpt-6.1-sol", "codex:gpt-6-astra"),
+        ("mixed", "dsh:deepseek-flash", "codex:gpt-6.1-terra", "claude:opus", "claude:fable"),
     ];
     for (name, low, medium, high, top) in expectations {
         let profile = chosen(examples().join("profiles").join(format!("{name}.gaviero")));
@@ -300,6 +300,78 @@ fn a_tier_param_cannot_also_set_effort() {
     let roster = vec![("panel".to_string(), "a=tier:top@low".to_string())];
     let error = compile(&script, Some(&profile), &roster).unwrap_err();
     assert!(error.contains("cannot be combined"), "{error}");
+}
+
+#[test]
+fn a_misspelled_effort_in_a_param_override_is_rejected() {
+    let script = examples().join("tiered_review.gaviero");
+    let profile = chosen(examples().join("profiles/claude.gaviero"));
+    let params = vec![("judge".to_string(), "claude:opus@hgih".to_string())];
+    let error = compile(&script, Some(&profile), &params).unwrap_err();
+    assert!(error.contains("unknown effort `hgih`"), "{error}");
+}
+
+fn preflight(body: &str) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write(dir.path(), "s.gaviero", body);
+    let plan = compile(&script, None, &[]).expect("compiles: the check is at run start");
+    gaviero_core::swarm::pipeline::preflight_plan_models(&plan, "claude:sonnet", None)
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_wrong_model_and_effort_pair_never_starts() {
+    for (model, effort, expected) in [
+        ("dsh:deepseek-flash", "medium", "no `medium` effort"),
+        ("deepseek:deepseek-v4-pro", "xhigh", "no `xhigh` effort"),
+        ("claude:opus", "ultra", "no `ultra` effort"),
+        ("cursor:grok-4.7-high", "high", "model id"),
+        ("ollama:llama3", "high", "does not use effort"),
+    ] {
+        let error = preflight(&format!(
+            "client c {{ model \"{model}\" effort {effort} default }}\nagent worker {{ prompt \"p\" }}\n"
+        ))
+        .unwrap_err();
+        assert!(error.contains(expected), "{model} {effort}: {error}");
+        assert!(error.contains("agent 'worker'"), "names the agent: {error}");
+    }
+}
+
+#[test]
+fn a_right_pair_and_choosing_no_level_both_start() {
+    for (model, effort) in [
+        ("dsh:deepseek-flash", "high"),
+        ("claude:opus", "xhigh"),
+        ("cursor:grok-4.7-high", "auto"),
+        ("ollama:llama3", "off"),
+    ] {
+        preflight(&format!(
+            "client c {{ model \"{model}\" effort {effort} default }}\nagent worker {{ prompt \"p\" }}\n"
+        ))
+        .unwrap_or_else(|e| panic!("{model} {effort}: {e}"));
+    }
+}
+
+#[test]
+fn an_unused_wrong_client_in_a_shared_pool_does_not_block_a_run() {
+    preflight(
+        "client unused { model \"cursor:composer-2.5\" effort high }\n\
+         client used { model \"claude:opus\" effort high default }\n\
+         agent worker { prompt \"p\" }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_roster_entry_is_checked_too() {
+    let error = preflight(
+        "client j { model \"claude:opus\" default }\n\
+         agent tpl { template true prompt \"p\" }\n\
+         agent judge { prompt \"j\" }\n\
+         workflow w { steps [ loop { reviewers [ { id \"a\" model \"dsh:deepseek-flash\" effort medium } ] template_refine tpl until agent judge max_iterations 1 } ] }\n",
+    )
+    .unwrap_err();
+    assert!(error.contains("agent 'a-refine'"), "{error}");
 }
 
 #[test]

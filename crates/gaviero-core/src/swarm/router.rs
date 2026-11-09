@@ -65,6 +65,22 @@ pub enum ResolvedBackend {
     Blocked { reason: String },
 }
 
+impl ResolvedBackend {
+    /// The `provider:model` spec this resolves to; `None` when blocked.
+    pub fn model_spec(&self) -> Option<String> {
+        Some(match self {
+            Self::Claude { model } if model.starts_with("claude:") => model.clone(),
+            Self::Claude { model } => format!("claude:{model}"),
+            Self::Codex { model } => format!("codex:{model}"),
+            Self::Cursor { model } => format!("cursor:{model}"),
+            Self::Ollama { model, .. } => format!("ollama:{model}"),
+            Self::Deepseek { model } => format!("deepseek:{model}"),
+            Self::Dsh { model } => format!("dsh:{model}"),
+            Self::Blocked { .. } => return None,
+        })
+    }
+}
+
 /// Routes work units to concrete backends based on tier + privacy + config.
 #[derive(Debug, Clone)]
 pub struct TierRouter {

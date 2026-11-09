@@ -1,8 +1,8 @@
 // Model profile: every tier on Codex.
 
-client luna  { model "codex:gpt-5.6-luna"  privacy public effort low }
-client terra { model "codex:gpt-5.6-terra" privacy public effort medium }
-client sol   { model "codex:gpt-5.6-sol"   privacy public effort high }
+client luna  { model "codex:gpt-6-luna"    privacy public effort low }
+client terra { model "codex:gpt-6.1-terra" privacy public effort medium }
+client sol   { model "codex:gpt-6.1-sol"   privacy public effort high }
 client astra { model "codex:gpt-6-astra"   privacy public effort xhigh }
 
 tier low    luna

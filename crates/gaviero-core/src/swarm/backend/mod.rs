@@ -9,6 +9,7 @@ pub mod codex;
 pub mod cursor;
 pub mod deepseek;
 pub mod dsh;
+pub mod effort;
 pub mod executor;
 pub mod mock;
 pub mod ollama;
@@ -292,7 +293,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(claude_code::ClaudeCodeBackend::new(m)))
         }
         BackendConfig::Codex { model } => {
-            let m = model.as_deref().unwrap_or("gpt-5.5");
+            let m = model.as_deref().unwrap_or(codex::DEFAULT_CODEX_MODEL);
             Ok(Box::new(codex::CodexBackend::new(m)))
         }
         BackendConfig::Cursor { model } => {
