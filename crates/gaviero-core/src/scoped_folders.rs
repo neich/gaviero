@@ -1,7 +1,7 @@
 //! The scope system shared by folder-per-entry catalogs.
 //!
 //! Skills (`.gaviero/skills/<name>/SKILL.md`) and workflow scripts
-//! (`.gaviero/dsl/<name>/DSL.gaviero`) are discovered and named the same way:
+//! (`.gaviero/dsl/<name>/<name>.gaviero`) are discovered and named the same way:
 //! one directory per scope, a bare name resolves to the nearest definition,
 //! and `<source>/<name>` selects a specific one. Those rules live here so the
 //! catalogs cannot drift apart.

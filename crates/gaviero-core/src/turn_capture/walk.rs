@@ -288,7 +288,7 @@ mod tests {
             ".env",
             ".gaviero/settings.json",
             ".gaviero/memory.db",
-            ".gaviero/dsl/audit/DSL.gaviero",
+            ".gaviero/dsl/audit/audit.gaviero",
             ".git/HEAD",
         ] {
             write(root, rel);
@@ -296,7 +296,7 @@ mod tests {
 
         let got = rels(&scope(root));
         assert!(
-            got.contains(&".gaviero/dsl/audit/DSL.gaviero".to_string()),
+            got.contains(&".gaviero/dsl/audit/audit.gaviero".to_string()),
             "scripts launch agents, so edits to them are reviewed: {got:?}"
         );
         assert!(got.contains(&"src/lib.rs".to_string()));

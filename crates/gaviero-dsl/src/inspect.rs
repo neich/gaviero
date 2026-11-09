@@ -176,7 +176,7 @@ mod tests {
 
     fn inspect(source: &str) -> ScriptInspection {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("DSL.gaviero");
+        let path = dir.path().join("script.gaviero");
         std::fs::write(&path, source).unwrap();
         inspect_file(&path).unwrap()
     }
@@ -297,7 +297,7 @@ mod tests {
             "agent b { prompt #\"{{SHARED}}\"# }\n",
         )
         .unwrap();
-        let path = dir.path().join("DSL.gaviero");
+        let path = dir.path().join("script.gaviero");
         std::fs::write(&path, "include \"lib.gaviero\"\n").unwrap();
 
         let info = inspect_file(&path).unwrap();
