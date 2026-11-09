@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod compiler;
 pub mod error;
+pub mod inspect;
 pub mod lexer;
 pub mod parser;
 pub mod patterns;
@@ -16,6 +17,10 @@ pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
 #[allow(deprecated)]
 pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
+pub use inspect::{
+    ParamInspection, ParamKindInfo, ScriptInspection, VarInspection, WorkflowInspection,
+    inspect_file,
+};
 pub use tiers::load_tier_overrides;
 
 /// Compile a `.gaviero` DSL script into a [`CompiledPlan`].

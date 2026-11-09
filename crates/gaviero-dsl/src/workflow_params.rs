@@ -83,6 +83,62 @@ pub fn parse_reviewers_override(value: &str) -> Result<Vec<ReviewerEntry>, Strin
     Ok(out)
 }
 
+/// One workflow's params as a caller sees them: kind and default in
+/// `--param` syntax. A param that cannot be classified is left out; compiling
+/// reports it with a diagnostic.
+pub(crate) fn describe_workflow_params(
+    script: &Script,
+    wf: &WorkflowDecl,
+) -> Vec<crate::inspect::ParamInspection> {
+    use crate::inspect::{ParamInspection, ParamKindInfo};
+
+    let agent_by_name: HashMap<String, AgentDecl> = script
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Agent(a) => Some((a.name.clone(), a.clone())),
+            _ => None,
+        })
+        .collect();
+    let usage = param_usage_for_workflow(wf, &agent_by_name);
+
+    let with_effort = |model: &str, effort: Option<&str>| match effort {
+        Some(e) => format!("{model}@{e}"),
+        None => model.to_string(),
+    };
+
+    wf.params
+        .iter()
+        .filter_map(|decl| {
+            let mut ignored = Vec::new();
+            let kind = resolve_param_kind(&decl.name, decl, &usage, &mut ignored)?;
+            Some(match kind {
+                ParamKind::Roster(entries) => ParamInspection {
+                    name: decl.name.clone(),
+                    kind: ParamKindInfo::Roster,
+                    default: entries.filter(|e| !e.is_empty()).map(|entries| {
+                        entries
+                            .iter()
+                            .map(|r| {
+                                let effort = r.effort.as_ref().map(|(e, _)| e.as_str());
+                                format!("{}={}", r.id, with_effort(&r.model, effort))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }),
+                },
+                ParamKind::Client(spec) => ParamInspection {
+                    name: decl.name.clone(),
+                    kind: ParamKindInfo::Client,
+                    default: spec.model.as_ref().map(|(model, _)| {
+                        with_effort(model, spec.effort.as_ref().map(|(e, _)| e.as_str()))
+                    }),
+                },
+            })
+        })
+        .collect()
+}
+
 /// Materialize client params and expand reviewer rosters for the selected workflow.
 pub fn expand_workflow_params_in_script(
     script: &mut Script,
