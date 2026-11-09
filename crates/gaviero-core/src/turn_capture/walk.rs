@@ -2,11 +2,12 @@
 //!
 //! Honours `.gitignore` / `.ignore` files as plain pattern files
 //! (`require_git(false)` — no repository needed) plus the host's
-//! `files.exclude` globs, and always skips `.git/` and `.gaviero/`. Three
+//! `files.exclude` globs, and always skips `.git/` and `.gaviero/`. Four
 //! carve-outs are added back because an agent changing them is exactly what a
 //! reviewer must see:
 //!
 //! * `<root>/.gaviero/settings.json` — tool permissions live there;
+//! * `<root>/.gaviero/dsl/` — workflow scripts, which launch agents;
 //! * sensitive paths (`.env`, keys, credentials — [`sensitive_match`]), which
 //!   are usually gitignored. Every walked directory is swept for direct
 //!   children with a sensitive name, and a sensitive directory is listed whole;
@@ -102,6 +103,11 @@ fn walk_root(root: &Path, scope: &CaptureScope, out: &mut BTreeMap<PathBuf, Obse
     let settings = root.join(".gaviero").join("settings.json");
     if settings.is_file() {
         push(out, root, &settings);
+    }
+
+    let scripts = root.join(".gaviero").join(crate::scripts::SCRIPTS_SUBDIR);
+    if scripts.is_dir() {
+        walk_included(root, &scripts, &excluder, out);
     }
 }
 
@@ -282,12 +288,17 @@ mod tests {
             ".env",
             ".gaviero/settings.json",
             ".gaviero/memory.db",
+            ".gaviero/dsl/audit/DSL.gaviero",
             ".git/HEAD",
         ] {
             write(root, rel);
         }
 
         let got = rels(&scope(root));
+        assert!(
+            got.contains(&".gaviero/dsl/audit/DSL.gaviero".to_string()),
+            "scripts launch agents, so edits to them are reviewed: {got:?}"
+        );
         assert!(got.contains(&"src/lib.rs".to_string()));
         assert!(got.contains(&".gitignore".to_string()));
         assert!(
