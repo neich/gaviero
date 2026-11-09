@@ -6,15 +6,29 @@ use std::sync::Arc;
 
 use crate::memory::embedder::{Embedder, EmbeddingPurpose};
 use crate::memory::reranker::Reranker;
-use crate::memory::scope::{SCOPE_GLOBAL, SCOPE_REPO, SCOPE_WORKSPACE, hash_path};
+use crate::memory::scope::SCOPE_GLOBAL;
+use crate::scoped_folders::{
+    SCOPE_EXTRA_ROOT, ScopedEntry, canonicalize_path, find_entry_file, folder_labels,
+    is_under_native_dir, native_roots, native_scope_label, nearest, sort_nearest_first,
+};
 use crate::workspace::Workspace;
 
 use super::{EXTRA_ROOT_WARNING_NAME, Skill, SkillWarning, parse_skill, skill_name_from_path};
 
-/// Catalog-local scope for `skills.extraRoots` entries. Intentionally
-/// outside the memory `SCOPE_*` range so extra skills never route through
-/// memory DBs. Ranked after global for unqualified `$name`.
-const SCOPE_EXTRA_ROOT: i32 = 10;
+/// Directory under `.gaviero/` holding one folder per skill.
+const SKILLS_SUBDIR: &str = "skills";
+
+impl ScopedEntry for Skill {
+    fn entry_name(&self) -> &str {
+        &self.name
+    }
+    fn scope_level(&self) -> i32 {
+        self.scope_level
+    }
+    fn entry_path(&self) -> &Path {
+        &self.source_path
+    }
+}
 
 /// Registry of skills discovered under workspace and global roots.
 #[derive(Debug, Clone)]
@@ -53,7 +67,7 @@ impl SkillCatalog {
     pub fn scan(workspace: &Workspace, global_dir: &Path) -> (Self, Vec<SkillWarning>) {
         let mut catalog = Self {
             by_name: HashMap::new(),
-            folder_index: HashMap::new(),
+            folder_index: folder_labels(workspace),
             extra_root_index: HashMap::new(),
             scanned: Vec::new(),
             warnings: Vec::new(),
@@ -61,44 +75,13 @@ impl SkillCatalog {
         let mut warnings = Vec::new();
         let mut native_skills_dirs: Vec<PathBuf> = Vec::new();
 
-        let workspace_root = workspace
-            .roots()
-            .first()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let canon_ws = canonicalize_path(&workspace_root);
-        let folders = workspace.folders();
-
-        for folder in folders {
-            let folder_canon = canonicalize_path(&folder.path);
-            catalog
-                .folder_index
-                .insert(folder_canon.clone(), folder.display_name().to_string());
-            let skills_dir = folder.path.join(".gaviero").join("skills");
-            native_skills_dirs.push(canonicalize_path(&skills_dir));
-            catalog.note_scanned(format!("repo {}", folder.display_name()), &skills_dir);
-            catalog.scan_dir(&skills_dir, SCOPE_REPO, &mut warnings);
-        }
-
-        // Workspace-level skills live beside the workspace settings layer:
-        // next to the workspace file, whatever its folder count, and also
-        // for a member folder opened on its own. In plain single-folder mode
-        // that is the folder's own dir, already scanned as repo scope.
-        let ws_skills = workspace.workspace_skills_dir();
-        let ws_canon = canonicalize_path(&ws_skills);
-        if !native_skills_dirs.contains(&ws_canon) {
-            native_skills_dirs.push(ws_canon);
-            catalog.note_scanned("workspace".to_string(), &ws_skills);
-            catalog.scan_dir(&ws_skills, SCOPE_WORKSPACE, &mut warnings);
-        }
-
-        let global_canon = canonicalize_path(global_dir);
-        if !native_skills_dirs.contains(&global_canon) {
-            catalog.note_scanned("global".to_string(), global_dir);
-            if global_dir.is_dir() {
-                native_skills_dirs.push(global_canon);
-                catalog.scan_dir(global_dir, SCOPE_GLOBAL, &mut warnings);
+        for root in native_roots(workspace, SKILLS_SUBDIR, global_dir) {
+            catalog.note_scanned(root.scope, &root.path);
+            if root.level == SCOPE_GLOBAL && !root.path.is_dir() {
+                continue;
             }
+            native_skills_dirs.push(canonicalize_path(&root.path));
+            catalog.scan_dir(&root.path, root.level, &mut warnings);
         }
 
         if workspace.skill_extra_roots_is_malformed(None) {
@@ -112,9 +95,6 @@ impl SkillCatalog {
             &native_skills_dirs,
             &mut warnings,
         );
-
-        // Suppress unused variable warning — canon_ws used in tests / future aliasing checks.
-        let _ = canon_ws;
 
         catalog.warnings = warnings.clone();
         (catalog, warnings)
@@ -220,7 +200,7 @@ impl SkillCatalog {
             }
             // `SKILL.md` in any letter case: on a case-sensitive filesystem
             // a `skill.md` would otherwise be invisible.
-            let Some(skill_md) = find_skill_md(&folder) else {
+            let Some(skill_md) = find_entry_file(&folder, "SKILL.md") else {
                 warnings.push(SkillWarning {
                     name: folder_name.to_string(),
                     message: format!("skill folder {} is missing SKILL.md", folder.display()),
@@ -256,22 +236,17 @@ impl SkillCatalog {
 
     /// Human-readable source label for completion display.
     pub fn source_label(&self, skill: &Skill) -> String {
-        match skill.scope_level {
-            SCOPE_GLOBAL => "global".to_string(),
-            SCOPE_WORKSPACE => "workspace".to_string(),
-            SCOPE_EXTRA_ROOT => self
+        if skill.scope_level == SCOPE_EXTRA_ROOT {
+            return self
                 .extra_label_for(skill)
-                .unwrap_or_else(|| "extra".to_string()),
-            SCOPE_REPO => {
-                if let Some(root) = repo_root_for_skill(skill)
-                    && let Some(label) = self.folder_index.get(&root)
-                {
-                    return label.clone();
-                }
-                "repo".to_string()
-            }
-            _ => "repo".to_string(),
+                .unwrap_or_else(|| "extra".to_string());
         }
+        native_scope_label(
+            skill.scope_level,
+            &skill.source_path,
+            &self.folder_index,
+            SKILLS_SUBDIR,
+        )
     }
 
     fn extra_label_for(&self, skill: &Skill) -> Option<String> {
@@ -293,41 +268,7 @@ impl SkillCatalog {
         if let Some(q) = qualifier {
             return skills.iter().find(|s| self.source_label(s) == q);
         }
-
-        let mut ordered: Vec<&Skill> = skills.iter().collect();
-
-        if let Some(repo_id) = active_repo_id
-            && let Some(active) = ordered
-                .iter()
-                .find(|s| {
-                    s.scope_level == SCOPE_REPO
-                        && self.repo_id_for_skill(s).as_deref() == Some(repo_id)
-                })
-                .copied()
-        {
-            return Some(active);
-        }
-
-        ordered.sort_by_key(|s| (s.scope_level, s.source_path.clone()));
-        // Nearest-first: repo (active first above) → other repos → workspace → global.
-        // Within repo level prefer lower scope_level number... actually repo=2, ws=1, global=0
-        // Plan says: active-folder repo → other folder repos → workspace → global
-        // So we want SCOPE_REPO first (but active handled), then SCOPE_WORKSPACE, then SCOPE_GLOBAL.
-        ordered.sort_by_key(|s| match s.scope_level {
-            SCOPE_REPO => 0,
-            SCOPE_WORKSPACE => 1,
-            SCOPE_GLOBAL => 2,
-            SCOPE_EXTRA_ROOT => 3,
-            _ => 4,
-        });
-        ordered.into_iter().next()
-    }
-
-    fn repo_id_for_skill(&self, skill: &Skill) -> Option<String> {
-        if skill.scope_level != SCOPE_REPO {
-            return None;
-        }
-        repo_root_for_skill(skill).map(|root| hash_path(&root))
+        nearest(skills, active_repo_id, SKILLS_SUBDIR)
     }
 
     /// Prefix completion candidates, scope-ordered nearest-first.
@@ -338,28 +279,7 @@ impl SkillCatalog {
             .filter(|(name, _)| name.starts_with(prefix))
             .flat_map(|(_, skills)| skills.iter())
             .collect();
-
-        out.sort_by(|a, b| {
-            let rank = |s: &Skill| -> (u8, String) {
-                let scope_rank = match s.scope_level {
-                    SCOPE_REPO => {
-                        if active_repo_id
-                            .is_some_and(|id| self.repo_id_for_skill(s).as_deref() == Some(id))
-                        {
-                            0
-                        } else {
-                            1
-                        }
-                    }
-                    SCOPE_WORKSPACE => 2,
-                    SCOPE_GLOBAL => 3,
-                    SCOPE_EXTRA_ROOT => 4,
-                    _ => 5,
-                };
-                (scope_rank, s.name.clone())
-            };
-            rank(a).cmp(&rank(b))
-        });
+        sort_nearest_first(&mut out, active_repo_id, SKILLS_SUBDIR);
         out
     }
 
@@ -423,17 +343,7 @@ impl SkillCatalog {
 
     /// True when `event_path` lies under any `*/.gaviero/skills/` directory.
     pub fn needs_rebuild(event_path: &Path) -> bool {
-        for ancestor in event_path.ancestors() {
-            if ancestor.file_name().is_some_and(|n| n == "skills")
-                && ancestor
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .is_some_and(|n| n == ".gaviero")
-            {
-                return true;
-            }
-        }
-        false
+        is_under_native_dir(event_path, SKILLS_SUBDIR)
     }
 
     /// Native `.gaviero/skills` predicate plus configured extra-root prefixes.
@@ -453,28 +363,6 @@ impl SkillCatalog {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
-}
-
-/// `<folder>/SKILL.md`, matched case-insensitively; the exact name wins.
-fn find_skill_md(folder: &Path) -> Option<PathBuf> {
-    let exact = folder.join("SKILL.md");
-    if exact.is_file() {
-        return Some(exact);
-    }
-    std::fs::read_dir(folder)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.is_file()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.eq_ignore_ascii_case("SKILL.md"))
-        })
-}
-
-fn canonicalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Label for an extra skill root. H-OD6 is "root basename"; when the last
@@ -519,24 +407,6 @@ fn unique_extra_label<'a>(base: String, existing: impl Iterator<Item = &'a Strin
     }
 }
 
-/// Repo folder root for a skill under `<repo>/.gaviero/skills/<name>/SKILL.md`.
-fn repo_root_for_skill(skill: &Skill) -> Option<PathBuf> {
-    for ancestor in skill.source_path.ancestors() {
-        if ancestor.file_name().is_some_and(|n| n == "skills")
-            && ancestor
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|n| n == ".gaviero")
-        {
-            return ancestor
-                .parent()
-                .and_then(|p| p.parent())
-                .map(canonicalize_path);
-        }
-    }
-    None
-}
-
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -556,6 +426,7 @@ mod tests {
     use super::*;
     use crate::memory::embedder::{Embedder, EmbeddingPurpose};
     use crate::memory::reranker::NullReranker;
+    use crate::memory::scope::{SCOPE_REPO, SCOPE_WORKSPACE};
     use async_trait::async_trait;
     use std::fs;
     use std::sync::Arc;

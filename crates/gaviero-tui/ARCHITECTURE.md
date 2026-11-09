@@ -10,7 +10,7 @@ Conventions and slash inventory: [CLAUDE.md](CLAUDE.md). Keybindings / settings:
 
 ```
 gaviero-core ◄── observer traits + WriterHandle
-gaviero-dsl  ◄── compile_file (/run)
+gaviero-dsl  ◄── compile_file (SWARM panel)
         ▲
 ┌───────┴────────────────────────┐
 │          gaviero-tui           │

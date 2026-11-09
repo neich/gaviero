@@ -22,8 +22,10 @@ pub enum Action {
     SetLeftModeFind,
     SetLeftModeChanges,
 
-    // Side panel modes (Alt+A/H/G/M/R)
+    // Side panel modes (Alt+A/H/G/M/R/W)
     SetSideModeChat,
+    /// Run a DSL script and follow its agents.
+    SetSideModeSwarm,
     /// Per-turn history panel.
     SetSideModeHistory,
     SetSideModeGit,
@@ -175,6 +177,7 @@ impl Keymap {
 
             // ── Side panel modes: Alt+letter ─────────────────────
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
+            KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('h') if alt => Action::SetSideModeHistory,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
@@ -402,14 +405,14 @@ mod tests {
             Keymap::resolve(&key(KeyCode::Char('h'), KeyModifiers::ALT)),
             Action::SetSideModeHistory
         );
-        // Ctrl+H stays word-delete; the swarm tab's Alt+W is unbound.
+        // Ctrl+H stays word-delete; Alt+W opens the swarm panel.
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
             Action::DeleteWordBack
         );
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('w'), KeyModifiers::ALT)),
-            Action::None
+            Action::SetSideModeSwarm
         );
     }
 

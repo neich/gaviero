@@ -54,8 +54,9 @@ pub struct Discovered {
     pub marker_root: PathBuf,
     /// The `*.gaviero-workspace` file, in multi-folder mode.
     pub workspace_file: Option<PathBuf>,
-    /// Where the TUI keeps workspace-level state: the workspace memory DB,
-    /// MCP endpoint, telemetry, history and code graph (its first root).
+    /// Where the TUI keeps workspace-level state (its first root): the
+    /// workspace memory DB, MCP endpoint, telemetry and history. Code graphs
+    /// are per folder.
     pub state_root: PathBuf,
     /// Workspace folder containing the run root; the run's repo-scoped
     /// memory is written here.
@@ -340,12 +341,18 @@ impl RunState {
         }
     }
 
-    /// Code graph for `run_root`. A run root other than the TUI's state
-    /// root gets its own database under that root — a graph build deletes
-    /// every file it did not scan, so it must not share the TUI's.
+    /// Code graph for `run_root`. A workspace folder uses the database the
+    /// TUI keeps for it. Any other run root, such as a subfolder, gets its
+    /// own under the state root: a graph build deletes every file it did not
+    /// scan, so it must not share a folder's.
     pub fn graph_db(&self, run_root: &Path) -> PathBuf {
         match self {
-            Self::Shared(d) if canonical(run_root) == canonical(&d.state_root) => {
+            Self::Shared(d)
+                if d.workspace
+                    .roots()
+                    .iter()
+                    .any(|folder| canonical(folder) == canonical(run_root)) =>
+            {
                 gaviero_core::repo_map::graph_builder::graph_db_path(run_root)
             }
             Self::Shared(d) => d
@@ -631,6 +638,34 @@ mod tests {
         assert_eq!(state.swarm_graph_db(&run), Some(db));
         assert_eq!(state.swarm_graph_db(&root), None);
         assert_eq!(state.swarm_memory_root(), Some(root));
+    }
+
+    /// The TUI keeps one graph per folder, not just for the first.
+    #[test]
+    fn every_workspace_folder_uses_the_graph_the_tui_keeps_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = canonical(tmp.path());
+        mark(&ws, "settings.json");
+        let a = ws.join("a");
+        let b = ws.join("b");
+        std::fs::create_dir_all(b.join("src")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        write_workspace_file(&ws.join("ws.gaviero-workspace"), &[&a, &b]);
+        let state = RunState::Shared(discover_with_home(&b, None).unwrap().unwrap());
+
+        assert_eq!(
+            state.graph_db(&b),
+            gaviero_core::repo_map::graph_builder::graph_db_path(&b)
+        );
+        assert_eq!(state.swarm_graph_db(&b), None);
+        assert_eq!(
+            state.graph_db(&a),
+            gaviero_core::repo_map::graph_builder::graph_db_path(&a)
+        );
+        assert!(
+            state.graph_db(&b.join("src")).starts_with(a.join(".gaviero").join("graphs")),
+            "a subfolder must still stay off the folder's database"
+        );
     }
 
     #[test]

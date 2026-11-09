@@ -311,7 +311,11 @@ pub(super) fn try_quit(app: &mut App) {
 
     let has_pending_review = app.diff_review.is_some();
 
-    if unsaved.is_empty() && streaming_agents == 0 && !has_pending_review {
+    if unsaved.is_empty()
+        && streaming_agents == 0
+        && !app.swarm_dashboard.running
+        && !has_pending_review
+    {
         app.should_quit = true;
     } else {
         app.quit_confirm = true;

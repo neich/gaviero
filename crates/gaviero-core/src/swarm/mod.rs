@@ -18,6 +18,7 @@ pub mod planner;
 pub mod privacy;
 pub mod replanner;
 pub mod router;
+pub mod script_run;
 pub mod spawn;
 pub mod validation;
 pub mod verify;

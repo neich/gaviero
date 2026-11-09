@@ -272,16 +272,18 @@ pub(super) fn left_panel_title(app: &App, fullscreen: bool) -> &'static str {
 
 pub(super) fn side_panel_title(app: &App, fullscreen: bool) -> &'static str {
     match (app.side_panel, fullscreen) {
-        (SidePanelMode::AgentChat, false) => "AGENT CHAT",
-        (SidePanelMode::AgentChat, true) => "AGENT CHAT (fullscreen)",
-        (SidePanelMode::HistoryPanel, false) => "HISTORY",
-        (SidePanelMode::HistoryPanel, true) => "HISTORY (fullscreen)",
-        (SidePanelMode::GitPanel, false) => "GIT",
-        (SidePanelMode::GitPanel, true) => "GIT (fullscreen)",
-        (SidePanelMode::MemoryPanel, false) => "MEMORY",
-        (SidePanelMode::MemoryPanel, true) => "MEMORY (fullscreen)",
-        (SidePanelMode::CodeGraph, false) => "CODE GRAPH",
-        (SidePanelMode::CodeGraph, true) => "CODE GRAPH (fullscreen)",
+        (SidePanelMode::AgentChat, false) => "AGENT CHAT [Alt+a]",
+        (SidePanelMode::AgentChat, true) => "AGENT CHAT [Alt+a] (fullscreen)",
+        (SidePanelMode::HistoryPanel, false) => "HISTORY [Alt+h]",
+        (SidePanelMode::HistoryPanel, true) => "HISTORY [Alt+h] (fullscreen)",
+        (SidePanelMode::GitPanel, false) => "GIT [Alt+g]",
+        (SidePanelMode::GitPanel, true) => "GIT [Alt+g] (fullscreen)",
+        (SidePanelMode::MemoryPanel, false) => "MEMORY [Alt+m]",
+        (SidePanelMode::MemoryPanel, true) => "MEMORY [Alt+m] (fullscreen)",
+        (SidePanelMode::CodeGraph, false) => "CODE GRAPH [Alt+r]",
+        (SidePanelMode::CodeGraph, true) => "CODE GRAPH [Alt+r] (fullscreen)",
+        (SidePanelMode::SwarmDashboard, false) => "SWARM [Alt+w]",
+        (SidePanelMode::SwarmDashboard, true) => "SWARM [Alt+w] (fullscreen)",
     }
 }
 
@@ -1499,6 +1501,10 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
             let base = app.theme.default_style();
             app.code_graph_panel.render(area, frame.buffer_mut(), base);
         }
+        SidePanelMode::SwarmDashboard => {
+            app.swarm_dashboard
+                .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
+        }
     }
 }
 
@@ -1550,6 +1556,13 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         lines.push("  Active agents (streaming):".to_string());
         for name in &streaming {
             lines.push(format!("    • {}", name));
+        }
+        lines.push(String::new());
+    }
+    if app.swarm_dashboard.running {
+        lines.push("  A swarm script is running. Quitting stops it:".to_string());
+        for id in super::swarm_run::running_agent_ids(app) {
+            lines.push(format!("    • {}", id));
         }
         lines.push(String::new());
     }

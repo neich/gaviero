@@ -2769,7 +2769,7 @@ impl AgentChatState {
                      /attach                  — List current attachments\n\
                      /detach <name|all>       — Remove attachment(s) (Tab completes names)\n\n\
                      Scripts:\n\
-                     (DSL scripts and multi-agent swarms run from the CLI: `gaviero-cli --script <path.gaviero>`)\n\n\
+                     Alt+w opens the SWARM panel: pick a script from .gaviero/dsl and follow its agents\n\n\
                      Memory:\n\
                      /remember <text>         — Store a memory at the default scope\n\
                      /remember-here <text>    — Store at run scope (dies with session)\n\
@@ -7096,6 +7096,27 @@ mod tests {
         let handled = state.process_slash_command();
 
         assert!(handled);
+        assert!(state.text_input.text.is_empty());
+        let messages = &state.conversations[state.active_conv].messages;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.content.contains("Unknown command")),
+            "expected an Unknown-command system message, got {:?}",
+            messages
+        );
+    }
+
+    /// Scripts run only from the SWARM panel: chat has no command for them,
+    /// and the text must not reach the agent as a request to run one.
+    #[test]
+    fn process_slash_command_does_not_run_scripts_from_chat() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/run audit".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        assert!(state.process_slash_command());
+
         assert!(state.text_input.text.is_empty());
         let messages = &state.conversations[state.active_conv].messages;
         assert!(

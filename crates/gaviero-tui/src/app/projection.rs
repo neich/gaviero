@@ -573,6 +573,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::MemoryDeletionsLoaded { .. }
         | Event::HistoryLoaded(_)
         | Event::MemoryReady(_)
+        | Event::Swarm { .. }
         | Event::RemoteCommand(_)
         | Event::RemoteSnapshotNeeded
         | Event::RemoteClientConnected

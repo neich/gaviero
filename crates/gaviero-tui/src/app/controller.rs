@@ -208,6 +208,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             {
                 return;
             }
+            if key.code == crossterm::event::KeyCode::Esc
+                && app.focus == Focus::SidePanel
+                && app.side_panel == SidePanelMode::SwarmDashboard
+                && super::swarm_run::handle_escape(app)
+            {
+                return;
+            }
 
             let action = Keymap::resolve(&key);
             // Windows: after a clipboard-backed paste, ConPTY may still inject
@@ -269,6 +276,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.graph_services.notify_changed(std::slice::from_ref(&path));
             if app.skill_catalog.needs_rebuild_for(&path) {
                 app.rebuild_skill_catalog();
+            }
+            if gaviero_core::scripts::ScriptCatalog::needs_rebuild(&path)
+                && app.swarm_dashboard.view
+                    == crate::panels::swarm_dashboard::SwarmView::Picker
+            {
+                super::swarm_run::refresh_picker(app);
             }
             if path.file_name().is_some_and(|n| n == ".gitignore") {
                 app.search_panel.invalidate_file_index();
@@ -1766,6 +1779,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             app.remote.status = crate::app::remote::RemoteStatus::Unavailable(reason);
         }
+        Event::Swarm { run, update } => {
+            app.swarm_dashboard.apply(run, update);
+        }
         Event::Tick => {
             app.terminal_manager.tick();
             app.maybe_reassert_vt_mouse(false);
@@ -1794,6 +1810,7 @@ fn editor_only_blocks(action: &Action) -> bool {
             | Action::FocusSidePanel
             | Action::SetLeftModeChanges
             | Action::SetSideModeChat
+            | Action::SetSideModeSwarm
             | Action::SetSideModeHistory
             | Action::SetSideModeGit
             | Action::SetSideModeMemory
@@ -2025,6 +2042,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.side_panel = SidePanelMode::AgentChat;
             app.focus = Focus::SidePanel;
         }
+        Action::SetSideModeSwarm => super::swarm_run::open_panel(app),
         Action::SetSideModeHistory => {
             app.panel_visible.side_panel = true;
             app.side_panel = SidePanelMode::HistoryPanel;
@@ -2325,6 +2343,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             SidePanelMode::GitPanel => app.handle_git_panel_action(action),
             SidePanelMode::MemoryPanel => app.handle_memory_panel_action(action),
             SidePanelMode::CodeGraph => app.handle_code_graph_action(action),
+            SidePanelMode::SwarmDashboard => super::swarm_run::handle_action(app, action),
         },
         _ => {}
     }

@@ -263,6 +263,12 @@ pub enum Event {
     // Memory
     MemoryReady(Arc<gaviero_core::memory::MemoryStores>),
 
+    /// Progress of a DSL script run shown in the SWARM panel.
+    Swarm {
+        run: u64,
+        update: crate::panels::swarm_dashboard::SwarmUpdate,
+    },
+
     // Remote sidecar (Plan A A3/A4): decoded, deduplicated, rate-limited
     // client commands plus connection lifecycle from the RemoteHub.
     RemoteCommand(Box<gaviero_remote::envelope::ClientEnvelope>),

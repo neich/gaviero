@@ -351,10 +351,10 @@ allow-list:
 ```
 
 Initial confirm-required: `/autoapprove /yolo /reset /clear`. Denied remotely (returned
-as `slash_not_allowed`, never forwarded to the agent): `/attach`, `/detach`, `/run`,
-swarm/coordinator commands, memory write/delete/restore/reembed/sleeptime commands, and
-any command not explicitly allow-listed. Matching preserves the desktop parser's token
-boundary — `/runaway` does not match `/run`.
+as `slash_not_allowed`, never forwarded to the agent): `/attach`, `/detach`,
+memory write/delete/restore/reembed/sleeptime commands, and any command not explicitly
+allow-listed. Matching preserves the desktop parser's token boundary — `/modelx` does
+not match `/model`.
 
 ## QR pairing payload
 

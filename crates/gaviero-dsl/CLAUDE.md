@@ -31,6 +31,7 @@ Examples: **9** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc
 - `compile` / `compile_with_vars` / `compile_file` — `override_vars`, `override_tiers`, `override_params`.
 - `load_tier_overrides` — backs `--tiers-file`.
 - `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
+- `inspect_file` ([`inspect.rs`](src/inspect.rs)) — a script's inputs (workflows, params, vars, prompt use) without compiling; backs the TUI SWARM form.
 
 **Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Tier: `--tiers-file` > script/includes `tier` lines.
 

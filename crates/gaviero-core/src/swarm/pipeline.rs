@@ -123,6 +123,31 @@ impl RunDeadline {
     }
 }
 
+/// A spawned agent task that dies with the run awaiting it.
+///
+/// `tokio::spawn` detaches: without this, abandoning [`execute`] (a front end
+/// stopping the run, or an early `?`) would leave parallel agents running and
+/// spending. Dropping the task drops its session, and `kill_on_drop` reaps the
+/// provider subprocess.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
 /// Configuration for a swarm execution.
 pub struct SwarmConfig {
     /// `Repo` (default): git worktrees, merge, repo-map / code graph.
@@ -1036,7 +1061,7 @@ pub async fn execute(
                     root.clone()
                 };
 
-                handles.push(tokio::spawn(async move {
+                handles.push(AbortOnDrop(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
                     invalidate_stale_sources(&mem, &unit, &root).await;
@@ -1096,7 +1121,7 @@ pub async fn execute(
                     }
 
                     Ok::<_, anyhow::Error>(manifest)
-                }));
+                })));
             }
 
             // Collect results
@@ -1727,7 +1752,7 @@ pub async fn execute(
                 let mut handles: Vec<(
                     String,
                     WorkUnit,
-                    tokio::task::JoinHandle<anyhow::Result<AgentManifest>>,
+                    AbortOnDrop<anyhow::Result<AgentManifest>>,
                 )> = Vec::new();
                 for (agent_id, unit, agent_root, branch_override) in prepared {
                     let sem = semaphore.clone();
@@ -1757,7 +1782,7 @@ pub async fn execute(
                     handles.push((
                         agent_id.clone(),
                         unit.clone(),
-                        tokio::spawn(async move {
+                        AbortOnDrop(tokio::spawn(async move {
                             let _permit = sem.acquire().await.unwrap();
                             let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
                                 WriteMode::AutoAccept,
@@ -1823,7 +1848,7 @@ pub async fn execute(
                             }
 
                             Ok(manifest)
-                        }),
+                        })),
                     ));
                 }
 
@@ -4407,6 +4432,42 @@ mod tests {
     use super::*;
     use crate::types::{FileScope, ModelTier, PrivacyLevel};
     use std::collections::HashMap;
+
+    /// Abandoning a run must take its parallel agents with it.
+    #[tokio::test]
+    async fn dropping_an_agent_handle_aborts_the_task() {
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = AbortOnDrop(tokio::spawn(async move {
+            let _guard = guard;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+
+        drop(handle);
+
+        for _ in 0..100 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the task kept running after its handle was dropped");
+    }
+
+    #[tokio::test]
+    async fn an_agent_handle_still_yields_the_task_result() {
+        assert_eq!(AbortOnDrop(tokio::spawn(async { 7 })).await.unwrap(), 7);
+    }
 
     fn test_unit(tier: ModelTier, privacy: PrivacyLevel, model: Option<&str>) -> WorkUnit {
         WorkUnit {
