@@ -92,6 +92,19 @@ pub fn preflight_plan_models(
             .join("; ");
         bail!("model / backend preflight failed: {}", msg);
     }
+
+    let effort_problems: Vec<String> = units
+        .iter()
+        .filter_map(|unit| {
+            let effort = unit.effort.as_deref()?;
+            let model = router.resolve(unit).model_spec()?;
+            let problem = super::backend::effort::effort_problem(&model, effort)?;
+            Some(format!("agent '{}': {problem}", unit.id))
+        })
+        .collect();
+    if !effort_problems.is_empty() {
+        bail!("model / effort preflight failed: {}", effort_problems.join("; "));
+    }
     Ok(())
 }
 

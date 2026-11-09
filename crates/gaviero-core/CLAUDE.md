@@ -57,6 +57,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Rules
 
+- **A wrong model + effort pair never reaches a provider.** [`swarm/backend/effort.rs`](src/swarm/backend/effort.rs) is the only source of what each model accepts. Swarm refuses in `preflight_plan_models` and fan-out (`effort_problem`); TUI chat refuses on `/effort`, moves the level on `/model`, and applies `fit_effort` at dispatch.
 - **Turn capture owns TUI chat review.** A session must not revert or re-propose anything when `AgentOptions::host_capture` is set — the host diffs the tree after the session is gone. A new session type that keeps its own snapshot must gate it on that flag.
 - **Every write goes through the writer task or the Write Gate.** No MCP tool may touch a store directly. The read-only surface is the default posture, not a hard rule — `memory_flag` is the one write-adjacent tool, and it signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. Each added tool costs ~150–250 prompt tokens on every subprocess turn; make it earn that.
 - **No UI deps.** Compiles without `ratatui` / `crossterm`. `vt100`/`portable-pty` are allowed (embedded terminal lives here).

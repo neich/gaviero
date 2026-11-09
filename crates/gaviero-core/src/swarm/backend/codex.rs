@@ -60,16 +60,25 @@ use super::{
     UnifiedStreamEvent,
 };
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+/// Model used when a spec names none: Codex's top-priority catalog entry.
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
 
-/// Whether a prompt of `len` bytes should be piped via stdin rather
-/// than passed as a positional argv. The threshold
-/// ([`crate::util::spawn::argv_threshold`]) leaves comfortable headroom
-/// for the rest of the argv (flags, `--config` keys, `--add-dir` roots)
-/// and matches the ACP/Claude path for symmetry. Extracted so tests can
-/// exercise the decision without spawning a subprocess.
-fn would_use_stdin(len: usize) -> bool {
-    len >= crate::util::spawn::argv_threshold()
+/// Context window, in tokens, the Codex catalog advertises for `model`
+/// (`context_window` in `codex debug models`, client 0.167.0, 2026-11-09).
+/// The 6.1 family has 500k; every other listed model has 272k, which is also
+/// the assumption for a model the catalog does not describe.
+pub fn codex_context_window(model: &str) -> usize {
+    let model = model.trim().to_ascii_lowercase();
+    let model = if model.is_empty() {
+        DEFAULT_CODEX_MODEL
+    } else {
+        model.as_str()
+    };
+    if model.starts_with("gpt-6.1") {
+        500_000
+    } else {
+        272_000
+    }
 }
 
 /// Backend that spawns the Codex CLI as a subprocess.
@@ -125,25 +134,17 @@ impl AgentBackend for CodexBackend {
             cmd.arg(arg);
         }
 
-        // Small prompts ride argv (zero-overhead, simpler); large prompts
-        // pipe via stdin so we don't hit MAX_ARG_STRLEN (E2BIG). codex
-        // exec reads the prompt from stdin when no positional argument
-        // is supplied.
-        let use_stdin = would_use_stdin(combined_prompt.len());
-        if !use_stdin {
-            cmd.arg(&combined_prompt);
-        }
+        // The prompt always goes through stdin (codex exec reads it there
+        // when no positional argument is supplied). On argv it would be
+        // refused on Windows, where the npm install is a `.cmd` shim and
+        // `std` rejects multi-line arguments to batch files.
         cmd.current_dir(&request.workspace_root)
             .env("NO_COLOR", "1");
         crate::mcp::apply_codex_http_token(&mut cmd, &request.workspace_root);
-        cmd.stdin(if use_stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let prompt_len = combined_prompt.len();
         let mut child = cmd.spawn().map_err(|e| {
@@ -155,25 +156,18 @@ impl AgentBackend for CodexBackend {
                      or switch provider by setting agent.model to a `claude:...` / `ollama:...` spec."
                 )
             } else {
-                anyhow::anyhow!(
-                    "spawning codex subprocess (prompt {} bytes via {}): {e}",
-                    prompt_len,
-                    if use_stdin { "stdin" } else { "argv" },
-                )
+                anyhow::anyhow!("spawning codex subprocess (prompt {prompt_len} bytes): {e}")
             }
         })?;
 
-        // For the stdin path, hand the prompt to codex and close stdin
-        // before we drive stdout — codex won't start streaming until it
-        // sees EOF on its input.
-        if use_stdin {
-            let mut stdin = child.stdin.take().context("codex stdin unavailable")?;
-            stdin
-                .write_all(combined_prompt.as_bytes())
-                .await
-                .context("writing codex prompt to stdin")?;
-            stdin.shutdown().await.context("closing codex stdin")?;
-        }
+        // Hand the prompt to codex and close stdin before we drive stdout —
+        // codex won't start streaming until it sees EOF on its input.
+        let mut stdin = child.stdin.take().context("codex stdin unavailable")?;
+        stdin
+            .write_all(combined_prompt.as_bytes())
+            .await
+            .context("writing codex prompt to stdin")?;
+        stdin.shutdown().await.context("closing codex stdin")?;
 
         let stdout = child.stdout.take().context("codex stdout unavailable")?;
         let stderr = child.stderr.take().context("codex stderr unavailable")?;
@@ -258,7 +252,7 @@ impl AgentBackend for CodexBackend {
             streaming: true,
             vision: false,
             extended_thinking: false,
-            max_context_tokens: 200_000,
+            max_context_tokens: codex_context_window(&self.model),
             supports_system_prompt: true,
             supports_file_blocks: true,
             // PUSH→PULL Phase 1: the gaviero MCP server is wired for Codex
@@ -717,14 +711,8 @@ async fn drive_codex_stdout(
 /// `xhigh`, `max`, `ultra`. `None` / `off` / `auto` omit the flag so Codex
 /// uses its model default.
 ///
-/// Supported ceilings follow the Codex model catalog (client 0.153.4, 2026-09):
-/// * `gpt-6-astra` / any `gpt-6` variant → up to `ultra`
-/// * `gpt-5.6-sol` / `gpt-5.6-terra` / bare `gpt-5.6` → up to `ultra`
-/// * `gpt-5.6-luna` → up to `max` (no `ultra`)
-/// * older models (`gpt-5.5` and the delisted `gpt-5.4` / `gpt-5.4-mini` /
-///   `gpt-5.3-codex-spark` / `gpt-5.2`, …) → up to `xhigh`
-///
-/// Requests above the active model's ceiling are clamped down (not dropped).
+/// A level the model does not offer moves to the nearest one it does
+/// ([`codex_effort_levels`]); it is never dropped.
 fn map_effort_to_codex(effort: Option<&str>, model: &str) -> Option<&'static str> {
     let requested = match effort?.trim().to_ascii_lowercase().as_str() {
         "off" | "auto" | "" => return None,
@@ -744,10 +732,26 @@ fn map_effort_to_codex(effort: Option<&str>, model: &str) -> Option<&'static str
             return None;
         }
     };
-    Some(clamp_codex_effort(requested, model))
+    let levels = codex_effort_levels(model);
+    Some(super::effort::nearest_level(requested, &levels).unwrap_or(requested))
 }
 
-/// Highest `model_reasoning_effort` the given Codex model advertises.
+/// The efforts `model` accepts, weakest first: the installed CLI's catalog,
+/// or the static ceilings for a model it does not describe.
+pub fn codex_effort_levels(model: &str) -> Vec<String> {
+    crate::acp::session::codex_catalog_effort_levels(model).unwrap_or_else(|| {
+        let ladder = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+        let ceiling = codex_effort_ceiling(model);
+        // Only the older generation, topping out at `xhigh`, took `minimal`.
+        let start = usize::from(ceiling != "xhigh");
+        let end = ladder.iter().position(|l| *l == ceiling).unwrap_or(ladder.len() - 1);
+        ladder[start..=end].iter().map(|l| l.to_string()).collect()
+    })
+}
+
+/// Highest `model_reasoning_effort` per the catalog as of client 0.167.0
+/// (2026-11): any `-luna` model reaches `max`, every other `gpt-6*` /
+/// `gpt-5.6*` model `ultra`, and older models `xhigh`.
 fn codex_effort_ceiling(model: &str) -> &'static str {
     let m = model
         .trim()
@@ -755,43 +759,17 @@ fn codex_effort_ceiling(model: &str) -> &'static str {
         .unwrap_or(model)
         .trim()
         .to_ascii_lowercase();
-    if m.starts_with("gpt-6") {
-        // gpt-6-astra advertises the full ladder through `ultra`; future
-        // gpt-6 variants inherit that ceiling until the catalog says otherwise.
-        "ultra"
-    } else if m == "gpt-5.6" || m.starts_with("gpt-5.6-sol") || m.starts_with("gpt-5.6-terra") {
-        "ultra"
-    } else if m.starts_with("gpt-5.6-luna") {
+    if m.contains("-luna") {
+        // Luna is the one current family without `ultra`.
         "max"
-    } else if m.starts_with("gpt-5.6") {
-        // Unknown 5.6 variant — allow the common Sol/Terra ceiling.
+    } else if m.starts_with("gpt-6") || m.starts_with("gpt-5.6") {
+        // Sol, Terra and Astra advertise the full ladder; a variant the
+        // catalog has not described yet inherits that ceiling.
         "ultra"
     } else {
         // gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark / gpt-5.2 /
         // legacy: Codex lists these through xhigh.
         "xhigh"
-    }
-}
-
-fn codex_effort_rank(effort: &str) -> u8 {
-    match effort {
-        "minimal" => 1,
-        "low" => 2,
-        "medium" => 3,
-        "high" => 4,
-        "xhigh" => 5,
-        "max" => 6,
-        "ultra" => 7,
-        _ => 0,
-    }
-}
-
-fn clamp_codex_effort(requested: &'static str, model: &str) -> &'static str {
-    let ceiling = codex_effort_ceiling(model);
-    if codex_effort_rank(requested) > codex_effort_rank(ceiling) {
-        ceiling
-    } else {
-        requested
     }
 }
 
@@ -1101,6 +1079,30 @@ url = "https://example/mcp/"
             map_effort_to_codex(Some("ultra"), "gpt-5.6-luna"),
             Some("max")
         );
+        assert_eq!(
+            map_effort_to_codex(Some("ultra"), "gpt-6-luna"),
+            Some("max")
+        );
+        // The rest of the current catalog accepts ultra.
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol"] {
+            assert_eq!(map_effort_to_codex(Some("ultra"), model), Some("ultra"), "{model}");
+        }
+    }
+
+    #[test]
+    fn test_context_window_follows_the_catalog() {
+        assert_eq!(codex_context_window("gpt-6.1-sol"), 500_000);
+        assert_eq!(codex_context_window("gpt-6.1-terra"), 500_000);
+        assert_eq!(codex_context_window("gpt-6-astra"), 272_000);
+        assert_eq!(codex_context_window("gpt-5.6-luna"), 272_000);
+        assert_eq!(codex_context_window("some-future-model"), 272_000);
+        assert_eq!(
+            codex_context_window(""),
+            codex_context_window(DEFAULT_CODEX_MODEL),
+            "an empty id means the default model"
+        );
+        let backend = CodexBackend::new("gpt-6.1-terra");
+        assert_eq!(backend.capabilities().max_context_tokens, 500_000);
     }
 
     #[test]
@@ -1438,19 +1440,5 @@ url = "https://example/mcp/"
         let msg = format_exit_error(&err, "auth failure\n");
         assert!(msg.contains("bad"));
         assert!(msg.contains("auth failure"));
-    }
-
-    #[test]
-    fn small_prompt_passes_via_argv() {
-        assert!(!would_use_stdin(0));
-        assert!(!would_use_stdin(1_000));
-        assert!(!would_use_stdin(crate::util::spawn::argv_threshold() - 1));
-    }
-
-    #[test]
-    fn large_prompt_passes_via_stdin() {
-        assert!(would_use_stdin(crate::util::spawn::argv_threshold()));
-        assert!(would_use_stdin(100_000));
-        assert!(would_use_stdin(1_000_000));
     }
 }

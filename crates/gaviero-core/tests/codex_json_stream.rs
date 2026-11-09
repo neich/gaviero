@@ -21,7 +21,7 @@
 //! cargo test -p gaviero-core --test codex_json_stream -- --ignored --nocapture
 //! ```
 //!
-//! Override the model with `E2E_CODEX_MODEL` (default `gpt-5.5`).
+//! Override the model with `E2E_CODEX_MODEL` (default `gpt-6.1-sol`).
 
 use std::time::Instant;
 
@@ -42,7 +42,7 @@ fn request(prompt: &str, workspace_root: std::path::PathBuf) -> CompletionReques
 #[tokio::test]
 #[ignore = "requires the codex CLI, a login, and real tokens"]
 async fn codex_exec_streams_tool_and_text_events_before_the_turn_ends() {
-    let model = std::env::var("E2E_CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    let model = std::env::var("E2E_CODEX_MODEL").unwrap_or_else(|_| "gpt-6.1-sol".to_string());
     let backend = CodexBackend::new(&model);
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 

@@ -13,18 +13,20 @@ pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
     "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh",
 ];
 
-/// DeepSeek HTTP API model ids (without the `deepseek:` / `dsh:` provider
-/// prefix). Same list for both routes.
+/// DeepSeek model ids the picker offers (without the `deepseek:` / `dsh:`
+/// provider prefix). Same list for both routes.
 ///
-/// Mirrors DeepSeek's Models & Pricing table (fetched 2026-09-15):
-/// `deepseek-flash` is V4.1-Flash (canonical), `deepseek-v4-pro` is still
-/// served as V4-Pro-0813. `deepseek-v4-flash` is a temporary compatibility
-/// alias that DeepSeek routes to V4.1-Flash; keep it so existing
-/// `deepseek:deepseek-v4-flash` / `dsh:deepseek-v4-flash` pins keep working.
-/// The retired `deepseek-v4-flash-vision-exp` alias is omitted from the
-/// picker — use `deepseek-flash` for multimodal.
-pub const DEEPSEEK_API_MODELS: &[&str] =
-    &["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"];
+/// Mirrors DeepSeek's `GET /models` and Models & Pricing page (2026-11-09):
+/// `deepseek-flash` is V4.1-Flash and `deepseek-v4-pro` is V4-Pro. Unlike
+/// Codex and Cursor this list stays static: dsh only exposes its catalog
+/// inside a started ACP session, and the API listing needs a key.
+pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-flash", "deepseek-v4-pro"];
+
+/// Retired names DeepSeek still accepts and serves with V4.1-Flash. Not
+/// offered, but valid in a spec so existing pins keep working.
+/// `deepseek-v4-flash-vision-exp` is left out: use `deepseek-flash` for
+/// multimodal.
+pub const DEEPSEEK_LEGACY_MODELS: &[&str] = &["deepseek-v4-flash"];
 
 /// Canonical Claude model ids the `/model` picker always offers, without the
 /// `claude:` prefix. Independent of `claude --help` parsing so the picker
@@ -63,35 +65,33 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
     "claude-opus-5-5",
 ];
 
-/// Canonical Codex model ids the `/model` picker always offers, without the
-/// `codex:` prefix. Codex has no CLI discovery path in Gaviero (unlike Claude
-/// `--help` / Cursor `--list-models`), so without this list Tab-completing
-/// `codex:` or typing a bare `gpt` fragment only surfaces Cursor's proxied
-/// `cursor:gpt-*` entries — Codex looks like it disappeared.
+/// Codex model ids, without the `codex:` prefix, offered when the installed
+/// CLI cannot be asked: [`crate::acp::session::discover_codex_model_options`]
+/// reads the live catalog (`codex debug models`) and only falls back to this
+/// list when the CLI is missing or fails.
 ///
-/// Mirrors the `visibility: "list"` slugs Codex serves in its model catalog
-/// (`~/.codex/models_cache.json`, client 0.153.4, fetched 2026-09-14), in
-/// upstream `priority` order: `gpt-6-astra` (flagship, priority 1), then
-/// `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` and the older `gpt-5.5`.
-/// Hidden slugs (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
+/// Mirrors the `visibility: "list"` slugs of that catalog (client 0.167.0,
+/// 2026-11-09), in upstream `priority` order. Hidden slugs (`gpt-reserve`,
+/// `codex-auto-review`) are deliberately absent.
 ///
-/// `gpt-6-astra` is gated on the Codex client version: a 0.146.0 CLI is served
-/// a catalog without it. Listing it unconditionally is deliberate — this list
-/// is host-side picker UX, and the spec is forwarded verbatim to whichever CLI
-/// is installed, so an outdated CLI fails at dispatch rather than silently
-/// substituting a model.
+/// Listing a model an older CLI is not served is deliberate: this is host-side
+/// picker UX, and the spec is forwarded verbatim to whichever CLI is installed,
+/// so an outdated CLI fails at dispatch rather than silently substituting a
+/// model.
 ///
-/// `gpt-5.2` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex-spark` were
-/// dropped as Codex delisted them upstream (the 2026-09-14 catalog lists none
-/// of them). Free-form ids still pass [`validate_model_spec`], so an existing
-/// `codex:gpt-5.4-mini` pin keeps working; it just no longer shows up in the
-/// picker. This list is picker UX only.
+/// `gpt-5.2` / `gpt-5.3-codex-spark` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.5`
+/// are gone because Codex delisted them upstream. Free-form ids still pass
+/// [`validate_model_spec`], so an existing pin is still sent as written; it
+/// just no longer shows up in the picker.
 pub const CODEX_MODEL_ALIASES: &[&str] = &[
+    "gpt-6.1-sol",
     "gpt-6-astra",
+    "gpt-6.1-terra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
-    "gpt-5.5",
 ];
 
 /// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
@@ -434,7 +434,7 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
             if model.is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
-            if !DEEPSEEK_API_MODELS.contains(&model) {
+            if !DEEPSEEK_API_MODELS.contains(&model) && !DEEPSEEK_LEGACY_MODELS.contains(&model) {
                 anyhow::bail!(
                     "unsupported DeepSeek model '{}'; supported models: {}",
                     model,
@@ -474,6 +474,21 @@ fn static_model_ids(provider: &str) -> Vec<String> {
         "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
         "dsh" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Static ids to offer for `provider` given what discovery returned. Codex's
+/// discovery is the authoritative catalog, so once it has answered, the static
+/// list must not bring back a model Codex has since delisted.
+fn fallback_model_ids(provider: &str, discovered: &[String]) -> Vec<String> {
+    let codex_answered = provider == "codex"
+        && discovered
+            .iter()
+            .any(|spec| spec.to_lowercase().starts_with("codex:"));
+    if codex_answered {
+        Vec::new()
+    } else {
+        static_model_ids(provider)
     }
 }
 
@@ -543,7 +558,7 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
 
             // Static ids always offered for this provider, regardless of CLI
             // discovery (which can be empty or drift across CLI versions).
-            let mut model_ids: Vec<String> = static_model_ids(&provider_lower);
+            let mut model_ids: Vec<String> = fallback_model_ids(&provider_lower, discovered);
 
             // Merge model ids surfaced by CLI discovery for the same provider.
             let disc_prefix = format!("{provider_lower}:");
@@ -590,7 +605,7 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
     if !partial.is_empty() {
         let mut model_matches: Vec<String> = Vec::new();
         for provider in SUPPORTED_PROVIDER_PREFIXES {
-            for model in static_model_ids(provider) {
+            for model in fallback_model_ids(provider, discovered) {
                 if model.to_lowercase().starts_with(&partial_lower) {
                     model_matches.push(format!("{provider}:{model}"));
                 }
@@ -1205,7 +1220,7 @@ mod tests {
         let hits = model_spec_completions("dsh:deep", &[]);
         assert!(hits.contains(&"dsh:deepseek-flash".to_string()));
         assert!(hits.contains(&"dsh:deepseek-v4-pro".to_string()));
-        assert!(hits.contains(&"dsh:deepseek-v4-flash".to_string()));
+        assert!(!hits.contains(&"dsh:deepseek-v4-flash".to_string()), "retired: {hits:?}");
     }
 
     #[test]
@@ -1213,7 +1228,7 @@ mod tests {
         let hits = model_spec_completions("deepseek:deep", &[]);
         assert!(hits.contains(&"deepseek:deepseek-flash".to_string()));
         assert!(hits.contains(&"deepseek:deepseek-v4-pro".to_string()));
-        assert!(hits.contains(&"deepseek:deepseek-v4-flash".to_string()));
+        assert!(!hits.contains(&"deepseek:deepseek-v4-flash".to_string()), "retired: {hits:?}");
     }
 
     #[test]
@@ -1228,10 +1243,13 @@ mod tests {
 
     #[test]
     fn test_model_spec_completions_codex_models_from_static_aliases() {
-        // Regression: Codex has no CLI discovery. Without static aliases,
-        // `/model codex:` and bare `gpt` fragments only surface Cursor's
-        // proxied gpt models — Codex looks unavailable.
+        // Regression: when the Codex CLI cannot be asked, `/model codex:` and
+        // bare `gpt` fragments would otherwise only surface Cursor's proxied
+        // gpt models — Codex looks unavailable.
         let hits = model_spec_completions("codex:", &[]);
+        for current in CODEX_MODEL_ALIASES {
+            assert!(hits.contains(&format!("codex:{current}")), "got {hits:?}");
+        }
         assert!(
             hits.contains(&"codex:gpt-6-astra".to_string()),
             "got {hits:?}"
@@ -1248,7 +1266,6 @@ mod tests {
             hits.contains(&"codex:gpt-5.6-luna".to_string()),
             "got {hits:?}"
         );
-        assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
         // Delisted upstream, so they are no longer offered — but an explicit
         // pin must still validate, since the picker list is UX only.
         for delisted in [
@@ -1256,6 +1273,7 @@ mod tests {
             "codex:gpt-5.4",
             "codex:gpt-5.4-mini",
             "codex:gpt-5.3-codex-spark",
+            "codex:gpt-5.5",
         ] {
             assert!(!hits.contains(&delisted.to_string()), "got {hits:?}");
             validate_model_spec(delisted).unwrap();
@@ -1282,6 +1300,18 @@ mod tests {
             gpt_hits.contains(&"codex:gpt-5.6-sol".to_string()),
             "bare gpt fragment must offer Codex specs: {gpt_hits:?}"
         );
+    }
+
+    #[test]
+    fn test_discovered_codex_models_replace_the_static_list() {
+        let discovered = vec!["codex:gpt-9-nova".to_string()];
+
+        let scoped = model_spec_completions("codex:", &discovered);
+        assert_eq!(scoped, vec!["codex:gpt-9-nova".to_string()]);
+
+        let bare = model_spec_completions("gpt", &discovered);
+        assert!(bare.contains(&"codex:gpt-9-nova".to_string()), "got {bare:?}");
+        assert!(!bare.contains(&"codex:gpt-5.6-sol".to_string()), "got {bare:?}");
     }
 
     #[test]

@@ -46,6 +46,13 @@ fn worker_to_unit(w: &SpawnWorkerSpec, op: &FanoutOp) -> Result<WorkUnit> {
         w.model.clone()
     };
     validate_model_spec(&model).with_context(|| format!("worker '{}'", w.id))?;
+    if let Some(problem) = w
+        .effort
+        .as_deref()
+        .and_then(|effort| crate::swarm::backend::effort::effort_problem(&model, effort))
+    {
+        bail!("worker '{}': {problem}", w.id);
+    }
 
     let prompt = if w.prompt.is_empty() {
         w.description.clone()
@@ -132,6 +139,22 @@ mod tests {
         assert_eq!(units[0].model.as_deref(), Some("claude:sonnet"));
         assert_eq!(units[0].depends_on, vec!["discover".to_string()]);
         assert_eq!(units[2].scope.owned_paths, vec!["src/2/".to_string()]);
+    }
+
+    #[test]
+    fn rejects_a_wrong_model_and_effort_pair() {
+        let op = FanoutOp {
+            after_unit: "discover".into(),
+            max_spawn: 16,
+            default_model: None,
+            barrier_id: None,
+        };
+        let wrong = r#"{"version":1,"workers":[{"id":"w","model":"dsh:deepseek-flash","effort":"medium"}]}"#;
+        let error = materialize_from_json(wrong, &op).unwrap_err().to_string();
+        assert!(error.contains("no `medium` effort"), "{error}");
+
+        let right = r#"{"version":1,"workers":[{"id":"w","model":"dsh:deepseek-flash","effort":"high"}]}"#;
+        assert_eq!(materialize_from_json(right, &op).unwrap()[0].effort.as_deref(), Some("high"));
     }
 
     #[test]

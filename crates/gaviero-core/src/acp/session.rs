@@ -473,8 +473,8 @@ impl AcpSession {
             cmd.arg("--resume").arg(id);
         }
 
-        if !options.effort.is_empty() && options.effort != "off" && options.effort != "auto" {
-            cmd.arg("--effort").arg(&options.effort);
+        if let Some(effort) = crate::swarm::backend::effort::claude_cli_effort(&options.effort) {
+            cmd.arg("--effort").arg(effort);
         }
 
         if options.auto_approve {
@@ -1333,6 +1333,113 @@ fn is_model_id_shaped(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
+/// Query the Codex CLI (`codex debug models`) for the models it lists, as
+/// `codex:<id>` specs in catalog priority order. Falls back to
+/// [`crate::swarm::backend::shared::CODEX_MODEL_ALIASES`] when the CLI is
+/// missing, fails, or returns nothing usable, so the result is never empty.
+pub fn discover_codex_model_options() -> Vec<String> {
+    let specs = codex_catalog().map(|catalog| catalog.specs.clone()).unwrap_or_default();
+    if !specs.is_empty() {
+        return specs;
+    }
+    crate::swarm::backend::shared::CODEX_MODEL_ALIASES
+        .iter()
+        .map(|model| format!("codex:{model}"))
+        .collect()
+}
+
+/// The efforts the installed CLI lists for `model`, weakest first. `None`
+/// when the CLI cannot be asked or does not describe it, and always in unit
+/// tests, so they do not depend on what is installed.
+pub fn codex_catalog_effort_levels(model: &str) -> Option<Vec<String>> {
+    if cfg!(test) {
+        return None;
+    }
+    codex_catalog()?.efforts.get(model.trim()).cloned()
+}
+
+/// One read of the installed CLI's model catalog.
+struct CodexCatalog {
+    specs: Vec<String>,
+    efforts: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// The catalog, read once per process: both callers can run on every
+/// keystroke or dispatch, and the file behind it barely changes.
+fn codex_catalog() -> Option<&'static CodexCatalog> {
+    static CATALOG: std::sync::OnceLock<Option<CodexCatalog>> = std::sync::OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            let output = crate::util::spawn::agent_command_std("codex")
+                .args(["debug", "models"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())?;
+            let json = String::from_utf8_lossy(&output.stdout);
+            Some(CodexCatalog {
+                specs: parse_codex_model_catalog(&json),
+                efforts: parse_codex_effort_levels(&json),
+            })
+        })
+        .as_ref()
+}
+
+/// Each model's `supported_reasoning_levels` from a `codex debug models`
+/// document, hidden models included: a pinned model still needs its levels.
+fn parse_codex_effort_levels(json: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let Ok(catalog) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Default::default();
+    };
+    let Some(models) = catalog.get("models").and_then(|m| m.as_array()) else {
+        return Default::default();
+    };
+    models
+        .iter()
+        .filter_map(|model| {
+            let slug = model.get("slug")?.as_str()?;
+            let levels: Vec<String> = model
+                .get("supported_reasoning_levels")?
+                .as_array()?
+                .iter()
+                .filter_map(|level| Some(level.get("effort")?.as_str()?.to_string()))
+                .collect();
+            (!levels.is_empty()).then(|| (slug.to_string(), levels))
+        })
+        .collect()
+}
+
+/// The `visibility: "list"` models of a `codex debug models` document, as
+/// `codex:<id>` specs sorted by `priority`. Anything malformed yields nothing
+/// for that entry; extracted so tests need no `codex` binary.
+fn parse_codex_model_catalog(json: &str) -> Vec<String> {
+    let Ok(catalog) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(models) = catalog.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut listed: Vec<(i64, &str)> = models
+        .iter()
+        .filter(|m| m.get("visibility").and_then(|v| v.as_str()) == Some("list"))
+        .filter_map(|m| {
+            let slug = m.get("slug")?.as_str()?;
+            is_model_id_shaped(slug).then_some(slug)?;
+            let priority = m
+                .get("priority")
+                .and_then(|p| p.as_i64())
+                .unwrap_or(i64::MAX);
+            Some((priority, slug))
+        })
+        .collect();
+    listed.sort_by_key(|(priority, _)| *priority);
+    listed
+        .into_iter()
+        .map(|(_, slug)| format!("codex:{slug}"))
+        .collect()
+}
+
 /// Query the Cursor CLI (`agent --list-models`) for the model ids the
 /// current account can route to, prefixed with `cursor:` so the TUI's
 /// model picker receives canonical `provider:model` strings.
@@ -1421,8 +1528,82 @@ fn parse_cursor_list_models(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod discover_codex_tests {
+    use super::{parse_codex_effort_levels, parse_codex_model_catalog};
+
+    #[test]
+    fn reads_each_models_effort_levels() {
+        let catalog = r#"{"models":[
+            {"slug":"gpt-a","visibility":"list","supported_reasoning_levels":[
+                {"effort":"low","description":"x"},{"effort":"max"}]},
+            {"slug":"gpt-hidden","visibility":"hide","supported_reasoning_levels":[{"effort":"high"}]},
+            {"slug":"gpt-none","visibility":"list","supported_reasoning_levels":[]},
+            {"slug":"gpt-missing","visibility":"list"}
+        ]}"#;
+        let efforts = parse_codex_effort_levels(catalog);
+        assert_eq!(efforts["gpt-a"], ["low", "max"]);
+        assert_eq!(efforts["gpt-hidden"], ["high"]);
+        assert_eq!(efforts.len(), 2, "{efforts:?}");
+        assert!(parse_codex_effort_levels("not json").is_empty());
+    }
+
+    #[test]
+    fn lists_visible_models_in_priority_order() {
+        let catalog = r#"{"models":[
+            {"slug":"gpt-b","visibility":"list","priority":2},
+            {"slug":"gpt-hidden","visibility":"hide","priority":1},
+            {"slug":"gpt-a","visibility":"list","priority":1}
+        ]}"#;
+        assert_eq!(parse_codex_model_catalog(catalog), ["codex:gpt-a", "codex:gpt-b"]);
+    }
+
+    #[test]
+    fn skips_entries_that_are_not_model_ids() {
+        let catalog = r#"{"models":[
+            {"slug":"not a model","visibility":"list","priority":1},
+            {"visibility":"list","priority":2},
+            {"slug":"gpt-ok","visibility":"list"}
+        ]}"#;
+        assert_eq!(parse_codex_model_catalog(catalog), ["codex:gpt-ok"]);
+    }
+
+    /// The fallback list can equal the live one, so compare against a direct
+    /// run of the command rather than trusting the result to be live.
+    #[test]
+    #[ignore = "requires the codex CLI on PATH"]
+    fn discovery_reads_the_installed_cli() {
+        let output = crate::util::spawn::agent_command_std("codex")
+            .args(["debug", "models"])
+            .output()
+            .expect("codex runs");
+        assert!(output.status.success());
+        let direct = parse_codex_model_catalog(&String::from_utf8_lossy(&output.stdout));
+        assert!(!direct.is_empty());
+        assert_eq!(super::discover_codex_model_options(), direct);
+    }
+
+    #[test]
+    fn unusable_output_yields_nothing() {
+        assert!(parse_codex_model_catalog("not json").is_empty());
+        assert!(parse_codex_model_catalog("{}").is_empty());
+        assert!(parse_codex_model_catalog(r#"{"models":[]}"#).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod discover_cursor_tests {
     use super::{parse_cursor_list_models, pin_cursor_picker_order};
+
+    /// Costs no tokens. The real listing must reach the parser, not the
+    /// one-entry failure fallback.
+    #[test]
+    #[ignore = "requires the Cursor CLI on PATH"]
+    fn discovery_reads_the_installed_cli() {
+        let models = super::discover_cursor_model_options();
+        assert!(models.len() > 1, "fell back: {models:?}");
+        assert!(models.iter().all(|m| m.starts_with("cursor:")), "{models:?}");
+        assert_eq!(models[0], "cursor:composer-2.5", "the default must still exist");
+    }
 
     #[test]
     fn parses_real_world_list_models_output() {

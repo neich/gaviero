@@ -24,10 +24,11 @@ use super::{
 };
 
 /// Context window of every DeepSeek chat model gaviero can address
-/// (`deepseek-flash` and `deepseek-v4-pro` both serve 1M tokens with up to
-/// 384K output — <https://api-docs.deepseek.com/quick_start/pricing>). Shared
-/// by the `deepseek:` and `dsh:` profile rows and both backends' capabilities.
-pub const DEEPSEEK_CONTEXT_WINDOW: usize = 1_000_000;
+/// (`deepseek-flash` and `deepseek-v4-pro` both declare this `context_window`
+/// and 393,216 output tokens — <https://api-docs.deepseek.com/api/list-models>).
+/// Shared by the `deepseek:` and `dsh:` profile rows and both backends'
+/// capabilities.
+pub const DEEPSEEK_CONTEXT_WINDOW: usize = 1_048_576;
 
 /// Whether `model` accepts image input. V4.1-Flash is natively multimodal and
 /// the legacy Flash names route to it; V4-Pro is text-only

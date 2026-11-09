@@ -215,7 +215,7 @@ pub fn provider_cli_bin(provider: &str) -> &str {
 pub fn provider_model_spec(provider: &str) -> Option<&'static str> {
     match provider {
         "claude" => Some("claude:sonnet"),
-        "codex" => Some("codex:gpt-5.5"),
+        "codex" => Some("codex:gpt-6.1-sol"),
         "cursor" => Some("cursor:auto"),
         "dsh" => Some("dsh:deepseek-flash"),
         _ => None,

@@ -8,8 +8,8 @@
 //! `where.exe` — and hand `Command` the resolved absolute path.
 //! `std` itself safely wraps `.cmd`/`.bat` programs in `cmd.exe /C`
 //! once it can see the extension — but its BatBadBut hardening
-//! (CVE-2024-24576) *rejects* any argument containing `"`, `\r`, or
-//! `\n` with "batch file arguments are invalid", and agent prompts are
+//! (CVE-2024-24576) *rejects* any argument containing a newline with
+//! "batch file arguments are invalid", and agent prompts are
 //! multi-line by construction. A CLI that ships only a `.cmd` shim can
 //! therefore never receive a prompt through it, so
 //! [`resolve_agent_invocation`] hops over known batch launcher shims
@@ -387,7 +387,7 @@ pub struct AgentInvocation {
 /// over known batch-file launcher shims to the executable they delegate
 /// to.
 ///
-/// `std` refuses to pass arguments containing `"`, `\r`, or `\n` to a
+/// `std` refuses to pass arguments containing a newline to a
 /// `.bat`/`.cmd` program (BatBadBut hardening — the error reads "batch
 /// file arguments are invalid"), and prompts always contain newlines,
 /// so spawning through such a shim can never work for prompt-on-argv
@@ -416,7 +416,7 @@ fn is_batch_file(path: &Path) -> bool {
 }
 
 /// True when `e` is `std`'s batch-argument rejection: spawning a
-/// `.bat`/`.cmd` whose argument list contains `"`, `\r`, or `\n`.
+/// `.bat`/`.cmd` whose argument list contains a newline.
 /// Spawn sites use it to replace the bare "batch file arguments are
 /// invalid" with an actionable explanation.
 pub fn is_batch_arg_error(e: &std::io::Error) -> bool {
@@ -844,6 +844,39 @@ mod tests {
         let inv = resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
         assert_eq!(inv.program, dir.path().join("node.exe"));
         assert_eq!(inv.prepend_args, vec![dir.path().join("index.js")]);
+    }
+
+    /// What `std` really refuses for a batch file. `--version` keeps this
+    /// free of tokens. Double quotes must pass, because every synthesized
+    /// MCP override carries them; a newline must not.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the npm-installed codex .cmd shim on PATH"]
+    fn batch_shim_accepts_quotes_and_refuses_newlines() {
+        let output = agent_command_std("codex")
+            .args(["--config", r#"mcp_servers.probe.command="x""#, "--version"])
+            .output()
+            .expect("codex spawns");
+        assert!(output.status.success(), "{output:?}");
+
+        let err = agent_command_std("codex")
+            .args(["--config", "a=b\nc", "--version"])
+            .output()
+            .expect_err("a newline cannot reach a batch file");
+        assert!(is_batch_arg_error(&err), "{err}");
+    }
+
+    /// Cursor's prompts ride argv, so its launcher must never be the shim.
+    /// `--version` keeps this free of tokens.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the Cursor CLI on PATH"]
+    fn installed_cursor_accepts_multiline_arguments() {
+        let output = agent_command_std("agent")
+            .args(["--version", "multi\nline"])
+            .output()
+            .expect("cursor spawns despite the newline");
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[cfg(windows)]
