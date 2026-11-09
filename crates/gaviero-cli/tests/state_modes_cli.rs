@@ -150,6 +150,102 @@ fn enclosed_by_a_workspace(dir: &Path) -> bool {
         .any(|d| Some(d) != home.as_deref() && has_workspace_marker(d))
 }
 
+/// `gaviero-cli --script` started from `cwd`, with no root flags.
+fn run_from(cwd: &Path, script: &Path) -> Output {
+    Command::new(gaviero_cli())
+        .current_dir(cwd)
+        .arg("--script")
+        .arg(script)
+        .arg("--ollama-base-url")
+        .arg(fake_ollama())
+        .args(["--model", "ollama:qwen", "--no-mcp"])
+        .args(["--skip-mcp-preflight", "--run-timeout", "120"])
+        .env("GAVIERO_EMBEDDER_MODEL", "null")
+        .output()
+        .expect("spawn gaviero-cli")
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(status.status.success(), "git {args:?}: {status:?}");
+}
+
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), ".gaviero/\n").unwrap();
+    git(dir, &["init", "-q"]);
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+fn write_repo_script(dir: &Path) -> PathBuf {
+    let path = dir.join("wf.gaviero");
+    std::fs::write(
+        &path,
+        SCRIPT.replace("execution_mode document", "execution_mode repo"),
+    )
+    .unwrap();
+    path
+}
+
+/// Started from the folder holding `.gaviero/`, a script uses that folder's
+/// memory and code graph: no flags, no copies elsewhere.
+#[test]
+fn a_run_from_the_workspace_folder_uses_its_memory_and_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    configure(&root);
+    init_repo(&root);
+    let script = write_repo_script(&root);
+
+    let stderr = stderr_of(&run_from(&root, &script));
+
+    assert!(stderr.contains("[state] shared"), "{stderr}");
+    assert!(root.join("out/report.md").is_file(), "{stderr}");
+    assert!(root.join(".gaviero/memory.db").is_file(), "{stderr}");
+    assert!(root.join(".gaviero/code_graph.db").is_file(), "{stderr}");
+    assert!(!root.join(".gaviero/graphs").exists(), "{stderr}");
+}
+
+/// Each folder of a multi-folder workspace has its own graph in the TUI, so
+/// a run from the second folder must use that one too.
+#[test]
+fn a_run_from_a_later_workspace_folder_uses_that_folders_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    configure(&root);
+    let first = root.join("first");
+    let second = root.join("second");
+    init_repo(&first);
+    init_repo(&second);
+    let folders: Vec<serde_json::Value> = [&first, &second]
+        .iter()
+        .map(|p| serde_json::json!({ "path": p.to_string_lossy() }))
+        .collect();
+    std::fs::write(
+        root.join("ws.gaviero-workspace"),
+        serde_json::json!({ "folders": folders, "settings": {} }).to_string(),
+    )
+    .unwrap();
+    let script = write_repo_script(&second);
+
+    let stderr = stderr_of(&run_from(&second, &script));
+
+    assert!(stderr.contains("[state] shared"), "{stderr}");
+    assert!(second.join(".gaviero/code_graph.db").is_file(), "{stderr}");
+    assert!(!first.join(".gaviero/graphs").exists(), "{stderr}");
+    assert!(
+        first.join(".gaviero/memory.db").is_file(),
+        "workspace memory lives with the first folder, as in the TUI: {stderr}"
+    );
+}
+
 /// A run in a subfolder of a configured workspace writes the workspace's
 /// memory, not a new `.gaviero/` in the subfolder.
 #[test]
