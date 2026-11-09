@@ -922,117 +922,6 @@ fn cli_repo_is_default(cli: &Cli) -> bool {
     cli.repo.as_os_str() == std::ffi::OsStr::new(".")
 }
 
-/// Resolve a path from `--var` before the workspace root is finalised.
-fn resolve_host_path_early(
-    cwd: &std::path::Path,
-    repo: &std::path::Path,
-    value: &str,
-) -> Option<std::path::PathBuf> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.ends_with('/') {
-        return None;
-    }
-    let host = if std::path::Path::new(trimmed).is_absolute() {
-        std::path::PathBuf::from(trimmed)
-    } else {
-        let under_repo = repo.join(trimmed);
-        if under_repo.is_file() {
-            under_repo
-        } else {
-            cwd.join(trimmed)
-        }
-    };
-    host.is_file().then_some(host)
-}
-
-fn set_var(vars: &mut Vec<(String, String)>, key: &str, value: String) {
-    if let Some((_, v)) = vars.iter_mut().find(|(k, _)| k == key) {
-        *v = value;
-    } else {
-        vars.push((key.to_string(), value));
-    }
-}
-
-/// Re-anchor an explicitly supplied `OUT_DIR` after `PLAN_FILE` moved the
-/// document workspace root.
-///
-/// `--var OUT_DIR=plans/out` written for a repo-root invocation stays
-/// repo-root-relative once the workspace anchors to the plan's own folder, so
-/// it resolves one level too deep (`<plan_dir>/plans/out`). Agents that write
-/// through their own tools probe the filesystem and silently self-correct;
-/// agents that write through the in-band `<file>` channel do not — the host
-/// joins their path onto the workspace root and the artefact lands in a
-/// directory nobody reads. Rewrite the var when the value clearly named a
-/// path inside the new workspace, and reject one that names a path outside it,
-/// which scope enforcement cannot honour.
-fn reanchor_out_dir_to_workspace(
-    vars: &mut Vec<(String, String)>,
-    cwd: &std::path::Path,
-    workspace: &std::path::Path,
-) -> Result<()> {
-    let Some(out) = vars
-        .iter()
-        .find(|(k, _)| k == "OUT_DIR")
-        .map(|(_, v)| v.clone())
-    else {
-        return Ok(());
-    };
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-
-    let as_given = std::path::Path::new(trimmed);
-    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let from_cwd = if as_given.is_absolute() {
-        as_given.to_path_buf()
-    } else {
-        cwd_canon.join(as_given)
-    };
-
-    // Interpreting the value against the new root already lands where the
-    // caller meant it to — the common case of running from inside the plan's
-    // own directory.
-    if !as_given.is_absolute() && workspace.join(as_given) == from_cwd {
-        return Ok(());
-    }
-
-    match from_cwd.strip_prefix(workspace) {
-        Ok(_) => {
-            let rel = path_spec_for_worktree(workspace, &from_cwd);
-            set_var(vars, "OUT_DIR", rel.clone());
-            eprintln!("[execution] OUT_DIR re-anchored to workspace: {out} -> {rel}");
-            Ok(())
-        }
-        // A value like `research` from an unrelated cwd was always meant to be
-        // workspace-relative; leave it alone.
-        Err(_) if !as_given.is_absolute() => Ok(()),
-        Err(_) => anyhow::bail!(
-            "--var OUT_DIR={out} points outside the document workspace {} \
-             (anchored to the PLAN_FILE directory). Agent scopes are enforced \
-             on workspace-relative paths, so artefacts written there would \
-             escape the scope check. Pass a path inside the workspace, or use \
-             --workspace <dir> to anchor the run somewhere that contains both.",
-            workspace.display()
-        ),
-    }
-}
-
-fn apply_out_dir_default_from_plan(
-    vars: &mut Vec<(String, String)>,
-    repo: &std::path::Path,
-    plan_host: &std::path::Path,
-) {
-    if vars.iter().any(|(k, _)| k == "OUT_DIR") {
-        return;
-    }
-    let Some(plan_dir) = plan_host.parent() else {
-        return;
-    };
-    let out = path_spec_for_worktree(repo, plan_dir);
-    set_var(vars, "OUT_DIR", out);
-}
-
 /// When running a DSL script with `PLAN_FILE`, anchor the workspace to the plan's
 /// directory (if `--repo` is still the default `.`) and default `OUT_DIR` there.
 struct SwarmWorkspacePrep {
@@ -1067,81 +956,21 @@ fn prepare_swarm_workspace(
         );
     }
 
-    let mut vars = parse_var_overrides(&cli.vars)?;
-    let mut repo_path = cli.workspace.clone().unwrap_or_else(|| cli.repo.clone());
-
-    if execution_mode == ExecutionMode::Document {
-        if let Some(ws) = &cli.workspace {
-            repo_path = ws.clone();
-            eprintln!("[execution] document workspace: {}", repo_path.display());
-        } else if let Some(plan_value) = vars
-            .iter()
-            .find(|(k, _)| k == "PLAN_FILE")
-            .map(|(_, v)| v.as_str())
-        {
-            let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value) else {
-                anyhow::bail!(
-                    "--var PLAN_FILE={plan_value}: file not found (pass an existing path)"
-                );
-            };
-            let plan_dir = plan_host
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("--var PLAN_FILE has no parent directory"))?;
-            let plan_dir = std::fs::canonicalize(plan_dir)
-                .with_context(|| format!("resolving plan directory {}", plan_dir.display()))?;
-            if cli_repo_is_default(cli) {
-                repo_path = plan_dir.clone();
-                let plan_rel = path_spec_for_worktree(&plan_dir, &plan_host);
-                set_var(&mut vars, "PLAN_FILE", plan_rel);
-                eprintln!(
-                    "[execution] document workspace: {} (PLAN_FILE={})",
-                    plan_dir.display(),
-                    vars.iter()
-                        .find(|(k, _)| k == "PLAN_FILE")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("?")
-                );
-                // After the anchor line, so the rewrite reads as a consequence
-                // of it rather than as an unexplained edit to the caller's var.
-                reanchor_out_dir_to_workspace(&mut vars, cwd, &plan_dir)?;
-            }
-            apply_out_dir_default_from_plan(&mut vars, &repo_path, &plan_host);
-        } else if cli_repo_is_default(cli) {
-            // Document workflows that only need a shared write root (e.g.
-            // plan_refinement with OUT_DIR under a gitignored `plans/`) can
-            // run against the current checkout without PLAN_FILE.
-            repo_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            eprintln!(
-                "[execution] document workspace: {} (cwd; pass --workspace to override)",
-                repo_path.display()
-            );
-        } else {
-            anyhow::bail!(
-                "execution document requires --workspace <dir> or --var PLAN_FILE=<path>"
-            );
-        }
-    } else if let Some(plan_value) = vars
-        .iter()
-        .find(|(k, _)| k == "PLAN_FILE")
-        .map(|(_, v)| v.as_str())
-        && let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value)
-    {
-        let repo_canon = std::fs::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
-        apply_out_dir_default_from_plan(&mut vars, &repo_canon, &plan_host);
-    }
-
-    if execution_mode == ExecutionMode::Document
-        && let Some(out) = vars
-            .iter()
-            .find(|(k, _)| k == "OUT_DIR")
-            .map(|(_, v)| v.as_str())
-    {
-        eprintln!("[execution] OUT_DIR={out} (versioned artefacts; not for commit)");
+    let anchor = gaviero_core::swarm::script_run::anchor_script_run(
+        cwd,
+        &cli.repo,
+        cli.workspace.as_deref(),
+        cli_repo_is_default(cli),
+        execution_mode,
+        parse_var_overrides(&cli.vars)?,
+    )?;
+    for note in &anchor.notes {
+        eprintln!("{note}");
     }
 
     Ok(SwarmWorkspacePrep {
-        repo_path,
-        override_vars: Some(vars),
+        repo_path: anchor.root,
+        override_vars: Some(anchor.vars),
     })
 }
 
@@ -1155,154 +984,12 @@ fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a `--var` value to an existing file under or outside `--repo`.
-fn resolve_var_file_path(repo: &std::path::Path, value: &str) -> Option<std::path::PathBuf> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.ends_with('/') {
-        return None;
-    }
-    let host = if std::path::Path::new(trimmed).is_absolute() {
-        std::path::PathBuf::from(trimmed)
-    } else {
-        repo.join(trimmed)
-    };
-    host.is_file().then_some(host)
-}
-
-fn path_spec_for_worktree(repo: &std::path::Path, host: &std::path::Path) -> String {
-    let normalize_rel = |rel: &std::path::Path| {
-        let s = rel.to_string_lossy().replace('\\', "/");
-        if s.is_empty() { ".".to_string() } else { s }
-    };
-    if let Ok(rel) = host.strip_prefix(repo) {
-        return normalize_rel(rel);
-    }
-    let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let host_canon = std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf());
-    if let Ok(rel) = host_canon.strip_prefix(&ws) {
-        normalize_rel(rel)
-    } else {
-        host.to_string_lossy().to_string()
-    }
-}
-
-/// Paths from the CLI that may need worktree injection (`--var` files, `--prompt-file`).
-fn collect_cli_worktree_context_paths(
-    repo: &std::path::Path,
-    cwd: &std::path::Path,
-    override_vars: &[(String, String)],
-    prompt_file: Option<&std::path::Path>,
-) -> Vec<String> {
-    use std::collections::HashSet;
-
-    let mut paths = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(p) = prompt_file {
-        let host = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cwd.join(p)
-        };
-        if host.is_file() {
-            let spec = path_spec_for_worktree(repo, &host);
-            if seen.insert(spec.clone()) {
-                paths.push(spec);
-            }
-        }
-    }
-
-    for (_key, value) in override_vars {
-        if let Some(host) = resolve_var_file_path(repo, value) {
-            let spec = path_spec_for_worktree(repo, &host);
-            if seen.insert(spec.clone()) {
-                paths.push(spec);
-            }
-        }
-    }
-
-    paths
-}
-
-/// When a `--var` points at a file outside `--repo`, copy it under
-/// `.gaviero/injected/` and rewrite the var so agents and worktrees can read it.
-fn materialize_external_vars_for_repo(
-    repo: &std::path::Path,
-    vars: &mut [(String, String)],
-) -> Result<()> {
-    let injected_dir = repo.join(".gaviero/injected");
-    let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-
-    for (key, value) in vars.iter_mut() {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(host) = resolve_var_file_path(repo, trimmed) else {
-            continue;
-        };
-        let host_canon = std::fs::canonicalize(&host).unwrap_or(host.clone());
-        if host_canon.starts_with(&ws) {
-            continue;
-        }
-        std::fs::create_dir_all(&injected_dir)
-            .with_context(|| format!("creating {}", injected_dir.display()))?;
-        let dest = injected_dir.join(
-            host.file_name()
-                .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", host.display()))?,
-        );
-        std::fs::copy(&host, &dest)
-            .with_context(|| format!("copying external file into {}", dest.display()))?;
-        let rel = dest
-            .strip_prefix(repo)
-            .with_context(|| "injected file must stay under --repo")?
-            .to_string_lossy()
-            .replace('\\', "/");
-        eprintln!(
-            "[vars] {}: file outside --repo copied to {} (was {})",
-            key,
-            rel,
-            host.display()
-        );
-        *value = rel;
-    }
-    Ok(())
-}
-
-/// Normalize remote MCP URLs (some hosts 308-redirect unless the path ends with `/`).
-fn normalize_remote_mcp_url(url: &str) -> String {
-    let url = url.trim();
-    if url.starts_with("https://mcp.wuilder.com/") && !url.ends_with('/') {
-        format!("{url}/")
-    } else {
-        url.to_string()
-    }
-}
-
-/// Register `CONSENSUS_MCP_URL` / `CONSENSUS_SERVER` script vars as MCP URLs.
-fn extra_mcp_urls_from_script_vars(vars: &[(String, String)]) -> Vec<(String, String)> {
-    let Some(url) = vars
-        .iter()
-        .find(|(k, _)| k == "CONSENSUS_MCP_URL")
-        .map(|(_, v)| v.as_str())
-        .filter(|v| !v.trim().is_empty())
-    else {
-        return Vec::new();
-    };
-    let name = vars
-        .iter()
-        .find(|(k, _)| k == "CONSENSUS_SERVER")
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "consensus".to_string());
-    vec![(name, normalize_remote_mcp_url(url))]
-}
-
 fn mcp_overrides_from_cli(
     cli: &Cli,
     script_vars: &[(String, String)],
 ) -> Result<gaviero_core::mcp::McpConfigOverrides> {
     use gaviero_core::mcp::{parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag};
+    use gaviero_core::swarm::script_run::{mcp_urls_from_script_vars, normalize_remote_mcp_url};
 
     let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
     if cli.no_mcp {
@@ -1314,7 +1001,7 @@ fn mcp_overrides_from_cli(
             .extra_urls
             .push((name, normalize_remote_mcp_url(&url)));
     }
-    for (name, url) in extra_mcp_urls_from_script_vars(script_vars) {
+    for (name, url) in mcp_urls_from_script_vars(script_vars) {
         if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
             continue;
         }
@@ -4734,8 +4421,13 @@ async fn main() -> Result<()> {
             .override_vars
             .clone()
             .expect("script mode always pre-parses --var overrides");
-        materialize_external_vars_for_repo(&repo, &mut override_vars)?;
-        worktree_context_paths = collect_cli_worktree_context_paths(
+        for note in gaviero_core::swarm::script_run::materialize_external_vars(
+            &repo,
+            &mut override_vars,
+        )? {
+            eprintln!("{note}");
+        }
+        worktree_context_paths = gaviero_core::swarm::script_run::worktree_context_paths(
             &repo,
             &cwd,
             &override_vars,
@@ -5275,6 +4967,7 @@ fn build_swarm_extractor_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gaviero_core::swarm::script_run::reanchor_out_dir_to_workspace;
     use std::fs;
     use std::path::PathBuf;
 
