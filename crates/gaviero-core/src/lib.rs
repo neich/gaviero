@@ -17,6 +17,8 @@ pub mod path_pattern;
 pub mod query_loader;
 pub mod repo_map;
 pub mod scope_enforcer;
+mod scoped_folders;
+pub mod scripts;
 pub mod secret_scan;
 pub mod session_journal;
 pub mod session_state;
