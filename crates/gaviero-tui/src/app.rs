@@ -50,6 +50,7 @@ mod settings_overlay;
 pub(crate) mod session;
 mod side_panel;
 mod state;
+mod swarm_run;
 mod turn_review;
 
 use self::observers::{TuiAcpObserver, TuiWriteGateObserver};
@@ -297,6 +298,7 @@ pub struct App {
 
     // History panel (per-turn prompt / tools / MCP / memory / totals)
     pub history_panel: crate::panels::history_panel::HistoryPanelState,
+    pub swarm_dashboard: crate::panels::swarm_dashboard::SwarmDashboardState,
 
     /// CODE GRAPH panel (`Alt+r`): the rendered document for the active file.
     pub code_graph_panel: crate::panels::code_graph_panel::CodeGraphPanel,
@@ -583,6 +585,7 @@ impl App {
             git_panel_entered: false,
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             history_panel: crate::panels::history_panel::HistoryPanelState::new(),
+            swarm_dashboard: crate::panels::swarm_dashboard::SwarmDashboardState::new(),
             code_graph_panel: Default::default(),
             definition_picker: None,
             mcp_server: None,

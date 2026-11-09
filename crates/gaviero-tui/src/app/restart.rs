@@ -81,6 +81,9 @@ fn running_task(app: &App) -> Option<&'static str> {
     if agent_running {
         return Some("an agent is running");
     }
+    if app.swarm_dashboard.running {
+        return Some("a swarm script is running");
+    }
     let terminal_busy = app.terminal_manager.tab_order().iter().any(|id| {
         app.terminal_manager
             .instance(*id)

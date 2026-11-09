@@ -1801,7 +1801,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     // `/attach` mode supports absolute and `~/`-rooted filesystem listings
     // so the user can attach screenshots / tempfiles outside the workspace
     // without typing the full path. Plain (relative) partials fall through
-    // to the shared workspace-file path used by `@` and `/run`.
+    // to the shared workspace-file path used by `@`.
     if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::AttachPath {
         let query = app.chat_state.autocomplete.query.clone();
         let trimmed = query.trim_start();
@@ -1815,17 +1815,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         }
     }
 
-    let at_pos = app.chat_state.autocomplete.at_pos;
-    let is_run_path_context = {
-        let text = &app.chat_state.text_input.text;
-        at_pos <= text.len() && text[..at_pos].trim() == "/run"
-    };
-
-    let files: Vec<String> = workspace_completion_files(app)
-        .into_iter()
-        .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
-        .collect();
-
+    let files = workspace_completion_files(app);
     app.chat_state.update_autocomplete_matches(&files);
 }
 

@@ -125,18 +125,21 @@ pub enum SidePanelMode {
     MemoryPanel,
     /// Code graph document for the active file. Activated via `Alt+r`.
     CodeGraph,
+    /// Run a DSL script and follow its agents. Activated via `Alt+w`.
+    SwarmDashboard,
 }
 
 impl SidePanelMode {
     /// The side-panel header arrow's cycle:
-    /// CHAT → HISTORY → GIT → MEMORY → CODE GRAPH → CHAT.
+    /// CHAT → HISTORY → GIT → MEMORY → CODE GRAPH → SWARM → CHAT.
     pub fn next_in_header_cycle(self) -> Self {
         match self {
             SidePanelMode::AgentChat => SidePanelMode::HistoryPanel,
             SidePanelMode::HistoryPanel => SidePanelMode::GitPanel,
             SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
             SidePanelMode::MemoryPanel => SidePanelMode::CodeGraph,
-            SidePanelMode::CodeGraph => SidePanelMode::AgentChat,
+            SidePanelMode::CodeGraph => SidePanelMode::SwarmDashboard,
+            SidePanelMode::SwarmDashboard => SidePanelMode::AgentChat,
         }
     }
 }
@@ -347,7 +350,7 @@ mod tests {
     fn header_cycle_visits_history_between_chat_and_git() {
         let mut mode = SidePanelMode::AgentChat;
         let mut seen = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             mode = mode.next_in_header_cycle();
             seen.push(mode);
         }
@@ -358,6 +361,7 @@ mod tests {
                 SidePanelMode::GitPanel,
                 SidePanelMode::MemoryPanel,
                 SidePanelMode::CodeGraph,
+                SidePanelMode::SwarmDashboard,
                 SidePanelMode::AgentChat,
             ]
         );

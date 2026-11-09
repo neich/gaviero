@@ -980,6 +980,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             {
                 app.focus = Focus::SidePanel;
 
+                if app.side_panel == SidePanelMode::SwarmDashboard {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        super::swarm_run::click(app, col, row);
+                    }
+                    return;
+                }
+
                 // Must run before the chat scrollbar branch below, or a click
                 // in the panel's rightmost column is routed to the chat.
                 if app.side_panel == SidePanelMode::CodeGraph
@@ -1543,6 +1550,7 @@ fn scroll_editor_group(app: &mut App, up: bool) {
 /// focused section; every other side mode scrolls the chat transcript.
 fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
     match app.side_panel {
+        SidePanelMode::SwarmDashboard => super::swarm_run::scroll_wheel(app, up, col, row),
         SidePanelMode::HistoryPanel => {
             let delta = theme::MOUSE_SCROLL_DELTA as isize;
             app.history_panel
@@ -2207,7 +2215,11 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             if should_skip_duplicate_text_paste(app) {
                 return;
             }
-            app.chat_state.insert_str(&paste_body);
+            if app.side_panel == SidePanelMode::SwarmDashboard {
+                super::swarm_run::handle_paste(app, &paste_body);
+            } else {
+                app.chat_state.insert_str(&paste_body);
+            }
             note_text_paste(app);
         }
         _ => {}

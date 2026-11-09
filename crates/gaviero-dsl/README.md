@@ -27,12 +27,9 @@ gaviero-cli --script examples/update_docs.gaviero \
 
 ### From the TUI
 
-```
-/run path/to/workflow.gaviero
-/run path/to/workflow.gaviero "runtime prompt text"
-```
+`Alt+w` opens the SWARM panel. Pick a script, fill in its inputs (prompt, `param`s, `vars`, folder, workflow), and follow the run agent by agent.
 
-The runtime prompt substitutes for `{{PROMPT}}` placeholders.
+Named scripts live in `.gaviero/dsl/<name>/DSL.gaviero`, in the same scopes as skills: a workspace folder, the workspace layer, or the global `.gaviero`. A bare name resolves to the nearest definition. A leading `// description: …` comment is shown in the list. Files placed beside `DSL.gaviero` can be pulled in with `include`.
 
 ### Coordinated planning
 
