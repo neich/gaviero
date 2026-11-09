@@ -1998,22 +1998,19 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
     }
 
     if app.focus == Focus::SidePanel {
-        match action {
-            Action::MoveLineUp | Action::ResizePanelUp => {
-                let current = app.chat_state.input_area_rows.max(3);
-                app.chat_state.input_area_rows = (current + 1).min(30);
-                return;
+        use crate::widgets::prompt_input::{grow_rows, shrink_rows};
+        let resize: Option<fn(u16) -> u16> = match action {
+            Action::MoveLineUp | Action::ResizePanelUp => Some(grow_rows),
+            Action::MoveLineDown | Action::ResizePanelDown => Some(shrink_rows),
+            _ => None,
+        };
+        if let Some(resize) = resize {
+            if app.side_panel == SidePanelMode::SwarmDashboard {
+                super::swarm_run::resize_prompt(app, resize);
+            } else {
+                app.chat_state.input_area_rows = resize(app.chat_state.input_area_rows);
             }
-            Action::MoveLineDown | Action::ResizePanelDown => {
-                let current = app.chat_state.input_area_rows;
-                if current <= 3 {
-                    app.chat_state.input_area_rows = 0;
-                } else {
-                    app.chat_state.input_area_rows = current - 1;
-                }
-                return;
-            }
-            _ => {}
+            return;
         }
     }
 

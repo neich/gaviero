@@ -1178,6 +1178,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 app.scroll_panel_to_row(target, row);
                 return;
             }
+            if super::swarm_run::drag(app, col, row) {
+                return;
+            }
             if app.chat_state.input_dragging {
                 if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
                     app.chat_state.extend_input_mouse_selection(ci);
@@ -1324,6 +1327,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 app.terminal_selection.dragging = false;
             }
+            super::swarm_run::end_drag(app);
             if app.chat_state.input_dragging {
                 if let Some(text) = app.chat_state.text_input.selected_text().map(str::to_owned)
                     && !text.is_empty()

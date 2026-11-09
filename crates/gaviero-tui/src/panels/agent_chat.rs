@@ -18,6 +18,10 @@ use crate::app::collapse_file_blocks;
 use crate::theme;
 use crate::theme::Theme;
 use crate::widgets::render_utils::write_text;
+use crate::widgets::prompt_input;
+pub use crate::widgets::prompt_input::{
+    AutocompleteMode, FileAutocomplete, match_file_paths, match_skills,
+};
 use crate::widgets::text_input::TextInput;
 
 const CHAT_RENDER_TRACE_ENV: &str = "GAVIERO_CHAT_RENDER_TRACE";
@@ -119,72 +123,6 @@ fn chat_render_trace_threshold_ms() -> u128 {
 }
 
 // ── Chat state ──────────────────────────────────────────────────
-
-/// What the autocomplete popup is completing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutocompleteMode {
-    /// `@path` references inside the prompt body — workspace files only,
-    /// inserts `@path ` on accept.
-    FileRef,
-    /// `/attach <path>` argument — workspace files plus filesystem listing
-    /// when the partial starts with `/` or `~`, inserts the bare path.
-    AttachPath,
-    /// `/detach <name|all>` argument — current attachment display names
-    /// plus `all`, inserts the bare token.
-    DetachName,
-    /// `$skill` invocation — catalog-backed name completion.
-    SkillRef,
-    /// `/model <provider:model>` argument — provider prefix and model names.
-    ModelSpec,
-    /// `/effort <level>` argument — the levels the current model offers.
-    Effort,
-}
-
-/// Autocomplete state for @file references or /attach|/detach arguments.
-#[derive(Debug)]
-pub struct FileAutocomplete {
-    /// Whether the autocomplete popup is visible.
-    pub active: bool,
-    /// The partial text being matched (excludes any leading `@`).
-    pub query: String,
-    /// Byte offset where the inserted path will be anchored. For [`FileRef`]
-    /// this points at the `@`; for [`AttachPath`]/[`DetachName`] it points
-    /// at the first character of the argument (after `/attach ` / `/detach `).
-    ///
-    /// [`FileRef`]: AutocompleteMode::FileRef
-    /// [`AttachPath`]: AutocompleteMode::AttachPath
-    /// [`DetachName`]: AutocompleteMode::DetachName
-    pub at_pos: usize,
-    /// What kind of completion is active.
-    pub mode: AutocompleteMode,
-    /// Filtered file paths matching the query.
-    pub matches: Vec<String>,
-    /// Currently selected index in the matches list.
-    pub selected: usize,
-}
-
-impl FileAutocomplete {
-    fn new() -> Self {
-        Self {
-            active: false,
-            query: String::new(),
-            at_pos: 0,
-            mode: AutocompleteMode::FileRef,
-            matches: Vec::new(),
-            selected: 0,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.active = false;
-        self.query.clear();
-        self.at_pos = 0;
-        self.mode = AutocompleteMode::FileRef;
-        self.matches.clear();
-        self.selected = 0;
-    }
-}
-
 /// Word-wrap `text` to `width` columns, prefixing the first row with
 /// `first_indent` and every continuation row with `cont_indent`.
 ///
@@ -3513,7 +3451,7 @@ impl AgentChatState {
         } else {
             self.build_visual_lines(first_w, full_w).len()
         };
-        (visual_lines as u16).clamp(3, max_input.max(3))
+        prompt_input::box_height(0, visual_lines, max_input)
     }
 
     /// Whether Up/Down should move within the input before history / chat scroll.
@@ -3621,71 +3559,24 @@ impl AgentChatState {
         self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
-    /// Column Up/Down aims for: the sticky goal while the cursor still sits
-    /// where it was recorded, else the cursor's own column.
-    fn goal_col_for(&self, current_col: usize) -> usize {
-        match self.input_goal_col {
-            Some((at, col)) if at == self.text_input.cursor => col,
-            _ => current_col,
-        }
-    }
-
-    /// Whether `vline` is the final visual row of its logical line.
-    ///
-    /// A wrapped continuation starts exactly where the previous row ends; a gap
-    /// between them means a newline was consumed, so the row before it closes
-    /// its logical line.
-    fn row_is_last_of_logical_line(lines: &[(usize, usize)], vline: usize) -> bool {
-        match lines.get(vline + 1) {
-            Some(&(next_start, _)) => next_start != lines[vline].0 + lines[vline].1,
-            None => true,
-        }
-    }
-
-    /// Highest column on visual row `vline` a caret may occupy.
-    ///
-    /// `len` (one past the row's last character) is a real cell only on the final
-    /// row of a logical line. On a wrapped row that position is drawn on the row
-    /// below, so a caret clamped to `len` would resolve back to the row it just
-    /// left — the row has to stop one column short instead.
-    fn last_owned_col(lines: &[(usize, usize)], vline: usize, len: usize) -> usize {
-        if Self::row_is_last_of_logical_line(lines, vline) {
-            len
-        } else {
-            len.saturating_sub(1)
-        }
-    }
-
     /// Move cursor up one visual line given the rendering widths.
     fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
-        let lines = self.build_visual_lines(first_line_width, full_width);
-        let cursor_char_pos = self.text_input.cursor;
-        let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
-        if cur_vline == 0 {
-            return false;
-        }
-        let goal = self.goal_col_for(cur_col);
-        let (prev_start, prev_len) = lines[cur_vline - 1];
-        let max_col = Self::last_owned_col(&lines, cur_vline - 1, prev_len);
-        self.text_input.cursor = prev_start + goal.min(max_col);
-        self.input_goal_col = Some((self.text_input.cursor, goal));
-        true
+        prompt_input::move_up_visual(
+            &mut self.text_input,
+            &mut self.input_goal_col,
+            first_line_width,
+            full_width,
+        )
     }
 
     /// Move cursor down one visual line given the rendering widths.
     fn move_down_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
-        let lines = self.build_visual_lines(first_line_width, full_width);
-        let cursor_char_pos = self.text_input.cursor;
-        let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
-        if cur_vline >= lines.len() - 1 {
-            return false;
-        }
-        let goal = self.goal_col_for(cur_col);
-        let (next_start, next_len) = lines[cur_vline + 1];
-        let max_col = Self::last_owned_col(&lines, cur_vline + 1, next_len);
-        self.text_input.cursor = next_start + goal.min(max_col);
-        self.input_goal_col = Some((self.text_input.cursor, goal));
-        true
+        prompt_input::move_down_visual(
+            &mut self.text_input,
+            &mut self.input_goal_col,
+            first_line_width,
+            full_width,
+        )
     }
 
     /// Build visual lines as (start_char_idx, char_count) for the current input.
@@ -3694,66 +3585,7 @@ impl AgentChatState {
         first_line_width: usize,
         full_width: usize,
     ) -> Vec<(usize, usize)> {
-        let mut lines = Vec::new();
-        let mut pos = 0;
-        for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
-            let line_char_count = logical_line.chars().count();
-            let avail = if lines.is_empty() {
-                first_line_width
-            } else {
-                full_width
-            };
-            if line_char_count == 0 {
-                lines.push((pos, 0));
-            } else {
-                let mut col = 0;
-                let first_visual = lines.len();
-                while col < line_char_count {
-                    let w = if lines.is_empty() {
-                        first_line_width
-                    } else if lines.len() == first_visual {
-                        avail
-                    } else {
-                        full_width
-                    };
-                    let w = w.max(1);
-                    let take = w.min(line_char_count - col);
-                    lines.push((pos + col, take));
-                    col += take;
-                }
-            }
-            pos += line_char_count;
-            if logical_idx < self.text_input.text.matches('\n').count() {
-                pos += 1;
-            }
-        }
-        if lines.is_empty() {
-            lines.push((0, 0));
-        }
-        lines
-    }
-
-    /// Find which visual line the cursor is on and the column within it.
-    ///
-    /// The row that owns the position is the last one starting at or before it.
-    /// At a wrap boundary that is the later row — the character under the cursor
-    /// is drawn there and the earlier row has no cell left for it. A position at
-    /// the end of a logical line stays on that line's own last row instead of
-    /// jumping to the row after the newline.
-    fn find_cursor_in_visual_lines(
-        lines: &[(usize, usize)],
-        cursor_char_pos: usize,
-    ) -> (usize, usize) {
-        let mut idx = 0;
-        for (i, &(start, _)) in lines.iter().enumerate() {
-            if start <= cursor_char_pos {
-                idx = i;
-            } else {
-                break;
-            }
-        }
-        let (start, len) = lines[idx];
-        (idx, cursor_char_pos.saturating_sub(start).min(len))
+        prompt_input::build_visual_lines(&self.text_input.text, first_line_width, full_width)
     }
 
     /// Take the input text (for sending), clear the input field.
@@ -3851,49 +3683,13 @@ impl AgentChatState {
     /// Uses the same wrap + cursor-follow scroll as `render_input`, so hit
     /// testing matches what the user sees.
     pub fn screen_to_input_char(&self, col: u16, row: u16) -> Option<usize> {
-        let area = self.input_area_cache?;
-        if row < area.y || row >= area.y + area.height || col < area.x || col >= area.x + area.width
-        {
-            return None;
-        }
-        if self.text_input.text.is_empty() {
-            return Some(0);
-        }
-
-        let prompt_len = self.input_prompt_label().chars().count();
-        let text_width = (area.width as usize).saturating_sub(prompt_len);
-        if text_width == 0 {
-            return Some(0);
-        }
-
-        let lines = self.build_visual_lines(text_width, area.width as usize);
-        let (cursor_line, _) = Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
-        let total_rows = area.height as usize;
-        let scroll = if cursor_line >= total_rows {
-            cursor_line - total_rows + 1
-        } else {
-            0
-        };
-
-        let viewport_row = (row - area.y) as usize;
-        let line_idx = scroll + viewport_row;
-        if line_idx >= lines.len() {
-            return Some(self.text_input.char_count());
-        }
-
-        let (start, len) = lines[line_idx];
-        let x_start = if line_idx == 0 {
-            area.x.saturating_add(prompt_len as u16)
-        } else {
-            area.x
-        };
-        if col <= x_start {
-            return Some(start);
-        }
-
-        let col_in_line = (col - x_start) as usize;
-        let offset = col_in_line.min(len);
-        Some((start + offset).min(self.text_input.char_count()))
+        prompt_input::screen_to_char(
+            self.input_area_cache?,
+            &self.text_input,
+            self.input_prompt_label().chars().count(),
+            col,
+            row,
+        )
     }
 
     /// Begin a mouse selection in the prompt (click / drag start).
@@ -4212,63 +4008,7 @@ impl AgentChatState {
             return;
         }
 
-        // ── $skill invocation completion ────────────────────────────────
-        let dollar_pos = before_cursor.rfind('$');
-        if let Some(pos) = dollar_pos {
-            if pos > 0 {
-                let prev_byte = text.as_bytes()[pos - 1];
-                if prev_byte == b'\\' {
-                    // escaped — fall through to @ completion
-                } else if prev_byte == b' ' || prev_byte == b'\n' || prev_byte == b'\t' {
-                    let query = &before_cursor[pos + 1..];
-                    if !query.contains(' ') && query.len() >= 2 {
-                        self.autocomplete.active = true;
-                        self.autocomplete.mode = AutocompleteMode::SkillRef;
-                        self.autocomplete.at_pos = pos;
-                        self.autocomplete.query = query.to_string();
-                        self.autocomplete.selected = 0;
-                        return;
-                    }
-                }
-            } else {
-                let query = &before_cursor[pos + 1..];
-                if !query.contains(' ') && query.len() >= 2 {
-                    self.autocomplete.active = true;
-                    self.autocomplete.mode = AutocompleteMode::SkillRef;
-                    self.autocomplete.at_pos = pos;
-                    self.autocomplete.query = query.to_string();
-                    self.autocomplete.selected = 0;
-                    return;
-                }
-            }
-        }
-
-        // ── @path reference completion ──────────────────────────────────
-        let at_pos = before_cursor.rfind('@');
-        match at_pos {
-            Some(pos) => {
-                if pos > 0 {
-                    let prev_byte = text.as_bytes()[pos - 1];
-                    if prev_byte != b' ' && prev_byte != b'\n' && prev_byte != b'\t' {
-                        self.autocomplete.reset();
-                        return;
-                    }
-                }
-                let query = &before_cursor[pos + 1..];
-                if query.contains(' ') {
-                    self.autocomplete.reset();
-                    return;
-                }
-                self.autocomplete.active = true;
-                self.autocomplete.mode = AutocompleteMode::FileRef;
-                self.autocomplete.at_pos = pos;
-                self.autocomplete.query = query.to_string();
-                self.autocomplete.selected = 0;
-            }
-            None => {
-                self.autocomplete.reset();
-            }
-        }
+        prompt_input::update_reference_autocomplete(&self.text_input, &mut self.autocomplete);
     }
 
     /// Update `$skill` autocomplete matches from the catalog.
@@ -4277,17 +4017,7 @@ impl AgentChatState {
         catalog: &gaviero_core::skills::SkillCatalog,
         active_repo_id: Option<&str>,
     ) {
-        if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::SkillRef {
-            return;
-        }
-        self.autocomplete.matches =
-            match_skills(catalog, &self.autocomplete.query, active_repo_id, 10)
-                .into_iter()
-                .map(|(insert, _)| insert)
-                .collect();
-        if self.autocomplete.selected >= self.autocomplete.matches.len() {
-            self.autocomplete.selected = 0;
-        }
+        prompt_input::set_skill_matches(&mut self.autocomplete, catalog, active_repo_id);
     }
 
     /// Update `/model` autocomplete matches from discovered provider specs.
@@ -4328,85 +4058,22 @@ impl AgentChatState {
         {
             return;
         }
-        self.autocomplete.matches = match_file_paths(all_files, &self.autocomplete.query, 10);
-        if self.autocomplete.selected >= self.autocomplete.matches.len() {
-            self.autocomplete.selected = 0;
-        }
+        prompt_input::set_file_matches(&mut self.autocomplete, all_files);
     }
 
     /// Accept the currently selected autocomplete match.
     pub fn accept_autocomplete(&mut self) {
-        if !self.autocomplete.active || self.autocomplete.matches.is_empty() {
-            return;
-        }
-        let selected = self
-            .autocomplete
-            .selected
-            .min(self.autocomplete.matches.len() - 1);
-        let path = self.autocomplete.matches[selected].clone();
-        let anchor = self.autocomplete.at_pos;
-
-        let cursor_byte = self.text_input.cursor_byte_offset();
-        let after_cursor = if matches!(
-            self.autocomplete.mode,
-            AutocompleteMode::ModelSpec | AutocompleteMode::Effort
-        ) {
-            // A model spec is a single whitespace-free token spanning to the
-            // end of the line. Accepting with the cursor mid-token must
-            // replace the *whole* token, so drop the remainder of it that
-            // sits right of the cursor — otherwise an existing tail like
-            // `cursor:composer-2.5` gets concatenated after the accepted
-            // `claude:`, yielding the doubly-prefixed `claude:cursor:...`.
-            let raw = &self.text_input.text[cursor_byte..];
-            match raw.find(char::is_whitespace) {
-                Some(ws) => raw[ws..].to_string(),
-                None => String::new(),
-            }
-        } else {
-            self.text_input.text[cursor_byte..].to_string()
-        };
-        self.text_input.text.truncate(anchor);
-
-        match self.autocomplete.mode {
-            AutocompleteMode::FileRef => {
-                // Replace `@<query>` with `@<path> ` (trailing space keeps
-                // typing fluid after accept).
-                self.text_input.text.push('@');
-                self.text_input.text.push_str(&path);
-                self.text_input.text.push(' ');
-            }
-            AutocompleteMode::AttachPath | AutocompleteMode::DetachName => {
-                // Replace just the argument; no trailing space because
-                // `/attach` / `/detach` take a single token.
-                self.text_input.text.push_str(&path);
-            }
-            AutocompleteMode::SkillRef => {
-                self.text_input.text.push_str(&path);
-                self.text_input.text.push(' ');
-            }
-            AutocompleteMode::ModelSpec | AutocompleteMode::Effort => {
-                self.text_input.text.push_str(&path);
-            }
-        }
-        self.text_input.cursor = self.text_input.char_count();
-        self.text_input.text.push_str(&after_cursor);
-
-        self.autocomplete.reset();
+        prompt_input::accept_autocomplete(&mut self.text_input, &mut self.autocomplete);
     }
 
     /// Move autocomplete selection up.
     pub fn autocomplete_up(&mut self) {
-        if self.autocomplete.active && !self.autocomplete.matches.is_empty() {
-            self.autocomplete.selected = self.autocomplete.selected.saturating_sub(1);
-        }
+        self.autocomplete.select_previous();
     }
 
     /// Move autocomplete selection down.
     pub fn autocomplete_down(&mut self) {
-        if self.autocomplete.active && !self.autocomplete.matches.is_empty() {
-            self.autocomplete.selected =
-                (self.autocomplete.selected + 1).min(self.autocomplete.matches.len() - 1);
-        }
+        self.autocomplete.select_next();
     }
 
     // ── Attachments ────────────────────────────────────────────
@@ -5194,7 +4861,7 @@ impl AgentChatState {
                 width: inner.width,
                 height: popup_height,
             };
-            self.render_autocomplete(popup_area, buf);
+            prompt_input::render_autocomplete(&self.autocomplete, popup_area, buf);
         }
     }
 
@@ -5666,173 +5333,18 @@ impl AgentChatState {
             return;
         }
 
-        let prompt = self.input_prompt_label();
-        let prompt_style = Style::default().fg(theme::ACCENT).bg(bg);
-
-        let mut x = area.x;
-        for ch in prompt.chars() {
-            if x < area.x + area.width && x < buf.area().right() {
-                buf[(x, area.y)].set_char(ch).set_style(prompt_style);
-                x += 1;
-            }
-        }
-
-        // Input text — wraps across available rows
-        let prompt_len = (x - area.x) as usize;
-        let text_width = (area.width as usize).saturating_sub(prompt_len);
-        let total_rows = area.height as usize;
-
-        if self.text_input.text.is_empty() && !self.active_conv_busy() {
-            // Hint text
-            let hint = "Type a message, Enter to send";
-            let hint_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
-            for (i, ch) in hint.chars().enumerate() {
-                let hx = x + i as u16;
-                if hx < area.x + area.width && hx < buf.area().right() {
-                    buf[(hx, area.y)].set_char(ch).set_style(hint_style);
-                }
-            }
-            // Show cursor at prompt position even with empty input
-            if focused {
-                let cursor_style = Style::default().fg(bg).bg(theme::TEXT_FG);
-                let cx = x.min((area.x + area.width).saturating_sub(1));
-                if cx < buf.area().right() && area.y < buf.area().bottom() {
-                    buf[(cx, area.y)].set_style(cursor_style);
-                }
-            }
-        } else if text_width > 0 {
-            let input_chars: Vec<char> = self.text_input.text.chars().collect();
-            let lines = self.build_visual_lines(text_width, area.width as usize);
-            let (cursor_line, cursor_col) =
-                Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
-
-            // Scroll so cursor line is visible
-            let scroll = if cursor_line >= total_rows {
-                cursor_line - total_rows + 1
-            } else {
-                0
-            };
-
-            // Render visible lines
-            for row in 0..total_rows {
-                let line_idx = scroll + row;
-                if line_idx >= lines.len() {
-                    break;
-                }
-                let (start, len) = lines[line_idx];
-                let y = area.y + row as u16;
-                let x_start = if line_idx == 0 { x } else { area.x };
-
-                // Get selection range for highlighting
-                let sel_range = self.text_input.selection_range();
-
-                for i in 0..len {
-                    let ch_idx = start + i;
-                    if ch_idx < input_chars.len() {
-                        let ch = input_chars[ch_idx];
-                        if ch == '\n' || ch == '\r' {
-                            continue;
-                        }
-                        let cx = x_start + i as u16;
-                        if cx < area.x + area.width
-                            && cx < buf.area().right()
-                            && y < buf.area().bottom()
-                        {
-                            let ch_style =
-                                if sel_range.is_some_and(|(s, e)| ch_idx >= s && ch_idx < e) {
-                                    Style::default().fg(fg).bg(theme::SELECTION_BG)
-                                } else {
-                                    style
-                                };
-                            buf[(cx, y)].set_char(ch).set_style(ch_style);
-                        }
-                    }
-                }
-            }
-
-            // Position cursor. When the caret column sits at the row's right
-            // edge there is no cell left *inside* the panel for it, so it is
-            // clamped onto the row's last cell (the readline convention) rather
-            // than dropped, which used to hide the caret at the end of a prompt
-            // that exactly filled its line.
-            if focused && !self.active_conv_busy() {
-                let visible_cursor_line = cursor_line.saturating_sub(scroll);
-                if visible_cursor_line < total_rows {
-                    let y = area.y + visible_cursor_line as u16;
-                    let x_start = if cursor_line == 0 { x } else { area.x };
-                    let row_right = area.x + area.width; // one past the row's last cell
-                    let cursor_x = (x_start + cursor_col as u16).min(row_right - 1);
-                    if cursor_x < buf.area().right() && y < buf.area().bottom() {
-                        let cursor_style = Style::default().fg(bg).bg(theme::TEXT_FG);
-                        buf[(cursor_x, y)].set_style(cursor_style);
-                    }
-                }
-            }
-
-            // Scrollbar when the prompt exceeds the input viewport.
-            if lines.len() > total_rows {
-                crate::widgets::scrollbar::render_scrollbar(
-                    area,
-                    buf,
-                    lines.len(),
-                    total_rows,
-                    scroll,
-                );
-            }
-        }
+        let busy = self.active_conv_busy();
+        prompt_input::render_input(
+            area,
+            buf,
+            &prompt_input::InputView {
+                input: &self.text_input,
+                label: self.input_prompt_label(),
+                hint: (!busy).then_some("Type a message, Enter to send"),
+                show_caret: focused && !busy,
+            },
+        );
     }
-
-    fn render_autocomplete(&self, area: Rect, buf: &mut RataBuf) {
-        let bg = theme::INPUT_BG;
-        let fg = theme::TEXT_FG;
-        let selected_bg = theme::SELECTION_BG;
-
-        for (row, (i, path)) in self
-            .autocomplete
-            .matches
-            .iter()
-            .enumerate()
-            .take(area.height as usize)
-            .enumerate()
-        {
-            let y = area.y + row as u16;
-            let is_selected = i == self.autocomplete.selected;
-            let style = if is_selected {
-                Style::default().fg(Color::White).bg(selected_bg)
-            } else {
-                Style::default().fg(fg).bg(bg)
-            };
-
-            // Clear row
-            for col in 0..area.width {
-                let cx = area.x + col;
-                if cx < buf.area().right() && y < buf.area().bottom() {
-                    buf[(cx, y)].set_char(' ').set_style(style);
-                }
-            }
-
-            // Prefix only relevant for @file refs — the /attach popup shows
-            // bare paths so they line up with what gets inserted on accept.
-            let display = match self.autocomplete.mode {
-                AutocompleteMode::FileRef => format!(" @{}", path),
-                AutocompleteMode::AttachPath
-                | AutocompleteMode::DetachName
-                | AutocompleteMode::ModelSpec
-                | AutocompleteMode::Effort => {
-                    format!(" {}", path)
-                }
-                AutocompleteMode::SkillRef => path.clone(),
-            };
-            let display = fit_autocomplete_label(&display, area.width as usize);
-            for (ci, ch) in display.chars().enumerate() {
-                let cx = area.x + ci as u16;
-                if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
-                    buf[(cx, y)].set_char(ch).set_style(style);
-                }
-            }
-        }
-    }
-
     /// Render attachment badges in a single-line bar and record close-button
     /// hit regions. Each badge is ` name x ` — clicking the `x` removes it.
     fn render_attachments(&mut self, area: Rect, buf: &mut RataBuf) {
@@ -5910,36 +5422,6 @@ impl AgentChatState {
             }
         }
     }
-}
-
-/// Fit an autocomplete row into `cols` cells.
-///
-/// Labels that fit are returned unchanged. Overflow drops the prefix and
-/// keeps the tail — the filename — starting at a `/` or `\` when one falls
-/// inside the window, so a long path stays identifiable.
-fn fit_autocomplete_label(label: &str, cols: usize) -> String {
-    let chars: Vec<char> = label.chars().collect();
-    if cols == 0 || chars.len() <= cols {
-        return if cols == 0 {
-            String::new()
-        } else {
-            label.to_string()
-        };
-    }
-    if cols == 1 {
-        return "…".to_string();
-    }
-    let budget = cols - 1;
-    let mut start = chars.len() - budget;
-    if let Some(rel) = chars[start..].iter().position(|c| *c == '/' || *c == '\\') {
-        let boundary = start + rel;
-        if boundary + 1 < chars.len() && chars.len() - boundary <= budget {
-            start = boundary;
-        }
-    }
-    let mut out = String::from("…");
-    out.extend(chars[start..].iter().copied());
-    out
 }
 
 /// Hidden provider context (built-in system prompt, tool schemas, auto-loaded
@@ -6215,68 +5697,6 @@ fn try_parse_invocation(text: &str, dollar: usize) -> Option<ParsedInvocation<'_
         raw_args,
         consumed,
     })
-}
-
-/// `$` completion matches: catalog skills whose name starts with `prefix`,
-/// in the catalog's ranking, each with its insertion text. Shared by the
-/// desktop popup and remote `request_skill_completions`.
-pub fn match_skills<'a>(
-    catalog: &'a gaviero_core::skills::SkillCatalog,
-    prefix: &str,
-    active_repo_id: Option<&str>,
-    limit: usize,
-) -> Vec<(String, &'a gaviero_core::skills::Skill)> {
-    let hits = catalog.complete(prefix, active_repo_id);
-    let mut by_name: std::collections::HashMap<&str, Vec<&gaviero_core::skills::Skill>> =
-        std::collections::HashMap::new();
-    for skill in &hits {
-        by_name.entry(&skill.name).or_default().push(*skill);
-    }
-    hits.iter()
-        .take(limit)
-        .map(|skill| {
-            let siblings = by_name
-                .get(skill.name.as_str())
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            (skill_autocomplete_insert(catalog, skill, siblings), *skill)
-        })
-        .collect()
-}
-
-/// Build the insertion text for a skill autocomplete selection.
-pub fn skill_autocomplete_insert(
-    catalog: &gaviero_core::skills::SkillCatalog,
-    skill: &gaviero_core::skills::Skill,
-    all_with_name: &[&gaviero_core::skills::Skill],
-) -> String {
-    let bare = format!("${}", skill.name);
-    if all_with_name.len() <= 1 {
-        if skill.arguments.is_empty() {
-            return bare;
-        }
-        return format!("{}()", bare);
-    }
-    let label = catalog.source_label(skill);
-    let qualified = format!("${}/{}", label, skill.name);
-    if skill.arguments.is_empty() {
-        qualified
-    } else {
-        format!("{}()", qualified)
-    }
-}
-
-/// `@` completion matches: case-insensitive substring over the whole path,
-/// in listing order; an empty query keeps the first `limit` paths. Shared by
-/// the desktop popup and remote `request_file_completions`.
-pub fn match_file_paths(all_files: &[String], query: &str, limit: usize) -> Vec<String> {
-    let query_lower = query.to_lowercase();
-    all_files
-        .iter()
-        .filter(|f| query_lower.is_empty() || f.to_lowercase().contains(&query_lower))
-        .take(limit)
-        .cloned()
-        .collect()
 }
 
 /// Parse `@path/to/file` references from input text.
@@ -6645,7 +6065,7 @@ mod tests {
             &["path"],
         );
         let skill = catalog.resolve(None, "review", None).unwrap();
-        let insert = skill_autocomplete_insert(&catalog, skill, &[skill]);
+        let insert = prompt_input::skill_autocomplete_insert(&catalog, skill, &[skill]);
         assert_eq!(insert, "$review()");
     }
 
@@ -7746,13 +7166,13 @@ mod tests {
 
     #[test]
     fn fit_autocomplete_label_keeps_short_paths() {
-        assert_eq!(fit_autocomplete_label(" @src/lib.rs", 40), " @src/lib.rs");
+        assert_eq!(prompt_input::fit_autocomplete_label(" @src/lib.rs", 40), " @src/lib.rs");
     }
 
     #[test]
     fn fit_autocomplete_label_keeps_filename_when_path_overflows() {
         let label = " @crates/gaviero-tui/src/panels/agent_chat.rs";
-        let fitted = fit_autocomplete_label(label, 20);
+        let fitted = prompt_input::fit_autocomplete_label(label, 20);
         assert!(fitted.starts_with('…'));
         assert!(fitted.ends_with("agent_chat.rs"));
         assert!(fitted.contains('/'));
@@ -7761,7 +7181,7 @@ mod tests {
 
     #[test]
     fn fit_autocomplete_label_truncates_a_filename_longer_than_the_popup() {
-        let fitted = fit_autocomplete_label(" @supercalifragilisticexpialidocious.rs", 12);
+        let fitted = prompt_input::fit_autocomplete_label(" @supercalifragilisticexpialidocious.rs", 12);
         assert!(fitted.starts_with('…'));
         assert!(fitted.ends_with(".rs"));
         assert_eq!(fitted.chars().count(), 12);
@@ -9438,7 +8858,7 @@ mod tests {
         assert!(state.cursor_up_in_input(panel_w));
         assert_eq!(state.text_input.cursor, 11);
         assert_eq!(
-            AgentChatState::find_cursor_in_visual_lines(&lines, state.text_input.cursor),
+            prompt_input::find_cursor_in_visual_lines(&lines, state.text_input.cursor),
             (0, 11)
         );
 
