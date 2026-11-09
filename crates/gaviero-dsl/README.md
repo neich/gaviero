@@ -72,7 +72,7 @@ workflow refactor_auth {
 
 ### Shipped examples
 
-Ten workflow scripts and three tier profiles live in `examples/`:
+Eleven workflow scripts, three tier overrides and three model profiles live in `examples/`:
 
 | File | Demonstrates |
 |---|---|
@@ -83,12 +83,11 @@ Ten workflow scripts and three tier profiles live in `examples/`:
 | `codebase_review.gaviero` | Per-module review loop (findings only) |
 | `update_docs.gaviero` | Parallel doc rewrite with `--tiers-file` |
 | `security_audit_memory.gaviero` | `memory {}` overrides, `read_ns`, staleness |
+| `tiered_review.gaviero` | Provider-agnostic script; models come from a profile |
 
-**Tier profiles** (`examples/profiles/`, `tier <role> <client>` lines only):
+**Model profiles** (`examples/profiles/`, see [below](#model-profiles)): `claude.gaviero`, `codex.gaviero`, `mixed.gaviero`.
 
-- `doc-claude.gaviero`
-- `doc-codex.gaviero`
-- `doc-cursor.gaviero`
+**Tier overrides** (`examples/profiles/`, `tier <role> <client>` lines only, for `--tiers-file`): `doc-claude.gaviero`, `doc-codex.gaviero`, `doc-cursor.gaviero`.
 
 ```bash
 gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
@@ -117,10 +116,55 @@ The DSL has no runtime config — behaviour is declared in the script and adjust
 | Override | CLI flag | Precedence |
 |---|---|---|
 | Vars | `--var KEY=VALUE` | agent `vars {}` > CLI > script `vars {}` |
-| Tiers | `--tiers-file` | CLI > script/includes |
+| Tiers | `--profile` or `--tiers-file` | CLI > script/includes > implicit `default` profile |
 | Workflow params | `--param NAME=VALUE` | Required params without defaults must be supplied |
 
 Provider resolution, memory namespaces, and verification execution are configured via `.gaviero/settings.json` on the `gaviero-core` side. See [gaviero-cli](../gaviero-cli/README.md#configuration).
+
+### Model profiles
+
+Write a script against tiers, not providers. Tier names are free-form; `low`, `medium`, `high` and `top` are the convention.
+
+```gaviero
+agent gather { tier low prompt "…" }
+
+workflow review {
+    param judge { model "tier:medium" }          // client param
+    param panel [ { id "a" model "tier:top" } ]  // roster
+    steps [ gather ]
+}
+```
+
+A profile says what each tier means. It holds only `client` and `tier` declarations (`include` works, for a shared client pool), and tiers may mix providers:
+
+```gaviero
+// .gaviero/dsl/profiles/mixed.gaviero
+client terra { model "codex:gpt-5.6-terra" effort medium }
+client opus  { model "claude:opus"         effort high }
+
+tier medium terra
+tier high   opus
+```
+
+Profiles are looked up by file name in each workspace folder's `.gaviero/dsl/profiles/`, then the workspace layer, then `$GAVIERO_ROOT/.gaviero/dsl/profiles/` — nearest wins. (`profiles` is reserved there, so no script can be called that.) Choose one per run without touching the script:
+
+```bash
+gaviero-cli --script review.gaviero --profile mixed
+gaviero-cli --script review.gaviero --profile ./one-off.gaviero
+gaviero-cli --script review.gaviero --profile mixed --param judge=tier:high
+```
+
+The TUI's SWARM form offers the same choice in a **Profile** selector.
+
+| Situation | Result |
+|---|---|
+| Profile chosen | Its tiers replace the script's bindings for those names |
+| No choice, a profile named `default` exists | It supplies only the tiers the script leaves unbound |
+| Agent says `client <name>` | Untouched — a concrete client is a deliberate pin |
+| A client in the profile is marked `default` | Used by agents that bind neither client nor tier |
+| A tier nothing binds | Compile error |
+
+A profile's clients are private to it, so they cannot clash with the script's, and a tier fixes model, effort and privacy together: `tier:high@low` is an error.
 
 ## API
 

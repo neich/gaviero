@@ -9,11 +9,11 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-Examples: **9** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc-cursor`) under [`examples/`](examples/).
+Examples: **10** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `doc-cursor`) + **3** model profiles (`claude`, `codex`, `mixed`) under [`examples/`](examples/).
 
 ## Architecture
 
-**9 pub mods** — see [`src/lib.rs`](src/lib.rs):
+**12 pub mods** — see [`src/lib.rs`](src/lib.rs):
 
 | Module | Role |
 |---|---|
@@ -24,16 +24,18 @@ Examples: **9** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports only; impl lives in `workflow_params`. |
 | [`resolver.rs`](src/resolver.rs) | `include` graph; drives `compile_file`. |
 | [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader (`tier` lines only). |
+| [`profile.rs`](src/profile.rs) | Merges a model profile (`client` + `tier`) into a resolved script. |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette spans). |
 
 **Public API** ([`lib.rs`](src/lib.rs)):
 
 - `compile` / `compile_with_vars` / `compile_file` — `override_vars`, `override_tiers`, `override_params`.
+- `compile_file_with_profile` — `compile_file` plus a [`SelectedProfile`](../gaviero-core/src/script_profiles.rs).
 - `load_tier_overrides` — backs `--tiers-file`.
 - `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
 - `inspect_file` ([`inspect.rs`](src/inspect.rs)) — a script's inputs (workflows, params, vars, prompt use) without compiling; backs the TUI SWARM form.
 
-**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Tier: `--tiers-file` > script/includes `tier` lines.
+**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Tier: `--tiers-file` > chosen profile > script/includes `tier` lines > implicit `default` profile.
 
 Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](README.md).
 
@@ -51,6 +53,8 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 
 - **Never extend the AST without updating [`ast.rs`](src/ast.rs).** Drift between AST and parser is the top DSL bug source.
 - **Tier-override files contain `tier` lines only** ([`tiers.rs`](src/tiers.rs)). Reject other items with a diagnostic.
+- **Profiles are closed model tables** ([`profile.rs`](src/profile.rs)): only `client` and `tier`, tiers point at the profile's own clients, and those clients are renamed on merge so they can never collide with the script's.
+- **`tier:<name>` is a model-spec form, not a provider.** It is accepted only where `workflow_params` reads a model (`param`, roster entries, `--param`), and cannot be combined with effort, privacy or extra.
 - **`include` is whole-file.** Inline paths (`compile`, `compile_with_vars`) must reject `include` and point callers to `compile_file`.
 - **Cycle detection lives in the resolver,** not the compiler.
 

@@ -930,8 +930,9 @@ fn compile_agent(
                     )
                         .into(),
                     reason: format!(
-                        "agent `{}` references undefined tier alias `{}`",
-                        decl.name, tier_name
+                        "agent `{}` references undefined tier alias `{}` — choose a profile \
+                         that binds it, or declare `tier {} <client>` in the script",
+                        decl.name, tier_name, tier_name
                     ),
                 })?;
             let cd = client_map

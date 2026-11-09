@@ -42,6 +42,7 @@ Single synchronous library. Depends on [`gaviero-core`](../gaviero-core), logos,
 | [`workflow_params.rs`](src/workflow_params.rs) | `param` client + roster expansion (`--param`) |
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports of roster helpers |
 | [`tiers.rs`](src/tiers.rs) | `load_tier_overrides` for `--tiers-file` |
+| [`profile.rs`](src/profile.rs) | Merges a model profile into the resolved script for `--profile` / the SWARM form |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette spans) |
 
 Examples: **10** workflow scripts + **3** profiles under [`examples/`](examples) (`doc-claude`, `doc-codex`, `doc-cursor`).

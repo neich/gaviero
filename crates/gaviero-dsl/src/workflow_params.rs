@@ -16,6 +16,52 @@ pub fn param_client_name(param: &str) -> String {
     format!("__param_{param}")
 }
 
+/// The tier named by a `tier:<name>` model spec, if `model` is one. A param or
+/// roster entry written this way binds its agent to the tier, leaving the
+/// choice of model to the profile.
+pub fn tier_of_model_spec(model: &str) -> Option<&str> {
+    model.strip_prefix("tier:").map(str::trim)
+}
+
+/// The tier a client param resolves to. A tier fixes model, effort and
+/// privacy together, so a spec that also sets those is contradictory.
+fn client_spec_tier(spec: &ClientParamSpec) -> Result<Option<String>, String> {
+    let Some(tier) = spec.model.as_ref().and_then(|(m, _)| tier_of_model_spec(m)) else {
+        return Ok(None);
+    };
+    if tier.is_empty() {
+        return Err("`tier:` needs a tier name, e.g. `tier:high`".into());
+    }
+    if spec.effort.is_some() || spec.privacy.is_some() || !spec.extra.is_empty() {
+        return Err(format!(
+            "`tier:{tier}` cannot be combined with effort, privacy or extra — \
+             the tier's client sets those"
+        ));
+    }
+    Ok(Some(tier.to_string()))
+}
+
+/// The tier a roster entry resolves to; see [`client_spec_tier`].
+fn roster_entry_tier(entry: &ReviewerEntry) -> Result<Option<&str>, String> {
+    let Some(tier) = tier_of_model_spec(&entry.model) else {
+        return Ok(None);
+    };
+    if tier.is_empty() {
+        return Err(format!(
+            "roster entry `{}`: `tier:` needs a tier name, e.g. `tier:high`",
+            entry.id
+        ));
+    }
+    if entry.effort.is_some() {
+        return Err(format!(
+            "roster entry `{}`: `tier:{tier}` cannot be combined with effort — \
+             the tier's client sets it",
+            entry.id
+        ));
+    }
+    Ok(Some(tier))
+}
+
 /// Parse `--param NAME=provider:model[@effort]` for a client param.
 pub fn parse_client_override(value: &str) -> Result<ClientParamSpec, String> {
     let value = value.trim();
@@ -176,6 +222,7 @@ pub fn expand_workflow_params_in_script(
     // Per-workflow resolved param kinds (used by roster pass).
     let mut kinds_by_workflow: HashMap<String, HashMap<String, ParamKind>> = HashMap::new();
     let mut client_rewrites: Vec<(String, String)> = Vec::new();
+    let mut tier_rewrites: Vec<(String, String)> = Vec::new();
 
     // Pass 1 — materialize client params (immutable workflow borrow).
     for item in &script.items {
@@ -243,6 +290,27 @@ pub fn expand_workflow_params_in_script(
                 }
             };
 
+            match client_spec_tier(&resolved) {
+                Ok(Some(tier)) => {
+                    tier_rewrites.push((param_name.clone(), tier));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    let name_span = params_by_name[param_name].name_span;
+                    errors.push(DslError::Compile {
+                        src: miette::NamedSource::new("script", String::new()),
+                        span: (
+                            name_span.start,
+                            name_span.end.saturating_sub(name_span.start).max(1),
+                        )
+                            .into(),
+                        reason: format!("workflow param `{param_name}`: {reason}"),
+                    });
+                    continue;
+                }
+            }
+
             let synth_name = param_client_name(param_name);
             new_clients.push(synth_client_from_spec(&synth_name, &resolved));
             client_rewrites.push((param_name.clone(), synth_name));
@@ -251,6 +319,9 @@ pub fn expand_workflow_params_in_script(
 
     for (param_name, synth_name) in &client_rewrites {
         rewrite_agent_client_param(script, param_name, synth_name);
+    }
+    for (param_name, tier) in &tier_rewrites {
+        rewrite_agent_tier_param(script, param_name, tier);
     }
 
     if !errors.is_empty() {
@@ -296,6 +367,28 @@ pub fn expand_workflow_params_in_script(
                             continue;
                         }
                     };
+
+                    let tier_problems: Vec<DslError> = roster
+                        .iter()
+                        .filter_map(|entry| {
+                            let reason = roster_entry_tier(entry).err()?;
+                            Some(DslError::Compile {
+                                src: miette::NamedSource::new("script", String::new()),
+                                span: (
+                                    entry.span.start,
+                                    entry.span.end.saturating_sub(entry.span.start).max(1),
+                                )
+                                    .into(),
+                                reason,
+                            })
+                        })
+                        .collect();
+                    if !tier_problems.is_empty() {
+                        errors.extend(tier_problems);
+                        lb.reviewers = ReviewerSource::None;
+                        expanded_steps.push(StepItem::Loop(lb));
+                        continue;
+                    }
 
                     let init_template = lb.template_init.as_ref().map(|(name, span)| {
                         match agent_by_name.get(name) {
@@ -362,11 +455,17 @@ pub fn expand_workflow_params_in_script(
                         } else {
                             format!("__roster_{}", entry.id)
                         };
-                        new_clients.push(synth_client_from_entry(&refine_client_name, entry));
+                        // A tier entry binds through the tier; it has no client of its own.
+                        let needs_client = tier_of_model_spec(&entry.model).is_none();
+                        if needs_client {
+                            new_clients.push(synth_client_from_entry(&refine_client_name, entry));
+                        }
 
                         if let Some((init_tpl, _, _)) = &init_template {
                             let init_client_name = format!("__roster_{}_init", entry.id);
-                            new_clients.push(synth_client_from_entry(&init_client_name, entry));
+                            if needs_client {
+                                new_clients.push(synth_client_from_entry(&init_client_name, entry));
+                            }
                             let init_agent = clone_reviewer_agent(
                                 init_tpl,
                                 &format!("{}-init", entry.id),
@@ -685,6 +784,10 @@ fn clone_reviewer_agent(
         template: false,
         ..clone_agent_shell(template)
     };
+    if let Some(tier) = tier_of_model_spec(&entry.model) {
+        agent.client = None;
+        agent.tier_ref = Some((tier.to_string(), template.name_span));
+    }
     if let Some(scope) = agent.scope.as_mut() {
         for path in scope.owned.iter_mut().chain(scope.read_only.iter_mut()) {
             *path = path.replace("{{REVIEWER_ID}}", &entry.id);
@@ -727,6 +830,20 @@ fn rewrite_agent_client_param(script: &mut Script, param_name: &str, synth_name:
         if agent.client.as_ref().is_some_and(|(n, _)| n == param_name) {
             let span = agent.client.as_ref().unwrap().1;
             agent.client = Some((synth_name.to_string(), span));
+        }
+    }
+}
+
+/// Turn every `client <param>` binding into `tier <name>`. The span stays on
+/// the agent's own `client` line, so a missing tier is reported in its file.
+fn rewrite_agent_tier_param(script: &mut Script, param_name: &str, tier: &str) {
+    for item in &mut script.items {
+        let Item::Agent(agent) = item else { continue };
+        if let Some((name, span)) = &agent.client
+            && name == param_name
+        {
+            agent.tier_ref = Some((tier.to_string(), *span));
+            agent.client = None;
         }
     }
 }
