@@ -152,7 +152,8 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--prompt-file` | `<path>` | File contents replacing every `{{PROMPT}}` (requires `--script`) |
 | `--var` | `KEY=VALUE` | Override a `vars {}` entry (repeatable, requires `--script`) |
 | `--param` | `NAME=VALUE` | Supply a workflow `param` (repeatable, requires `--script`) |
-| `--tiers-file` | `<path>` | Tier profile (`tier <role> <client>` lines only; requires `--script`) |
+| `--profile` | `<name|path>` | Model profile from `.gaviero/dsl/profiles/` or a file path (`client` + `tier` only; requires `--script`; conflicts with `--tiers-file`) |
+| `--tiers-file` | `<path>` | Tier overrides (`tier <role> <client>` lines only; requires `--script`) |
 | `--coordinated` | — | Emit a reviewable plan and exit (requires `--task`) |
 | `--output` | `<path>` | Save the generated plan (`--coordinated` only) |
 
