@@ -33,7 +33,12 @@ pub enum AutocompleteMode {
     ModelSpec,
     /// `/effort <level>` argument — the levels the current model offers.
     Effort,
+    /// `tier:<name>` in a roster or client param — the active profile's tiers.
+    Tier,
 }
+
+/// Rows the popup shows at most; longer lists scroll.
+pub const POPUP_ROWS: usize = 8;
 
 /// Autocomplete state for @file references or /attach|/detach arguments.
 #[derive(Debug, Clone)]
@@ -56,6 +61,8 @@ pub struct FileAutocomplete {
     pub matches: Vec<String>,
     /// Currently selected index in the matches list.
     pub selected: usize,
+    /// First match on screen when the list is longer than the popup.
+    scroll: usize,
 }
 
 impl FileAutocomplete {
@@ -67,6 +74,7 @@ impl FileAutocomplete {
             mode: AutocompleteMode::FileRef,
             matches: Vec::new(),
             selected: 0,
+            scroll: 0,
         }
     }
 
@@ -77,6 +85,7 @@ impl FileAutocomplete {
         self.mode = AutocompleteMode::FileRef;
         self.matches.clear();
         self.selected = 0;
+        self.scroll = 0;
     }
 
     /// The popup is on screen.
@@ -85,15 +94,37 @@ impl FileAutocomplete {
     }
 
     pub fn select_previous(&mut self) {
-        if self.is_open() {
-            self.selected = self.selected.saturating_sub(1);
-        }
+        self.move_selection(-1);
     }
 
     pub fn select_next(&mut self) {
-        if self.is_open() {
-            self.selected = (self.selected + 1).min(self.matches.len() - 1);
+        self.move_selection(1);
+    }
+
+    /// Move the selection by `delta`, scrolling only once it would leave the
+    /// visible rows.
+    pub fn move_selection(&mut self, delta: isize) {
+        if !self.is_open() {
+            return;
         }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.matches.len() - 1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + POPUP_ROWS {
+            self.scroll = self.selected + 1 - POPUP_ROWS;
+        }
+    }
+
+    /// First match to draw in `rows` rows, keeping the selection on screen
+    /// even when the panel left the popup fewer than [`POPUP_ROWS`].
+    fn window_start(&self, rows: usize) -> usize {
+        self.scroll
+            .min(self.selected)
+            .max((self.selected + 1).saturating_sub(rows))
+            .min(self.matches.len().saturating_sub(rows))
     }
 
     fn open(&mut self, mode: AutocompleteMode, at_pos: usize, query: &str) {
@@ -102,11 +133,13 @@ impl FileAutocomplete {
         self.at_pos = at_pos;
         self.query = query.to_string();
         self.selected = 0;
+        self.scroll = 0;
     }
 
     fn clamp_selection(&mut self) {
         if self.selected >= self.matches.len() {
             self.selected = 0;
+            self.scroll = 0;
         }
     }
 }
@@ -364,6 +397,62 @@ pub fn update_reference_autocomplete(input: &TextInput, autocomplete: &mut FileA
     autocomplete.open(AutocompleteMode::FileRef, pos, query);
 }
 
+/// Open the popup for a field holding one file path: the whole text before
+/// the cursor is the query, with a leading `@` allowed out of chat habit.
+pub fn update_path_autocomplete(input: &TextInput, autocomplete: &mut FileAutocomplete) {
+    let before_cursor = &input.text[..input.cursor_byte_offset()];
+    autocomplete.open(
+        AutocompleteMode::AttachPath,
+        0,
+        before_cursor.trim_start_matches('@'),
+    );
+}
+
+const TIER_PREFIX: &str = "tier:";
+
+/// Open the popup while the cursor is on a model spec that is, or could become,
+/// `tier:<name>`. In a roster that is the text after `id=` of the current entry.
+pub fn update_tier_autocomplete(
+    input: &TextInput,
+    autocomplete: &mut FileAutocomplete,
+    roster: bool,
+) {
+    let before_cursor = &input.text[..input.cursor_byte_offset()];
+    let mut start = 0;
+    if roster {
+        let entry = before_cursor.rfind(',').map_or(0, |comma| comma + 1);
+        let Some(equals) = before_cursor[entry..].find('=') else {
+            autocomplete.reset();
+            return;
+        };
+        start = entry + equals + 1;
+    }
+    let spec = before_cursor[start..].trim_start();
+    start = before_cursor.len() - spec.len();
+    let query = match spec.strip_prefix(TIER_PREFIX) {
+        Some(name) => name,
+        None if TIER_PREFIX.starts_with(spec) => "",
+        None => {
+            autocomplete.reset();
+            return;
+        }
+    };
+    autocomplete.open(AutocompleteMode::Tier, start, query);
+}
+
+/// Fill a tier popup; each match is the full `tier:<name>` to insert. Capped
+/// at what the popup can show, so the selection never leaves the screen.
+pub fn set_tier_matches(autocomplete: &mut FileAutocomplete, tiers: &[String]) {
+    let query = autocomplete.query.to_lowercase();
+    autocomplete.matches = tiers
+        .iter()
+        .filter(|tier| tier.to_lowercase().starts_with(&query))
+        .take(8)
+        .map(|tier| format!("{TIER_PREFIX}{tier}"))
+        .collect();
+    autocomplete.clamp_selection();
+}
+
 /// Fill a `$skill` popup from the catalog.
 pub fn set_skill_matches(
     autocomplete: &mut FileAutocomplete,
@@ -411,6 +500,10 @@ pub fn accept_autocomplete(input: &mut TextInput, autocomplete: &mut FileAutocom
             Some(ws) => raw[ws..].to_string(),
             None => String::new(),
         }
+    } else if autocomplete.mode == AutocompleteMode::Tier {
+        // The rest of this entry is replaced; later roster entries stay.
+        let raw = &input.text[cursor_byte..];
+        raw.find(',').map_or_else(String::new, |comma| raw[comma..].to_string())
     } else {
         input.text[cursor_byte..].to_string()
     };
@@ -433,7 +526,7 @@ pub fn accept_autocomplete(input: &mut TextInput, autocomplete: &mut FileAutocom
             input.text.push_str(&path);
             input.text.push(' ');
         }
-        AutocompleteMode::ModelSpec | AutocompleteMode::Effort => {
+        AutocompleteMode::ModelSpec | AutocompleteMode::Effort | AutocompleteMode::Tier => {
             input.text.push_str(&path);
         }
     }
@@ -633,11 +726,17 @@ pub fn render_autocomplete(autocomplete: &FileAutocomplete, area: Rect, buf: &mu
     let fg = theme::TEXT_FG;
     let selected_bg = theme::SELECTION_BG;
 
+    let rows = area.height as usize;
+    let start = autocomplete.window_start(rows);
+    let scrolls = autocomplete.matches.len() > rows;
+    let text_width = (area.width as usize).saturating_sub(usize::from(scrolls));
+
     for (row, (i, path)) in autocomplete
         .matches
         .iter()
         .enumerate()
-        .take(area.height as usize)
+        .skip(start)
+        .take(rows)
         .enumerate()
     {
         let y = area.y + row as u16;
@@ -663,18 +762,23 @@ pub fn render_autocomplete(autocomplete: &FileAutocomplete, area: Rect, buf: &mu
             AutocompleteMode::AttachPath
             | AutocompleteMode::DetachName
             | AutocompleteMode::ModelSpec
-            | AutocompleteMode::Effort => {
+            | AutocompleteMode::Effort
+            | AutocompleteMode::Tier => {
                 format!(" {}", path)
             }
             AutocompleteMode::SkillRef => path.clone(),
         };
-        let display = fit_autocomplete_label(&display, area.width as usize);
+        let display = fit_autocomplete_label(&display, text_width);
         for (ci, ch) in display.chars().enumerate() {
             let cx = area.x + ci as u16;
             if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
                 buf[(cx, y)].set_char(ch).set_style(style);
             }
         }
+    }
+
+    if scrolls {
+        super::scrollbar::render_scrollbar(area, buf, autocomplete.matches.len(), rows, start);
     }
 }
 
@@ -711,7 +815,7 @@ pub(crate) fn fit_autocomplete_label(label: &str, cols: usize) -> String {
 /// Where the popup for a box at `input` goes inside `bounds`: above the box,
 /// or below it when more of the list fits there. `None` if neither has room.
 pub fn popup_area(input: Rect, bounds: Rect, match_count: usize) -> Option<Rect> {
-    let wanted = match_count.min(8) as u16;
+    let wanted = match_count.min(POPUP_ROWS) as u16;
     let above = input.y.saturating_sub(bounds.y);
     let below = bounds.bottom().saturating_sub(input.bottom());
     let (y, height) = if above >= wanted || above >= below {
@@ -934,6 +1038,178 @@ mod tests {
         assert_eq!(prompt.input.text, "use $lint  now");
         assert_eq!(prompt.input.cursor, "use $lint ".len());
         assert!(!prompt.autocomplete.active);
+    }
+
+    fn field(text: &str) -> TextInput {
+        let mut input = TextInput::new();
+        input.insert_str(text);
+        input
+    }
+
+    fn tiers() -> Vec<String> {
+        ["low", "lower", "top"].map(String::from).to_vec()
+    }
+
+    #[test]
+    fn a_path_field_completes_its_whole_value_and_ignores_a_leading_at() {
+        let mut ac = FileAutocomplete::new();
+        let input = field("@src/ma");
+        update_path_autocomplete(&input, &mut ac);
+        assert_eq!(ac.mode, AutocompleteMode::AttachPath);
+        assert_eq!(ac.query, "src/ma");
+
+        let mut input = input;
+        ac.matches = vec!["src/main.rs".to_string()];
+        accept_autocomplete(&mut input, &mut ac);
+        assert_eq!(input.text, "src/main.rs", "no @ and no trailing space");
+    }
+
+    #[test]
+    fn a_roster_entry_completes_after_its_equals_sign() {
+        let mut ac = FileAutocomplete::new();
+        update_tier_autocomplete(&field("a=tier:lo"), &mut ac, true);
+        assert_eq!(ac.mode, AutocompleteMode::Tier);
+        assert_eq!(ac.query, "lo");
+        assert_eq!(ac.at_pos, 2);
+        set_tier_matches(&mut ac, &tiers());
+        assert_eq!(ac.matches, ["tier:low", "tier:lower"]);
+
+        update_tier_autocomplete(&field("a=tier:top,b="), &mut ac, true);
+        assert_eq!(ac.at_pos, "a=tier:top,b=".len(), "only the current entry");
+        assert_eq!(ac.query, "");
+    }
+
+    #[test]
+    fn tier_completion_stays_out_of_the_way_of_other_text() {
+        let mut ac = FileAutocomplete::new();
+        update_tier_autocomplete(&field("first"), &mut ac, true);
+        assert!(!ac.active, "still typing the id");
+        update_tier_autocomplete(&field("a=claude:op"), &mut ac, true);
+        assert!(!ac.active, "a provider spec");
+        update_tier_autocomplete(&field("claude:op"), &mut ac, false);
+        assert!(!ac.active);
+        update_tier_autocomplete(&field("ti"), &mut ac, false);
+        assert!(ac.active, "on the way to `tier:`");
+        assert_eq!(ac.query, "");
+    }
+
+    #[test]
+    fn accepting_a_tier_mid_roster_keeps_the_entries_after_it() {
+        let mut input = field("a=tier:lo,b=tier:top");
+        input.cursor = "a=tier:lo".len();
+        let mut ac = FileAutocomplete::new();
+        update_tier_autocomplete(&input, &mut ac, true);
+        set_tier_matches(&mut ac, &tiers());
+
+        accept_autocomplete(&mut input, &mut ac);
+
+        assert_eq!(input.text, "a=tier:low,b=tier:top");
+        assert_eq!(input.cursor, "a=tier:low".len());
+    }
+
+    #[test]
+    fn accepting_a_tier_replaces_the_rest_of_the_name() {
+        let mut input = field("tier:lower");
+        input.cursor = "tier:lo".len();
+        let mut ac = FileAutocomplete::new();
+        update_tier_autocomplete(&input, &mut ac, false);
+        set_tier_matches(&mut ac, &["low".to_string()]);
+
+        accept_autocomplete(&mut input, &mut ac);
+
+        assert_eq!(input.text, "tier:low");
+    }
+
+    fn long_popup(count: usize) -> FileAutocomplete {
+        let mut ac = FileAutocomplete::new();
+        ac.open(AutocompleteMode::AttachPath, 0, "");
+        ac.matches = (0..count).map(|i| format!("m{i:02}")).collect();
+        ac
+    }
+
+    fn drawn(ac: &FileAutocomplete, rows: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, 20, rows);
+        let mut buf = Buffer::empty(area);
+        render_autocomplete(ac, area, &mut buf);
+        (0..rows)
+            .map(|y| (0..20).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_list_scrolls_only_when_the_selection_leaves_the_rows() {
+        let mut ac = long_popup(12);
+        for _ in 0..7 {
+            ac.select_next();
+        }
+        assert_eq!(ac.window_start(8), 0, "the last visible row needs no scroll");
+
+        ac.select_next();
+        assert_eq!(ac.selected, 8);
+        assert_eq!(ac.window_start(8), 1);
+
+        ac.select_previous();
+        assert_eq!(ac.window_start(8), 1, "moving back up keeps the window");
+        for _ in 0..7 {
+            ac.select_previous();
+        }
+        assert_eq!(ac.selected, 0);
+        assert_eq!(ac.window_start(8), 0);
+    }
+
+    #[test]
+    fn the_selection_stops_at_both_ends_and_pages() {
+        let mut ac = long_popup(12);
+        ac.select_previous();
+        assert_eq!(ac.selected, 0);
+        ac.move_selection(100);
+        assert_eq!(ac.selected, 11);
+        assert_eq!(ac.window_start(8), 4);
+        ac.select_next();
+        assert_eq!(ac.selected, 11);
+        ac.move_selection(-8);
+        assert_eq!(ac.selected, 3);
+        assert_eq!(ac.window_start(8), 3);
+    }
+
+    #[test]
+    fn a_popup_the_panel_shrank_still_shows_the_selection() {
+        let mut ac = long_popup(12);
+        ac.move_selection(6);
+        assert_eq!(ac.window_start(3), 4);
+        let rows = drawn(&ac, 3);
+        assert!(rows[2].contains("m06"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_new_query_goes_back_to_the_first_match() {
+        let mut ac = long_popup(12);
+        ac.move_selection(11);
+        ac.open(AutocompleteMode::AttachPath, 0, "x");
+        assert_eq!(ac.selected, 0);
+        assert_eq!(ac.window_start(8), 0);
+    }
+
+    #[test]
+    fn a_long_list_draws_its_window_and_a_bar() {
+        let mut ac = long_popup(12);
+        ac.move_selection(11);
+        let rows = drawn(&ac, 8);
+
+        assert!(rows[0].contains("m04"), "{rows:#?}");
+        assert!(rows[7].contains("m11"), "{rows:#?}");
+        assert!(!rows.join("").contains("m03"), "{rows:#?}");
+        assert!(
+            rows.iter().all(|r| r.ends_with('█') || r.ends_with('│')),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_draws_no_bar() {
+        let rows = drawn(&long_popup(8), 8);
+        assert!(rows[7].contains("m07"), "{rows:#?}");
+        assert!(rows.iter().all(|r| r.ends_with(' ')), "{rows:#?}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ratatui::{
 };
 
 use crate::theme;
-use crate::widgets::prompt_input::{self, PromptInput};
+use crate::widgets::prompt_input::{self, FileAutocomplete, PromptInput};
 use crate::widgets::render_utils::{strip_ansi, word_wrap, write_text};
 use crate::widgets::scroll_state::ScrollState;
 use crate::widgets::scrollbar::render_scrollbar;
@@ -23,7 +23,7 @@ use crate::widgets::text_input::TextInput;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::swarm::plan::ExecutionMode;
 use gaviero_core::types::ModelTier;
-use gaviero_dsl::{ParamKindInfo, ScriptInspection};
+use gaviero_dsl::{ParamKindInfo, ScriptInspection, VarKind};
 
 /// Activity kept per agent; the oldest output goes first.
 const MAX_ACTIVITY_LINES: usize = 500;
@@ -174,6 +174,10 @@ pub enum FieldRole {
     Prompt,
     Param(ParamKindInfo),
     Var,
+    /// A var declared `file`.
+    File,
+    /// A var declared `dir`.
+    Dir,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +218,8 @@ impl FormField {
         let kind = match self.role {
             FieldRole::Param(ParamKindInfo::Roster) => " (roster)",
             FieldRole::Param(ParamKindInfo::Client) => " (model)",
+            FieldRole::File => " (file)",
+            FieldRole::Dir => " (folder)",
             _ => "",
         };
         format!("{}{kind}{required}", self.name)
@@ -228,6 +234,8 @@ impl FormField {
             FieldRole::Param(ParamKindInfo::Roster) => "id=provider:model[@effort],… or id=tier:<name>,…",
             FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort] or tier:<name>",
             FieldRole::Var => "Script variable. Empty leaves it unset",
+            FieldRole::File => "An existing file. Type to search, as with @ in chat",
+            FieldRole::Dir => "A folder. Type to search the workspace",
         }
     }
 
@@ -287,6 +295,8 @@ pub struct SwarmForm {
     pub focus: usize,
     pub error: Option<String>,
     pub warnings: Vec<String>,
+    /// Popup of the focused file or param field.
+    pub completion: FileAutocomplete,
 }
 
 impl SwarmForm {
@@ -306,6 +316,7 @@ impl SwarmForm {
             focus: 0,
             error: None,
             warnings: Vec::new(),
+            completion: FileAutocomplete::new(),
         };
         form.fields = form.build_fields(selected_folder, 0, 0);
         form
@@ -377,11 +388,16 @@ impl SwarmForm {
             }
         }
         for var in &self.inspection.vars {
+            let (role, required) = match var.kind {
+                VarKind::File => (FieldRole::File, var.default.is_none()),
+                VarKind::Dir => (FieldRole::Dir, var.default.is_none()),
+                VarKind::String => (FieldRole::Var, false),
+            };
             fields.push(FormField::text_field(
                 &var.name,
-                FieldRole::Var,
+                role,
                 var.default.clone(),
-                false,
+                required,
             ));
         }
         fields
@@ -407,7 +423,7 @@ impl SwarmForm {
     }
 
     /// The profile picked by name; entry 0 of the selector is [`PROFILE_AUTO`].
-    fn selected_profile(&self) -> Option<String> {
+    pub fn selected_profile(&self) -> Option<String> {
         let index = self.choice_of(FieldRole::Profile).checked_sub(1)?;
         self.profiles.get(index).cloned()
     }
@@ -492,15 +508,58 @@ impl SwarmForm {
         }
     }
 
+    pub fn focused_role(&self) -> Option<FieldRole> {
+        self.fields.get(self.focus).map(|f| f.role)
+    }
+
+    /// Focus the field called `name`, if there is one.
+    pub fn focus_field(&mut self, name: &str) {
+        if let Some(index) = self.fields.iter().position(|f| f.name == name) {
+            self.focus = index;
+        }
+    }
+
+    /// Open or close the popup for what the focused field now holds.
+    pub fn update_completion(&mut self) {
+        let Some(field) = self.fields.get(self.focus) else {
+            return;
+        };
+        match (field.role, &field.value) {
+            (FieldRole::File | FieldRole::Dir, FieldValue::Text(input)) => {
+                prompt_input::update_path_autocomplete(input, &mut self.completion);
+            }
+            (FieldRole::Param(kind), FieldValue::Text(input)) => {
+                prompt_input::update_tier_autocomplete(
+                    input,
+                    &mut self.completion,
+                    kind == ParamKindInfo::Roster,
+                );
+            }
+            _ => self.completion.reset(),
+        }
+    }
+
+    pub fn accept_completion(&mut self) {
+        if let Some(FormField {
+            value: FieldValue::Text(input),
+            ..
+        }) = self.fields.get_mut(self.focus)
+        {
+            prompt_input::accept_autocomplete(input, &mut self.completion);
+        }
+    }
+
     pub fn on_run_button(&self) -> bool {
         self.focus >= self.fields.len()
     }
 
     pub fn focus_next(&mut self) {
+        self.completion.reset();
         self.focus = (self.focus + 1).min(self.fields.len());
     }
 
     pub fn focus_previous(&mut self) {
+        self.completion.reset();
         self.focus = self.focus.saturating_sub(1);
     }
 
@@ -538,8 +597,13 @@ impl SwarmForm {
                 FieldRole::Param(_) if field.is_edited() => {
                     values.params.push((field.name.clone(), text.to_string()));
                 }
-                FieldRole::Var if field.is_edited() => {
+                // `dir` only chooses the completion; otherwise it is a string.
+                FieldRole::Var | FieldRole::Dir if field.is_edited() => {
                     values.vars.push((field.name.clone(), text.to_string()));
+                }
+                // Even at its default: run preparation must see the path.
+                FieldRole::File if !text.trim().is_empty() => {
+                    values.vars.push((field.name.clone(), text.trim().to_string()));
                 }
                 _ => {}
             }
@@ -1294,8 +1358,13 @@ impl SwarmDashboardState {
             .unwrap_or(0);
         let offset = form_offset(first_focused, last_focused, body_height, rows.len());
         let mut box_rows: Option<(u16, u16)> = None;
+        let mut value_rows: Option<(u16, u16)> = None;
         for (i, row) in rows.iter().skip(offset).take(body_height).enumerate() {
             let y = body_y + i as u16;
+            if row.field == Some(form.focus) && row.fill.is_some() && !row.prompt_box {
+                let (top, height) = value_rows.unwrap_or((y, 0));
+                value_rows = Some((top, height + 1));
+            }
             if row.prompt_box {
                 let (top, height) = box_rows.unwrap_or((y, 0));
                 box_rows = Some((top, height + 1));
@@ -1331,6 +1400,22 @@ impl SwarmDashboardState {
             ..area
         };
         self.render_prompt_box(box_area, bounds, buf, focused);
+
+        if let (Some(form), Some((y, height))) = (self.form.as_ref(), value_rows)
+            && form.completion.is_open()
+        {
+            let value = Rect {
+                x: area.x + 1,
+                y,
+                width: box_width,
+                height,
+            };
+            if let Some(popup) =
+                prompt_input::popup_area(value, bounds, form.completion.matches.len())
+            {
+                prompt_input::render_autocomplete(&form.completion, popup, buf);
+            }
+        }
     }
 
     /// Draw the prompt box into the rows reserved for it, then its popup,
@@ -1893,15 +1978,18 @@ mod tests {
                 VarInspection {
                     name: "OUT_DIR".into(),
                     default: Some("out".into()),
+                    kind: VarKind::String,
                 },
                 VarInspection {
                     name: "TARGET".into(),
                     default: None,
+                    kind: VarKind::String,
                 },
             ],
             requires_prompt: true,
             accepts_prompt: true,
             default_execution: ExecutionMode::Repo,
+            tiers: Vec::new(),
         }
     }
 
@@ -2453,6 +2541,124 @@ mod tests {
         let screen = render_rows(&mut dash, 80, 24).join("\n");
         assert!(screen.contains("takes no prompt"), "{screen}");
         assert!(!screen.contains("Prompt"), "{screen}");
+    }
+
+    fn form_with_file_vars() -> SwarmForm {
+        let mut info = inspection(vec![workflow("w", vec![])]);
+        info.vars = vec![
+            VarInspection {
+                name: "BRIEF".into(),
+                default: Some("docs/brief.md".into()),
+                kind: VarKind::File,
+            },
+            VarInspection {
+                name: "NEEDED".into(),
+                default: None,
+                kind: VarKind::File,
+            },
+        ];
+        SwarmForm::new(row(), info, folders(), 0)
+    }
+
+    #[test]
+    fn file_vars_are_always_passed_and_one_without_a_default_is_required() {
+        let mut form = form_with_file_vars();
+        type_into(&mut form, "Prompt", "p");
+
+        assert_eq!(form.collect().unwrap_err(), "NEEDED is required");
+
+        type_into(&mut form, "NEEDED", " a.md ");
+        let values = form.collect().unwrap();
+        assert_eq!(
+            values.vars,
+            vec![
+                ("BRIEF".to_string(), "docs/brief.md".to_string()),
+                ("NEEDED".to_string(), "a.md".to_string()),
+            ],
+            "a file stays passed at its default, trimmed"
+        );
+    }
+
+    #[test]
+    fn a_file_field_is_labelled_and_draws_its_popup() {
+        let mut dash = SwarmDashboardState::new();
+        let mut form = form_with_file_vars();
+        focus_field(&mut form, "NEEDED");
+        form.focused_input().unwrap().insert_str("mai");
+        form.update_completion();
+        dash.form = Some(form);
+        dash.view = SwarmView::Form;
+
+        let closed = render_rows(&mut dash, 60, 24).join("\n");
+        assert!(closed.contains("NEEDED (file) *"), "{closed}");
+        assert!(closed.contains("BRIEF (file)"), "{closed}");
+        assert!(!closed.contains("src/main.rs"), "no matches, no popup: {closed}");
+
+        dash.form.as_mut().unwrap().completion.matches = vec!["src/main.rs".to_string()];
+        let open = render_rows(&mut dash, 60, 24).join("\n");
+        assert!(open.contains(" src/main.rs"), "{open}");
+    }
+
+    #[test]
+    fn a_dir_var_completes_and_is_otherwise_a_string() {
+        let mut info = inspection(vec![workflow("w", vec![])]);
+        info.vars = vec![VarInspection {
+            name: "SRC".into(),
+            default: Some("src".into()),
+            kind: VarKind::Dir,
+        }];
+        let mut form = SwarmForm::new(row(), info, folders(), 0);
+        type_into(&mut form, "Prompt", "p");
+        assert!(form.collect().unwrap().vars.is_empty(), "the default stays the script's");
+
+        type_into(&mut form, "SRC", "lib");
+        assert_eq!(
+            form.collect().unwrap().vars,
+            vec![("SRC".to_string(), "lib".to_string())]
+        );
+
+        focus_field(&mut form, "SRC");
+        form.update_completion();
+        assert!(form.completion.active, "completes like a file field");
+
+        let mut dash = SwarmDashboardState::new();
+        form.completion.reset();
+        dash.form = Some(form);
+        dash.view = SwarmView::Form;
+        let screen = render_rows(&mut dash, 60, 24).join("\n");
+        assert!(screen.contains("SRC (folder)"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_completion_shows_eight_rows_and_a_bar() {
+        let mut dash = SwarmDashboardState::new();
+        let mut form = form_with_file_vars();
+        focus_field(&mut form, "NEEDED");
+        form.update_completion();
+        form.completion.matches = (0..12).map(|i| format!("path{i:02}.md")).collect();
+        form.completion.move_selection(11);
+        dash.form = Some(form);
+        dash.view = SwarmView::Form;
+
+        let screen = render_rows(&mut dash, 60, 30);
+        let shown = screen.iter().filter(|r| r.contains("path")).count();
+
+        assert_eq!(shown, 8, "{screen:#?}");
+        assert!(screen.join("\n").contains("path11.md"), "{screen:#?}");
+        assert!(!screen.join("\n").contains("path03.md"), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains('█')), "{screen:#?}");
+    }
+
+    #[test]
+    fn moving_off_a_field_closes_its_popup() {
+        let mut form = form_with_file_vars();
+        focus_field(&mut form, "BRIEF");
+        form.update_completion();
+        assert!(form.completion.active);
+
+        form.focus_next();
+
+        assert!(!form.completion.active);
     }
 
     #[test]
