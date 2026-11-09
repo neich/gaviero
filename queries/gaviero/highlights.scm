@@ -106,6 +106,7 @@
 
 ; ── Vars / extra pair keys ────────────────────────────────────
 (vars_pair (identifier) @property)
+(var_type) @type
 (extra_pair (identifier) @property)
 
 ; ── Strings ───────────────────────────────────────────────────
