@@ -4,11 +4,14 @@
 //! ([`crate::scoped_folders`]). A script is listed without being compiled:
 //! core has no DSL dependency and a scan runs on every relevant file event,
 //! so the only thing read here is the optional `// description:` header.
+//! `.gaviero/dsl/profiles/` is not a script: it holds the model profiles
+//! ([`crate::script_profiles`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::memory::scope::SCOPE_REPO;
+use crate::script_profiles::PROFILES_SUBDIR;
 use crate::scoped_folders::{
     ScopedEntry, find_entry_file, folder_labels, is_under_native_dir, native_roots,
     native_scope_label, nearest, sort_nearest_first,
@@ -91,7 +94,7 @@ impl ScriptCatalog {
                 continue;
             }
             let name = folder.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-            if name.starts_with('.') {
+            if name.starts_with('.') || name.eq_ignore_ascii_case(PROFILES_SUBDIR) {
                 continue;
             }
             let warn = |message: String| SkillWarning {
@@ -288,6 +291,19 @@ mod tests {
         let catalog = scan(&ws, Path::new("/nonexistent"));
         assert_eq!(catalog.complete("", None).len(), 1, "one script per folder");
         assert_eq!(catalog.resolve(None, "audit", None).unwrap().source_path, main);
+    }
+
+    #[test]
+    fn the_profiles_folder_is_neither_a_script_nor_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".gaviero/dsl").join(PROFILES_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("claude.gaviero"), "// profile\n").unwrap();
+
+        let ws = Workspace::single_folder(tmp.path().to_path_buf());
+        let catalog = scan(&ws, Path::new("/nonexistent"));
+        assert!(catalog.complete("", None).is_empty());
+        assert!(catalog.warnings().is_empty(), "{:?}", catalog.warnings());
     }
 
     #[test]

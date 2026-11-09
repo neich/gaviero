@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
+use gaviero_core::script_profiles::ProfileCatalog;
+use gaviero_core::scripts::ScriptCatalog;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
 
 impl std::fmt::Display for OutputFormat {
@@ -235,6 +237,7 @@ struct Cli {
     /// `NAME=VALUE`. For roster params, the value is a comma-separated list
     /// of `id=provider:model[@effort]` entries
     /// (e.g. `--param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high`).
+    /// `tier:<name>` may stand in for any model spec (e.g. `--param judge=tier:high`).
     /// Required params without a default fail compilation when absent.
     /// Can be specified multiple times. Only valid with `--script`.
     #[arg(long = "param", requires = "script")]
@@ -247,6 +250,21 @@ struct Cli {
     /// Only valid with `--script`.
     #[arg(long = "tiers-file", requires = "script")]
     tiers_file: Option<PathBuf>,
+
+    /// Model profile for a DSL script: the name of a
+    /// `.gaviero/dsl/profiles/<name>.gaviero` file (workspace folders first, then
+    /// the workspace layer, then `$GAVIERO_ROOT`), or a path to a `.gaviero`
+    /// file. It binds the script's `tier` names to its own clients and
+    /// replaces the script's bindings for those tiers. Without this flag a
+    /// profile named `default`, if any, supplies only the tiers the script
+    /// leaves unbound. Only valid with `--script`.
+    #[arg(
+        long = "profile",
+        value_name = "NAME|PATH",
+        requires = "script",
+        conflicts_with = "tiers_file"
+    )]
+    profile: Option<String>,
 
     /// Print the N most recent retrieval manifests (Tier S / S4) and exit.
     /// Useful for auditing what memory was injected into recent chat turns.
@@ -4455,10 +4473,21 @@ async fn main() -> Result<()> {
         } else {
             Vec::new()
         };
-        // compile_file resolves any `include "..."` directives transitively,
-        // so multi-file scripts (shared clients/prompts/etc.) work here.
-        gaviero_dsl::compile_file(
+        let profile = ProfileCatalog::scan(&workspace, &ScriptCatalog::global_scripts_dir())
+            .select(
+                cli.profile.as_deref(),
+                Some(&gaviero_core::memory::scope::hash_path(&repo)),
+                &cwd,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?;
+        if let Some(profile) = &profile {
+            eprintln!("[profile] {} ({})", profile.name, profile.path.display());
+        }
+        // Resolves any `include "..."` directives transitively, so multi-file
+        // scripts (shared clients/prompts/etc.) work here.
+        gaviero_dsl::compile_file_with_profile(
             script_path,
+            profile.as_ref(),
             cli.workflow.as_deref(),
             runtime_prompt.as_deref(),
             &override_vars,

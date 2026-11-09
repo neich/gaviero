@@ -1,0 +1,57 @@
+// description: Provider-agnostic review; models come from the profile
+//
+// This script names no provider and declares no client: agents ask for a tier
+// (`low`, `medium`, `high`, `top`), and the profile says what each one means.
+// Run the same file on different models without editing it:
+//
+//   gaviero-cli --script tiered_review.gaviero --profile claude --prompt "the auth module"
+//   gaviero-cli --script tiered_review.gaviero --profile mixed  --prompt "the auth module"
+//
+// `model "tier:<name>"` does the same for workflow params and rosters.
+
+agent gather {
+    description "List the files relevant to the review"
+    tier low
+    scope { owned [".gaviero/review/files.md"] }
+    prompt #"
+        List the files that matter for reviewing {{PROMPT}} in
+        .gaviero/review/files.md, one path per line.
+    "#
+}
+
+agent reviewer_template {
+    template true
+    description "Review the listed files"
+    scope { owned [".gaviero/review/{{REVIEWER_ID}}.md"] }
+    prompt #"
+        Review the files in .gaviero/review/files.md. Write your findings for
+        {{PROMPT}} to .gaviero/review/{{REVIEWER_ID}}.md.
+    "#
+}
+
+agent verdict {
+    description "Decide whether the reviews agree"
+    client judge
+    scope { read_only [".gaviero/review/**"] }
+    prompt #"
+        Read the reviews in .gaviero/review/ and reply with a verdict on
+        whether they agree.
+    "#
+}
+
+workflow tiered_review {
+    param judge { model "tier:medium" }
+    param panel [
+        { id "first"  model "tier:high" }
+        { id "second" model "tier:top" }
+    ]
+    steps [
+        gather
+        loop {
+            reviewers panel
+            template_refine reviewer_template
+            until agent verdict
+            max_iterations 2
+        }
+    ]
+}

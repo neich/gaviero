@@ -5,6 +5,7 @@ pub mod inspect;
 pub mod lexer;
 pub mod parser;
 pub mod patterns;
+pub mod profile;
 pub mod resolver;
 pub mod reviewers;
 pub mod tiers;
@@ -57,8 +58,9 @@ pub fn compile(
 ///   declarations.
 /// - `override_params` — `--param NAME=VALUE` workflow-parameter overrides.
 ///   Roster params: `id=provider:model[@effort],...`. Client params:
-///   `provider:model[@effort]`. Required params without an in-script default
-///   fail compilation when absent here.
+///   `provider:model[@effort]`. Either model spec may instead be `tier:<name>`.
+///   Required params without an in-script default fail compilation when absent
+///   here.
 pub fn compile_with_vars(
     source: &str,
     filename: &str,
@@ -126,7 +128,35 @@ pub fn compile_file(
     override_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
-    let (script, sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
+    compile_file_with_profile(
+        entry_path,
+        None,
+        workflow,
+        runtime_prompt,
+        override_vars,
+        override_tiers,
+        override_params,
+    )
+}
+
+/// Like [`compile_file`], with the tiers bound by a model profile. Pick the
+/// profile with [`gaviero_core::script_profiles::ProfileCatalog::select`].
+///
+/// Tier precedence: `override_tiers` > a chosen profile > the script's `tier`
+/// lines > the implicit `default` profile.
+pub fn compile_file_with_profile(
+    entry_path: &std::path::Path,
+    profile: Option<&gaviero_core::script_profiles::SelectedProfile>,
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
+    override_params: &[(String, String)],
+) -> Result<CompiledPlan, miette::Report> {
+    let (mut script, mut sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
+    if let Some(profile) = profile {
+        profile::apply_profile(&mut script, &mut sources, profile).map_err(miette::Report::new)?;
+    }
     compiler::compile_ast_with_sources(
         &script,
         &sources,

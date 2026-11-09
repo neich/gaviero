@@ -169,6 +169,7 @@ impl ScriptPicker {
 pub enum FieldRole {
     Folder,
     Workflow,
+    Profile,
     Prompt,
     Param(ParamKindInfo),
     Var,
@@ -218,9 +219,10 @@ impl FormField {
         match self.role {
             FieldRole::Folder => "Where the script runs. ←/→ to change",
             FieldRole::Workflow => "Which workflow to run. ←/→ to change",
+            FieldRole::Profile => "Which models the script's tiers use. ←/→ to change",
             FieldRole::Prompt => "Replaces {{PROMPT}}. Alt+Enter for a new line",
-            FieldRole::Param(ParamKindInfo::Roster) => "id=provider:model[@effort],…",
-            FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort]",
+            FieldRole::Param(ParamKindInfo::Roster) => "id=provider:model[@effort],… or id=tier:<name>,…",
+            FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort] or tier:<name>",
             FieldRole::Var => "Script variable. Empty leaves it unset",
         }
     }
@@ -247,15 +249,22 @@ impl FormField {
 pub struct FormValues {
     pub root: PathBuf,
     pub workflow: Option<String>,
+    /// `None` leaves the choice to the `default` profile, if there is one.
+    pub profile: Option<String>,
     pub prompt: Option<String>,
     pub vars: Vec<(String, String)>,
     pub params: Vec<(String, String)>,
 }
 
+/// First entry of the Profile selector: no explicit choice.
+const PROFILE_AUTO: &str = "auto";
+
 pub struct SwarmForm {
     pub script: ScriptRow,
     pub inspection: ScriptInspection,
     pub folders: Vec<(String, PathBuf)>,
+    /// Profile names on offer; the selector is hidden when empty.
+    pub profiles: Vec<String>,
     pub fields: Vec<FormField>,
     /// `fields.len()` is the Run button.
     pub focus: usize,
@@ -275,16 +284,24 @@ impl SwarmForm {
             script,
             inspection,
             folders,
+            profiles: Vec::new(),
             fields: Vec::new(),
             focus: 0,
             error: None,
             warnings: Vec::new(),
         };
-        form.fields = form.build_fields(selected_folder, 0);
+        form.fields = form.build_fields(selected_folder, 0, 0);
         form
     }
 
-    fn build_fields(&self, folder: usize, workflow: usize) -> Vec<FormField> {
+    /// Offer these profiles in a selector.
+    pub fn with_profiles(mut self, profiles: Vec<String>) -> Self {
+        self.profiles = profiles;
+        self.fields = self.build_fields(self.selected_folder(), self.selected_workflow(), 0);
+        self
+    }
+
+    fn build_fields(&self, folder: usize, workflow: usize, profile: usize) -> Vec<FormField> {
         let mut fields = Vec::new();
         if self.folders.len() > 1 {
             fields.push(FormField {
@@ -310,6 +327,20 @@ impl SwarmForm {
                         .map(|w| w.name.clone())
                         .collect(),
                     selected: workflow,
+                },
+                default: None,
+                required: false,
+            });
+        }
+        if !self.profiles.is_empty() {
+            let mut options = vec![PROFILE_AUTO.to_string()];
+            options.extend(self.profiles.iter().cloned());
+            fields.push(FormField {
+                name: "Profile".into(),
+                role: FieldRole::Profile,
+                value: FieldValue::Choice {
+                    options,
+                    selected: profile,
                 },
                 default: None,
                 required: false,
@@ -363,6 +394,12 @@ impl SwarmForm {
         self.choice_of(FieldRole::Workflow)
     }
 
+    /// The profile picked by name; entry 0 of the selector is [`PROFILE_AUTO`].
+    fn selected_profile(&self) -> Option<String> {
+        let index = self.choice_of(FieldRole::Profile).checked_sub(1)?;
+        self.profiles.get(index).cloned()
+    }
+
     pub fn execution_mode(&self) -> ExecutionMode {
         self.inspection
             .workflows
@@ -388,8 +425,9 @@ impl SwarmForm {
         let focused = self.focus;
         let folder = self.selected_folder();
         let workflow = self.selected_workflow();
+        let profile = self.choice_of(FieldRole::Profile);
         let old = std::mem::take(&mut self.fields);
-        let mut fresh = self.build_fields(folder, workflow);
+        let mut fresh = self.build_fields(folder, workflow, profile);
         for field in &mut fresh {
             if let Some(previous) = old
                 .iter()
@@ -445,6 +483,7 @@ impl SwarmForm {
         let mut values = FormValues {
             root: self.folders[self.selected_folder()].1.clone(),
             workflow,
+            profile: self.selected_profile(),
             prompt: None,
             vars: Vec::new(),
             params: Vec::new(),
@@ -1818,6 +1857,54 @@ mod tests {
         let values = form.collect().unwrap();
         assert_eq!(values.workflow.as_deref(), Some("two"));
         assert_eq!(values.prompt.as_deref(), Some("keep me"));
+    }
+
+    fn focus_field(form: &mut SwarmForm, name: &str) {
+        form.focus = form.fields.iter().position(|f| f.name == name).unwrap();
+    }
+
+    #[test]
+    fn profile_selector_starts_on_auto_and_names_the_choice() {
+        let mut form = SwarmForm::new(row(), inspection(vec![workflow("w", vec![])]), folders(), 0)
+            .with_profiles(vec!["claude".into(), "mixed".into()]);
+        type_into(&mut form, "Prompt", "p");
+
+        assert_eq!(form.collect().unwrap().profile, None, "auto chooses nothing");
+
+        focus_field(&mut form, "Profile");
+        form.cycle_focused_choice(1);
+        assert_eq!(form.collect().unwrap().profile.as_deref(), Some("claude"));
+
+        form.cycle_focused_choice(1);
+        assert_eq!(form.collect().unwrap().profile.as_deref(), Some("mixed"));
+    }
+
+    #[test]
+    fn profile_choice_survives_changing_the_workflow() {
+        let mut form = SwarmForm::new(
+            row(),
+            inspection(vec![workflow("one", vec![]), workflow("two", vec![])]),
+            folders(),
+            0,
+        )
+        .with_profiles(vec!["claude".into()]);
+        type_into(&mut form, "Prompt", "p");
+        focus_field(&mut form, "Profile");
+        form.cycle_focused_choice(1);
+
+        focus_field(&mut form, "Workflow");
+        form.cycle_focused_choice(1);
+
+        let values = form.collect().unwrap();
+        assert_eq!(values.workflow.as_deref(), Some("two"));
+        assert_eq!(values.profile.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn no_profiles_means_no_selector() {
+        let form = SwarmForm::new(row(), inspection(vec![workflow("w", vec![])]), folders(), 0)
+            .with_profiles(Vec::new());
+        assert!(form.fields.iter().all(|f| f.role != FieldRole::Profile));
     }
 
     #[test]

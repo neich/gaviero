@@ -1,0 +1,16 @@
+// Model profile: every tier on Claude.
+//
+// Copy to .gaviero/dsl/profiles/ (in a project or $GAVIERO_ROOT), then:
+//   gaviero-cli --script tiered_review.gaviero --profile claude
+//
+// A profile holds its own clients, so scripts run on it need none.
+
+client haiku  { model "claude:haiku"  privacy public effort low }
+client sonnet { model "claude:sonnet" privacy public effort medium }
+client opus   { model "claude:opus"   privacy public effort high }
+client fable  { model "claude:fable"  privacy public effort max }
+
+tier low    haiku
+tier medium sonnet
+tier high   opus
+tier top    fable

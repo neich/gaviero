@@ -19,6 +19,7 @@ use crate::panels::swarm_dashboard::{
 };
 use crate::widgets::render_utils::strip_ansi;
 use crate::widgets::text_input::TextInput;
+use gaviero_core::script_profiles::ProfileCatalog;
 use gaviero_core::scripts::{ScriptCatalog, is_repo_scoped};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::swarm::plan::ExecutionMode;
@@ -237,8 +238,11 @@ fn open_form(app: &mut App, script: ScriptRow) {
         Ok(inspection) => {
             let folders = workspace_folders(app);
             let selected = default_folder(app, &script, &folders);
+            let profiles =
+                ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
+                    .names();
             app.swarm_dashboard.form =
-                Some(SwarmForm::new(script, inspection, folders, selected));
+                Some(SwarmForm::new(script, inspection, folders, selected).with_profiles(profiles));
             app.swarm_dashboard.view = SwarmView::Form;
             refresh_form_warnings(app);
         }
@@ -361,8 +365,19 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
     );
     let worktree_context_paths = script_run::worktree_context_paths(&root, &root, &vars, None);
 
-    let plan = gaviero_dsl::compile_file(
+    let profile = ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
+        .select(
+            values.profile.as_deref(),
+            Some(&gaviero_core::memory::scope::hash_path(&root)),
+            &root,
+        )?;
+    if let Some(profile) = &profile {
+        notes.push(format!("Profile: {}", profile.name));
+    }
+
+    let plan = gaviero_dsl::compile_file_with_profile(
         &script.path,
+        profile.as_ref(),
         values.workflow.as_deref(),
         values.prompt.as_deref(),
         &vars,

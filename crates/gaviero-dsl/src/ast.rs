@@ -241,7 +241,8 @@ pub struct ReviewerEntry {
     pub id: String,
     pub id_span: Span,
     /// Canonical `provider:model` spec (validated downstream by
-    /// `gaviero_core::swarm::backend::shared::validate_model_spec`).
+    /// `gaviero_core::swarm::backend::shared::validate_model_spec`), or
+    /// `tier:<name>` to bind this reviewer to a tier instead.
     pub model: String,
     pub model_span: Span,
     /// Optional effort override (`off | auto | low | medium | high | xhigh | max`).
@@ -300,6 +301,7 @@ pub enum ParamKind {
 /// ```text
 /// param roster [ { id "a" model "claude:opus" } ]   // roster param
 /// param judge { model "claude:sonnet" effort medium } // client param
+/// param gate { model "tier:high" }                    // client param bound to a tier
 /// param roster                                        // required roster (CLI)
 /// param gate { }                                      // required client (CLI)
 /// ```

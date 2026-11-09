@@ -289,6 +289,7 @@ mod tests {
             ".gaviero/settings.json",
             ".gaviero/memory.db",
             ".gaviero/dsl/audit/audit.gaviero",
+            ".gaviero/dsl/profiles/claude.gaviero",
             ".git/HEAD",
         ] {
             write(root, rel);
@@ -298,6 +299,10 @@ mod tests {
         assert!(
             got.contains(&".gaviero/dsl/audit/audit.gaviero".to_string()),
             "scripts launch agents, so edits to them are reviewed: {got:?}"
+        );
+        assert!(
+            got.contains(&".gaviero/dsl/profiles/claude.gaviero".to_string()),
+            "profiles pick the models scripts run on: {got:?}"
         );
         assert!(got.contains(&"src/lib.rs".to_string()));
         assert!(got.contains(&".gitignore".to_string()));
