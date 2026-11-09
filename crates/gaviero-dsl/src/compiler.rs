@@ -121,9 +121,26 @@ pub fn compile_ast_with_sources(
     for item in &script.items {
         match item {
             Item::Agent(a) if a.template => continue,
-            Item::Vars(pairs) => {
-                // Later declarations override earlier ones for the same key.
-                script_vars.extend(pairs.clone());
+            Item::Vars(decls) => {
+                for decl in decls {
+                    match &decl.default {
+                        // Later declarations override earlier ones for the same key.
+                        Some(value) => script_vars.push((decl.name.clone(), value.clone())),
+                        None if !override_vars.iter().any(|(k, _)| *k == decl.name) => {
+                            errors.push(DslError::Compile {
+                                src: NamedSource::new("<cli>", String::new()),
+                                span: (0, 1).into(),
+                                reason: format!(
+                                    "{1} var `{0}` has no default and was not supplied \
+                                     — pass `--var {0}=<path>`",
+                                    decl.name,
+                                    decl.kind.keyword()
+                                ),
+                            });
+                        }
+                        None => {}
+                    }
+                }
             }
             Item::Client(c) => {
                 if let Some((effort, span)) = &c.effort
