@@ -18,9 +18,10 @@ pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
 #[allow(deprecated)]
 pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
+pub use ast::VarKind;
 pub use inspect::{
     ParamInspection, ParamKindInfo, ScriptInspection, VarInspection, WorkflowInspection,
-    inspect_file,
+    inspect_file, profile_tier_names,
 };
 pub use tiers::load_tier_overrides;
 

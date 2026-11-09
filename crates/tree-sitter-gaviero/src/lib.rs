@@ -17,6 +17,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_typed_vars() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = "vars {
+  A \"x\"
+  B file \"docs/b.md\"
+  C file
+  file \"y\"
+  D dir \"src\"
+  E dir
+}
+";
+        let tree = parser.parse(src, None).unwrap();
+        let sexp = tree.root_node().to_sexp();
+        assert!(!tree.root_node().has_error(), "parse tree: {sexp}");
+        assert_eq!(sexp.matches("(vars_pair").count(), 6, "{sexp}");
+        assert_eq!(sexp.matches("(var_type").count(), 4, "{sexp}");
+    }
+
+    #[test]
     fn parse_client() {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();

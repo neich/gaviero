@@ -761,6 +761,11 @@
     }
   },
   {
+    "type": "var_type",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "vars_block",
     "named": true,
     "fields": {},
@@ -793,6 +798,10 @@
         },
         {
           "type": "string",
+          "named": true
+        },
+        {
+          "type": "var_type",
           "named": true
         }
       ]
@@ -980,6 +989,10 @@
     "named": false
   },
   {
+    "type": "dir",
+    "named": false
+  },
+  {
     "type": "discover",
     "named": false
   },
@@ -1017,6 +1030,10 @@
   },
   {
     "type": "false",
+    "named": false
+  },
+  {
+    "type": "file",
     "named": false
   },
   {

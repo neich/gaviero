@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::{Item, Script};
+use crate::ast::{Item, Script, VarKind};
 use crate::compiler::peek_workflow_execution_mode;
 use crate::resolver;
 use crate::workflow_params::describe_workflow_params;
@@ -39,6 +39,42 @@ pub struct ScriptInspection {
     pub accepts_prompt: bool,
     /// Execution mode when the script declares no workflow.
     pub default_execution: ExecutionMode,
+    /// Tiers the script binds itself, in declaration order.
+    pub tiers: Vec<String>,
+}
+
+impl ScriptInspection {
+    /// The vars declared as `file`.
+    pub fn file_var_names(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::File)
+            .map(|v| v.name.clone())
+            .collect()
+    }
+
+    /// The vars declared as `dir`.
+    pub fn dir_var_names(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Dir)
+            .map(|v| v.name.clone())
+            .collect()
+    }
+
+    /// `vars` plus the defaults of `file` vars it does not set. Run
+    /// preparation only sees what it is given, and a file must be brought
+    /// within reach of agents whether or not the user changed it.
+    pub fn with_file_defaults(&self, mut vars: Vec<(String, String)>) -> Vec<(String, String)> {
+        for var in self.vars.iter().filter(|v| v.kind == VarKind::File) {
+            if let Some(default) = &var.default
+                && !vars.iter().any(|(k, _)| *k == var.name)
+            {
+                vars.push((var.name.clone(), default.clone()));
+            }
+        }
+        vars
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +87,10 @@ pub struct WorkflowInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInspection {
     pub name: String,
-    /// `None` for a placeholder that no `vars {}` block declares.
+    /// `None` for a placeholder that no `vars {}` block declares, or a
+    /// `file` var the caller must supply.
     pub default: Option<String>,
+    pub kind: VarKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +107,24 @@ pub struct ParamInspection {
     pub kind: ParamKindInfo,
     /// The in-script default in `--param` syntax; `None` means required.
     pub default: Option<String>,
+}
+
+/// The tiers a profile file binds, in declaration order.
+pub fn profile_tier_names(profile_path: &Path) -> Result<Vec<String>, miette::Report> {
+    let (profile, _) = resolver::resolve(profile_path).map_err(miette::Report::new)?;
+    Ok(tier_names(&profile))
+}
+
+fn tier_names(script: &Script) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for item in &script.items {
+        if let Item::TierAlias(tier) = item
+            && !names.contains(&tier.name)
+        {
+            names.push(tier.name.clone());
+        }
+    }
+    names
 }
 
 /// Inspect a script on disk, resolving its includes.
@@ -91,16 +147,21 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
         })
         .collect();
 
-    let mut declared: Vec<(String, String)> = Vec::new();
+    let mut declared: Vec<VarInspection> = Vec::new();
     let mut agent_vars: HashSet<String> = HashSet::new();
     let mut agent_without_prompt = false;
     for item in &script.items {
         match item {
-            Item::Vars(pairs) => {
-                for (key, value) in pairs {
-                    match declared.iter_mut().find(|(k, _)| k == key) {
-                        Some((_, v)) => *v = value.clone(),
-                        None => declared.push((key.clone(), value.clone())),
+            Item::Vars(decls) => {
+                for decl in decls {
+                    let var = VarInspection {
+                        name: decl.name.clone(),
+                        default: decl.default.clone(),
+                        kind: decl.kind,
+                    };
+                    match declared.iter_mut().find(|v| v.name == decl.name) {
+                        Some(existing) => *existing = var,
+                        None => declared.push(var),
                     }
                 }
             }
@@ -115,21 +176,16 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
     let placeholders = placeholders_in(sources);
     let requires_prompt = placeholders.iter().any(|p| p == "PROMPT");
 
-    let mut vars: Vec<VarInspection> = declared
-        .iter()
-        .map(|(name, value)| VarInspection {
-            name: name.clone(),
-            default: Some(value.clone()),
-        })
-        .collect();
+    let mut vars = declared;
     for name in placeholders {
         let settable = !RESERVED_PLACEHOLDERS.contains(&name.as_str())
             && !agent_vars.contains(&name)
-            && !declared.iter().any(|(k, _)| *k == name);
+            && !vars.iter().any(|v| v.name == name);
         if settable {
             vars.push(VarInspection {
                 name,
                 default: None,
+                kind: VarKind::String,
             });
         }
     }
@@ -140,6 +196,7 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
         requires_prompt,
         accepts_prompt: requires_prompt || agent_without_prompt,
         default_execution: peek_workflow_execution_mode(script, None),
+        tiers: tier_names(script),
     }
 }
 
@@ -195,11 +252,13 @@ mod tests {
             vec![
                 VarInspection {
                     name: "OUT_DIR".into(),
-                    default: Some("plans/out".into())
+                    default: Some("plans/out".into()),
+                    kind: VarKind::String,
                 },
                 VarInspection {
                     name: "TARGET".into(),
-                    default: None
+                    default: None,
+                    kind: VarKind::String,
                 },
             ]
         );
@@ -219,6 +278,107 @@ mod tests {
         assert!(info.vars.is_empty(), "{:?}", info.vars);
         assert!(info.requires_prompt);
         assert!(info.accepts_prompt);
+    }
+
+    #[test]
+    fn file_vars_report_their_kind_and_only_a_default_can_be_added() {
+        let info = inspect(concat!(
+            "vars {\n",
+            "  PLAIN \"x\"\n",
+            "  INPUT file \"docs/a.md\"\n",
+            "  NEEDED file\n",
+            "  AFTER \"y\"\n",
+            "}\n",
+            "agent a { prompt #\"{{INPUT}} {{NEEDED}}\"# }\n",
+        ));
+        let names: Vec<&str> = info.vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["PLAIN", "INPUT", "NEEDED", "AFTER"]);
+        assert_eq!(info.file_var_names(), ["INPUT", "NEEDED"]);
+        assert_eq!(info.vars[0].kind, VarKind::String);
+        assert_eq!(info.vars[2].default, None);
+
+        let given = vec![("OTHER".to_string(), "1".to_string())];
+        assert_eq!(
+            info.with_file_defaults(given),
+            vec![
+                ("OTHER".to_string(), "1".to_string()),
+                ("INPUT".to_string(), "docs/a.md".to_string()),
+            ]
+        );
+        let overridden = vec![("INPUT".to_string(), "b.md".to_string())];
+        assert_eq!(info.with_file_defaults(overridden.clone()), overridden);
+    }
+
+    const NEEDS_FILE: &str = concat!(
+        "vars { NEEDED file\n PLAIN \"p\" }\n",
+        "client c { model \"claude:opus\" privacy public }\n",
+        "agent a { client c scope { owned [\"o.md\"] } prompt #\"read {{NEEDED}} {{PLAIN}}\"# }\n",
+        "workflow w { steps [a] }\n",
+    );
+
+    #[test]
+    fn a_file_var_without_a_default_must_be_supplied() {
+        let err = crate::compile_with_vars(NEEDS_FILE, "t", None, None, &[], &[], &[]).unwrap_err();
+        assert!(format!("{err:?}").contains("file var `NEEDED`"), "{err:?}");
+
+        let vars = vec![("NEEDED".to_string(), "docs/a.md".to_string())];
+        let plan = crate::compile_with_vars(NEEDS_FILE, "t", None, None, &vars, &[], &[]).unwrap();
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("read docs/a.md p"), "{shown}");
+    }
+
+    #[test]
+    fn dir_vars_are_listed_apart_from_files_and_can_be_required() {
+        let info = inspect(concat!(
+            "vars {\n  SRC dir \"src\"\n  DATA dir\n  IN file \"a.md\"\n}\n",
+            "agent a { prompt #\"{{SRC}} {{DATA}} {{IN}}\"# }\n",
+        ));
+        assert_eq!(info.dir_var_names(), ["SRC", "DATA"]);
+        assert_eq!(info.file_var_names(), ["IN"]);
+        assert_eq!(
+            info.with_file_defaults(Vec::new()),
+            vec![("IN".to_string(), "a.md".to_string())],
+            "a dir default is not an override"
+        );
+
+        let src = NEEDS_FILE.replace("NEEDED file\n", "NEEDED dir\n");
+        let err = crate::compile_with_vars(&src, "t", None, None, &[], &[], &[]).unwrap_err();
+        assert!(format!("{err:?}").contains("dir var `NEEDED`"), "{err:?}");
+    }
+
+    #[test]
+    fn untyped_vars_compile_exactly_as_before() {
+        let src = NEEDS_FILE.replace("NEEDED file\n", "NEEDED \"x.md\"\n");
+        let plan = crate::compile_with_vars(&src, "t", None, None, &[], &[], &[]).unwrap();
+        assert!(format!("{plan:?}").contains("read x.md p"));
+    }
+
+    #[test]
+    fn agent_level_vars_take_no_type() {
+        let src = concat!(
+            "client c { model \"claude:opus\" privacy public }\n",
+            "agent a { client c vars { X file \"y\" } prompt #\"{{X}}\"# }\n",
+        );
+        assert!(crate::compile_with_vars(src, "t", None, None, &[], &[], &[]).is_err());
+    }
+
+    #[test]
+    fn script_and_profile_tiers_are_listed_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("p.gaviero");
+        std::fs::write(
+            &profile,
+            "client a { model \"claude:opus\" privacy public }\ntier top a\ntier low a\n",
+        )
+        .unwrap();
+        assert_eq!(profile_tier_names(&profile).unwrap(), ["top", "low"]);
+
+        let info = inspect(concat!(
+            "client c { model \"claude:opus\" privacy public }\n",
+            "tier mine c\n",
+            "agent a { tier mine prompt #\"x\"# }\n",
+        ));
+        assert_eq!(info.tiers, ["mine"]);
     }
 
     #[test]

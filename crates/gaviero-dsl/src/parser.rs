@@ -231,6 +231,35 @@ where
             .delimited_by(just(Token::LBrace), just(Token::RBrace)),
     );
 
+    // Top-level entries are a run's inputs, so they may also carry a type:
+    // `KEY file "default"`, or `KEY file` for a file the caller must supply;
+    // `dir` likewise for a folder.
+    let var_kind = select! {
+        Token::Ident(s) if s == "file" => VarKind::File,
+        Token::Ident(s) if s == "dir" => VarKind::Dir,
+    };
+    let script_var = choice((
+        ident.then(string).map(|(name, value)| VarDecl {
+            name,
+            kind: VarKind::String,
+            default: Some(value),
+        }),
+        ident
+            .then(var_kind)
+            .then(string.or_not())
+            .map(|((name, kind), default)| VarDecl {
+                name,
+                kind,
+                default,
+            }),
+    ));
+    let script_vars_block = just(Token::KwVars).ignore_then(
+        script_var
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+    );
+
     // ── client declaration ────────────────────────────────────────
 
     // `effort <ident-or-string>` — accept bare identifiers (e.g. `effort high`)
@@ -1277,7 +1306,7 @@ where
         agent_decl.map(Item::Agent),
         workflow_decl.map(Item::Workflow),
         prompt_decl.map(Item::Prompt),
-        vars_block.map(Item::Vars),
+        script_vars_block.map(Item::Vars),
         tier_alias_decl.map(Item::TierAlias),
     ));
 

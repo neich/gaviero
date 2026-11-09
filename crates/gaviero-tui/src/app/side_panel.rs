@@ -1862,6 +1862,16 @@ fn resolve_at_path(
     rel_path: &str,
     named_roots: &[(String, std::path::PathBuf)],
 ) -> Option<std::path::PathBuf> {
+    resolve_named_path(rel_path, named_roots, std::path::Path::is_file)
+}
+
+/// A completion's display path back to a real path `exists` accepts. In a
+/// multi-folder workspace the path may start with a folder label.
+pub(super) fn resolve_named_path(
+    rel_path: &str,
+    named_roots: &[(String, std::path::PathBuf)],
+    exists: fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
     let multi_root = named_roots.len() > 1;
     let labels = unique_root_labels(named_roots);
     if multi_root {
@@ -1874,10 +1884,10 @@ fn resolve_at_path(
             }
             if let Some(tail) = rel_path
                 .strip_prefix(label.as_str())
-                .and_then(|t| t.strip_prefix('/'))
+                .and_then(|t| if t.is_empty() { Some(t) } else { t.strip_prefix('/') })
             {
                 let abs_path = named_roots[i].1.join(tail);
-                if abs_path.is_file() {
+                if exists(&abs_path) {
                     return Some(abs_path);
                 }
             }
@@ -1885,7 +1895,7 @@ fn resolve_at_path(
     }
     for (_, root) in named_roots {
         let abs_path = root.join(rel_path);
-        if abs_path.is_file() {
+        if exists(&abs_path) {
             return Some(abs_path);
         }
     }
@@ -1932,6 +1942,14 @@ fn completion_display_paths(
     roots: &[(String, std::path::PathBuf)],
     excludes_for: impl Fn(&std::path::Path) -> Vec<String>,
 ) -> Vec<String> {
+    completion_display_entries(roots, excludes_for, false)
+}
+
+fn completion_display_entries(
+    roots: &[(String, std::path::PathBuf)],
+    excludes_for: impl Fn(&std::path::Path) -> Vec<String>,
+    want_dirs: bool,
+) -> Vec<String> {
     let multi_root = roots.len() > 1;
     let labels = unique_root_labels(roots);
 
@@ -1945,10 +1963,17 @@ fn completion_display_paths(
         // root. Directory order is unspecified and that folder can hold
         // thousands of state files, so pin it ahead of the capped walk.
         let mut listed = Vec::new();
-        if root.join("settings.json").is_file() && !matches_exclude("settings.json", &excludes) {
+        if !want_dirs
+            && root.join("settings.json").is_file()
+            && !matches_exclude("settings.json", &excludes)
+        {
             listed.push("settings.json".to_string());
         }
-        listed.extend(list_workspace_files(root, per_root, &excludes));
+        listed.extend(if want_dirs {
+            list_workspace_dirs(root, per_root, &excludes)
+        } else {
+            list_workspace_files(root, per_root, &excludes)
+        });
         for f in listed {
             let display = if multi_root && !label.is_empty() {
                 format!("{}/{}", label, f)
@@ -1963,6 +1988,32 @@ fn completion_display_paths(
     files
 }
 
+/// Completions for a field holding one path: the same sources as `/attach`,
+/// with every match kept because the popup scrolls.
+pub(super) fn path_completion_matches(app: &App, query: &str) -> Vec<String> {
+    let trimmed = query.trim_start();
+    if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
+        return list_filesystem_entries(trimmed, usize::MAX);
+    }
+    crate::panels::agent_chat::match_file_paths(&workspace_completion_files(app), query, usize::MAX)
+}
+
+/// [`path_completion_matches`] for a field holding a folder.
+pub(super) fn dir_completion_matches(app: &App, query: &str) -> Vec<String> {
+    let trimmed = query.trim_start();
+    if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
+        let mut dirs = list_filesystem_entries(trimmed, usize::MAX);
+        dirs.retain(|m| m.ends_with('/'));
+        return dirs;
+    }
+    let dirs = completion_display_entries(
+        &completion_named_roots(&app.workspace),
+        |root| parse_exclude_patterns(&app.workspace, Some(root)),
+        true,
+    );
+    crate::panels::agent_chat::match_file_paths(&dirs, query, usize::MAX)
+}
+
 /// List up to 50 directory entries matching the user's typed prefix.
 ///
 /// The query is split into a parent directory (everything up to and
@@ -1970,7 +2021,10 @@ fn completion_display_paths(
 /// whose names start with the prefix are returned as absolute paths with
 /// a trailing `/` for subdirectories. `~` is expanded against `$HOME`.
 fn list_filesystem_matches(query: &str) -> Vec<String> {
-    const MAX_ENTRIES: usize = 50;
+    list_filesystem_entries(query, 50)
+}
+
+fn list_filesystem_entries(query: &str, max_entries: usize) -> Vec<String> {
     let expanded = expand_tilde(query);
     let (parent, prefix) = match expanded.rfind('/') {
         Some(idx) => (&expanded[..=idx], &expanded[idx + 1..]),
@@ -1992,7 +2046,7 @@ fn list_filesystem_matches(query: &str) -> Vec<String> {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let suffix = if is_dir { "/" } else { "" };
         matches.push(format!("{}{}{}", display_prefix, name_str, suffix));
-        if matches.len() >= MAX_ENTRIES {
+        if matches.len() >= max_entries {
             break;
         }
     }
@@ -2000,7 +2054,7 @@ fn list_filesystem_matches(query: &str) -> Vec<String> {
     matches
 }
 
-fn expand_tilde(query: &str) -> String {
+pub(super) fn expand_tilde(query: &str) -> String {
     if let Some(rest) = query.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return format!("{}/{}", home.display(), rest);

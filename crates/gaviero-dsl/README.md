@@ -121,6 +121,25 @@ The DSL has no runtime config — behaviour is declared in the script and adjust
 
 Provider resolution, memory namespaces, and verification execution are configured via `.gaviero/settings.json` on the `gaviero-core` side. See [gaviero-cli](../gaviero-cli/README.md#configuration).
 
+### Typed inputs
+
+A top-level var is a string unless it says otherwise. `file` marks the path of an existing input file, and `dir` a folder:
+
+```gaviero
+vars {
+    OUT_DIR "plans/out"             // a string, as always
+    BRIEF   file "docs/brief.md"    // a file, with a default
+    PLAN    file                    // a file the caller must supply
+    SOURCES dir "src"               // a folder
+}
+```
+
+A run is refused before it starts if a `file` var names nothing on disk. Use a plain string or `dir` for a path the run will create. A `file` or `dir` with no default and no `--var` fails compilation. Agent-level `vars` take no type.
+
+A `file` outside the run root is copied in, and an uncommitted one is copied into agent worktrees. `dir` has one effect only: the SWARM form completes the field with folders. At run time it is a string, so a folder need not exist and is never copied.
+
+In the TUI's SWARM form `file` and `dir` vars complete as you type: `file` from the same list as `@` in chat, `dir` from the workspace's folders. The popup shows eight rows and scrolls through every match (Up/Down, PageUp/PageDown, wheel). Roster and client `param` fields complete `tier:<name>` from the tiers the run would have: the profile selected on the form, then the script's own.
+
 ### Model profiles
 
 Write a script against tiers, not providers. Tier names are free-form; `low`, `medium`, `high` and `top` are the convention.

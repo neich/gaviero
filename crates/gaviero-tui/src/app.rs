@@ -1595,6 +1595,19 @@ fn save_clipboard_image_as_png(img: &arboard::ImageData) -> anyhow::Result<std::
 }
 
 fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String]) -> Vec<String> {
+    list_workspace_entries(root, limit, excludes, false)
+}
+
+fn list_workspace_dirs(root: &std::path::Path, limit: usize, excludes: &[String]) -> Vec<String> {
+    list_workspace_entries(root, limit, excludes, true)
+}
+
+fn list_workspace_entries(
+    root: &std::path::Path,
+    limit: usize,
+    excludes: &[String],
+    want_dirs: bool,
+) -> Vec<String> {
     let mut files = Vec::new();
     fn walk(
         dir: &std::path::Path,
@@ -1602,6 +1615,7 @@ fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String
         files: &mut Vec<String>,
         limit: usize,
         excludes: &[String],
+        want_dirs: bool,
     ) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -1619,20 +1633,18 @@ fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String
                 continue;
             }
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                walk(
-                    &entry.path(),
-                    &format!("{}/", rel_path),
-                    files,
-                    limit,
-                    excludes,
-                );
-            } else {
+                let inner = format!("{}/", rel_path);
+                if want_dirs {
+                    files.push(rel_path);
+                }
+                walk(&entry.path(), &inner, files, limit, excludes, want_dirs);
+            } else if !want_dirs {
                 files.push(rel_path);
             }
         }
     }
     if std::fs::read_dir(root).is_ok() {
-        walk(root, "", &mut files, limit, excludes);
+        walk(root, "", &mut files, limit, excludes, want_dirs);
     }
     files
 }

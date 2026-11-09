@@ -15,7 +15,8 @@ use super::state::{Focus, SidePanelMode};
 use crate::event::Event;
 use crate::keymap::Action;
 use crate::panels::swarm_dashboard::{
-    DashboardFocus, PlannedAgent, ScriptRow, SwarmForm, SwarmUpdate, SwarmView,
+    DashboardFocus, FieldRole, FormValues, PlannedAgent, ScriptRow, SwarmForm, SwarmUpdate,
+    SwarmView,
 };
 use crate::widgets::prompt_input::{self, AutocompleteMode};
 use crate::widgets::render_utils::strip_ansi;
@@ -344,7 +345,14 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         .as_mut()
         .ok_or_else(|| "no script selected".to_string())?;
     form.error = None;
-    let values = form.collect()?;
+    let mut values = form.collect()?;
+    let named_roots = super::side_panel::completion_named_roots(&app.workspace);
+    if let Err((name, message)) =
+        locate_path_vars(&mut values, &form.inspection, &named_roots)
+    {
+        form.focus_field(&name);
+        return Err(message);
+    }
     let script = form.script.clone();
     let execution_mode = form.execution_mode();
 
@@ -467,6 +475,53 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
             let _ = tx.send(Event::Swarm { run, update });
         }
     });
+    Ok(())
+}
+
+/// Turn each `file` and `dir` var into the path agents should see. Values
+/// come from the same list as `@` in chat, so in a multi-folder workspace they
+/// can start with a folder label. On a missing file, returns the var and the
+/// message.
+fn locate_path_vars(
+    values: &mut FormValues,
+    inspection: &gaviero_dsl::ScriptInspection,
+    named_roots: &[(String, PathBuf)],
+) -> Result<(), (String, String)> {
+    let (files, dirs) = (inspection.file_var_names(), inspection.dir_var_names());
+    let root = values.root.clone();
+    for (name, value) in values.vars.iter_mut() {
+        let is_dir = dirs.contains(name);
+        if !is_dir && !files.contains(name) {
+            continue;
+        }
+        let typed = super::side_panel::expand_tilde(value.trim().trim_start_matches('@'));
+        if is_dir {
+            // Only undoes what completion inserted. A folder that is not
+            // there is the script's business, like any other string.
+            let lookup = match typed.trim_end_matches(['/', '\\']) {
+                "" => typed.as_str(),
+                trimmed => trimmed,
+            };
+            if root.join(lookup).is_dir() {
+                *value = lookup.to_string();
+            } else if let Some(host) =
+                super::side_panel::resolve_named_path(lookup, named_roots, Path::is_dir)
+            {
+                *value = script_run::path_spec_for_worktree(&root, &host);
+            }
+            continue;
+        }
+        let direct = root.join(&typed);
+        let host = if direct.is_file() {
+            Some(direct)
+        } else {
+            super::side_panel::resolve_named_path(&typed, named_roots, Path::is_file)
+        };
+        let Some(host) = host else {
+            return Err((name.clone(), format!("{name}: file not found: {typed}")));
+        };
+        *value = script_run::path_spec_for_worktree(&root, &host);
+    }
     Ok(())
 }
 
@@ -655,6 +710,12 @@ pub(super) fn handle_escape(app: &mut App) -> bool {
                 prompt.autocomplete.reset();
                 return true;
             }
+            if let Some(form) = dash.form.as_mut()
+                && form.completion.is_open()
+            {
+                form.completion.reset();
+                return true;
+            }
             dash.form = None;
             dash.view = SwarmView::Picker;
             refresh_picker(app);
@@ -702,6 +763,7 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
                     refresh_prompt_autocomplete(app);
                 } else if let Some(input) = form.focused_input() {
                     input.insert_str(&text.replace(['\r', '\n'], " "));
+                    refresh_field_completion(app);
                 }
             }
         }
@@ -785,6 +847,58 @@ fn refresh_prompt_autocomplete(app: &mut App) {
     match files {
         Some(files) => prompt_input::set_file_matches(&mut prompt.autocomplete, &files),
         None => prompt_input::set_skill_matches(&mut prompt.autocomplete, &catalog, Some(&repo)),
+    }
+}
+
+/// The tiers a run would have right now: the profile the form has selected,
+/// then whatever the script binds itself ([`gaviero_dsl`] merges them so).
+fn active_tiers(app: &App) -> Vec<String> {
+    let Some(form) = app.swarm_dashboard.form.as_ref() else {
+        return Vec::new();
+    };
+    let root = &form.folders[form.selected_folder()].1;
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    let repo = gaviero_core::memory::scope::hash_path(&canonical);
+    let mut tiers = ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
+        .select(form.selected_profile().as_deref(), Some(&repo), root)
+        .ok()
+        .flatten()
+        .and_then(|profile| gaviero_dsl::profile_tier_names(&profile.path).ok())
+        .unwrap_or_default();
+    for tier in &form.inspection.tiers {
+        if !tiers.contains(tier) {
+            tiers.push(tier.clone());
+        }
+    }
+    tiers
+}
+
+/// Bring the focused field's popup up to date after its text changed.
+fn refresh_field_completion(app: &mut App) {
+    let Some(form) = app.swarm_dashboard.form.as_mut() else {
+        return;
+    };
+    form.update_completion();
+    if !form.completion.active {
+        return;
+    }
+    let is_tier = form.completion.mode == AutocompleteMode::Tier;
+    let wants_dir = form.focused_role() == Some(FieldRole::Dir);
+    let query = form.completion.query.clone();
+    if is_tier {
+        let tiers = active_tiers(app);
+        if let Some(form) = app.swarm_dashboard.form.as_mut() {
+            prompt_input::set_tier_matches(&mut form.completion, &tiers);
+        }
+    } else {
+        let matches = if wants_dir {
+            super::side_panel::dir_completion_matches(app, &query)
+        } else {
+            super::side_panel::path_completion_matches(app, &query)
+        };
+        if let Some(form) = app.swarm_dashboard.form.as_mut() {
+            form.completion.matches = matches;
+        }
     }
 }
 
@@ -912,6 +1026,31 @@ fn handle_form(app: &mut App, action: Action) {
     let Some(form) = app.swarm_dashboard.form.as_mut() else {
         return;
     };
+    if form.completion.is_open() {
+        match action {
+            Action::Tab | Action::Enter => {
+                form.accept_completion();
+                return;
+            }
+            Action::CursorUp => {
+                form.completion.select_previous();
+                return;
+            }
+            Action::CursorDown => {
+                form.completion.select_next();
+                return;
+            }
+            Action::PageUp => {
+                form.completion.move_selection(-(prompt_input::POPUP_ROWS as isize));
+                return;
+            }
+            Action::PageDown => {
+                form.completion.move_selection(prompt_input::POPUP_ROWS as isize);
+                return;
+            }
+            _ => {}
+        }
+    }
     match action {
         Action::Tab | Action::CursorDown => form.focus_next(),
         Action::CursorUp => form.focus_previous(),
@@ -928,6 +1067,12 @@ fn handle_form(app: &mut App, action: Action) {
             form.error = None;
             if let Some(input) = form.focused_input() {
                 edit_input(input, &other);
+            }
+            if matches!(
+                other,
+                Action::InsertChar(_) | Action::Backspace | Action::DeleteWordBack
+            ) {
+                refresh_field_completion(app);
             }
         }
     }
@@ -1109,6 +1254,13 @@ pub(super) fn scroll_wheel(app: &mut App, up: bool, col: u16, row: u16) {
             }
         }
         SwarmView::Form => {
+            if let Some(form) = dash.form.as_mut()
+                && form.completion.is_open()
+            {
+                let step = delta as isize;
+                form.completion.move_selection(if up { -step } else { step });
+                return;
+            }
             if let Some(prompt) = dash.form.as_mut().and_then(|f| f.prompt_mut())
                 && prompt.area.is_some_and(|a| a.contains((col, row).into()))
             {
@@ -1311,9 +1463,17 @@ workflow run {
         dir: &Path,
         base_url: &str,
     ) -> (App, mpsc::UnboundedReceiver<Event>) {
+        app_with_source(dir, base_url, SCRIPT)
+    }
+
+    fn app_with_source(
+        dir: &Path,
+        base_url: &str,
+        source: &str,
+    ) -> (App, mpsc::UnboundedReceiver<Event>) {
         let script_dir = dir.join(".gaviero/dsl/report");
         std::fs::create_dir_all(&script_dir).unwrap();
-        std::fs::write(script_dir.join("report.gaviero"), SCRIPT).unwrap();
+        std::fs::write(script_dir.join("report.gaviero"), source).unwrap();
         std::fs::write(
             dir.join(".gaviero/settings.json"),
             serde_json::json!({
@@ -1547,6 +1707,316 @@ workflow run {
 
         assert!(handle_escape(&mut app));
         assert_eq!(app.swarm_dashboard.view, SwarmView::Run, "the last run can be reopened");
+    }
+
+    const FILE_SCRIPT: &str = r#"client local {
+    model "ollama:qwen"
+    privacy public
+}
+
+agent writer {
+    client local
+    scope { owned ["report.md"] }
+    produces ["report.md"]
+    prompt "Summarize {{BRIEF}}."
+    max_retries 0
+}
+
+vars { BRIEF file }
+
+workflow run {
+    execution_mode document
+    steps [writer]
+    max_parallel 1
+}
+"#;
+
+    const ROSTER_SCRIPT: &str = r#"client c {
+    model "ollama:qwen"
+    privacy public
+}
+agent worker { client c prompt "w" }
+agent judge { client c prompt "j" }
+workflow run {
+    param panel [ { id "a" model "tier:low" } ]
+    steps [ loop { agents [worker] reviewers panel until agent judge } judge ]
+}
+"#;
+
+    fn field_text(app: &App, name: &str) -> String {
+        let form = app.swarm_dashboard.form.as_ref().unwrap();
+        let field = form.fields.iter().find(|f| f.name == name).unwrap();
+        match &field.value {
+            crate::panels::swarm_dashboard::FieldValue::Text(input) => input.text.clone(),
+            _ => panic!("{name} is not a text field"),
+        }
+    }
+
+    fn completion_matches(app: &App) -> Vec<String> {
+        app.swarm_dashboard.form.as_ref().unwrap().completion.matches.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_is_chosen_from_completion_and_reaches_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/brief.md"), "x").unwrap();
+        let (url, asked) = fake_ollama("report.md");
+        let (mut app, mut rx) = app_with_source(&root, &url, FILE_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "brie");
+        assert_eq!(completion_matches(&app), vec!["docs/brief.md".to_string()]);
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(field_text(&app, "BRIEF"), "docs/brief.md");
+
+        press_run(&mut app);
+        assert_eq!(
+            app.swarm_dashboard.view,
+            SwarmView::Run,
+            "error: {:?}",
+            app.swarm_dashboard.form.as_ref().and_then(|f| f.error.clone())
+        );
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        let request = asked.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.contains("Summarize docs/brief.md."), "{request}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_file_stays_on_the_form_with_the_field_focused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_source(&root, "http://127.0.0.1:9", FILE_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "nope.md");
+        assert!(completion_matches(&app).is_empty());
+        press_run(&mut app);
+
+        let dash = &app.swarm_dashboard;
+        assert_eq!(dash.view, SwarmView::Form);
+        assert!(!dash.has_run());
+        let form = dash.form.as_ref().unwrap();
+        assert_eq!(form.error.as_deref(), Some("BRIEF: file not found: nope.md"));
+        assert_eq!(form.focused_role(), Some(FieldRole::File));
+    }
+
+    #[test]
+    fn a_folder_labelled_path_becomes_relative_to_the_run_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let (one, two) = (outer_path.join("one"), outer_path.join("two"));
+        std::fs::create_dir_all(one.join("docs")).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(one.join("docs/a.md"), "x").unwrap();
+        std::fs::write(two.join("b.md"), "x").unwrap();
+        let roots = vec![("one".to_string(), one.clone()), ("two".to_string(), two.clone())];
+        let inspection = file_inspection(gaviero_dsl::VarKind::File);
+        let values = |value: &str| FormValues {
+            root: one.clone(),
+            workflow: None,
+            profile: None,
+            prompt: None,
+            vars: vec![("IN".to_string(), value.to_string())],
+            params: Vec::new(),
+        };
+
+        let mut labelled = values("one/docs/a.md");
+        locate_path_vars(&mut labelled, &inspection, &roots).unwrap();
+        assert_eq!(labelled.vars[0].1, "docs/a.md");
+
+        let mut other_folder = values("two/b.md");
+        locate_path_vars(&mut other_folder, &inspection, &roots).unwrap();
+        assert_eq!(
+            PathBuf::from(&other_folder.vars[0].1),
+            two.join("b.md"),
+            "outside the run root stays absolute, for run preparation to copy in"
+        );
+
+        let mut missing = values("one/none.md");
+        assert_eq!(locate_path_vars(&mut missing, &inspection, &roots).unwrap_err().0, "IN");
+
+        // The same paths as a `dir` var.
+        let inspection = file_inspection(gaviero_dsl::VarKind::Dir);
+        let mut folder = values("one/docs/");
+        locate_path_vars(&mut folder, &inspection, &roots).unwrap();
+        assert_eq!(folder.vars[0].1, "docs", "label and trailing slash are gone");
+
+        let mut run_root = values("one");
+        locate_path_vars(&mut run_root, &inspection, &roots).unwrap();
+        assert_eq!(run_root.vars[0].1, ".", "a label alone is that folder");
+
+        let mut not_there = values("output/new");
+        locate_path_vars(&mut not_there, &inspection, &roots).unwrap();
+        assert_eq!(not_there.vars[0].1, "output/new", "left as typed");
+    }
+
+    fn file_inspection(kind: gaviero_dsl::VarKind) -> gaviero_dsl::ScriptInspection {
+        gaviero_dsl::ScriptInspection {
+            workflows: Vec::new(),
+            vars: vec![gaviero_dsl::VarInspection {
+                name: "IN".to_string(),
+                default: None,
+                kind,
+            }],
+            requires_prompt: false,
+            accepts_prompt: false,
+            default_execution: ExecutionMode::Repo,
+            tiers: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_is_chosen_from_completion_and_reaches_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs/specs")).unwrap();
+        std::fs::write(root.join("docs/specs/a.md"), "x").unwrap();
+        let (url, asked) = fake_ollama("report.md");
+        let script = FILE_SCRIPT.replace("BRIEF file", "BRIEF dir");
+        let (mut app, mut rx) = app_with_source(&root, &url, &script);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "spec");
+        assert_eq!(completion_matches(&app), vec!["docs/specs".to_string()]);
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(field_text(&app, "BRIEF"), "docs/specs");
+
+        press_run(&mut app);
+        assert_eq!(
+            app.swarm_dashboard.view,
+            SwarmView::Run,
+            "error: {:?}",
+            app.swarm_dashboard.form.as_ref().and_then(|f| f.error.clone())
+        );
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        let request = asked.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.contains("Summarize docs/specs."), "{request}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_that_does_not_exist_yet_runs_and_empty_folders_are_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("empty_one")).unwrap();
+        let (url, asked) = fake_ollama("report.md");
+        let script = FILE_SCRIPT.replace("BRIEF file", "BRIEF dir");
+        let (mut app, mut rx) = app_with_source(&root, &url, &script);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "empty_");
+        assert_eq!(completion_matches(&app), vec!["empty_one".to_string()]);
+        for _ in 0.."empty_".len() {
+            handle_action(&mut app, Action::Backspace);
+        }
+
+        type_text(&mut app, "out/new");
+        assert!(completion_matches(&app).is_empty());
+        press_run(&mut app);
+        assert_eq!(
+            app.swarm_dashboard.view,
+            SwarmView::Run,
+            "error: {:?}",
+            app.swarm_dashboard.form.as_ref().and_then(|f| f.error.clone())
+        );
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        let request = asked.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.contains("Summarize out/new."), "{request}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_matching_file_is_offered_and_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        for i in 0..12 {
+            std::fs::write(root.join(format!("docs/note{i:02}.md")), "x").unwrap();
+        }
+        let (mut app, _rx) = app_with_source(&root, "http://127.0.0.1:9", FILE_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "note");
+        let matches = completion_matches(&app);
+        assert_eq!(matches.len(), 12, "{matches:?}");
+
+        handle_action(&mut app, Action::PageDown);
+        assert_eq!(app.swarm_dashboard.form.as_ref().unwrap().completion.selected, 8);
+        handle_action(&mut app, Action::PageUp);
+        assert_eq!(app.swarm_dashboard.form.as_ref().unwrap().completion.selected, 0);
+
+        scroll_wheel(&mut app, false, 0, 0);
+        let after_wheel = app.swarm_dashboard.form.as_ref().unwrap().completion.selected;
+        assert_eq!(after_wheel, crate::theme::MOUSE_SCROLL_DELTA);
+
+        for _ in 0..20 {
+            handle_action(&mut app, Action::CursorDown);
+        }
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(field_text(&app, "BRIEF"), matches[11]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_field_refuses_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let (mut app, _rx) = app_with_source(&root, "http://127.0.0.1:9", FILE_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "docs");
+        assert!(completion_matches(&app).is_empty());
+        press_run(&mut app);
+
+        let form = app.swarm_dashboard.form.as_ref().unwrap();
+        assert_eq!(form.error.as_deref(), Some("BRIEF: file not found: docs"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roster_tiers_come_from_the_profile_selected_on_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let profiles = root.join(".gaviero/dsl/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let client = "client a { model \"ollama:qwen\" privacy public }\n";
+        std::fs::write(profiles.join("fast.gaviero"), format!("{client}tier quick a\ntier deep a\n")).unwrap();
+        std::fs::write(profiles.join("slow.gaviero"), format!("{client}tier glacial a\n")).unwrap();
+        let (mut app, _rx) = app_with_source(&root, "http://127.0.0.1:9", ROSTER_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        // Profile selector first: auto -> fast.
+        handle_action(&mut app, Action::CursorRight);
+        handle_action(&mut app, Action::Tab);
+        for _ in 0.."low".len() {
+            handle_action(&mut app, Action::Backspace);
+        }
+        assert_eq!(
+            completion_matches(&app),
+            vec!["tier:quick".to_string(), "tier:deep".to_string()]
+        );
+
+        handle_action(&mut app, Action::CursorDown);
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(field_text(&app, "panel"), "a=tier:deep");
+
+        // Same field, the other profile.
+        handle_action(&mut app, Action::CursorUp);
+        handle_action(&mut app, Action::CursorRight);
+        handle_action(&mut app, Action::Tab);
+        for _ in 0.."deep".len() {
+            handle_action(&mut app, Action::Backspace);
+        }
+        assert_eq!(completion_matches(&app), vec!["tier:glacial".to_string()]);
     }
 
     /// Open the form with a repo skill named `lint` available.

@@ -58,7 +58,14 @@ module.exports = grammar({
     vars_block: ($) =>
       seq("vars", "{", repeat($.vars_pair), "}"),
 
-    vars_pair: ($) => seq($.identifier, $._string_value),
+    // `KEY "value"`, or a typed top-level input: `KEY file|dir ["default"]`.
+    vars_pair: ($) =>
+      choice(
+        seq($.identifier, $._string_value),
+        seq($.identifier, $.var_type, optional($._string_value)),
+      ),
+
+    var_type: ($) => choice("file", "dir"),
 
     // ── Top-level tier alias: `tier <name> <client-ref>` ─────────
     tier_alias_declaration: ($) =>
@@ -221,6 +228,18 @@ module.exports = grammar({
         seq("escalate_after", $.integer),
         $.verify_block,
         $.param_declaration,
+        $.pattern_block,
+      ),
+
+    // `pattern map_reduce { discover <agent> reduce <agent> max_spawn <n> }`
+    pattern_block: ($) =>
+      seq("pattern", $.identifier, "{", repeat($.map_reduce_field), "}"),
+
+    map_reduce_field: ($) =>
+      choice(
+        seq("discover", $.identifier),
+        seq("reduce", $.identifier),
+        seq("max_spawn", $.integer),
       ),
 
     // `param <name>`                                — bare; kind inferred from usage

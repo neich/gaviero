@@ -19,7 +19,7 @@ pub enum Item {
     Prompt(PromptDecl),
     /// A top-level `vars { KEY "value" ... }` block.
     /// Keys defined here are substituted compile-time across all agents.
-    Vars(Vec<(String, String)>),
+    Vars(Vec<VarDecl>),
     /// A top-level `tier <name> <client>` alias — a named routing label
     /// that resolves to a concrete client profile. See [`TierAlias`].
     TierAlias(TierAlias),
@@ -46,6 +46,39 @@ pub struct IncludeDecl {
     pub path: String,
     pub path_span: Span,
     pub span: Span,
+}
+
+/// What a script-level var holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VarKind {
+    #[default]
+    String,
+    /// `KEY file ["default"]` — the path of an existing input file.
+    File,
+    /// `KEY dir ["default"]` — a folder. Only changes what the SWARM form
+    /// completes; at run time it is a string.
+    Dir,
+}
+
+impl VarKind {
+    /// The word a script uses for this type.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            VarKind::String => "string",
+            VarKind::File => "file",
+            VarKind::Dir => "dir",
+        }
+    }
+}
+
+/// One entry of a top-level `vars` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarDecl {
+    pub name: String,
+    pub kind: VarKind,
+    /// `None` only for a typed `KEY file` / `KEY dir`, which the caller must
+    /// supply.
+    pub default: Option<String>,
 }
 
 /// Top-level `tier <name> <client-ref>` declaration.

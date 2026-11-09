@@ -974,13 +974,29 @@ fn prepare_swarm_workspace(
         );
     }
 
+    let mut vars = parse_var_overrides(&cli.vars)?;
+    // A script that cannot be read is reported with its diagnostics at compile.
+    if let Some(inspection) = cli
+        .script
+        .as_deref()
+        .and_then(|path| gaviero_dsl::inspect_file(path).ok())
+    {
+        vars = inspection.with_file_defaults(vars);
+        gaviero_core::swarm::script_run::require_file_vars(
+            cwd,
+            cli.workspace.as_deref().unwrap_or(&cli.repo),
+            &inspection.file_var_names(),
+            &vars,
+        )?;
+    }
+
     let anchor = gaviero_core::swarm::script_run::anchor_script_run(
         cwd,
         &cli.repo,
         cli.workspace.as_deref(),
         cli_repo_is_default(cli),
         execution_mode,
-        parse_var_overrides(&cli.vars)?,
+        vars,
     )?;
     for note in &anchor.notes {
         eprintln!("{note}");

@@ -118,6 +118,25 @@ pub fn anchor_script_run(
     })
 }
 
+/// Refuse a run whose `file` vars (`names`) point at nothing, before anything
+/// moves. An empty value is left to the compiler, which knows if it is required.
+pub fn require_file_vars(
+    cwd: &Path,
+    repo: &Path,
+    names: &[String],
+    vars: &[(String, String)],
+) -> Result<()> {
+    for name in names {
+        let Some(value) = var(vars, name).filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        if resolve_host_path_early(cwd, repo, value).is_none() {
+            bail!("{name}: file not found: {value}");
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a path from a var before the workspace root is finalised.
 fn resolve_host_path_early(cwd: &Path, repo: &Path, value: &str) -> Option<PathBuf> {
     let trimmed = value.trim();
@@ -228,7 +247,8 @@ fn resolve_var_file_path(repo: &Path, value: &str) -> Option<PathBuf> {
     host.is_file().then_some(host)
 }
 
-fn path_spec_for_worktree(repo: &Path, host: &Path) -> String {
+/// How a file is named to agents: relative to the run root when inside it.
+pub fn path_spec_for_worktree(repo: &Path, host: &Path) -> String {
     let normalize_rel = |rel: &Path| {
         let s = rel.to_string_lossy().replace('\\', "/");
         if s.is_empty() { ".".to_string() } else { s }
@@ -412,6 +432,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn file_vars_must_exist_and_other_vars_are_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "x").unwrap();
+        let names = vec!["INPUT".to_string()];
+        let check = |pairs: &[(&str, &str)]| {
+            require_file_vars(dir.path(), dir.path(), &names, &vars(pairs))
+        };
+
+        assert!(check(&[("INPUT", "a.md")]).is_ok());
+        assert!(check(&[("INPUT", ""), ("OTHER", "nope.md")]).is_ok());
+        assert!(check(&[]).is_ok());
+        let err = check(&[("INPUT", "nope.md")]).unwrap_err().to_string();
+        assert!(err.contains("INPUT") && err.contains("nope.md"), "{err}");
     }
 
     #[test]
