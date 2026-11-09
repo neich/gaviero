@@ -15,6 +15,7 @@ use ratatui::{
 };
 
 use crate::theme;
+use crate::widgets::prompt_input::{self, PromptInput};
 use crate::widgets::render_utils::{strip_ansi, word_wrap, write_text};
 use crate::widgets::scroll_state::ScrollState;
 use crate::widgets::scrollbar::render_scrollbar;
@@ -179,6 +180,8 @@ pub enum FieldRole {
 pub enum FieldValue {
     Choice { options: Vec<String>, selected: usize },
     Text(TextInput),
+    /// The script's prompt, in the same box the chat uses.
+    Prompt(Box<PromptInput>),
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +198,7 @@ impl FormField {
     fn text(&self) -> Option<&str> {
         match &self.value {
             FieldValue::Text(input) => Some(&input.text),
+            FieldValue::Prompt(prompt) => Some(&prompt.input.text),
             FieldValue::Choice { .. } => None,
         }
     }
@@ -220,10 +224,20 @@ impl FormField {
             FieldRole::Folder => "Where the script runs. ←/→ to change",
             FieldRole::Workflow => "Which workflow to run. ←/→ to change",
             FieldRole::Profile => "Which models the script's tiers use. ←/→ to change",
-            FieldRole::Prompt => "Replaces {{PROMPT}}. Alt+Enter for a new line",
+            FieldRole::Prompt => "Alt+Enter new line  Alt+↑↓ resize  $skill  @file",
             FieldRole::Param(ParamKindInfo::Roster) => "id=provider:model[@effort],… or id=tier:<name>,…",
             FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort] or tier:<name>",
             FieldRole::Var => "Script variable. Empty leaves it unset",
+        }
+    }
+
+    fn prompt_field(required: bool) -> Self {
+        Self {
+            name: "Prompt".to_string(),
+            role: FieldRole::Prompt,
+            value: FieldValue::Prompt(Box::default()),
+            default: None,
+            required,
         }
     }
 
@@ -258,6 +272,9 @@ pub struct FormValues {
 
 /// First entry of the Profile selector: no explicit choice.
 const PROFILE_AUTO: &str = "auto";
+
+/// Shown in place of the prompt box, so its absence does not look like a fault.
+const NO_PROMPT_NOTE: &str = "This script takes no prompt: its agents have fixed instructions.";
 
 pub struct SwarmForm {
     pub script: ScriptRow,
@@ -347,12 +364,7 @@ impl SwarmForm {
             });
         }
         if self.inspection.accepts_prompt {
-            fields.push(FormField::text_field(
-                "Prompt",
-                FieldRole::Prompt,
-                None,
-                self.inspection.requires_prompt,
-            ));
+            fields.push(FormField::prompt_field(self.inspection.requires_prompt));
         }
         if let Some(wf) = self.inspection.workflows.get(workflow) {
             for param in &wf.params {
@@ -381,7 +393,7 @@ impl SwarmForm {
             .find(|f| f.role == role)
             .and_then(|f| match f.value {
                 FieldValue::Choice { selected, .. } => Some(selected),
-                FieldValue::Text(_) => None,
+                _ => None,
             })
             .unwrap_or(0)
     }
@@ -443,12 +455,41 @@ impl SwarmForm {
     pub fn focused_input(&mut self) -> Option<&mut TextInput> {
         match &mut self.fields.get_mut(self.focus)?.value {
             FieldValue::Text(input) => Some(input),
+            FieldValue::Prompt(prompt) => Some(&mut prompt.input),
             FieldValue::Choice { .. } => None,
         }
     }
 
-    pub fn focused_role(&self) -> Option<FieldRole> {
-        self.fields.get(self.focus).map(|f| f.role)
+    /// The prompt box, when it has the keyboard.
+    pub fn focused_prompt(&mut self) -> Option<&mut PromptInput> {
+        match &mut self.fields.get_mut(self.focus)?.value {
+            FieldValue::Prompt(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// The prompt box, if this script takes a prompt.
+    pub fn prompt_mut(&mut self) -> Option<&mut PromptInput> {
+        self.fields.iter_mut().find_map(|f| match &mut f.value {
+            FieldValue::Prompt(prompt) => Some(prompt.as_mut()),
+            _ => None,
+        })
+    }
+
+    /// A press on the prompt box focuses it and places the cursor.
+    pub fn press_prompt(&mut self, col: u16, row: u16) {
+        let index = self.fields.iter().position(|f| match &f.value {
+            FieldValue::Prompt(prompt) => {
+                prompt.area.is_some_and(|a| a.contains((col, row).into()))
+            }
+            _ => false,
+        });
+        if let Some(index) = index {
+            self.focus = index;
+            if let Some(prompt) = self.prompt_mut() {
+                prompt.start_drag(col, row);
+            }
+        }
     }
 
     pub fn on_run_button(&self) -> bool {
@@ -643,6 +684,8 @@ pub struct SwarmDashboardState {
     pub view: SwarmView,
     pub picker: ScriptPicker,
     pub form: Option<SwarmForm>,
+    /// Height the user gave the prompt box with `Alt+Up/Down`; 0 fits the text.
+    pub prompt_rows: u16,
 
     /// Identifies the current run; updates from an older one are dropped.
     pub run_id: u64,
@@ -681,6 +724,7 @@ impl SwarmDashboardState {
             view: SwarmView::Picker,
             picker: ScriptPicker::new(),
             form: None,
+            prompt_rows: 0,
             run_id: 0,
             running: false,
             abort: None,
@@ -1174,10 +1218,16 @@ impl SwarmDashboardState {
             .unwrap_or_default();
         let error_height = (error_rows.len() as u16).min(area.height / 2);
 
+        let box_width = area.width.saturating_sub(2);
         let mut rows: Vec<FormRow> = Vec::new();
         for warning in &form.warnings {
             for line in word_wrap(warning, width + 2) {
                 rows.push(FormRow::plain(line, fg(theme::WARNING)));
+            }
+        }
+        if !form.inspection.accepts_prompt {
+            for line in word_wrap(NO_PROMPT_NOTE, width + 2) {
+                rows.push(FormRow::plain(line, fg(theme::TEXT_DIM)));
             }
         }
         for (index, field) in form.fields.iter().enumerate() {
@@ -1194,9 +1244,8 @@ impl SwarmDashboardState {
                     rows.push(FormRow::field(value, fg(theme::TEXT_BRIGHT), index, None));
                 }
                 FieldValue::Text(input) => {
-                    let max_rows = if field.role == FieldRole::Prompt { 4 } else { 2 };
                     let cursor = is_focused.then_some(input.cursor);
-                    for (text, col) in field_rows(&input.text, cursor, width, max_rows) {
+                    for (text, col) in field_rows(&input.text, cursor, width, 2) {
                         let style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
                         rows.push(FormRow {
                             text,
@@ -1204,7 +1253,18 @@ impl SwarmDashboardState {
                             cursor: col,
                             field: Some(index),
                             fill: Some(theme::INPUT_BG),
+                            prompt_box: false,
                         });
+                    }
+                }
+                FieldValue::Prompt(prompt) => {
+                    let height = prompt_input::box_height(
+                        self.prompt_rows,
+                        prompt.visual_line_count(box_width),
+                        (area.height / 2).max(3),
+                    );
+                    for _ in 0..height {
+                        rows.push(FormRow::prompt_box(index));
                     }
                 }
             }
@@ -1233,8 +1293,13 @@ impl SwarmDashboardState {
             .rposition(|r| r.field == Some(form.focus))
             .unwrap_or(0);
         let offset = form_offset(first_focused, last_focused, body_height, rows.len());
+        let mut box_rows: Option<(u16, u16)> = None;
         for (i, row) in rows.iter().skip(offset).take(body_height).enumerate() {
             let y = body_y + i as u16;
+            if row.prompt_box {
+                let (top, height) = box_rows.unwrap_or((y, 0));
+                box_rows = Some((top, height + 1));
+            }
             if let Some(fill) = row.fill {
                 for x in (area.x + 1)..right.saturating_sub(1) {
                     buf[(x, y)].set_style(Style::default().bg(fill));
@@ -1252,6 +1317,58 @@ impl SwarmDashboardState {
         for (i, line) in error_rows.iter().take(error_height as usize).enumerate() {
             let y = footer_y - error_height + i as u16;
             put(buf, area.x + 1, y, right, line, fg(theme::ERROR));
+        }
+
+        let box_area = box_rows.map(|(y, height)| Rect {
+            x: area.x + 1,
+            y,
+            width: box_width,
+            height,
+        });
+        let bounds = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(2),
+            ..area
+        };
+        self.render_prompt_box(box_area, bounds, buf, focused);
+    }
+
+    /// Draw the prompt box into the rows reserved for it, then its popup,
+    /// which may cover other fields.
+    fn render_prompt_box(
+        &mut self,
+        box_area: Option<Rect>,
+        bounds: Rect,
+        buf: &mut Buffer,
+        focused: bool,
+    ) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let prompt_focused = form.focused_prompt().is_some();
+        let Some(prompt) = form.prompt_mut() else {
+            return;
+        };
+        prompt.area = box_area;
+        let Some(area) = box_area else {
+            return;
+        };
+        prompt_input::render_input(
+            area,
+            buf,
+            &prompt_input::InputView {
+                input: &prompt.input,
+                label: PromptInput::LABEL,
+                hint: Some("Type the prompt"),
+                show_caret: focused && prompt_focused,
+            },
+        );
+        if prompt_focused
+            && prompt.autocomplete.is_open()
+            && let Some(popup) =
+                prompt_input::popup_area(area, bounds, prompt.autocomplete.matches.len())
+        {
+            prompt_input::render_autocomplete(&prompt.autocomplete, popup, buf);
         }
     }
 
@@ -1353,7 +1470,7 @@ impl SwarmDashboardState {
         } else if self.running {
             "↑↓ agent  Enter expand  Tab scroll output  x stop"
         } else {
-            "↑↓ agent  Enter expand  d diff  u undo  n new run"
+            "Esc scripts  ↑↓ agent  Enter expand  d diff  u undo"
         }
     }
 
@@ -1567,6 +1684,8 @@ struct FormRow {
     cursor: Option<usize>,
     field: Option<usize>,
     fill: Option<Color>,
+    /// Blank row the prompt box is drawn over.
+    prompt_box: bool,
 }
 
 impl FormRow {
@@ -1577,6 +1696,18 @@ impl FormRow {
             cursor: None,
             field: None,
             fill: None,
+            prompt_box: false,
+        }
+    }
+
+    fn prompt_box(field: usize) -> Self {
+        Self {
+            text: String::new(),
+            style: Style::default(),
+            cursor: None,
+            field: Some(field),
+            fill: Some(theme::INPUT_BG),
+            prompt_box: true,
         }
     }
 
@@ -1587,6 +1718,7 @@ impl FormRow {
             cursor,
             field: Some(field),
             fill: None,
+            prompt_box: false,
         }
     }
 }
@@ -2252,6 +2384,75 @@ mod tests {
         assert!(screen.contains("OUT_DIR"), "{screen}");
         assert!(screen.contains("Run"), "{screen}");
         assert!(screen.contains("gate is required"), "{screen}");
+    }
+
+    fn prompt_form() -> SwarmDashboardState {
+        let mut dash = SwarmDashboardState::new();
+        dash.form = Some(SwarmForm::new(
+            row(),
+            inspection(vec![workflow("w", vec![])]),
+            vec![("a".to_string(), PathBuf::from("/a"))],
+            0,
+        ));
+        dash.view = SwarmView::Form;
+        dash
+    }
+
+    fn prompt_of(dash: &mut SwarmDashboardState) -> &mut PromptInput {
+        dash.form.as_mut().unwrap().prompt_mut().unwrap()
+    }
+
+    #[test]
+    fn the_prompt_is_a_box_with_a_row_per_line() {
+        let mut dash = prompt_form();
+        prompt_of(&mut dash).insert_str("first line\nsecond line");
+
+        let screen = render_rows(&mut dash, 60, 24);
+
+        let first = screen.iter().position(|r| r.contains("> first line")).unwrap();
+        assert!(screen[first + 1].contains("second line"), "{screen:#?}");
+        assert!(!screen.join("").contains('↵'), "newlines are real rows");
+        assert_eq!(prompt_of(&mut dash).area.unwrap().height, 3);
+    }
+
+    #[test]
+    fn the_user_sized_prompt_box_overrides_fitting_within_the_limit() {
+        let mut dash = prompt_form();
+        dash.prompt_rows = 7;
+        render_rows(&mut dash, 60, 24);
+        assert_eq!(prompt_of(&mut dash).area.unwrap().height, 7);
+
+        dash.prompt_rows = 30;
+        render_rows(&mut dash, 60, 24);
+        assert_eq!(prompt_of(&mut dash).area.unwrap().height, 12, "half the panel");
+    }
+
+    #[test]
+    fn the_completion_popup_is_drawn_with_the_prompt_focused() {
+        let mut dash = prompt_form();
+        let prompt = prompt_of(&mut dash);
+        prompt.insert_str("$li");
+        prompt.autocomplete.matches = vec!["$lint".to_string(), "$links".to_string()];
+
+        let screen = render_rows(&mut dash, 60, 24).join("\n");
+
+        assert!(screen.contains("$lint"), "{screen}");
+        assert!(screen.contains("$links"), "{screen}");
+    }
+
+    #[test]
+    fn a_script_without_a_prompt_says_so_instead_of_showing_a_box() {
+        let mut dash = prompt_form();
+        assert!(!render_rows(&mut dash, 80, 24).join("\n").contains("takes no prompt"));
+
+        let mut info = inspection(vec![workflow("w", vec![])]);
+        info.accepts_prompt = false;
+        info.requires_prompt = false;
+        dash.form = Some(SwarmForm::new(row(), info, folders(), 0));
+
+        let screen = render_rows(&mut dash, 80, 24).join("\n");
+        assert!(screen.contains("takes no prompt"), "{screen}");
+        assert!(!screen.contains("Prompt"), "{screen}");
     }
 
     #[test]

@@ -15,8 +15,9 @@ use super::state::{Focus, SidePanelMode};
 use crate::event::Event;
 use crate::keymap::Action;
 use crate::panels::swarm_dashboard::{
-    DashboardFocus, FieldRole, PlannedAgent, ScriptRow, SwarmForm, SwarmUpdate, SwarmView,
+    DashboardFocus, PlannedAgent, ScriptRow, SwarmForm, SwarmUpdate, SwarmView,
 };
+use crate::widgets::prompt_input::{self, AutocompleteMode};
 use crate::widgets::render_utils::strip_ansi;
 use crate::widgets::text_input::TextInput;
 use gaviero_core::script_profiles::ProfileCatalog;
@@ -375,11 +376,18 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         notes.push(format!("Profile: {}", profile.name));
     }
 
+    let prompt = values.prompt.as_deref().map(|prompt| {
+        let repo = gaviero_core::memory::scope::hash_path(&values.root);
+        let (expanded, skill_notes) = expand_prompt_skills(prompt, &app.skill_catalog, &repo);
+        notes.extend(skill_notes);
+        expanded
+    });
+
     let plan = gaviero_dsl::compile_file_with_profile(
         &script.path,
         profile.as_ref(),
         values.workflow.as_deref(),
-        values.prompt.as_deref(),
+        prompt.as_deref(),
         &vars,
         &[],
         &values.params,
@@ -460,6 +468,36 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+/// Resolve `$skill` in the prompt as chat does when it sends: the invocation
+/// leaves the text and the skill's instructions follow it. The pipeline only
+/// attaches skills by path, so a literal `$name` would do nothing there.
+/// Returns the prompt and a note per invocation that names no skill.
+fn expand_prompt_skills(
+    prompt: &str,
+    catalog: &gaviero_core::skills::SkillCatalog,
+    repo: &str,
+) -> (String, Vec<String>) {
+    let (text, resolved, warnings) =
+        crate::panels::agent_chat::parse_skill_invocations(prompt, catalog, Some(repo));
+    let selections: Vec<gaviero_core::context_planner::SkillSelection> = resolved
+        .into_iter()
+        .map(|skill| gaviero_core::context_planner::SkillSelection {
+            name: skill.name,
+            scope_level: skill.scope_level,
+            rendered_body: skill.rendered_body,
+        })
+        .collect();
+    let expanded = match gaviero_core::swarm::backend::shared::render_skill_block(&selections) {
+        Some(block) => format!("{text}\n\n{block}"),
+        None => text,
+    };
+    let notes = warnings
+        .into_iter()
+        .map(|w| format!("Skill warning ({}): {}", w.name, w.message))
+        .collect();
+    (expanded, notes)
 }
 
 fn planned_agents(
@@ -610,6 +648,13 @@ pub(super) fn handle_escape(app: &mut App) -> bool {
     let dash = &mut app.swarm_dashboard;
     match dash.view {
         SwarmView::Form => {
+            // Closing the popup must not throw away what was typed.
+            if let Some(prompt) = dash.form.as_mut().and_then(|f| f.focused_prompt())
+                && prompt.autocomplete.is_open()
+            {
+                prompt.autocomplete.reset();
+                return true;
+            }
             dash.form = None;
             dash.view = SwarmView::Picker;
             refresh_picker(app);
@@ -631,6 +676,10 @@ pub(super) fn handle_escape(app: &mut App) -> bool {
             } else if dash.output_maximized {
                 dash.output_maximized = false;
                 true
+            } else if !dash.running {
+                dash.view = SwarmView::Picker;
+                refresh_picker(app);
+                true
             } else {
                 false
             }
@@ -648,13 +697,11 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
         }
         SwarmView::Form => {
             if let Some(form) = dash.form.as_mut() {
-                let multiline = form.focused_role() == Some(FieldRole::Prompt);
-                if let Some(input) = form.focused_input() {
-                    if multiline {
-                        input.insert_str(text);
-                    } else {
-                        input.insert_str(&text.replace(['\r', '\n'], " "));
-                    }
+                if let Some(prompt) = form.focused_prompt() {
+                    prompt.insert_str(text);
+                    refresh_prompt_autocomplete(app);
+                } else if let Some(input) = form.focused_input() {
+                    input.insert_str(&text.replace(['\r', '\n'], " "));
                 }
             }
         }
@@ -713,7 +760,155 @@ fn handle_picker(app: &mut App, action: Action) {
     }
 }
 
+/// Fill the open popup, ranking skills for the folder the script will run in.
+fn refresh_prompt_autocomplete(app: &mut App) {
+    let open_mode = app
+        .swarm_dashboard
+        .form
+        .as_mut()
+        .and_then(|f| f.focused_prompt())
+        .filter(|p| p.autocomplete.active)
+        .map(|p| p.autocomplete.mode);
+    let Some(mode) = open_mode else {
+        return;
+    };
+    let files = (mode == AutocompleteMode::FileRef)
+        .then(|| super::side_panel::workspace_completion_files(app));
+    let catalog = Arc::clone(&app.skill_catalog);
+    let Some(form) = app.swarm_dashboard.form.as_mut() else {
+        return;
+    };
+    let repo = gaviero_core::memory::scope::hash_path(&form.folders[form.selected_folder()].1);
+    let Some(prompt) = form.focused_prompt() else {
+        return;
+    };
+    match files {
+        Some(files) => prompt_input::set_file_matches(&mut prompt.autocomplete, &files),
+        None => prompt_input::set_skill_matches(&mut prompt.autocomplete, &catalog, Some(&repo)),
+    }
+}
+
+fn paste_into_prompt(app: &mut App) {
+    app.clear_windows_ctrl_v_pending();
+    let text = app.get_clipboard();
+    if text.is_empty() || super::editing::should_skip_duplicate_text_paste(app) {
+        return;
+    }
+    if let Some(prompt) = app
+        .swarm_dashboard
+        .form
+        .as_mut()
+        .and_then(|f| f.focused_prompt())
+    {
+        prompt.insert_str(&text);
+    }
+    super::editing::note_text_paste(app);
+    refresh_prompt_autocomplete(app);
+}
+
+fn copy_prompt_selection(app: &mut App) {
+    let Some(prompt) = app
+        .swarm_dashboard
+        .form
+        .as_mut()
+        .and_then(|f| f.focused_prompt())
+    else {
+        return;
+    };
+    let selected = prompt.input.selected_text().map(str::to_owned);
+    prompt.input.sel_anchor = None;
+    if let Some(text) = selected {
+        app.set_clipboard(&text);
+    }
+}
+
+/// Keys for the focused prompt box, matching the chat's. Returns false for
+/// what the form should handle: Up on the top row, Down on the bottom row,
+/// and Tab or Enter with no popup open.
+fn handle_prompt(app: &mut App, action: &Action) -> bool {
+    match action {
+        Action::Paste => {
+            paste_into_prompt(app);
+            return true;
+        }
+        Action::Copy => {
+            copy_prompt_selection(app);
+            return true;
+        }
+        _ => {}
+    }
+
+    let Some(form) = app.swarm_dashboard.form.as_mut() else {
+        return false;
+    };
+    let Some(prompt) = form.focused_prompt() else {
+        return false;
+    };
+    let popup_open = prompt.autocomplete.is_open();
+    let mut refresh = false;
+    match action {
+        Action::Tab | Action::Enter if popup_open => prompt.accept_autocomplete(),
+        Action::CursorUp if popup_open => prompt.autocomplete.select_previous(),
+        Action::CursorDown if popup_open => prompt.autocomplete.select_next(),
+        Action::CursorUp => return prompt.cursor_up(),
+        Action::CursorDown => return prompt.cursor_down(),
+        Action::AltEnter => prompt.insert_char('\n'),
+        Action::InsertChar(ch) => {
+            prompt.insert_char(*ch);
+            refresh = true;
+        }
+        Action::Backspace => {
+            prompt.backspace();
+            refresh = true;
+        }
+        Action::DeleteWordBack => {
+            prompt.delete_word_back();
+            refresh = true;
+        }
+        Action::Delete => prompt.input.delete(),
+        Action::Undo => prompt.input.undo(),
+        Action::Redo => prompt.input.redo(),
+        Action::SelectAll => prompt.input.select_all(),
+        Action::CursorLeft => prompt.input.move_left(),
+        Action::CursorRight => prompt.input.move_right(),
+        Action::WordLeft => prompt.input.move_word_left(),
+        Action::WordRight => prompt.input.move_word_right(),
+        Action::SelectLeft => prompt.input.select_left(),
+        Action::SelectRight => prompt.input.select_right(),
+        Action::SelectWordLeft => prompt.input.select_word_left(),
+        Action::SelectWordRight => prompt.input.select_word_right(),
+        Action::SelectUp => prompt.select_up(),
+        Action::SelectDown => prompt.select_down(),
+        Action::Home => prompt.input.move_home(),
+        Action::End => prompt.input.move_end(),
+        Action::PageUp => prompt.scroll_by(-10),
+        Action::PageDown => prompt.scroll_by(10),
+        _ => return false,
+    }
+    form.error = None;
+    if refresh {
+        refresh_prompt_autocomplete(app);
+    }
+    true
+}
+
+/// `Alt+Up/Down`: size the prompt box. Does nothing where there is no box.
+pub(super) fn resize_prompt(app: &mut App, resize: fn(u16) -> u16) {
+    let dash = &mut app.swarm_dashboard;
+    if dash.view == SwarmView::Form
+        && dash.form.as_mut().is_some_and(|f| f.prompt_mut().is_some())
+    {
+        dash.prompt_rows = resize(dash.prompt_rows);
+    }
+}
+
 fn handle_form(app: &mut App, action: Action) {
+    let Some(form) = app.swarm_dashboard.form.as_mut() else {
+        return;
+    };
+    if form.focused_prompt().is_some() && handle_prompt(app, &action) {
+        return;
+    }
     let Some(form) = app.swarm_dashboard.form.as_mut() else {
         return;
     };
@@ -722,11 +917,6 @@ fn handle_form(app: &mut App, action: Action) {
         Action::CursorUp => form.focus_previous(),
         Action::Enter if form.on_run_button() => launch(app),
         Action::Enter => form.focus_next(),
-        Action::AltEnter if form.focused_role() == Some(FieldRole::Prompt) => {
-            if let Some(input) = form.focused_input() {
-                input.insert_char('\n');
-            }
-        }
         Action::CursorLeft | Action::CursorRight | Action::InsertChar(' ')
             if form.focused_input().is_none() =>
         {
@@ -918,7 +1108,14 @@ pub(super) fn scroll_wheel(app: &mut App, up: bool, col: u16, row: u16) {
                 dash.picker.scroll.scroll_down(delta, visible);
             }
         }
-        SwarmView::Form => {}
+        SwarmView::Form => {
+            if let Some(prompt) = dash.form.as_mut().and_then(|f| f.prompt_mut())
+                && prompt.area.is_some_and(|a| a.contains((col, row).into()))
+            {
+                let step = delta as i32;
+                prompt.scroll_by(if up { -step } else { step });
+            }
+        }
         SwarmView::Run => {
             if dash.detail_rect.contains((col, row).into()) {
                 scroll_output(dash, if up { -(delta as isize) } else { delta as isize });
@@ -941,7 +1138,11 @@ pub(super) fn click(app: &mut App, col: u16, row: u16) {
                 dash.picker.scroll.selected = index;
             }
         }
-        SwarmView::Form => {}
+        SwarmView::Form => {
+            if let Some(form) = dash.form.as_mut() {
+                form.press_prompt(col, row);
+            }
+        }
         SwarmView::Run => {
             let position = (col, row).into();
             if dash.table_rect.contains(position) {
@@ -954,6 +1155,45 @@ pub(super) fn click(app: &mut App, col: u16, row: u16) {
                 dash.focus = DashboardFocus::Detail;
             }
         }
+    }
+}
+
+/// Mouse moved with the button held. True if a prompt-box drag took it.
+pub(super) fn drag(app: &mut App, col: u16, row: u16) -> bool {
+    match app
+        .swarm_dashboard
+        .form
+        .as_mut()
+        .and_then(|f| f.prompt_mut())
+    {
+        Some(prompt) if prompt.dragging => {
+            prompt.extend_drag(col, row);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Button released: finish a prompt-box drag, copying what it selected as the
+/// chat does.
+pub(super) fn end_drag(app: &mut App) {
+    let Some(prompt) = app
+        .swarm_dashboard
+        .form
+        .as_mut()
+        .and_then(|f| f.prompt_mut())
+        .filter(|p| p.dragging)
+    else {
+        return;
+    };
+    let selected = prompt
+        .input
+        .selected_text()
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    prompt.end_drag();
+    if let Some(text) = selected {
+        app.set_clipboard(&text);
     }
 }
 
@@ -1275,6 +1515,151 @@ workflow run {
         assert!(handle_escape(&mut app));
         assert_eq!(app.swarm_dashboard.view, SwarmView::Picker);
         assert!(!handle_escape(&mut app), "nothing further to step back to");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_returns_to_the_scripts_only_once_the_run_has_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        let run = app.swarm_dashboard.begin_run(
+            "report".into(),
+            root.clone(),
+            vec![PlannedAgent {
+                id: "writer".into(),
+                tier: gaviero_core::types::ModelTier::Cheap,
+                model: None,
+            }],
+            vec![],
+        );
+
+        assert!(!handle_escape(&mut app), "a live run stays on screen");
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Run);
+
+        app.swarm_dashboard.apply(run, SwarmUpdate::Stopped);
+        app.swarm_dashboard.output_maximized = true;
+        assert!(handle_escape(&mut app));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Run, "the expanded output closes first");
+
+        assert!(handle_escape(&mut app));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Picker);
+        assert_eq!(app.swarm_dashboard.picker.rows.len(), 1, "the list is fresh");
+
+        assert!(handle_escape(&mut app));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Run, "the last run can be reopened");
+    }
+
+    /// Open the form with a repo skill named `lint` available.
+    fn form_with_a_skill(root: &Path, url: &str) -> (App, mpsc::UnboundedReceiver<Event>) {
+        let skill_dir = root.join(".gaviero/skills/lint");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: lint\ndescription: Run the linter on changed files\n---\nCheck every warning.\n",
+        )
+        .unwrap();
+        let (mut app, rx) = app_with_script(root, url);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+        (app, rx)
+    }
+
+    fn prompt_text(app: &mut App) -> String {
+        let form = app.swarm_dashboard.form.as_mut().unwrap();
+        form.prompt_mut().unwrap().input.text.clone()
+    }
+
+    fn popup_matches(app: &mut App) -> Vec<String> {
+        let form = app.swarm_dashboard.form.as_mut().unwrap();
+        form.prompt_mut().unwrap().autocomplete.matches.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alt_enter_adds_a_line_and_arrows_leave_the_box_only_at_its_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "one");
+        handle_action(&mut app, Action::AltEnter);
+        type_text(&mut app, "two");
+        assert_eq!(prompt_text(&mut app), "one\ntwo");
+
+        let focus = |app: &App| app.swarm_dashboard.form.as_ref().unwrap().focus;
+        let prompt_focus = focus(&app);
+        handle_action(&mut app, Action::CursorUp);
+        assert_eq!(focus(&app), prompt_focus, "Up moved within the box");
+
+        handle_action(&mut app, Action::CursorDown);
+        assert_eq!(focus(&app), prompt_focus, "Down moved back to the last row");
+        handle_action(&mut app, Action::CursorDown);
+        assert_eq!(focus(&app), prompt_focus + 1, "the last row leaves the box");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alt_arrows_size_the_swarm_box_and_leave_the_chat_box_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        app.handle_action(Action::MoveLineUp);
+        app.handle_action(Action::MoveLineUp);
+        assert_eq!(app.swarm_dashboard.prompt_rows, 5);
+        assert_eq!(app.chat_state.input_area_rows, 0);
+
+        app.handle_action(Action::MoveLineDown);
+        assert_eq!(app.swarm_dashboard.prompt_rows, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_completes_with_enter_and_keeps_the_prompt_focused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = form_with_a_skill(&root, "http://127.0.0.1:9");
+        let before = app.swarm_dashboard.form.as_ref().unwrap().focus;
+
+        type_text(&mut app, "$li");
+        assert_eq!(popup_matches(&mut app), vec!["$lint".to_string()]);
+
+        handle_action(&mut app, Action::Enter);
+
+        assert_eq!(prompt_text(&mut app), "$lint ");
+        assert_eq!(app.swarm_dashboard.form.as_ref().unwrap().focus, before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_closes_the_popup_before_it_discards_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = form_with_a_skill(&root, "http://127.0.0.1:9");
+
+        type_text(&mut app, "$li");
+        assert!(handle_escape(&mut app));
+
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Form);
+        assert_eq!(prompt_text(&mut app), "$li");
+        assert!(popup_matches(&mut app).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_in_the_prompt_reaches_the_agent_as_its_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, asked) = fake_ollama("default_out/report.md");
+        let (mut app, mut rx) = form_with_a_skill(&root, &url);
+
+        type_text(&mut app, "the moon $lint");
+        press_run(&mut app);
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Run);
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        let request = asked.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.contains("Check every warning."), "{request}");
+        assert!(!request.contains("$lint"), "the invocation is consumed: {request}");
     }
 
     #[test]
