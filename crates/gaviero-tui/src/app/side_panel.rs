@@ -292,6 +292,14 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         Action::CursorDown if ac_active => {
             app.chat_state.autocomplete_down();
         }
+        Action::PageUp if ac_active => {
+            let page = crate::widgets::prompt_input::POPUP_ROWS as isize;
+            app.chat_state.autocomplete.move_selection(-page);
+        }
+        Action::PageDown if ac_active => {
+            let page = crate::widgets::prompt_input::POPUP_ROWS as isize;
+            app.chat_state.autocomplete.move_selection(page);
+        }
         Action::Quit if ac_active => {
             app.chat_state.autocomplete.reset();
         }
@@ -1815,14 +1823,19 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::AttachPath {
         let query = app.chat_state.autocomplete.query.clone();
         let trimmed = query.trim_start();
-        if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
-            let matches = list_filesystem_matches(trimmed);
-            app.chat_state.autocomplete.matches = matches;
-            if app.chat_state.autocomplete.selected >= app.chat_state.autocomplete.matches.len() {
-                app.chat_state.autocomplete.selected = 0;
-            }
+        if is_filesystem_query(trimmed) {
+            app.chat_state.autocomplete.matches = list_filesystem_matches(trimmed);
+            app.chat_state.autocomplete.clamp_selection();
             return;
         }
+    }
+
+    // `/add-dir` names a folder, usually outside the workspace.
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::DirPath {
+        let query = app.chat_state.autocomplete.query.clone();
+        app.chat_state.autocomplete.matches = folder_arg_matches(app, &query);
+        app.chat_state.autocomplete.clamp_selection();
+        return;
     }
 
     let files = workspace_completion_files(app);
@@ -1997,8 +2010,8 @@ fn completion_display_entries(
 /// with every match kept because the popup scrolls.
 pub(super) fn path_completion_matches(app: &App, query: &str) -> Vec<String> {
     let trimmed = query.trim_start();
-    if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
-        return list_filesystem_entries(trimmed, usize::MAX);
+    if is_filesystem_query(trimmed) {
+        return list_filesystem_entries(trimmed, None, usize::MAX);
     }
     crate::panels::agent_chat::match_file_paths(&workspace_completion_files(app), query, usize::MAX)
 }
@@ -2006,9 +2019,9 @@ pub(super) fn path_completion_matches(app: &App, query: &str) -> Vec<String> {
 /// [`path_completion_matches`] for a field holding a folder.
 pub(super) fn dir_completion_matches(app: &App, query: &str) -> Vec<String> {
     let trimmed = query.trim_start();
-    if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
-        let mut dirs = list_filesystem_entries(trimmed, usize::MAX);
-        dirs.retain(|m| m.ends_with('/'));
+    if is_filesystem_query(trimmed) {
+        let mut dirs = list_filesystem_entries(trimmed, None, usize::MAX);
+        dirs.retain(|m| ends_with_separator(m));
         return dirs;
     }
     let dirs = completion_display_entries(
@@ -2019,29 +2032,77 @@ pub(super) fn dir_completion_matches(app: &App, query: &str) -> Vec<String> {
     crate::panels::agent_chat::match_file_paths(&dirs, query, usize::MAX)
 }
 
-/// List up to 50 directory entries matching the user's typed prefix.
-///
-/// The query is split into a parent directory (everything up to and
-/// including the last `/`) and a filename prefix; entries in the parent
-/// whose names start with the prefix are returned as absolute paths with
-/// a trailing `/` for subdirectories. `~` is expanded against `$HOME`.
-fn list_filesystem_matches(query: &str) -> Vec<String> {
-    list_filesystem_entries(query, 50)
+/// `/add-dir` completions: folders only. An absolute or `~` query lists the
+/// filesystem; anything else lists under the first workspace root, the base
+/// `/add-dir` resolves a relative path against.
+pub(super) fn folder_arg_matches(app: &App, query: &str) -> Vec<String> {
+    let trimmed = query.trim_start();
+    let base = (!is_filesystem_query(trimmed)).then(|| {
+        app.workspace
+            .roots()
+            .first()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    });
+    let mut dirs = list_filesystem_entries(trimmed, base.as_deref(), usize::MAX);
+    dirs.retain(|m| ends_with_separator(m));
+    dirs
 }
 
-fn list_filesystem_entries(query: &str, max_entries: usize) -> Vec<String> {
+/// A typed path the filesystem should complete rather than the workspace
+/// file list: rooted (`/`, `\`), home-relative (`~`), or a Windows drive
+/// path (`C:\`, `C:/`).
+pub(super) fn is_filesystem_query(query: &str) -> bool {
+    let b = query.as_bytes();
+    query.starts_with(['/', '\\'])
+        || query == "~"
+        || query.starts_with("~/")
+        || query.starts_with("~\\")
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+}
+
+fn ends_with_separator(path: &str) -> bool {
+    path.ends_with(['/', '\\'])
+}
+
+/// Every directory entry matching the user's typed prefix.
+///
+/// The query is split into a parent directory (everything up to and
+/// including the last `/` or `\`) and a filename prefix; entries in the
+/// parent whose names start with the prefix are returned as the typed parent
+/// plus the name, with a trailing separator for subdirectories. `~` is
+/// expanded against `$HOME`.
+fn list_filesystem_matches(query: &str) -> Vec<String> {
+    list_filesystem_entries(query, None, usize::MAX)
+}
+
+/// [`list_filesystem_matches`] with at most `max_entries` results. With a
+/// `base`, the query is relative to it and needs no separator; without one,
+/// a query without a separator lists nothing.
+fn list_filesystem_entries(
+    query: &str,
+    base: Option<&std::path::Path>,
+    max_entries: usize,
+) -> Vec<String> {
     let expanded = expand_tilde(query);
-    let (parent, prefix) = match expanded.rfind('/') {
+    let (parent, prefix) = match expanded.rfind(['/', '\\']) {
         Some(idx) => (&expanded[..=idx], &expanded[idx + 1..]),
+        None if base.is_some() => ("", expanded.as_str()),
         None => return Vec::new(),
     };
-    let dir = if parent.is_empty() { "/" } else { parent };
-    let entries = match std::fs::read_dir(dir) {
+    let dir = match base {
+        Some(base) => base.join(parent),
+        None if parent.is_empty() => std::path::PathBuf::from("/"),
+        None => std::path::PathBuf::from(parent),
+    };
+    let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
         Err(_) => return Vec::new(),
     };
     let mut matches: Vec<String> = Vec::new();
     let display_prefix = display_dir_prefix(query);
+    // A completed folder ends with the separator the user is typing.
+    let separator = if display_prefix.ends_with('\\') { "\\" } else { "/" };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -2049,7 +2110,7 @@ fn list_filesystem_entries(query: &str, max_entries: usize) -> Vec<String> {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let suffix = if is_dir { "/" } else { "" };
+        let suffix = if is_dir { separator } else { "" };
         matches.push(format!("{}{}{}", display_prefix, name_str, suffix));
         if matches.len() >= max_entries {
             break;
@@ -2060,7 +2121,7 @@ fn list_filesystem_entries(query: &str, max_entries: usize) -> Vec<String> {
 }
 
 pub(super) fn expand_tilde(query: &str) -> String {
-    if let Some(rest) = query.strip_prefix("~/") {
+    if let Some(rest) = query.strip_prefix("~/").or_else(|| query.strip_prefix("~\\")) {
         if let Some(home) = dirs::home_dir() {
             return format!("{}/{}", home.display(), rest);
         }
@@ -2073,7 +2134,7 @@ pub(super) fn expand_tilde(query: &str) -> String {
 }
 
 fn display_dir_prefix(query: &str) -> String {
-    match query.rfind('/') {
+    match query.rfind(['/', '\\']) {
         Some(idx) => query[..=idx].to_string(),
         None => String::new(),
     }
@@ -4227,6 +4288,117 @@ mod tests {
         assert_eq!(app.chat_state.history_index, Some(0));
 
         cleanup_session(dir.path());
+    }
+
+    fn type_into_chat(app: &mut crate::app::App, text: &str) {
+        for ch in text.chars() {
+            super::handle_chat_action(app, crate::keymap::Action::InsertChar(ch));
+        }
+    }
+
+    #[test]
+    fn chat_at_completion_offers_every_file_and_pages_through_them() {
+        use crate::keymap::Action;
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("note{i:02}.md")), "x").unwrap();
+        }
+        let mut app = chat_app(dir.path());
+        type_into_chat(&mut app, "@note");
+        assert_eq!(app.chat_state.autocomplete.matches.len(), 30);
+
+        let before = app.chat_state.scroll_offset;
+        super::handle_chat_action(&mut app, Action::PageDown);
+        assert_eq!(app.chat_state.autocomplete.selected, 8);
+        assert_eq!(app.chat_state.scroll_offset, before, "the transcript stays put");
+        for _ in 0..5 {
+            super::handle_chat_action(&mut app, Action::PageDown);
+        }
+        assert_eq!(app.chat_state.autocomplete.selected, 29);
+        super::handle_chat_action(&mut app, Action::PageUp);
+        assert_eq!(app.chat_state.autocomplete.selected, 21);
+
+        // Typing again starts the list over.
+        type_into_chat(&mut app, "2");
+        assert_eq!(app.chat_state.autocomplete.selected, 0);
+        assert_eq!(app.chat_state.autocomplete.matches.len(), 10);
+
+        // With the popup closed, PageUp scrolls the transcript again.
+        super::handle_chat_action(&mut app, Action::Quit);
+        assert!(!app.chat_state.autocomplete.is_open());
+        app.chat_state.scroll_offset = 40;
+        super::handle_chat_action(&mut app, Action::PageUp);
+        assert_eq!(app.chat_state.scroll_offset, 20);
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn add_dir_completes_folders_only_and_accepts_into_the_argument() {
+        use crate::keymap::Action;
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for i in 0..12 {
+            std::fs::create_dir(outside.path().join(format!("proj{i:02}"))).unwrap();
+        }
+        std::fs::write(outside.path().join("proj_file.txt"), "x").unwrap();
+        let mut app = chat_app(ws.path());
+
+        let base = format!("{}/", outside.path().display());
+        type_into_chat(&mut app, &format!("/add-dir {base}pr"));
+        let ac = &app.chat_state.autocomplete;
+        assert_eq!(ac.mode, crate::panels::agent_chat::AutocompleteMode::DirPath);
+        assert_eq!(ac.matches.len(), 12, "{:?}", ac.matches);
+        assert!(ac.matches.iter().all(|m| m.ends_with('/')), "{:?}", ac.matches);
+        assert_eq!(ac.matches[11], format!("{base}proj11/"));
+
+        super::handle_chat_action(&mut app, Action::PageDown);
+        super::handle_chat_action(&mut app, Action::PageDown);
+        super::handle_chat_action(&mut app, Action::Enter);
+        assert_eq!(
+            app.chat_state.text_input.text,
+            format!("/add-dir {base}proj11/")
+        );
+
+        // A first token that only starts with `/add-dir` completes nothing.
+        app.chat_state.text_input.clear();
+        type_into_chat(&mut app, "/add-dirx ");
+        assert!(!app.chat_state.autocomplete.is_open());
+
+        cleanup_session(ws.path());
+    }
+
+    #[test]
+    fn add_dir_lists_relative_folders_under_the_workspace_root() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("docs")).unwrap();
+        std::fs::write(ws.path().join("docs.md"), "x").unwrap();
+        let app = chat_app(ws.path());
+        assert_eq!(super::folder_arg_matches(&app, "do"), vec!["docs/".to_string()]);
+        cleanup_session(ws.path());
+    }
+
+    #[test]
+    fn filesystem_queries_include_windows_paths() {
+        for q in ["/", "/tmp", "\\\\server", "~", "~/x", "~\\x", "C:\\", "c:/Users"] {
+            assert!(super::is_filesystem_query(q), "{q}");
+        }
+        for q in ["", "src", "C:", "./x", "../x", "@foo"] {
+            assert!(!super::is_filesystem_query(q), "{q}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_query_lists_with_backslashes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+        std::fs::write(tmp.path().join("subfile.txt"), "x").unwrap();
+        let query = format!("{}\\sub", tmp.path().display().to_string().replace('/', "\\"));
+        let matches = list_filesystem_matches(&query);
+        let prefix = &query[..query.len() - "sub".len()];
+        assert!(matches.contains(&format!("{prefix}subdir\\")), "{matches:?}");
+        assert!(matches.contains(&format!("{prefix}subfile.txt")), "{matches:?}");
     }
 
     #[test]

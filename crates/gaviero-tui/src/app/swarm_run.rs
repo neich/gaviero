@@ -964,6 +964,12 @@ fn handle_prompt(app: &mut App, action: &Action) -> bool {
         Action::Tab | Action::Enter if popup_open => prompt.accept_autocomplete(),
         Action::CursorUp if popup_open => prompt.autocomplete.select_previous(),
         Action::CursorDown if popup_open => prompt.autocomplete.select_next(),
+        Action::PageUp if popup_open => prompt
+            .autocomplete
+            .move_selection(-(prompt_input::POPUP_ROWS as isize)),
+        Action::PageDown if popup_open => prompt
+            .autocomplete
+            .move_selection(prompt_input::POPUP_ROWS as isize),
         Action::CursorUp => return prompt.cursor_up(),
         Action::CursorDown => return prompt.cursor_down(),
         Action::AltEnter => prompt.insert_char('\n'),
@@ -1259,6 +1265,13 @@ pub(super) fn scroll_wheel(app: &mut App, up: bool, col: u16, row: u16) {
             {
                 let step = delta as isize;
                 form.completion.move_selection(if up { -step } else { step });
+                return;
+            }
+            if let Some(prompt) = dash.form.as_mut().and_then(|f| f.focused_prompt())
+                && prompt.autocomplete.is_open()
+            {
+                let step = delta as isize;
+                prompt.autocomplete.move_selection(if up { -step } else { step });
                 return;
             }
             if let Some(prompt) = dash.form.as_mut().and_then(|f| f.prompt_mut())
@@ -2042,6 +2055,40 @@ workflow run {
     fn popup_matches(app: &mut App) -> Vec<String> {
         let form = app.swarm_dashboard.form.as_mut().unwrap();
         form.prompt_mut().unwrap().autocomplete.matches.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_at_match_in_the_prompt_box_is_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        for i in 0..30 {
+            std::fs::write(root.join(format!("docs/note{i:02}.md")), "x").unwrap();
+        }
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+
+        type_text(&mut app, "@note");
+        let matches = popup_matches(&mut app);
+        assert_eq!(matches.len(), 30, "{matches:?}");
+
+        let selected = |app: &mut App| {
+            let form = app.swarm_dashboard.form.as_mut().unwrap();
+            form.prompt_mut().unwrap().autocomplete.selected
+        };
+        handle_action(&mut app, Action::PageDown);
+        assert_eq!(selected(&mut app), 8);
+        handle_action(&mut app, Action::PageUp);
+        assert_eq!(selected(&mut app), 0);
+        scroll_wheel(&mut app, false, 0, 0);
+        assert_eq!(selected(&mut app), crate::theme::MOUSE_SCROLL_DELTA);
+
+        for _ in 0..5 {
+            handle_action(&mut app, Action::PageDown);
+        }
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(prompt_text(&mut app), format!("@{} ", matches[29]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
