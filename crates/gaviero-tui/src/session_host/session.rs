@@ -1,7 +1,7 @@
 //! One session: a `gaviero` child in a pseudo-terminal, its emulated screen,
 //! and the status it reports through its window title.
 
-use super::{CONTROL_ENV, HOST_ENV, HostEvent, encode};
+use super::{CONTROL_ENV, HOST_ENV, HOST_RESTARTS_ENV, HostEvent, encode};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -137,8 +137,16 @@ pub(crate) struct Session {
     pub restart_pending: bool,
 }
 
+/// Session `id`'s launch-state file (`supervisor::LAUNCH_STATE_ENV`).
+pub(crate) fn launch_state_path(state_dir: &Path, id: u64) -> PathBuf {
+    state_dir.join(format!("{id}.launch"))
+}
+
 /// Start `gaviero <path>` in a `rows` × `cols` pseudo-terminal. Output and
 /// end-of-output arrive on `tx` as [`HostEvent::Output`] / [`HostEvent::Exited`].
+/// `host_restarts`: the host restarts this child onto a new build, so the
+/// child must not do it itself ([`HOST_RESTARTS_ENV`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     id: u64,
     path: &Path,
@@ -147,10 +155,11 @@ pub(crate) fn spawn(
     cols: u16,
     state_dir: &Path,
     tx: UnboundedSender<HostEvent>,
+    host_restarts: bool,
 ) -> Result<Session> {
     let rows = rows.max(2);
     let cols = cols.max(10);
-    let launch_state = state_dir.join(format!("{id}.launch"));
+    let launch_state = launch_state_path(state_dir, id);
     let control = state_dir.join(format!("{id}.ctl"));
 
     let pair = native_pty_system()
@@ -177,6 +186,11 @@ pub(crate) fn spawn(
     }
     cmd.env(HOST_ENV, "1");
     cmd.env(CONTROL_ENV, &control);
+    // The host's own restart file is no business of its tabs.
+    cmd.env_remove(crate::supervisor::HOST_RESTART_ENV);
+    if host_restarts {
+        cmd.env(HOST_RESTARTS_ENV, "1");
+    }
 
     let child = pair
         .slave

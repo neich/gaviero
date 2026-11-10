@@ -31,8 +31,14 @@ fn tap(vk: u16, scan: u16, uchar: u16, ctrl_state: u32) -> String {
     down + &win32_key_seq(&r)
 }
 
+/// The host's: quit the host, keeping every tab for the next start.
 fn ctrl_q() -> String {
     tap(0x51, 0x10, 17, LEFT_CTRL)
+}
+
+/// The host's: close the current tab.
+fn alt_q() -> String {
+    tap(0x51, 0x10, 'q' as u16, LEFT_ALT)
 }
 
 /// The probe reports work in progress (an agent and a shell command).
@@ -51,10 +57,6 @@ fn alt_left() -> String {
 
 fn alt_right() -> String {
     tap(0x27, 0x4D, 0, LEFT_ALT)
-}
-
-fn alt_x() -> String {
-    tap(0x58, 0x2D, 'x' as u16, LEFT_ALT)
 }
 
 fn name_of(path: &Path) -> String {
@@ -109,10 +111,10 @@ fn host_forwards_input_and_switches_tabs() {
     pty.wait_text("KEY Char('y')");
     assert_eq!(pty.row(0).matches(&label).count(), 1, "row 0: {}", pty.row(0));
 
-    // 5. Alt+X is the host's: it never reaches the session. Nothing is in
+    // 5. Alt+Q is the host's: it never reaches the session. Nothing is in
     // progress, so it closes the tab without asking.
     assert!(pty.row(0).starts_with(" x "), "row 0: {}", pty.row(0));
-    pty.send(&alt_x());
+    pty.send(&alt_q());
 
     // 6. That closed the last tab, so the host ends. The probe ignores the
     // exit request: the host kills it after the grace period.
@@ -194,11 +196,11 @@ fn two_sessions_switch_close_and_quit() {
         s.contains("KEY Char('k')") && !s.contains("KEY Char('z')")
     });
 
-    // B has work in progress: Alt+X asks first; any key but y cancels and
+    // B has work in progress: Alt+Q asks first; any key but y cancels and
     // never reaches the session.
     pty.send(&ctrl_b());
     pty.wait_text("STATUS busy");
-    pty.send(&alt_x());
+    pty.send(&alt_q());
     let close_b = format!(" Close {lb}? ");
     pty.wait_text(&close_b);
     let screen = pty.contents();
@@ -211,7 +213,7 @@ fn two_sessions_switch_close_and_quit() {
 
     // Asked again, y closes B: its tab goes and A, the one before, is
     // current.
-    pty.send(&alt_x());
+    pty.send(&alt_q());
     pty.wait_text(&close_b);
     pty.send(&tap(0x59, 0x15, 'y' as u16, 0));
     pty.wait_for("A's screen after closing B", |s, _| {
@@ -227,12 +229,12 @@ fn two_sessions_switch_close_and_quit() {
     });
     assert_eq!(open_names(&state), vec![la.clone(), lb.clone()]);
 
-    // B has work in progress, so Alt+Q asks, naming it; 'y' quits the
+    // B has work in progress, so Ctrl+Q asks, naming it; 'y' quits the
     // host and keeps both tabs for next time. The probes ignore the exit
     // request and are killed after the grace.
     pty.send(&ctrl_b());
     pty.wait_text("STATUS busy");
-    pty.send(&tap(0x51, 0x10, 'q' as u16, LEFT_ALT));
+    pty.send(&ctrl_q());
     pty.wait_text(" Quit gaviero? ");
     let named = format!("{lb}: an agent is running");
     assert!(pty.contents().contains(&named), "screen:\n{}", pty.contents());
@@ -258,11 +260,13 @@ fn two_sessions_switch_close_and_quit() {
     pty.wait_text("KEY Char('w')");
     assert!(!pty.contents().contains("MOUSE"), "screen:\n{}", pty.contents());
 
-    // Ctrl+Q in the session ends it: the last tab, so the host ends too.
+    // Ctrl+Q is the host's, never the session's: with nothing in progress
+    // it quits the host at once and keeps B for the next start.
     pty.send(&ctrl_q());
     let code = pty.wait_exit(Duration::from_secs(10));
     assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
-    assert!(open_names(&state).is_empty());
+    assert!(!pty.contents().contains("Char('q')"), "screen:\n{}", pty.contents());
+    assert_eq!(open_names(&state), vec![lb.clone()]);
 }
 
 /// The host's circle colours (`session_host/render.rs`).
@@ -334,10 +338,76 @@ fn background_tabs_show_agent_and_shell_activity() {
     pty.wait_text("KEY Char('z')");
     assert!(!pty.row(0).contains('●'), "row 0: {}", pty.row(0));
 
-    // Nothing in progress: Alt+Q quits at once.
-    pty.send(&tap(0x51, 0x10, 'q' as u16, LEFT_ALT));
+    // Nothing in progress: Ctrl+Q quits at once.
+    pty.send(&ctrl_q());
     let code = pty.wait_exit(Duration::from_secs(10));
     assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
+}
+
+/// A deploy (`scripts/deploy.ps1`) restarts a supervised host onto the new
+/// build with the same tabs. The host runs from a copy of the binary, so the
+/// test can install over it: rename the running file aside, put a new one
+/// in its place. Nothing is typed, so the restart is not held back by recent
+/// input.
+#[test]
+fn a_deploy_restarts_the_host_with_its_tabs() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    let b = root.path().join("beta-b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let (la, lb) = (name_of(&a), name_of(&b));
+    let state = root.path().join("state.json");
+    std::fs::write(
+        &state,
+        serde_json::json!({ "open": [a, b], "recent": [] }).to_string(),
+    )
+    .unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let exe = bin.join("gaviero.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_gaviero"), &exe).unwrap();
+
+    // Supervised: no GAVIERO_NO_SUPERVISOR.
+    let mut pty = Pty::spawn_exe(
+        &exe,
+        &[OsStr::new("--sessions")],
+        &[
+            ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+            ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ],
+        root.path(),
+    );
+    pty.wait_for("both tabs", |_, _| {
+        let bar = pty.row(0);
+        bar.contains(&la) && bar.contains(&lb)
+    });
+    assert!(!pty.contents().contains("restarted"), "screen:\n{}", pty.contents());
+
+    // Install a "new build" the way deploy.ps1 does.
+    std::fs::rename(&exe, bin.join("gaviero.exe.old-1")).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_gaviero"), &exe).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&exe)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+
+    // Settle (≈5 s) + the probes ignoring their exit request (3 s) + the
+    // supervisor's back-off for a short run (5 s).
+    pty.wait_text_within("restarted onto a new build", Duration::from_secs(45));
+    let bar = pty.row(0);
+    assert!(bar.contains(&la) && bar.contains(&lb), "row 0: {bar}");
+    // The new host is a live host: its tab gets keys.
+    pty.send(&tap(0x58, 0x2D, 'x' as u16, 0));
+    pty.wait_text("KEY Char('x')");
+
+    // Ctrl+Q ends it, and the supervisor with it.
+    pty.send(&ctrl_q());
+    let code = pty.wait_exit(Duration::from_secs(15));
+    assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
+    assert_eq!(open_names(&state), vec![la, lb]);
 }
 
 /// Alt+N, the full path of `dir`, Enter.

@@ -13,6 +13,10 @@
 //!   normal quit path saves the session and flushes turn reviews, and the
 //!   supervisor starts the new build in the same pane. A task that starts
 //!   while it waits turns this into the popup case.
+//!
+//! A tab of a supervised session host (`GAVIERO_SESSION_HOST_RESTARTS`) does
+//! none of this: the host restarts every tab together once all are idle
+//! (`session_host/restart.rs`).
 
 use std::time::{Duration, Instant};
 
@@ -36,6 +40,9 @@ pub(crate) enum ManualRestart {
 pub(crate) struct RestartState {
     watch: BuildWatch,
     supervised: bool,
+    /// The session host restarts this instance; it never acts on a new
+    /// build itself.
+    host_restarts: bool,
     last_input: Instant,
     last_notice: Option<Instant>,
     /// Set when the app quits to restart; `main` turns it into the exit code.
@@ -52,6 +59,7 @@ impl RestartState {
         Self {
             watch: BuildWatch::for_current_exe(),
             supervised: crate::supervisor::is_supervised(),
+            host_restarts: std::env::var_os(crate::session_host::HOST_RESTARTS_ENV).is_some(),
             last_input: Instant::now(),
             last_notice: None,
             requested: false,
@@ -166,6 +174,9 @@ fn decide(supervised: bool, task: Option<&'static str>, blocker: Option<&'static
 }
 
 pub(super) fn on_tick(app: &mut App) {
+    if app.restart.host_restarts {
+        return;
+    }
     let now = Instant::now();
     app.restart.watch.poll(now);
     if !app.restart.watch.ready() || app.restart.requested || app.restart.manual.is_some() {
