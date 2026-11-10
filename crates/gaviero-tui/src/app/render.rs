@@ -504,6 +504,7 @@ pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     let tab_bar = TabBar {
         titles: &titles,
         active: app.active_buffer,
+        closable: false,
     };
     tab_bar.render(area, frame.buffer_mut());
 }
