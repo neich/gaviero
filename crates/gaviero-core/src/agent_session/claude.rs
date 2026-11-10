@@ -161,6 +161,9 @@ pub struct ClaudeSession {
     /// itself, so tool edits land without the snapshot → revert → propose
     /// round trip below.
     host_capture: bool,
+    /// `AgentOptions::session_read_folders`: the conversation's `/add-dir`
+    /// grants, forwarded to `AcpSession::spawn` and the system prompt.
+    session_read_folders: Vec<PathBuf>,
     profile: ProviderProfile,
     /// Resume handle, initialized from `options.resume_session_id` at
     /// construction. M6: set once and used as input to `AcpSession::spawn`
@@ -264,6 +267,7 @@ impl ClaudeSession {
         let approved_tools = args.options.approved_tools.clone();
         let exposed_tools = args.options.exposed_tools.clone();
         let host_capture = args.options.host_capture;
+        let session_read_folders = args.options.session_read_folders.clone();
 
         Self {
             write_gate: args.write_gate,
@@ -280,6 +284,7 @@ impl ClaudeSession {
             approved_tools,
             exposed_tools,
             host_capture,
+            session_read_folders,
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
@@ -402,6 +407,7 @@ impl ClaudeSession {
                 stdin_prompt: true,
                 host_capture: self.host_capture,
                 skip_native_instructions,
+                session_read_folders: self.session_read_folders.clone(),
                 ..AgentOptions::default()
             }
         };
@@ -421,9 +427,10 @@ impl ClaudeSession {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&found.render());
         }
-        if let Some(block) = crate::agent_guard::outside_folders_prompt(
+        if let Some(block) = crate::agent_guard::outside_folders_prompt_with_grants(
             &self.workspace_root,
             &self.additional_roots,
+            &self.session_read_folders,
         ) {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&block);

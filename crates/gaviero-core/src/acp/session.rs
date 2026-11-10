@@ -113,6 +113,12 @@ pub struct AgentOptions {
     /// Claude's native `CLAUDE.md` / `AGENTS.md` discovery. The caller puts
     /// the `GAVIERO.md` text in the system prompt.
     pub skip_native_instructions: bool,
+    /// TUI chat `/add-dir` grants for this conversation: absolute folders
+    /// outside the workspace the agent may read but not write, on top of
+    /// `agent.permissions.read.extraFolders`
+    /// ([`crate::scope_enforcer::SensitivePolicy::with_session_read_folders`]).
+    /// Empty everywhere else (swarm, CLI).
+    pub session_read_folders: Vec<PathBuf>,
 }
 
 /// Edit tools approved without a prompt when the host reviews the turn's
@@ -144,6 +150,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("stdin_prompt", &self.stdin_prompt)
             .field("host_capture", &self.host_capture)
             .field("skip_native_instructions", &self.skip_native_instructions)
+            .field("session_read_folders", &self.session_read_folders)
             .finish()
     }
 }
@@ -169,6 +176,7 @@ impl Default for AgentOptions {
             stdin_prompt: false,
             host_capture: false,
             skip_native_instructions: false,
+            session_read_folders: Vec::new(),
         }
     }
 }
@@ -336,6 +344,22 @@ pub fn spill_prompt_to_tempfile(
     Ok((file, wrapper))
 }
 
+/// The read-only folders (`agent.permissions.read.extraFolders` plus the
+/// conversation's `/add-dir` grants) and the scratch folders for a Claude
+/// session over `cwd` plus `additional_roots`.
+fn guard_folders(
+    cwd: &Path,
+    additional_roots: &[&Path],
+    session_read_folders: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let policy = crate::scope_enforcer::SensitivePolicy::resolve(cwd)
+        .with_session_read_folders(session_read_folders);
+    (
+        crate::agent_guard::read_only_folders(&policy, cwd, additional_roots),
+        crate::agent_guard::scratch_folders(&policy, cwd, additional_roots),
+    )
+}
+
 impl AcpSession {
     /// Spawn a new Claude Code subprocess.
     ///
@@ -493,15 +517,13 @@ impl AcpSession {
         // GAVIERO.md is in scope — the exclusion of Claude's own CLAUDE.md /
         // AGENTS.md discovery. One flag-level layer: above project/user
         // files, so project permissions still load and merge.
-        let guard_policy = crate::scope_enforcer::SensitivePolicy::resolve(cwd);
-        let read_only_folders =
-            crate::agent_guard::read_only_folders(&guard_policy, cwd, additional_roots);
+        // `agent.permissions.read.extraFolders` plus the conversation's
+        // `/add-dir` grants are read-only; `agent.permissions.scratchFolders`
+        // are writable roots like the workspace siblings, so the
+        // sensitive-file denies are anchored there too, but no `Edit` deny.
+        let (read_only_folders, scratch_folders) =
+            guard_folders(cwd, additional_roots, &options.session_read_folders);
         let read_only_refs: Vec<&Path> = read_only_folders.iter().map(PathBuf::as_path).collect();
-        // `agent.permissions.scratchFolders`: writable roots like the
-        // workspace siblings, so the sensitive-file denies are anchored there
-        // too, but no `Edit` deny.
-        let scratch_folders =
-            crate::agent_guard::scratch_folders(&guard_policy, cwd, additional_roots);
         let writable_roots: Vec<&Path> = additional_roots
             .iter()
             .copied()
@@ -902,6 +924,20 @@ pub fn is_claude_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_folders_include_session_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(ws.join(".gaviero/settings.json"), "{}").unwrap();
+        let (read_only, scratch) = guard_folders(&ws, &[], std::slice::from_ref(&docs));
+        assert_eq!(read_only, vec![docs]);
+        assert!(scratch.is_empty());
+        assert!(guard_folders(&ws, &[], &[]).0.is_empty());
+    }
 
     #[test]
     fn small_prompt_uses_argv() {

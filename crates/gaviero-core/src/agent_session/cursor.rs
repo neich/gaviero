@@ -73,6 +73,10 @@ pub struct CursorSession {
     /// these in the user message as a `<workspace_folders>` hint — same
     /// fallback `codex_app_server` uses.
     additional_roots: Vec<PathBuf>,
+    /// `AgentOptions::session_read_folders`: the conversation's `/add-dir`
+    /// grants. Cursor gets them as the `<read_only_folders>` prompt block,
+    /// like `agent.permissions.read.extraFolders`.
+    session_read_folders: Vec<PathBuf>,
     agent_id: String,
     conv_id: Option<String>,
     profile: ProviderProfile,
@@ -130,6 +134,7 @@ impl CursorSession {
             cursor_model,
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
+            session_read_folders: args.options.session_read_folders.clone(),
             agent_id: args.agent_id,
             conv_id: args.conv_id,
             profile: args.profile,
@@ -217,10 +222,11 @@ impl CursorSession {
         .with_exposed_tools(self.exposed_tools.as_deref());
         // GAVIERO.md rides the prompt; `.cursorignore` keeps Cursor's own
         // AGENTS.md / CLAUDE.md out (`instructions::sync_cursorignore`).
-        let system_prompt = crate::instructions::append_to_system_prompt(
+        let system_prompt = crate::instructions::append_to_system_prompt_with_grants(
             shared::default_editor_system_prompt(&backend_caps),
             &self.workspace_root,
             &self.additional_roots,
+            &self.session_read_folders,
         );
         let user_prompt =
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);

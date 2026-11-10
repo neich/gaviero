@@ -953,6 +953,11 @@ impl App {
         commands::handle_detach_command(self);
     }
 
+    /// Handle `/add-dir [path]` command.
+    fn handle_add_dir_command(&mut self) {
+        commands::handle_add_dir_command(self);
+    }
+
     /// Paste from clipboard into chat — checks for image first, then text.
     fn chat_paste_from_clipboard(&mut self) {
         side_panel::chat_paste_from_clipboard(self);

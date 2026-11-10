@@ -18,6 +18,9 @@
 //! The same list carries the `.gaviero` directory of the settings file
 //! itself when it lies outside every workspace folder (workspace mode), so
 //! an agent can read the policy that governs it without a permission prompt.
+//! TUI chat's `/add-dir` adds per-conversation entries to the same read-only
+//! set ([`SensitivePolicy::with_session_read_folders`], checked by
+//! [`check_session_read_folder`]); `/reset`, `/clear` and `/handoff` drop them.
 //!
 //! `agent.permissions.scratchFolders` ([`scratch_folders`]) widens the
 //! writable set with folders outside the workspace where the agent works
@@ -199,7 +202,19 @@ pub fn outside_folders_prompt(
     workspace_root: &Path,
     additional_roots: &[impl AsRef<Path>],
 ) -> Option<String> {
-    let policy = SensitivePolicy::resolve(workspace_root);
+    outside_folders_prompt_with_grants(workspace_root, additional_roots, &[])
+}
+
+/// [`outside_folders_prompt`] with the conversation's `/add-dir` grants
+/// ([`SensitivePolicy::with_session_read_folders`]) listed among the
+/// read-only folders.
+pub fn outside_folders_prompt_with_grants(
+    workspace_root: &Path,
+    additional_roots: &[impl AsRef<Path>],
+    session_read_folders: &[PathBuf],
+) -> Option<String> {
+    let policy =
+        SensitivePolicy::resolve(workspace_root).with_session_read_folders(session_read_folders);
     let blocks: Vec<String> = [
         read_only_folders_block(&read_only_folders(&policy, workspace_root, additional_roots)),
         scratch_folders_block(&scratch_folders(&policy, workspace_root, additional_roots)),
@@ -208,6 +223,108 @@ pub fn outside_folders_prompt(
     .flatten()
     .collect();
     (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+/// Outcome of checking one `/add-dir` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReadFolderCheck {
+    /// Not readable yet; store this absolute path as a grant.
+    Grant(PathBuf),
+    /// Already readable; nothing to store. `.1` says why, for the user.
+    AlreadyReadable(PathBuf, String),
+}
+
+/// Check a `/add-dir` argument for a conversation over `workspace_root`
+/// plus `additional_roots`, with `existing` grants already stored. `~`,
+/// `~/x`, relative (to `workspace_root`) and `..` forms are resolved
+/// lexically. `Err` carries a user-facing reason.
+///
+/// A folder that is or contains a workspace folder or a scratch folder is
+/// refused: granting it would make that folder read-only. One inside a
+/// workspace folder, a scratch folder, a read-only folder from the settings
+/// or an existing grant is already readable.
+pub fn check_session_read_folder(
+    raw: &str,
+    workspace_root: &Path,
+    additional_roots: &[PathBuf],
+    existing: &[PathBuf],
+) -> Result<SessionReadFolderCheck, String> {
+    let mut raw = raw.trim();
+    for quote in ['"', '\''] {
+        if raw.len() >= 2 && raw.starts_with(quote) && raw.ends_with(quote) {
+            raw = raw[1..raw.len() - 1].trim();
+            break;
+        }
+    }
+    if raw.is_empty() {
+        return Err("usage: /add-dir <path>".to_string());
+    }
+    let path = crate::scope_enforcer::resolve_read_folder(raw, workspace_root)
+        .ok_or_else(|| format!("cannot resolve {raw}"))?;
+    if !path.is_dir() {
+        return Err(format!("{} is not an existing directory", path.display()));
+    }
+    let key = path_key(&path);
+    let roots: Vec<&Path> = std::iter::once(workspace_root)
+        .chain(additional_roots.iter().map(PathBuf::as_path))
+        .filter(|r| !r.as_os_str().is_empty())
+        .collect();
+    for root in &roots {
+        let r = path_key(root);
+        if within(&key, &r) {
+            return Ok(SessionReadFolderCheck::AlreadyReadable(
+                path,
+                format!("it is inside workspace folder {}", root.display()),
+            ));
+        }
+        if within(&r, &key) {
+            return Err(format!(
+                "{} contains workspace folder {}; granting it would make that folder read-only",
+                path.display(),
+                root.display()
+            ));
+        }
+    }
+    let policy = SensitivePolicy::resolve(workspace_root);
+    for scratch in scratch_folders(&policy, workspace_root, additional_roots) {
+        let s = path_key(&scratch);
+        if within(&key, &s) {
+            return Ok(SessionReadFolderCheck::AlreadyReadable(
+                path,
+                format!("it is inside scratch folder {}", scratch.display()),
+            ));
+        }
+        if within(&s, &key) {
+            return Err(format!(
+                "{} contains scratch folder {}; granting it would make that folder read-only",
+                path.display(),
+                scratch.display()
+            ));
+        }
+    }
+    for folder in read_only_folders(&policy, workspace_root, additional_roots) {
+        if within(&key, &path_key(&folder)) {
+            return Ok(SessionReadFolderCheck::AlreadyReadable(
+                path,
+                format!(
+                    "it is inside read-only folder {} from .gaviero/settings.json",
+                    folder.display()
+                ),
+            ));
+        }
+    }
+    for grant in existing {
+        if within(&key, &path_key(grant)) {
+            return Ok(SessionReadFolderCheck::AlreadyReadable(
+                path,
+                format!(
+                    "it is inside {}, already granted to this conversation",
+                    grant.display()
+                ),
+            ));
+        }
+    }
+    Ok(SessionReadFolderCheck::Grant(path))
 }
 
 /// The policy's `.gaviero` directory, when it exists and neither lies
@@ -397,6 +514,106 @@ pub(crate) mod tests {
         assert!(prompt.starts_with("<read_only_folders>"));
         assert!(prompt.contains("<scratch_folders>"));
         assert!(prompt.ends_with("</scratch_folders>"));
+    }
+
+    /// `<tmp>/ws` (settings `{}`) and an outside `<tmp>/docs`.
+    fn grant_layout(dir: &Path) -> (PathBuf, PathBuf) {
+        let ws = dir.join("ws");
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        write_scratch_settings(&ws, &[], &[]);
+        (ws, docs)
+    }
+
+    #[test]
+    fn check_session_read_folder_grants_an_outside_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, docs) = grant_layout(dir.path());
+        assert_eq!(
+            check_session_read_folder("../docs", &ws, &[], &[]),
+            Ok(SessionReadFolderCheck::Grant(docs.clone()))
+        );
+        let quoted = format!("\"{}\"", docs.display());
+        assert_eq!(
+            check_session_read_folder(&quoted, &ws, &[], &[]),
+            Ok(SessionReadFolderCheck::Grant(docs))
+        );
+    }
+
+    #[test]
+    fn check_session_read_folder_rejects_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, _) = grant_layout(dir.path());
+        let err = check_session_read_folder("../nope", &ws, &[], &[]).unwrap_err();
+        assert!(err.contains("not an existing directory"), "{err}");
+        assert!(check_session_read_folder("  ", &ws, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn check_session_read_folder_reports_inside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, _) = grant_layout(dir.path());
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        assert!(matches!(
+            check_session_read_folder("src", &ws, &[], &[]),
+            Ok(SessionReadFolderCheck::AlreadyReadable(..))
+        ));
+    }
+
+    #[test]
+    fn check_session_read_folder_refuses_a_parent_of_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, _) = grant_layout(dir.path());
+        let err = check_session_read_folder("..", &ws, &[], &[]).unwrap_err();
+        assert!(err.contains("contains workspace folder"), "{err}");
+    }
+
+    #[test]
+    fn check_session_read_folder_refuses_a_parent_of_a_scratch_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(dir.path().join("outer").join("scratch")).unwrap();
+        write_scratch_settings(&ws, &[], &["../outer/scratch"]);
+        let err = check_session_read_folder("../outer", &ws, &[], &[]).unwrap_err();
+        assert!(err.contains("contains scratch folder"), "{err}");
+        assert!(matches!(
+            check_session_read_folder("../outer/scratch", &ws, &[], &[]),
+            Ok(SessionReadFolderCheck::AlreadyReadable(..))
+        ));
+    }
+
+    #[test]
+    fn check_session_read_folder_reports_existing_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, docs) = grant_layout(dir.path());
+        std::fs::create_dir_all(docs.join("sub")).unwrap();
+        assert!(matches!(
+            check_session_read_folder("../docs/sub", &ws, &[], &[docs]),
+            Ok(SessionReadFolderCheck::AlreadyReadable(..))
+        ));
+    }
+
+    #[test]
+    fn check_session_read_folder_reports_settings_extra_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(dir.path().join("docs").join("sub")).unwrap();
+        write_scratch_settings(&ws, &["../docs"], &[]);
+        assert!(matches!(
+            check_session_read_folder("../docs/sub", &ws, &[], &[]),
+            Ok(SessionReadFolderCheck::AlreadyReadable(..))
+        ));
+    }
+
+    #[test]
+    fn outside_folders_prompt_with_grants_lists_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, docs) = grant_layout(dir.path());
+        let block =
+            outside_folders_prompt_with_grants(&ws, &[] as &[PathBuf], std::slice::from_ref(&docs))
+                .unwrap();
+        assert!(block.starts_with("<read_only_folders>"));
+        assert!(block.contains(&docs.display().to_string()));
     }
 
     #[test]

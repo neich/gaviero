@@ -83,13 +83,18 @@ fn codex_native_edit_capabilities() -> Capabilities {
     }
 }
 
-fn codex_native_edit_developer_instructions(cwd: &Path, additional_roots: &[PathBuf]) -> String {
-    codex_instructions_with_tools(cwd, additional_roots, None)
+fn codex_native_edit_developer_instructions(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
+) -> String {
+    codex_instructions_with_tools(cwd, additional_roots, session_read_folders, None)
 }
 
 fn codex_instructions_with_tools(
     cwd: &Path,
     additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
     exposed: Option<&[String]>,
 ) -> String {
     let mut instructions =
@@ -116,7 +121,12 @@ fn codex_instructions_with_tools(
         push_workspace_folders(&mut instructions, cwd, additional_roots);
     }
     // GAVIERO.md replaces AGENTS.md (switched off in `codex_app_server_args`).
-    crate::instructions::append_to_system_prompt(instructions, cwd, additional_roots)
+    crate::instructions::append_to_system_prompt_with_grants(
+        instructions,
+        cwd,
+        additional_roots,
+        session_read_folders,
+    )
 }
 
 fn push_workspace_folders(instructions: &mut String, cwd: &Path, additional_roots: &[PathBuf]) {
@@ -138,6 +148,7 @@ fn thread_start_params(
     model: &str,
     cwd: &Path,
     additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
     allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -147,8 +158,17 @@ fn thread_start_params(
         // The read-only sandbox, network and the deny-read profile from
         // `.gaviero/settings.json` all come from this config: Codex rejects
         // a `default_permissions` profile combined with `sandbox` modes.
-        "config": crate::agent_guard::codex::codex_thread_config(cwd, additional_roots, allow_network),
-        "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
+        "config": crate::agent_guard::codex::codex_thread_config(
+            cwd,
+            additional_roots,
+            session_read_folders,
+            allow_network,
+        ),
+        "developerInstructions": codex_native_edit_developer_instructions(
+            cwd,
+            additional_roots,
+            session_read_folders,
+        ),
     })
 }
 
@@ -156,14 +176,24 @@ fn thread_resume_params(
     thread_id: &str,
     cwd: &Path,
     additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
     allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
-        "config": crate::agent_guard::codex::codex_thread_config(cwd, additional_roots, allow_network),
-        "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
+        "config": crate::agent_guard::codex::codex_thread_config(
+            cwd,
+            additional_roots,
+            session_read_folders,
+            allow_network,
+        ),
+        "developerInstructions": codex_native_edit_developer_instructions(
+            cwd,
+            additional_roots,
+            session_read_folders,
+        ),
     })
 }
 
@@ -354,6 +384,9 @@ pub struct CodexAppServerSession {
     exposed_tools: Option<Vec<String>>,
     workspace_root: PathBuf,
     additional_roots: Vec<PathBuf>,
+    /// `AgentOptions::session_read_folders`: the conversation's `/add-dir`
+    /// grants, sent as `"read"` entries in the thread config.
+    session_read_folders: Vec<PathBuf>,
     continuity_mode: ContinuityMode,
     /// `ProviderProfile::max_context_tokens`, for the replay bound.
     max_context_tokens: Option<usize>,
@@ -447,6 +480,7 @@ impl CodexAppServerSession {
             exposed_tools: args.options.exposed_tools,
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
+            session_read_folders: args.options.session_read_folders,
             continuity_mode,
             max_context_tokens,
             inner: None,
@@ -498,6 +532,7 @@ impl CodexAppServerSession {
                 &self.model,
                 &self.workspace_root,
                 &self.additional_roots,
+                &self.session_read_folders,
                 &self.handle,
                 allow_network,
                 self.exposed_tools.as_deref(),
@@ -705,6 +740,7 @@ async fn handshake(
     model: &str,
     cwd: &Path,
     additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
     existing_handle: &Option<ContinuityHandle>,
     allow_network: bool,
     exposed_tools: Option<&[String]>,
@@ -726,17 +762,30 @@ async fn handshake(
     let (method, mut params) = match existing_handle {
         Some(ContinuityHandle::CodexThreadId(id)) => (
             "thread/resume",
-            thread_resume_params(id, cwd, additional_roots, allow_network),
+            thread_resume_params(
+                id,
+                cwd,
+                additional_roots,
+                session_read_folders,
+                allow_network,
+            ),
         ),
         _ => (
             "thread/start",
-            thread_start_params(model, cwd, additional_roots, allow_network),
+            thread_start_params(
+                model,
+                cwd,
+                additional_roots,
+                session_read_folders,
+                allow_network,
+            ),
         ),
     };
 
     params["developerInstructions"] = serde_json::json!(codex_instructions_with_tools(
         cwd,
         additional_roots,
+        session_read_folders,
         exposed_tools
     ));
     let request_id = next_id();
@@ -2340,7 +2389,7 @@ url = "https://example/mcp/"
         assert!(args.windows(2).any(|pair| {
             pair[0] == "--config" && pair[1] == crate::instructions::CODEX_DISABLE_PROJECT_DOCS
         }));
-        let instructions = codex_instructions_with_tools(dir.path(), &[], None);
+        let instructions = codex_instructions_with_tools(dir.path(), &[], &[], None);
         assert!(instructions.contains("<project_instructions"));
         assert!(instructions.contains("rules"));
     }
@@ -2373,7 +2422,7 @@ url = "https://example/mcp/"
 
     #[test]
     fn thread_policy_uses_native_edit_and_verification_approvals() {
-        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], false);
+        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], &[], false);
         assert_eq!(params["approvalPolicy"], "on-request");
         // The sandbox comes from the deny-read profile in `config`.
         assert!(params.get("sandbox").is_none());
@@ -2397,8 +2446,27 @@ url = "https://example/mcp/"
     }
 
     #[test]
+    fn thread_start_params_carry_session_read_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(ws.join(".gaviero/settings.json"), "{}").unwrap();
+        let params = thread_start_params("m", &ws, &[], std::slice::from_ref(&docs), false);
+        let key = docs.to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            params["config"]["permissions"]["gaviero"]["filesystem"][key.as_str()],
+            "read"
+        );
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(instructions.contains("<read_only_folders>"));
+        assert!(instructions.contains(&docs.display().to_string()));
+    }
+
+    #[test]
     fn resume_and_turn_reassert_native_edit_policy() {
-        let resume = thread_resume_params("thread-1", Path::new("/tmp/work"), &[], true);
+        let resume = thread_resume_params("thread-1", Path::new("/tmp/work"), &[], &[], true);
         assert_eq!(resume["threadId"], "thread-1");
         assert_eq!(resume["approvalPolicy"], "on-request");
         assert!(resume.get("sandboxPolicy").is_none());
@@ -2406,7 +2474,7 @@ url = "https://example/mcp/"
         assert_eq!(resume["config"]["permissions"]["gaviero"]["network"]["enabled"], true);
         assert_eq!(
             resume["developerInstructions"],
-            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], true)["developerInstructions"]
+            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], &[], true)["developerInstructions"]
         );
 
         let turn = turn_start_params("thread-1", "hello");
@@ -2420,7 +2488,7 @@ url = "https://example/mcp/"
             PathBuf::from("/tmp/sibling-a"),
             PathBuf::from("/tmp/sibling-b"),
         ];
-        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &extras, false);
+        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &extras, &[], false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("primary: /tmp/work"));
         assert!(instructions.contains("sibling: /tmp/sibling-a"));

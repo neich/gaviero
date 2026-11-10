@@ -145,6 +145,9 @@ pub struct ToolAgentSession {
     /// changes, so writes need no turn snapshot and nothing is reverted here
     /// on error or cancel (the review shows those turns too).
     host_capture: bool,
+    /// `AgentOptions::session_read_folders`: the conversation's `/add-dir`
+    /// grants, readable through [`ToolCtx::confine_read`] (never writable).
+    session_read_folders: Vec<PathBuf>,
     /// Whether [`Self::connect_extra_servers`] has run. Connections live in
     /// the registry's `RemoteMcpTool`s and close when the session drops.
     extra_servers_connected: bool,
@@ -255,6 +258,7 @@ impl ToolAgentSession {
         let policy = surface.policy().clone();
         let host_capture = options.host_capture;
         let effort = options.effort.clone();
+        let session_read_folders = options.session_read_folders.clone();
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
@@ -276,6 +280,7 @@ impl ToolAgentSession {
             write_gate,
             cancel_token,
             host_capture,
+            session_read_folders,
             extra_servers_connected: false,
         }
     }
@@ -393,10 +398,11 @@ impl AgentSession for ToolAgentSession {
         apply_replay_compaction(&mut turn, &self.compaction, self.profile.max_context_tokens);
         self.connect_extra_servers().await;
 
-        let system = crate::instructions::append_to_system_prompt(
+        let system = crate::instructions::append_to_system_prompt_with_grants(
             default_editor_system_prompt(&self.capabilities()),
             &self.workspace_root,
             &self.additional_roots,
+            &self.session_read_folders,
         );
         let prompt = Self::build_prompt(&turn);
         let user_content =
@@ -418,7 +424,8 @@ impl AgentSession for ToolAgentSession {
             policy: self.policy.clone(),
             auto_approve: turn.auto_approve,
             observer: Some(self.observer.clone()),
-            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&self.workspace_root),
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&self.workspace_root)
+                .with_session_read_folders(&self.session_read_folders),
         };
 
         let outcome = agent_loop::run_agent_loop(
