@@ -24,6 +24,9 @@ pub enum AutocompleteMode {
     /// `/attach <path>` argument — workspace files plus filesystem listing
     /// when the partial starts with `/` or `~`, inserts the bare path.
     AttachPath,
+    /// `/add-dir <folder>` argument — folders on the filesystem, inserts the
+    /// bare path.
+    DirPath,
     /// `/detach <name|all>` argument — current attachment display names
     /// plus `all`, inserts the bare token.
     DetachName,
@@ -127,7 +130,8 @@ impl FileAutocomplete {
             .min(self.matches.len().saturating_sub(rows))
     }
 
-    fn open(&mut self, mode: AutocompleteMode, at_pos: usize, query: &str) {
+    /// Show the popup for `query`, anchored at `at_pos`, from the first match.
+    pub fn open(&mut self, mode: AutocompleteMode, at_pos: usize, query: &str) {
         self.active = true;
         self.mode = mode;
         self.at_pos = at_pos;
@@ -136,7 +140,9 @@ impl FileAutocomplete {
         self.scroll = 0;
     }
 
-    fn clamp_selection(&mut self) {
+    /// Back to the first match when the new list no longer reaches the
+    /// selection.
+    pub fn clamp_selection(&mut self) {
         if self.selected >= self.matches.len() {
             self.selected = 0;
             self.scroll = 0;
@@ -440,14 +446,13 @@ pub fn update_tier_autocomplete(
     autocomplete.open(AutocompleteMode::Tier, start, query);
 }
 
-/// Fill a tier popup; each match is the full `tier:<name>` to insert. Capped
-/// at what the popup can show, so the selection never leaves the screen.
+/// Fill a tier popup; each match is the full `tier:<name>` to insert. Every
+/// tier is kept; the popup scrolls.
 pub fn set_tier_matches(autocomplete: &mut FileAutocomplete, tiers: &[String]) {
     let query = autocomplete.query.to_lowercase();
     autocomplete.matches = tiers
         .iter()
         .filter(|tier| tier.to_lowercase().starts_with(&query))
-        .take(8)
         .map(|tier| format!("{TIER_PREFIX}{tier}"))
         .collect();
     autocomplete.clamp_selection();
@@ -462,16 +467,17 @@ pub fn set_skill_matches(
     if !autocomplete.active || autocomplete.mode != AutocompleteMode::SkillRef {
         return;
     }
-    autocomplete.matches = match_skills(catalog, &autocomplete.query, active_repo_id, 10)
+    autocomplete.matches = match_skills(catalog, &autocomplete.query, active_repo_id, usize::MAX)
         .into_iter()
         .map(|(insert, _)| insert)
         .collect();
     autocomplete.clamp_selection();
 }
 
-/// Fill a path popup from workspace file paths.
+/// Fill a path popup from workspace file paths, keeping every match: the
+/// popup scrolls.
 pub fn set_file_matches(autocomplete: &mut FileAutocomplete, all_files: &[String]) {
-    autocomplete.matches = match_file_paths(all_files, &autocomplete.query, 10);
+    autocomplete.matches = match_file_paths(all_files, &autocomplete.query, usize::MAX);
     autocomplete.clamp_selection();
 }
 
@@ -517,9 +523,9 @@ pub fn accept_autocomplete(input: &mut TextInput, autocomplete: &mut FileAutocom
             input.text.push_str(&path);
             input.text.push(' ');
         }
-        AutocompleteMode::AttachPath | AutocompleteMode::DetachName => {
+        AutocompleteMode::AttachPath | AutocompleteMode::DirPath | AutocompleteMode::DetachName => {
             // Replace just the argument; no trailing space because
-            // `/attach` / `/detach` take a single token.
+            // `/attach` / `/add-dir` / `/detach` take a single token.
             input.text.push_str(&path);
         }
         AutocompleteMode::SkillRef => {
@@ -760,6 +766,7 @@ pub fn render_autocomplete(autocomplete: &FileAutocomplete, area: Rect, buf: &mu
         let display = match autocomplete.mode {
             AutocompleteMode::FileRef => format!(" @{}", path),
             AutocompleteMode::AttachPath
+            | AutocompleteMode::DirPath
             | AutocompleteMode::DetachName
             | AutocompleteMode::ModelSpec
             | AutocompleteMode::Effort
@@ -1203,6 +1210,28 @@ mod tests {
             rows.iter().all(|r| r.ends_with('█') || r.ends_with('│')),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn set_file_matches_keeps_every_match() {
+        let files: Vec<String> = (0..30).map(|i| format!("src/f{i:02}.rs")).collect();
+        let mut ac = FileAutocomplete::new();
+        ac.open(AutocompleteMode::FileRef, 0, "src");
+        set_file_matches(&mut ac, &files);
+        assert_eq!(ac.matches.len(), 30);
+
+        ac.move_selection(100);
+        assert_eq!(ac.matches[ac.selected], "src/f29.rs");
+        assert!(drawn(&ac, 8)[7].contains("f29"));
+    }
+
+    #[test]
+    fn set_tier_matches_keeps_every_tier() {
+        let many: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        let mut ac = FileAutocomplete::new();
+        ac.open(AutocompleteMode::Tier, 0, "");
+        set_tier_matches(&mut ac, &many);
+        assert_eq!(ac.matches.len(), 12);
     }
 
     #[test]

@@ -1572,6 +1572,13 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
                     .scroll_down(delta, app.code_graph_panel.lines.len());
             }
         }
+        SidePanelMode::AgentChat if app.chat_state.autocomplete.is_open() => {
+            // An open completion list takes the wheel, like Up/Down.
+            let step = theme::MOUSE_SCROLL_DELTA as isize;
+            app.chat_state
+                .autocomplete
+                .move_selection(if up { -step } else { step });
+        }
         _ => {
             // Wheel while chat is focused: prefer the overflowing prompt unless
             // the pointer is explicitly over the transcript. Focus-first routing
@@ -2715,6 +2722,32 @@ mod tests {
             .as_ref()
             .map(|(m, _)| m.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn wheel_on_chat_moves_an_open_completion_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = agent_edit_app(dir.path());
+        app.side_panel = SidePanelMode::AgentChat;
+        app.chat_state.autocomplete.open(
+            crate::widgets::prompt_input::AutocompleteMode::FileRef,
+            0,
+            "",
+        );
+        app.chat_state.autocomplete.matches = (0..20).map(|i| format!("f{i}")).collect();
+        app.chat_state.scroll_offset = 10;
+
+        scroll_side_panel(&mut app, false, 0, 0);
+        assert_eq!(app.chat_state.autocomplete.selected, theme::MOUSE_SCROLL_DELTA);
+        scroll_side_panel(&mut app, true, 0, 0);
+        assert_eq!(app.chat_state.autocomplete.selected, 0);
+        assert_eq!(app.chat_state.scroll_offset, 10, "the transcript stays put");
+
+        app.chat_state.autocomplete.reset();
+        scroll_side_panel(&mut app, true, 0, 0);
+        assert_eq!(app.chat_state.scroll_offset, 10 - theme::MOUSE_SCROLL_DELTA);
+
+        cleanup_session(dir.path());
     }
 
     #[test]

@@ -3966,11 +3966,8 @@ impl AgentChatState {
         if let Some(rest) = before_cursor.strip_prefix("/model ")
             && !rest.contains('\n')
         {
-            self.autocomplete.active = true;
-            self.autocomplete.mode = AutocompleteMode::ModelSpec;
-            self.autocomplete.at_pos = "/model ".len();
-            self.autocomplete.query = rest.to_string();
-            self.autocomplete.selected = 0;
+            self.autocomplete
+                .open(AutocompleteMode::ModelSpec, "/model ".len(), rest);
             return;
         }
 
@@ -3979,11 +3976,8 @@ impl AgentChatState {
             if let Some(rest) = before_cursor.strip_prefix(command)
                 && !rest.contains(char::is_whitespace)
             {
-                self.autocomplete.active = true;
-                self.autocomplete.mode = AutocompleteMode::Effort;
-                self.autocomplete.at_pos = command.len();
-                self.autocomplete.query = rest.to_string();
-                self.autocomplete.selected = 0;
+                self.autocomplete
+                    .open(AutocompleteMode::Effort, command.len(), rest);
                 return;
             }
         }
@@ -3997,25 +3991,27 @@ impl AgentChatState {
             // Bail if the argument spans a newline (e.g. user moved the
             // cursor into a multi-line prompt body).
             if !rest.contains('\n') {
-                let arg_start = "/attach ".len();
-                self.autocomplete.active = true;
-                self.autocomplete.mode = AutocompleteMode::AttachPath;
-                self.autocomplete.at_pos = arg_start;
-                self.autocomplete.query = rest.to_string();
-                self.autocomplete.selected = 0;
+                self.autocomplete
+                    .open(AutocompleteMode::AttachPath, "/attach ".len(), rest);
                 return;
             }
+        }
+
+        // ── /add-dir <folder> completion ─────────────────────────────────
+        if let Some(rest) = before_cursor.strip_prefix("/add-dir ")
+            && !rest.contains('\n')
+        {
+            self.autocomplete
+                .open(AutocompleteMode::DirPath, "/add-dir ".len(), rest);
+            return;
         }
 
         // ── /detach <name|all> completion ────────────────────────────────
         if let Some(rest) = before_cursor.strip_prefix("/detach ")
             && !rest.contains('\n')
         {
-            self.autocomplete.active = true;
-            self.autocomplete.mode = AutocompleteMode::DetachName;
-            self.autocomplete.at_pos = "/detach ".len();
-            self.autocomplete.query = rest.to_string();
-            self.autocomplete.selected = 0;
+            self.autocomplete
+                .open(AutocompleteMode::DetachName, "/detach ".len(), rest);
             return;
         }
 
@@ -4040,9 +4036,7 @@ impl AgentChatState {
             &self.autocomplete.query,
             discovered,
         );
-        if self.autocomplete.selected >= self.autocomplete.matches.len() {
-            self.autocomplete.selected = 0;
-        }
+        self.autocomplete.clamp_selection();
     }
 
     /// Update `/effort` autocomplete matches from the current model.
@@ -4054,9 +4048,7 @@ impl AgentChatState {
             self.effective_model(),
             &self.autocomplete.query,
         );
-        if self.autocomplete.selected >= self.autocomplete.matches.len() {
-            self.autocomplete.selected = 0;
-        }
+        self.autocomplete.clamp_selection();
     }
 
     /// Update autocomplete matches from a list of workspace file paths.
@@ -4066,6 +4058,7 @@ impl AgentChatState {
             || self.autocomplete.mode == AutocompleteMode::ModelSpec
             || self.autocomplete.mode == AutocompleteMode::Effort
             || self.autocomplete.mode == AutocompleteMode::DetachName
+            || self.autocomplete.mode == AutocompleteMode::DirPath
         {
             return;
         }
@@ -4155,9 +4148,7 @@ impl AgentChatState {
             }
         }
         self.autocomplete.matches = matches;
-        if self.autocomplete.selected >= self.autocomplete.matches.len() {
-            self.autocomplete.selected = 0;
-        }
+        self.autocomplete.clamp_selection();
     }
 
     // ── Message management ─────────────────────────────────────
@@ -4864,7 +4855,8 @@ impl AgentChatState {
 
         // Render autocomplete popup above the input area
         if self.autocomplete.active && !self.autocomplete.matches.is_empty() {
-            let popup_height = self.autocomplete.matches.len().min(8) as u16;
+            let popup_height =
+                self.autocomplete.matches.len().min(prompt_input::POPUP_ROWS) as u16;
             let popup_y = sep_y.saturating_sub(popup_height);
             let popup_area = Rect {
                 x: inner.x,
