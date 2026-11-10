@@ -2,6 +2,11 @@ use super::*;
 
 use std::path::PathBuf;
 
+#[cfg(test)]
+use crate::widgets::path_listing::display_dir_prefix;
+use crate::widgets::path_listing::{ends_with_separator, is_filesystem_query, list_filesystem_entries};
+pub(super) use crate::widgets::path_listing::expand_tilde;
+
 use crate::panels::code_graph_panel::{
     EdgeRow, GraphDoc, LinkStyle, MAX_EDGE_ROWS, MAX_SYMBOL_ROWS, RefRow, SymbolRow,
 };
@@ -2049,22 +2054,6 @@ pub(super) fn folder_arg_matches(app: &App, query: &str) -> Vec<String> {
     dirs
 }
 
-/// A typed path the filesystem should complete rather than the workspace
-/// file list: rooted (`/`, `\`), home-relative (`~`), or a Windows drive
-/// path (`C:\`, `C:/`).
-pub(super) fn is_filesystem_query(query: &str) -> bool {
-    let b = query.as_bytes();
-    query.starts_with(['/', '\\'])
-        || query == "~"
-        || query.starts_with("~/")
-        || query.starts_with("~\\")
-        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
-}
-
-fn ends_with_separator(path: &str) -> bool {
-    path.ends_with(['/', '\\'])
-}
-
 /// Every directory entry matching the user's typed prefix.
 ///
 /// The query is split into a parent directory (everything up to and
@@ -2074,70 +2063,6 @@ fn ends_with_separator(path: &str) -> bool {
 /// expanded against `$HOME`.
 fn list_filesystem_matches(query: &str) -> Vec<String> {
     list_filesystem_entries(query, None, usize::MAX)
-}
-
-/// [`list_filesystem_matches`] with at most `max_entries` results. With a
-/// `base`, the query is relative to it and needs no separator; without one,
-/// a query without a separator lists nothing.
-fn list_filesystem_entries(
-    query: &str,
-    base: Option<&std::path::Path>,
-    max_entries: usize,
-) -> Vec<String> {
-    let expanded = expand_tilde(query);
-    let (parent, prefix) = match expanded.rfind(['/', '\\']) {
-        Some(idx) => (&expanded[..=idx], &expanded[idx + 1..]),
-        None if base.is_some() => ("", expanded.as_str()),
-        None => return Vec::new(),
-    };
-    let dir = match base {
-        Some(base) => base.join(parent),
-        None if parent.is_empty() => std::path::PathBuf::from("/"),
-        None => std::path::PathBuf::from(parent),
-    };
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(it) => it,
-        Err(_) => return Vec::new(),
-    };
-    let mut matches: Vec<String> = Vec::new();
-    let display_prefix = display_dir_prefix(query);
-    // A completed folder ends with the separator the user is typing.
-    let separator = if display_prefix.ends_with('\\') { "\\" } else { "/" };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !prefix.is_empty() && !name_str.starts_with(prefix) {
-            continue;
-        }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let suffix = if is_dir { separator } else { "" };
-        matches.push(format!("{}{}{}", display_prefix, name_str, suffix));
-        if matches.len() >= max_entries {
-            break;
-        }
-    }
-    matches.sort();
-    matches
-}
-
-pub(super) fn expand_tilde(query: &str) -> String {
-    if let Some(rest) = query.strip_prefix("~/").or_else(|| query.strip_prefix("~\\")) {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}/{}", home.display(), rest);
-        }
-    } else if query == "~"
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.display().to_string();
-    }
-    query.to_string()
-}
-
-fn display_dir_prefix(query: &str) -> String {
-    match query.rfind(['/', '\\']) {
-        Some(idx) => query[..=idx].to_string(),
-        None => String::new(),
-    }
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
