@@ -270,8 +270,8 @@ fn two_sessions_switch_close_and_quit() {
 }
 
 /// The host's circle colours (`session_host/render.rs`).
-const RUNNING: vt100::Color = vt100::Color::Rgb(152, 195, 121);
-const DONE: vt100::Color = vt100::Color::Rgb(97, 175, 239);
+const RUNNING: vt100::Color = vt100::Color::Rgb(0, 204, 0);
+const DONE: vt100::Color = vt100::Color::Rgb(0, 0, 204);
 
 /// The two circle cells after `label` on the tab bar: (symbol, colour) each.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {

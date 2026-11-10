@@ -32,10 +32,11 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
 }
 
 /// Circle palette, shared by both circles: green = working, yellow = waiting
-/// for the user, blue = finished while out of view.
-const GREEN: Color = Color::Rgb(152, 195, 121);
-const YELLOW: Color = Color::Rgb(229, 192, 123);
-const BLUE: Color = Color::Rgb(97, 175, 239);
+/// for the user, blue = finished while out of view. Pure hues at 80%
+/// brightness (204/255), so the three tell apart at a glance.
+const GREEN: Color = Color::Rgb(0, 204, 0);
+const YELLOW: Color = Color::Rgb(204, 204, 0);
+const BLUE: Color = Color::Rgb(0, 0, 204);
 /// Agent circle: an agent or swarm is running / waits for the user (a
 /// permission, a question, a turn review) / finished while out of view.
 const AGENT_RUNNING: Color = GREEN;
