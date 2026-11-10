@@ -344,6 +344,73 @@ fn background_tabs_show_agent_and_shell_activity() {
     assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
 }
 
+/// Labels on the tab bar, left to right, among `labels`.
+fn bar_order(pty: &Pty, labels: &[&str]) -> Vec<String> {
+    let bar = pty.row(0);
+    let mut found: Vec<(usize, String)> = labels
+        .iter()
+        .filter_map(|l| bar.find(l).map(|at| (at, l.to_string())))
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, l)| l).collect()
+}
+
+fn alt_shift_left() -> String {
+    tap(0x25, 0x4B, 0, LEFT_ALT | SHIFT)
+}
+
+#[test]
+fn alt_shift_arrows_reorder_tabs_and_the_order_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs: Vec<_> = ["alpha-a", "beta-b", "gamma-c"]
+        .iter()
+        .map(|n| {
+            let p = root.path().join(n);
+            std::fs::create_dir(&p).unwrap();
+            p
+        })
+        .collect();
+    let labels: Vec<String> = dirs.iter().map(|d| name_of(d)).collect();
+    let [la, lb, lc] = [&labels[0], &labels[1], &labels[2]].map(|s| s.as_str());
+    let state = root.path().join("state.json");
+    std::fs::write(
+        &state,
+        serde_json::json!({ "open": dirs, "recent": [] }).to_string(),
+    )
+    .unwrap();
+
+    let mut pty = host(&[OsStr::new("--sessions")], &state, root.path());
+    pty.wait_for("three tabs", |_, _| bar_order(&pty, &[la, lb, lc]).len() == 3);
+    assert_eq!(bar_order(&pty, &[la, lb, lc]), [la, lb, lc]);
+
+    // C, opened last, is current: mark its screen.
+    pty.send(&tap(0x4B, 0x25, 'k' as u16, 0));
+    pty.wait_text("KEY Char('k')");
+
+    // Alt+Shift+Left twice walks C to the front; a third press does nothing.
+    pty.send(&alt_shift_left());
+    pty.wait_for("C second", |_, _| bar_order(&pty, &[la, lb, lc]) == [la, lc, lb]);
+    pty.send(&alt_shift_left());
+    pty.wait_for("C first", |_, _| bar_order(&pty, &[la, lb, lc]) == [lc, la, lb]);
+    pty.send(&alt_shift_left());
+    // C is still current, and no arrow reached a session.
+    pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));
+    pty.wait_for("C's screen", |s, _| s.contains("KEY Char('k')") && s.contains("KEY Char('z')"));
+    assert_eq!(bar_order(&pty, &[la, lb, lc]), [lc, la, lb]);
+    assert!(!pty.contents().contains("Left"), "screen:\n{}", pty.contents());
+    assert_eq!(open_names(&state), [lc, la, lb]);
+
+    // The next start reopens them in that order.
+    pty.send(&ctrl_q());
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(pty);
+    let mut pty = host(&[OsStr::new("--sessions")], &state, root.path());
+    pty.wait_for("three tabs again", |_, _| bar_order(&pty, &[la, lb, lc]).len() == 3);
+    assert_eq!(bar_order(&pty, &[la, lb, lc]), [lc, la, lb]);
+    pty.send(&ctrl_q());
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
 /// A deploy (`scripts/deploy.ps1`) restarts a supervised host onto the new
 /// build with the same tabs. The host runs from a copy of the binary, so the
 /// test can install over it: rename the running file aside, put a new one

@@ -78,6 +78,19 @@ impl HostState {
         }
     }
 
+    /// The tabs were reordered: `open` follows `tabs` (one entry per path,
+    /// at its first tab). Paths in `open` with no tab keep their order after
+    /// the rest.
+    pub fn reorder_open(&mut self, tabs: &[PathBuf]) {
+        let mut open: Vec<PathBuf> = Vec::with_capacity(self.open.len());
+        for path in tabs.iter().chain(self.open.iter()) {
+            if !open.contains(path) {
+                open.push(path.clone());
+            }
+        }
+        self.open = open;
+    }
+
     /// The tab for `path` closed.
     pub fn note_closed(&mut self, path: &Path) {
         self.open.retain(|p| p != path);
@@ -134,6 +147,22 @@ mod tests {
         assert_eq!(state.open, vec![PathBuf::from("a"), PathBuf::from("b")]);
         state.note_tab_ended(Path::new("a"), false);
         assert_eq!(state.open, vec![PathBuf::from("b")]);
+    }
+
+    #[test]
+    fn reordering_follows_the_tabs_once_per_path() {
+        let p = |s: &str| PathBuf::from(s);
+        let mut state = HostState::default();
+        for name in ["a", "b", "c"] {
+            state.note_opened(Path::new(name));
+        }
+        let recent = state.recent.clone();
+        state.reorder_open(&[p("b"), p("a"), p("c")]);
+        assert_eq!(state.open, vec![p("b"), p("a"), p("c")]);
+        // `a` open in two tabs: listed once, at its first tab.
+        state.reorder_open(&[p("c"), p("a"), p("b"), p("a")]);
+        assert_eq!(state.open, vec![p("c"), p("a"), p("b")]);
+        assert_eq!(state.recent, recent, "recents are untouched");
     }
 
     #[test]

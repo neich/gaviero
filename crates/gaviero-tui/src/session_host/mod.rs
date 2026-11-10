@@ -100,6 +100,10 @@ pub(crate) enum Chord {
     Prev,
     /// Alt+Right: next session.
     Next,
+    /// Alt+Shift+Left: move the current tab one place left.
+    MoveLeft,
+    /// Alt+Shift+Right: move the current tab one place right.
+    MoveRight,
     /// Alt+N: open the new-session picker.
     New,
     /// Alt+Q: close the active tab and end its session (asks first).
@@ -128,6 +132,8 @@ pub(crate) fn host_chord(r: &encode::KeyRecord) -> Option<Chord> {
     }
     let shift = r.ctrl_state & encode::SHIFT != 0;
     match r.vk {
+        0x25 if shift => Some(Chord::MoveLeft),
+        0x27 if shift => Some(Chord::MoveRight),
         0x25 => Some(Chord::Prev),
         0x27 => Some(Chord::Next),
         0x4E if !shift => Some(Chord::New),
@@ -149,6 +155,8 @@ fn term_chord(k: &KeyEvent) -> Option<Chord> {
     }
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
     match k.code {
+        KeyCode::Left if shift => Some(Chord::MoveLeft),
+        KeyCode::Right if shift => Some(Chord::MoveRight),
         KeyCode::Left => Some(Chord::Prev),
         KeyCode::Right => Some(Chord::Next),
         KeyCode::Char('n') if !shift => Some(Chord::New),
@@ -660,12 +668,32 @@ impl Host {
             Chord::Prev if n > 1 => self.switch_to((self.active + n - 1) % n),
             Chord::Next if n > 1 => self.switch_to((self.active + 1) % n),
             Chord::Prev | Chord::Next => {}
+            Chord::MoveLeft => self.move_active(-1),
+            Chord::MoveRight => self.move_active(1),
             Chord::New if !self.quitting() => self.open_picker(),
             Chord::New => {}
             Chord::Close => self.request_close(self.active),
             Chord::QuitAll if !self.quitting() => self.request_quit(),
             Chord::QuitAll => {}
         }
+    }
+
+    /// Alt+Shift+Left/Right: the current tab trades places with its
+    /// neighbour and stays current; nothing happens at either end. The new
+    /// order is saved, so the next start reopens the tabs in it.
+    fn move_active(&mut self, step: isize) {
+        if self.quitting() {
+            return;
+        }
+        let Some(to) = moved_index(self.active, step, self.sessions.len()) else {
+            return;
+        };
+        self.sessions.swap(self.active, to);
+        self.active = to;
+        self.dirty = true;
+        let order: Vec<PathBuf> = self.sessions.iter().map(|s| s.path.clone()).collect();
+        self.state.reorder_open(&order);
+        self.save_state();
     }
 
     /// A left click on the tab bar: the close button closes its tab,
@@ -916,6 +944,13 @@ fn is_input(event: &HostEvent) -> bool {
         HostEvent::Term(e) => matches!(e, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)),
         _ => false,
     }
+}
+
+/// Where the tab at `active` goes when moved by `step` among `len` tabs;
+/// `None` past either end (no wrap).
+fn moved_index(active: usize, step: isize, len: usize) -> Option<usize> {
+    let to = active.checked_add_signed(step)?;
+    (to < len && to != active).then_some(to)
 }
 
 /// The current tab after removing tab `removed`, `len` tabs left: the one
@@ -1251,6 +1286,34 @@ mod tests {
         let mut up = down(0x51, 17, LEFT_CTRL);
         up.key_down = false;
         assert_eq!(host_chord(&up), None);
+    }
+
+    #[test]
+    fn alt_shift_arrows_move_the_tab() {
+        use encode::{LEFT_ALT, LEFT_CTRL, RIGHT_ALT, SHIFT};
+        assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT | SHIFT)), Some(Chord::MoveLeft));
+        assert_eq!(host_chord(&down(0x27, 0, RIGHT_ALT | SHIFT)), Some(Chord::MoveRight));
+        // Shift alone or with Ctrl+Alt is the session's.
+        assert_eq!(host_chord(&down(0x25, 0, SHIFT)), None);
+        assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT | LEFT_CTRL | SHIFT)), None);
+        let shift_alt = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(
+            term_chord(&KeyEvent::new(KeyCode::Left, shift_alt)),
+            Some(Chord::MoveLeft)
+        );
+        assert_eq!(
+            term_chord(&KeyEvent::new(KeyCode::Right, shift_alt)),
+            Some(Chord::MoveRight)
+        );
+    }
+
+    #[test]
+    fn a_moved_tab_stops_at_either_end() {
+        assert_eq!(moved_index(1, -1, 3), Some(0));
+        assert_eq!(moved_index(1, 1, 3), Some(2));
+        assert_eq!(moved_index(0, -1, 3), None);
+        assert_eq!(moved_index(2, 1, 3), None);
+        assert_eq!(moved_index(0, 1, 1), None);
     }
 
     #[test]
