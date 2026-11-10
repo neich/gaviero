@@ -50,8 +50,19 @@ const EXE_WAIT: Duration = Duration::from_secs(30);
 
 /// A child that asks for a restart sooner than this after starting is backed
 /// off by [`RESTART_BACKOFF`], so a misbehaving build cannot spin the pane.
-const MIN_RUN: Duration = Duration::from_secs(10);
-const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+/// The session host (`session_host`) applies the same limits to its tabs.
+pub(crate) const MIN_RUN: Duration = Duration::from_secs(10);
+pub(crate) const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The environment a supervised TUI child gets: marked as supervised, with
+/// `launch_state` as its private launch-state file. Used by the session host,
+/// which supervises each of its tabs the way [`supervise`] does one pane.
+pub(crate) fn child_env(launch_state: &Path) -> [(&'static str, OsString); 2] {
+    [
+        (CHILD_ENV, OsString::from("1")),
+        (LAUNCH_STATE_ENV, launch_state.as_os_str().to_owned()),
+    ]
+}
 
 /// True in the TUI child of a supervisor — only then may the TUI exit with
 /// [`RESTART_EXIT_CODE`] and expect to come back.

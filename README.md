@@ -39,6 +39,8 @@ gaviero --folder ~/src               # plain folder, even if ~/src holds a works
 
 A plain `gaviero <dir>` on a directory that holds a `.gaviero-workspace` file asks whether to open that workspace instead (memory, code graph and member settings differ between the two); `--folder` skips the question.
 
+**Several sessions in one terminal.** `gaviero --sessions [path]` starts a session host: every session is its own `gaviero` process, shown under a tab bar. Alt+Left / Alt+Right switch sessions, Alt+N opens another folder or workspace, Alt+X (or the `x` on a tab) closes the tab and ends its gaviero, Alt+Q quits the host and reopens every tab at the next start; both ask first when an agent, a swarm or a shell command is running or files are unsaved. Tabs mark a busy session and a background session that waits for you. Without a path it reopens the sessions open when the host last ended. See [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md#usage).
+
 **First run.** Opening a folder that has no `.gaviero/settings.json` shows a setup screen before the editor, at every launch until the folder has one. It offers three choices:
 
 1. *Editor only* (preselected; Esc picks it too) — nothing is written to the folder. You get the explorer, find, the editor and the terminal; there is no side panel, agent, memory or code graph. Settings come from the global `$GAVIERO_ROOT/.gaviero/settings.json` (or the built-in defaults).

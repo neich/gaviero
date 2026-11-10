@@ -1797,6 +1797,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             session::maybe_persist_composer(app);
             super::restart::on_tick(app);
+            app.poll_session_control();
         }
     }
 }

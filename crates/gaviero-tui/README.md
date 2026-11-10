@@ -22,7 +22,11 @@ gaviero                                        # current directory
 gaviero /path/to/repo                          # single-folder workspace
 gaviero /path/to/workspace.gaviero-workspace   # multi-folder workspace
 gaviero --folder /path/to/dir                  # plain folder, even if it holds a workspace file
+gaviero --sessions                             # session host: reopen the last set of sessions
+gaviero --sessions /path/to/repo               # session host with only this session
 ```
+
+`gaviero --sessions` runs several gaviero sessions in one terminal, each a full `gaviero` process, under a one-row tab bar. Alt+Left / Alt+Right switch sessions (or click a tab), Alt+N opens a new one in a folder browser over the whole disk (the empty box lists recent paths, the start folder, home and every drive; type a folder / `.gaviero-workspace` path with Tab completion, → enters the selected folder, ← goes to the parent, Enter opens the selection — a listed folder shows itself first), Alt+X or a click on the `x` at the start of a tab closes that tab and ends its gaviero (it saves its session state; a session that has not exited after 3 s is killed), and the tab before it becomes current. Alt+Q (or Alt+Shift+Q) quits the host the same way, keeping every tab for the next start. Both act at once unless something would be lost — an agent, a swarm or a shell command running, or unsaved files — in which case a popup lists it per tab and only `y` goes ahead. A tab shows `⋯` while its session runs an agent, swarm or terminal task, and `●` when a background session waits for you (a permission prompt or a turn review). A tab closes when its gaviero exits; the host exits after the last one. Without a path the host reopens the sessions open when it last ended, else the current directory. Each session restarts in place onto a new build, like a plain `gaviero`. Windows is the tested platform.
 
 Opening a directory that holds a `.gaviero-workspace` file asks first whether to open that workspace (preselected) or the directory as a plain folder (Esc). A plain folder keeps its own memory, code graph and turn history under its `.gaviero/` and ignores the members' `.gaviero/settings.json`. `--folder` skips the question, `--workspace` opens the workspace directly, and a restart onto a new build reuses the answer.
 
@@ -93,6 +97,10 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+T / Ctrl+W | New tab / close tab |
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |
+| Alt+Left/Right (`--sessions` host) | Previous / next session |
+| Alt+N (`--sessions` host) | New session picker |
+| Alt+X (`--sessions` host) | Close the active tab and end its gaviero (or click the `x` on a tab; asks first when work is in progress) |
+| Alt+Q (`--sessions` host) | Quit the host; every tab reopens next start (asks first when work is in progress) |
 
 F7 is the reliable word-wrap chord on every host. See [Root README](../../README.md) for the full editor keybinding tables.
 

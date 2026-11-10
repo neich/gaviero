@@ -413,6 +413,24 @@ fn spawn_external(_url: &str) -> std::io::Result<()> {
     ))
 }
 
+/// The filesystem roots a folder browser offers at the top: every mounted
+/// drive (`C:\`, `D:\`, …) on Windows, `/` elsewhere. Asks the OS for the
+/// drive bitmask instead of probing each letter, so a disconnected network
+/// drive cannot stall the caller.
+#[cfg(windows)]
+pub fn filesystem_roots() -> Vec<std::path::PathBuf> {
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| std::path::PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn filesystem_roots() -> Vec<std::path::PathBuf> {
+    vec![std::path::PathBuf::from("/")]
+}
+
 #[cfg(unix)]
 fn spawn_detached(bin: &str, args: &[&str]) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
