@@ -24,26 +24,42 @@ impl vt100::Callbacks for TitleCb {
     }
 }
 
-/// What a session's tab shows about it.
+/// What a session is doing, from its status title: the two circles on
+/// its tab (`render::tab_badges`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum SessionStatus {
-    #[default]
-    Idle,
-    /// An agent, swarm or terminal task is running.
-    Busy,
-    /// Waiting for the user: a permission prompt or a pending turn review.
-    Attention,
+pub(crate) struct Activity {
+    /// Waiting for the user: a permission prompt, an agent's question or a
+    /// pending turn review (`attention`).
+    pub waiting: bool,
+    /// An agent or a swarm script is running.
+    pub agent: bool,
+    /// A command is running in one of the session's shells.
+    pub shell: bool,
 }
 
-/// The status a child reports in its window title
+/// The activity a child reports in its window title
 /// (`gaviero-session:<idle|busy|attention>[:work,...]`); anything else is
-/// idle.
-pub(crate) fn parse_status(title: Option<&str>) -> SessionStatus {
-    match status_fields(title) {
-        Some(("busy", _)) => SessionStatus::Busy,
-        Some(("attention", _)) => SessionStatus::Attention,
-        _ => SessionStatus::Idle,
+/// none. A child that reports `busy` with no detail (an older build) counts
+/// as an agent running.
+pub(crate) fn parse_activity(title: Option<&str>) -> Activity {
+    let Some((status, detail)) = status_fields(title) else {
+        return Activity::default();
+    };
+    let has = |keyword: &str| detail.split(',').any(|k| k == keyword);
+    let agent = has("agent") || has("swarm");
+    let shell = has("terminal");
+    Activity {
+        waiting: status == "attention",
+        agent: agent || (status == "busy" && !shell),
+        shell,
     }
+}
+
+/// Which of a background tab's work ended between `before` and `after`:
+/// `(agent, shell)`. Each sets that tab's "finished" circle until the tab is
+/// made current.
+pub(crate) fn finished(before: Activity, after: Activity) -> (bool, bool) {
+    (before.agent && !after.agent, before.shell && !after.shell)
 }
 
 /// What closing the child now would cut off, from its status title, as the
@@ -109,10 +125,13 @@ pub(crate) struct Session {
     pub started: Instant,
     pub launch_state: PathBuf,
     pub control: PathBuf,
-    pub status: SessionStatus,
+    pub activity: Activity,
     /// What closing this session now would cut off (`parse_work`).
     pub work: Vec<&'static str>,
-    pub attention_unseen: bool,
+    /// An agent turn / a shell command ended while this tab was not
+    /// current; cleared when it is made current.
+    pub agent_done_unseen: bool,
+    pub shell_done_unseen: bool,
     /// Exited for a restart too soon after starting; a delayed
     /// [`HostEvent::Relaunch`] is on its way.
     pub restart_pending: bool,
@@ -223,9 +242,10 @@ pub(crate) fn spawn(
         started: Instant::now(),
         launch_state,
         control,
-        status: SessionStatus::Idle,
+        activity: Activity::default(),
         work: Vec::new(),
-        attention_unseen: false,
+        agent_done_unseen: false,
+        shell_done_unseen: false,
         restart_pending: false,
     })
 }
@@ -237,7 +257,7 @@ impl Session {
     }
 
     /// Feed child output into the screen, answer its terminal queries, and
-    /// update the status from its title.
+    /// update its activity from its title.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
         let replies = encode::query_replies(bytes, self.parser.screen().cursor_position());
@@ -245,7 +265,7 @@ impl Session {
             self.send(replies);
         }
         let title = self.parser.callbacks().title.as_deref();
-        self.status = parse_status(title);
+        self.activity = parse_activity(title);
         self.work = parse_work(title);
     }
 
@@ -283,20 +303,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_titles_parse() {
-        assert_eq!(parse_status(Some("gaviero-session:busy")), SessionStatus::Busy);
+    fn activity_parses_from_the_title() {
+        let activity = |t| parse_activity(Some(t));
+        assert_eq!(activity("gaviero-session:idle"), Activity::default());
+        assert_eq!(activity("gaviero-session:other"), Activity::default());
+        assert_eq!(parse_activity(Some("vim")), Activity::default());
+        assert_eq!(parse_activity(None), Activity::default());
         assert_eq!(
-            parse_status(Some("gaviero-session:attention")),
-            SessionStatus::Attention
+            activity("gaviero-session:busy:agent,terminal"),
+            Activity { waiting: false, agent: true, shell: true }
         );
-        assert_eq!(parse_status(Some("gaviero-session:idle")), SessionStatus::Idle);
-        assert_eq!(parse_status(Some("gaviero-session:other")), SessionStatus::Idle);
-        assert_eq!(parse_status(Some("vim")), SessionStatus::Idle);
-        assert_eq!(parse_status(None), SessionStatus::Idle);
         assert_eq!(
-            parse_status(Some("gaviero-session:busy:agent,terminal")),
-            SessionStatus::Busy
+            activity("gaviero-session:busy:swarm,unsaved"),
+            Activity { waiting: false, agent: true, shell: false }
         );
+        assert_eq!(
+            activity("gaviero-session:busy:terminal"),
+            Activity { waiting: false, agent: false, shell: true }
+        );
+        // A permission prompt or question while the agent runs.
+        assert_eq!(
+            activity("gaviero-session:attention:agent"),
+            Activity { waiting: true, agent: true, shell: false }
+        );
+        // A pending turn review after the turn.
+        assert_eq!(
+            activity("gaviero-session:attention"),
+            Activity { waiting: true, agent: false, shell: false }
+        );
+        // An older child: busy, no detail.
+        assert_eq!(
+            activity("gaviero-session:busy"),
+            Activity { waiting: false, agent: true, shell: false }
+        );
+        // Unsaved files alone are no activity.
+        assert_eq!(activity("gaviero-session:idle:unsaved"), Activity::default());
+    }
+
+    #[test]
+    fn work_that_ends_is_reported_finished() {
+        let both = Activity { waiting: false, agent: true, shell: true };
+        let none = Activity::default();
+        assert_eq!(finished(both, none), (true, true));
+        assert_eq!(finished(none, both), (false, false));
+        assert_eq!(finished(both, both), (false, false));
+        let shell_only = Activity { agent: false, ..both };
+        assert_eq!(finished(both, shell_only), (true, false));
+        // The turn ends into a turn review: the agent finished.
+        let review = Activity { waiting: true, agent: false, shell: false };
+        assert_eq!(finished(both, review), (true, true));
     }
 
     #[test]

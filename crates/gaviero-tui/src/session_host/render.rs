@@ -2,9 +2,9 @@
 //! below it.
 
 use super::Host;
-use super::session::SessionStatus;
+use super::session::Activity;
 use crate::panels::terminal::vt100_style_to_ratatui;
-use crate::widgets::tabs::{TabBar, TabKind};
+use crate::widgets::tabs::{TabBadges, TabBar, TabKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -31,36 +31,84 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
     }
 }
 
-/// One tab: the label (`⋯ ` in front while busy) and the attention marker,
-/// shown only on tabs other than the active one.
-pub(crate) fn tab_title(
-    label: &str,
-    status: SessionStatus,
-    attention_unseen: bool,
-    active: bool,
-) -> (String, bool, TabKind) {
-    let title = if status == SessionStatus::Busy {
-        format!("⋯ {label}")
-    } else {
-        label.to_string()
-    };
-    (title, attention_unseen && !active, TabKind::Normal)
-}
+/// Circle palette, shared by both circles: green = working, yellow = waiting
+/// for the user, blue = finished while out of view.
+const GREEN: Color = Color::Rgb(152, 195, 121);
+const YELLOW: Color = Color::Rgb(229, 192, 123);
+const BLUE: Color = Color::Rgb(97, 175, 239);
+/// Agent circle: an agent or swarm is running / waits for the user (a
+/// permission, a question, a turn review) / finished while out of view.
+const AGENT_RUNNING: Color = GREEN;
+const AGENT_WAITING: Color = YELLOW;
+const AGENT_DONE: Color = BLUE;
+/// Shell circle: a command is running / one finished while out of view.
+const SHELL_RUNNING: Color = GREEN;
+const SHELL_DONE: Color = BLUE;
 
 pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
     host.sessions
         .iter()
-        .enumerate()
-        .map(|(i, s)| tab_title(&s.label, s.status, s.attention_unseen, i == host.active))
+        .map(|s| (s.label.clone(), false, TabKind::Normal))
         .collect()
 }
 
-/// The host's tab bar: every tab has a close button.
-pub(crate) fn tab_bar<'a>(host: &Host, titles: &'a [(String, bool, TabKind)]) -> TabBar<'a> {
+/// A tab's two circles: the agent one, then the shell one. The current tab
+/// shows neither; making a tab current clears its "finished" marks.
+pub(crate) fn badges(
+    activity: Activity,
+    agent_done_unseen: bool,
+    shell_done_unseen: bool,
+    active: bool,
+) -> TabBadges {
+    if active {
+        return [None, None];
+    }
+    let agent = if activity.waiting {
+        Some(AGENT_WAITING)
+    } else if activity.agent {
+        Some(AGENT_RUNNING)
+    } else if agent_done_unseen {
+        Some(AGENT_DONE)
+    } else {
+        None
+    };
+    let shell = if activity.shell {
+        Some(SHELL_RUNNING)
+    } else if shell_done_unseen {
+        Some(SHELL_DONE)
+    } else {
+        None
+    };
+    [agent, shell]
+}
+
+pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
+    host.sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            badges(
+                s.activity,
+                s.agent_done_unseen,
+                s.shell_done_unseen,
+                i == host.active,
+            )
+        })
+        .collect()
+}
+
+/// The host's tab bar: every tab has a close button and two activity
+/// circles.
+pub(crate) fn tab_bar<'a>(
+    host: &Host,
+    titles: &'a [(String, bool, TabKind)],
+    badges: &'a [TabBadges],
+) -> TabBar<'a> {
     TabBar {
         titles,
         active: host.active,
         closable: true,
+        badges: Some(badges),
     }
 }
 
@@ -77,7 +125,8 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
     };
 
     let titles = tab_titles(host);
-    tab_bar(host, &titles).render(bar, frame.buffer_mut());
+    let badges = tab_badges(host);
+    tab_bar(host, &titles, &badges).render(bar, frame.buffer_mut());
     if let Some(text) = host.bar_notice() {
         draw_notice(&text, bar, frame.buffer_mut());
     }
@@ -177,19 +226,31 @@ mod tests {
     }
 
     #[test]
-    fn tab_titles_mark_busy_and_unseen_attention() {
-        let busy = tab_title("alpha", SessionStatus::Busy, false, false);
-        assert_eq!(busy.0, "⋯ alpha");
-        assert!(!busy.1);
-
-        let idle = tab_title("beta", SessionStatus::Idle, false, false);
-        assert_eq!(idle.0, "beta");
-
-        let waiting = tab_title("gamma", SessionStatus::Attention, true, false);
-        assert_eq!(waiting.0, "gamma");
-        assert!(waiting.1, "a background tab waiting for the user is marked");
-
-        let active = tab_title("gamma", SessionStatus::Attention, true, true);
-        assert!(!active.1, "the active tab never shows the marker");
+    fn badges_show_agent_and_shell_state_on_background_tabs() {
+        let none = Activity::default();
+        let running = Activity { waiting: false, agent: true, shell: true };
+        let asking = Activity { waiting: true, ..running };
+        assert_eq!(badges(none, false, false, false), [None, None]);
+        assert_eq!(
+            badges(running, false, false, false),
+            [Some(AGENT_RUNNING), Some(SHELL_RUNNING)]
+        );
+        // Waiting for the user wins over running.
+        assert_eq!(badges(asking, false, false, false)[0], Some(AGENT_WAITING));
+        // A turn review pending after the turn: waiting, not finished.
+        let review = Activity { waiting: true, ..none };
+        assert_eq!(badges(review, true, false, false), [Some(AGENT_WAITING), None]);
+        // Finished while out of view.
+        assert_eq!(
+            badges(none, true, true, false),
+            [Some(AGENT_DONE), Some(SHELL_DONE)]
+        );
+        // Running again wins over an earlier finish.
+        assert_eq!(
+            badges(running, true, true, false),
+            [Some(AGENT_RUNNING), Some(SHELL_RUNNING)]
+        );
+        // The current tab shows nothing.
+        assert_eq!(badges(asking, true, true, true), [None, None]);
     }
 }

@@ -19,7 +19,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use encode::MouseTranslator;
-use session::{Session, SessionStatus};
+use session::Session;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -299,7 +299,8 @@ impl Host {
     fn switch_to(&mut self, i: usize) {
         if let Some(s) = self.sessions.get_mut(i) {
             self.active = i;
-            s.attention_unseen = false;
+            s.agent_done_unseen = false;
+            s.shell_done_unseen = false;
             self.dirty = true;
         }
     }
@@ -392,13 +393,15 @@ impl Host {
         };
         let active = i == self.active;
         let s = &mut self.sessions[i];
-        let before = s.status;
+        let before = s.activity;
         s.feed(bytes);
-        let changed = s.status != before;
-        if changed {
-            // A background tab that starts waiting for the user is marked
-            // until the user looks at it; leaving that state clears it.
-            s.attention_unseen = s.status == SessionStatus::Attention && !active;
+        let changed = s.activity != before;
+        if changed && !active {
+            // Work that ends in a background tab is marked finished until
+            // the user makes the tab current.
+            let (agent, shell) = session::finished(before, s.activity);
+            s.agent_done_unseen |= agent;
+            s.shell_done_unseen |= shell;
         }
         if active || changed {
             self.dirty = true;
@@ -680,13 +683,15 @@ impl Host {
     /// The tab under column `col` of the tab bar.
     fn tab_at(&self, col: u16) -> Option<usize> {
         let titles = render::tab_titles(self);
-        render::tab_bar(self, &titles).tab_at_x(col, 0)
+        let badges = render::tab_badges(self);
+        render::tab_bar(self, &titles, &badges).tab_at_x(col, 0)
     }
 
     /// The tab whose close button is at column `col` of the tab bar.
     fn close_at(&self, col: u16) -> Option<usize> {
         let titles = render::tab_titles(self);
-        render::tab_bar(self, &titles).close_at_x(col, 0)
+        let badges = render::tab_badges(self);
+        render::tab_bar(self, &titles, &badges).close_at_x(col, 0)
     }
 
     fn on_resize(&mut self) {
