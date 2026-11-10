@@ -129,7 +129,8 @@ pub(crate) struct Session {
     /// What closing this session now would cut off (`parse_work`).
     pub work: Vec<&'static str>,
     /// An agent turn / a shell command ended while this tab was not
-    /// current; cleared when it is made current.
+    /// current; cleared when the user leaves the tab after making it
+    /// current, or when its activity changes while it is current.
     pub agent_done_unseen: bool,
     pub shell_done_unseen: bool,
     /// Exited for a restart too soon after starting; a delayed
