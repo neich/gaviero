@@ -53,16 +53,12 @@ pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
 }
 
 /// A tab's two circles: the agent one, then the shell one. The current tab
-/// shows neither; making a tab current clears its "finished" marks.
+/// shows them too; its "finished" marks stay until the user leaves it.
 pub(crate) fn badges(
     activity: Activity,
     agent_done_unseen: bool,
     shell_done_unseen: bool,
-    active: bool,
 ) -> TabBadges {
-    if active {
-        return [None, None];
-    }
     let agent = if activity.waiting {
         Some(AGENT_WAITING)
     } else if activity.agent {
@@ -85,15 +81,7 @@ pub(crate) fn badges(
 pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
     host.sessions
         .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            badges(
-                s.activity,
-                s.agent_done_unseen,
-                s.shell_done_unseen,
-                i == host.active,
-            )
-        })
+        .map(|s| badges(s.activity, s.agent_done_unseen, s.shell_done_unseen))
         .collect()
 }
 
@@ -226,31 +214,26 @@ mod tests {
     }
 
     #[test]
-    fn badges_show_agent_and_shell_state_on_background_tabs() {
+    fn badges_show_agent_and_shell_state() {
         let none = Activity::default();
         let running = Activity { waiting: false, agent: true, shell: true };
         let asking = Activity { waiting: true, ..running };
-        assert_eq!(badges(none, false, false, false), [None, None]);
+        assert_eq!(badges(none, false, false), [None, None]);
         assert_eq!(
-            badges(running, false, false, false),
+            badges(running, false, false),
             [Some(AGENT_RUNNING), Some(SHELL_RUNNING)]
         );
         // Waiting for the user wins over running.
-        assert_eq!(badges(asking, false, false, false)[0], Some(AGENT_WAITING));
+        assert_eq!(badges(asking, false, false)[0], Some(AGENT_WAITING));
         // A turn review pending after the turn: waiting, not finished.
         let review = Activity { waiting: true, ..none };
-        assert_eq!(badges(review, true, false, false), [Some(AGENT_WAITING), None]);
+        assert_eq!(badges(review, true, false), [Some(AGENT_WAITING), None]);
         // Finished while out of view.
-        assert_eq!(
-            badges(none, true, true, false),
-            [Some(AGENT_DONE), Some(SHELL_DONE)]
-        );
+        assert_eq!(badges(none, true, true), [Some(AGENT_DONE), Some(SHELL_DONE)]);
         // Running again wins over an earlier finish.
         assert_eq!(
-            badges(running, true, true, false),
+            badges(running, true, true),
             [Some(AGENT_RUNNING), Some(SHELL_RUNNING)]
         );
-        // The current tab shows nothing.
-        assert_eq!(badges(asking, true, true, true), [None, None]);
     }
 }

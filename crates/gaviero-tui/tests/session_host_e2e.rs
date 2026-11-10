@@ -302,12 +302,15 @@ fn background_tabs_show_agent_and_shell_activity() {
         bar.contains(&la) && bar.contains(&lb)
     });
 
-    // B, current, starts an agent and a shell command: no circles on it.
+    // B, current, starts an agent and a shell command: its circles show.
     pty.send(&ctrl_e());
     pty.wait_text("STATUS busy");
-    assert!(!pty.row(0).contains('●'), "row 0: {}", pty.row(0));
+    pty.wait_for("B's running circles while current", |_, _| {
+        let [agent, shell] = circles(&pty, &lb);
+        agent == ("●".to_string(), RUNNING) && shell == ("●".to_string(), RUNNING)
+    });
 
-    // Seen from A, B shows both running.
+    // Seen from A, B still shows both running.
     pty.send(&alt_left());
     pty.wait_for("B's running circles", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
@@ -322,16 +325,20 @@ fn background_tabs_show_agent_and_shell_activity() {
         agent == ("●".to_string(), DONE) && shell == ("●".to_string(), DONE)
     });
 
-    // Making B current clears them, and they stay clear when B is left.
+    // Making B current keeps them.
     pty.send(&alt_right());
-    pty.wait_for("B current, circles cleared", |s, _| {
-        s.contains("STATUS idle (later)") && !pty.row(0).contains('●')
+    pty.wait_for("B current, finished circles kept", |s, _| {
+        let [agent, shell] = circles(&pty, &lb);
+        s.contains("STATUS idle (later)")
+            && agent == ("●".to_string(), DONE)
+            && shell == ("●".to_string(), DONE)
     });
 
-    // Work that ends while B is current leaves no finished mark.
+    // New work on the current tab replaces them; when it ends in view it
+    // leaves no finished mark.
     pty.send(&ctrl_e());
     pty.wait_for("B's second run ended", |s, _| {
-        s.matches("STATUS idle (later)").count() == 2
+        s.matches("STATUS idle (later)").count() == 2 && !pty.row(0).contains('●')
     });
     pty.send(&alt_left());
     pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));

@@ -340,13 +340,20 @@ impl Host {
         self.sessions.iter().position(|s| s.id == id)
     }
 
+    /// Make tab `i` current. Its circles stay as they were; the tab being
+    /// left has been seen, so its "finished" marks clear.
     fn switch_to(&mut self, i: usize) {
-        if let Some(s) = self.sessions.get_mut(i) {
-            self.active = i;
-            s.agent_done_unseen = false;
-            s.shell_done_unseen = false;
-            self.dirty = true;
+        if i >= self.sessions.len() {
+            return;
         }
+        if i != self.active
+            && let Some(left) = self.sessions.get_mut(self.active)
+        {
+            left.agent_done_unseen = false;
+            left.shell_done_unseen = false;
+        }
+        self.active = i;
+        self.dirty = true;
     }
 
     fn notify(&mut self, text: String) {
@@ -445,10 +452,15 @@ impl Host {
         let changed = s.activity != before;
         if changed && !active {
             // Work that ends in a background tab is marked finished until
-            // the user makes the tab current.
+            // the user has made the tab current and left it again.
             let (agent, shell) = session::finished(before, s.activity);
             s.agent_done_unseen |= agent;
             s.shell_done_unseen |= shell;
+        } else if changed {
+            // The current tab is in view: any change there means its earlier
+            // finish has been seen.
+            s.agent_done_unseen = false;
+            s.shell_done_unseen = false;
         }
         if active || changed {
             self.dirty = true;
