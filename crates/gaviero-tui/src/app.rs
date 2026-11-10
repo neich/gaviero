@@ -369,6 +369,10 @@ pub struct App {
     /// The side panel and the agent-review left modes stay hidden, and no
     /// agent, memory, code-graph, MCP or remote service is started.
     pub(crate) editor_only: bool,
+    /// Under a session host (`gaviero --sessions`): the control file the
+    /// host writes `quit` into for "quit all", and when it was last checked.
+    /// `None` unless `GAVIERO_SESSION_CONTROL` is set.
+    pub(crate) session_control: Option<(std::path::PathBuf, std::time::Instant)>,
 }
 
 impl App {
@@ -604,6 +608,8 @@ impl App {
             windows_paste_settle_until: None,
             restart: restart::RestartState::new(),
             editor_only: false,
+            session_control: std::env::var_os("GAVIERO_SESSION_CONTROL")
+                .map(|path| (std::path::PathBuf::from(path), std::time::Instant::now())),
         };
         emit_extra_root_skill_warnings(&mut app, &skill_load_warnings);
         turn_review::restore_on_startup(&mut app);
@@ -1245,6 +1251,66 @@ impl App {
         session::try_quit(self);
     }
 
+    /// What a session host shows on this session's tab: `attention` while a
+    /// permission prompt or a turn review waits for the user, `busy` while
+    /// an agent, swarm or terminal task runs, else `idle`. `main` reports it
+    /// in the window title, only under a host, followed by `:` and the work
+    /// closing this session would cut off (`restart::work_in_progress`), so
+    /// the host can warn before it closes the tab: `busy:agent,unsaved`.
+    /// Not `;`: terminals split OSC parameters on it.
+    pub(crate) fn session_host_status(&self) -> String {
+        let waiting = self
+            .chat_state
+            .conversations
+            .iter()
+            .any(|c| c.pending_permission.is_some())
+            || !self.pending_turn_reviews.is_empty();
+        let status = if waiting {
+            "attention"
+        } else if restart::running_task(self).is_some() {
+            "busy"
+        } else {
+            "idle"
+        };
+        let work = restart::work_in_progress(self);
+        if work.is_empty() {
+            status.to_string()
+        } else {
+            format!("{status}:{}", work.join(","))
+        }
+    }
+
+    /// Under a session host, at most every 500 ms: a control file reading
+    /// `quit` is consumed and the app quits through its normal path (which
+    /// may ask first); `exit` quits without asking (the host closed the tab).
+    fn poll_session_control(&mut self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+        let Some((path, last)) = self.session_control.as_mut() else {
+            return;
+        };
+        if last.elapsed() < EVERY {
+            return;
+        }
+        *last = std::time::Instant::now();
+        let Ok(text) = std::fs::read_to_string(&*path) else {
+            return;
+        };
+        match text.trim() {
+            // Ask first, like Ctrl+Q.
+            "quit" => {
+                let _ = std::fs::remove_file(&*path);
+                self.try_quit();
+            }
+            // The host is closing this tab: leave now through the normal
+            // exit path (session state saved, reviews flushed), no question.
+            "exit" => {
+                let _ = std::fs::remove_file(&*path);
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
     fn spawn_active_terminal(&mut self) {
         editing::spawn_active_terminal(self);
     }
@@ -1684,4 +1750,98 @@ pub(crate) fn matches_exclude(rel_path: &str, excludes: &[String]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod session_host_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// An `App` over a throwaway workspace (as `app/editing.rs` tests do).
+    fn host_app(dir: &Path) -> App {
+        std::fs::create_dir_all(dir.join(".gaviero")).unwrap();
+        std::fs::write(dir.join(".gaviero/settings.json"), "{}").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(Workspace::single_folder(dir.to_path_buf()), tx)
+    }
+
+    /// `App::new` keys session state under the OS data dir by workspace path.
+    fn cleanup_session(dir: &Path) {
+        if let Some(state_dir) = session_state::state_dir_for(dir) {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    #[test]
+    fn session_host_status_is_idle_then_busy_while_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        assert_eq!(app.session_host_status(), "idle");
+        app.chat_state.conversations[0].is_streaming = true;
+        assert_eq!(app.session_host_status(), "busy:agent");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn session_host_status_lists_unsaved_files_while_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        app.buffers.push(crate::editor::buffer::Buffer::empty());
+        app.buffers.last_mut().unwrap().modified = true;
+        assert_eq!(app.session_host_status(), "idle:unsaved");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn a_quit_control_file_quits_through_the_normal_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        let control = dir.path().join("1.ctl");
+        std::fs::write(&control, "quit\n").unwrap();
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        app.session_control = Some((control.clone(), long_ago));
+
+        app.handle_event(Event::Tick);
+
+        assert!(app.should_quit || app.quit_confirm, "quit was not requested");
+        assert!(!control.exists(), "the request is consumed");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn an_exit_control_file_quits_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        // Unsaved work or a running agent would make `quit` ask first.
+        app.chat_state.conversations[0].is_streaming = true;
+        let control = dir.path().join("1.ctl");
+        std::fs::write(&control, "exit").unwrap();
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        app.session_control = Some((control.clone(), long_ago));
+
+        app.handle_event(Event::Tick);
+
+        assert!(app.should_quit && !app.quit_confirm);
+        assert!(!control.exists(), "the request is consumed");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn the_control_file_is_checked_at_most_every_500_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        let control = dir.path().join("1.ctl");
+        std::fs::write(&control, "quit").unwrap();
+        app.session_control = Some((control.clone(), Instant::now()));
+
+        app.handle_event(Event::Tick);
+
+        assert!(!app.should_quit && !app.quit_confirm);
+        assert!(control.exists());
+        cleanup_session(dir.path());
+    }
 }

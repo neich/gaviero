@@ -493,7 +493,7 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
 }
 
 /// Convert vt100 cell attributes to ratatui style.
-fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Style {
+pub(crate) fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Style {
     use ratatui::style::{Color, Modifier, Style};
 
     let fg = match cell.fgcolor() {

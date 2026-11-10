@@ -71,28 +71,54 @@ impl RestartState {
 }
 
 /// A running task that a restart would cut short.
-fn running_task(app: &App) -> Option<&'static str> {
-    let agent_running = !app.acp_tasks.is_empty()
-        || app
-            .chat_state
-            .conversations
-            .iter()
-            .any(|c| c.is_streaming || c.has_running_background_agents());
-    if agent_running {
+pub(super) fn running_task(app: &App) -> Option<&'static str> {
+    if agent_running(app) {
         return Some("an agent is running");
     }
     if app.swarm_dashboard.running {
         return Some("a swarm script is running");
     }
-    let terminal_busy = app.terminal_manager.tab_order().iter().any(|id| {
-        app.terminal_manager
-            .instance(*id)
-            .is_some_and(|inst| inst.shell_state.is_running())
-    });
-    if terminal_busy {
+    if terminal_busy(app) {
         return Some("a terminal command is running");
     }
     None
+}
+
+/// What ending this instance now would cut off, as the keywords a session
+/// host reads from the status title (`session_host::session::parse_work`):
+/// `agent`, `swarm`, `terminal` (a command running in a shell), `unsaved`.
+pub(super) fn work_in_progress(app: &App) -> Vec<&'static str> {
+    let mut work = Vec::new();
+    if agent_running(app) {
+        work.push("agent");
+    }
+    if app.swarm_dashboard.running {
+        work.push("swarm");
+    }
+    if terminal_busy(app) {
+        work.push("terminal");
+    }
+    if app.buffers.iter().any(|b| b.modified) {
+        work.push("unsaved");
+    }
+    work
+}
+
+fn agent_running(app: &App) -> bool {
+    !app.acp_tasks.is_empty()
+        || app
+            .chat_state
+            .conversations
+            .iter()
+            .any(|c| c.is_streaming || c.has_running_background_agents())
+}
+
+fn terminal_busy(app: &App) -> bool {
+    app.terminal_manager.tab_order().iter().any(|id| {
+        app.terminal_manager
+            .instance(*id)
+            .is_some_and(|inst| inst.shell_state.is_running())
+    })
 }
 
 /// Something that only delays the restart until it clears.

@@ -5,6 +5,7 @@ mod keymap;
 mod notify;
 mod panels;
 mod platform;
+mod session_host;
 mod setup;
 mod supervisor;
 mod theme;
@@ -51,6 +52,12 @@ struct Cli {
     /// `*.gaviero-workspace` file, without asking.
     #[arg(long, conflicts_with = "workspace")]
     folder: bool,
+
+    /// Run a session host: several gaviero sessions in this terminal,
+    /// switched with Alt+Left/Right (Alt+N opens one, Alt+Shift+Q quits all).
+    /// With PATH, opens only PATH; without, reopens the last set.
+    #[arg(long, conflicts_with_all = ["workspace", "folder"])]
+    sessions: bool,
 }
 
 /// C1: synchronous yes/no prompt on stdin/stderr asking the user to
@@ -208,6 +215,35 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> Result<()> {
+    // Session host (`gaviero --sessions`): a separate program sharing this
+    // binary. Checked first — before the probe below, so a host started with
+    // `GAVIERO_INPUT_PROBE` stays a host and only its children become
+    // probes, and before the supervisor, which the host replaces.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(launch) = session_host::sessions_requested(&args) {
+        let launch = match launch {
+            Ok(launch) => launch,
+            Err(msg) => {
+                eprintln!("gaviero: {msg}");
+                std::process::exit(2);
+            }
+        };
+        // Nested host refusal: every session child carries
+        // `GAVIERO_SESSION_HOST` (`session_host::HOST_ENV`).
+        if std::env::var_os(session_host::HOST_ENV).is_some() {
+            eprintln!("gaviero: --sessions cannot run inside a session host");
+            std::process::exit(2);
+        }
+        std::process::exit(session_host::run(launch));
+    }
+
+    // Test-only plumbing for `tests/session_host_*.rs`: with
+    // `GAVIERO_INPUT_PROBE` set, the binary is an input probe that prints
+    // every event it receives (`session_host::probe`) instead of the TUI.
+    if std::env::var_os("GAVIERO_INPUT_PROBE").is_some() {
+        return session_host::probe::run_probe();
+    }
+
     // Restart-on-new-build: the process a user starts supervises the real
     // TUI and relaunches it in place after a deploy (`supervisor`). It runs
     // before the runtime, logging, or argument parsing — the child does all
@@ -283,6 +319,11 @@ async fn run() -> Result<bool> {
         .init();
 
     let cli = Cli::parse();
+    // `--sessions` is documented here for `--help` only: `main` hands it to
+    // the session host before this point.
+    if cli.sessions {
+        anyhow::bail!("--sessions is handled by the session host");
+    }
 
     // Simplify away Windows' `\\?\` verbatim prefix — this path becomes
     // the workspace root and flows into shell cwds, prompts, and configs.
@@ -485,6 +526,15 @@ async fn run() -> Result<bool> {
     // budget. Most non-chat events still draw immediately.
     let mut render_scheduler = RenderScheduler::new();
     let mut needs_render = true;
+    // Under a session host only (`GAVIERO_SESSION_HOST`, set by
+    // `gaviero --sessions` on its children): report this session's status in
+    // the window title so the host can mark its tab.
+    let mut session_status: Option<String> = None;
+    if std::env::var_os(session_host::HOST_ENV).is_some() {
+        let status = app.session_host_status();
+        write_session_status(&mut terminal, &status)?;
+        session_status = Some(status);
+    }
     loop {
         if app.needs_full_redraw {
             terminal.clear()?;
@@ -495,6 +545,13 @@ async fn run() -> Result<bool> {
             terminal.draw(|frame| app.render(frame))?;
             render_scheduler.record_render(&app);
             needs_render = false;
+            if let Some(last) = &session_status {
+                let status = app.session_host_status();
+                if status != *last {
+                    write_session_status(&mut terminal, &status)?;
+                    session_status = Some(status);
+                }
+            }
         }
 
         // Block until at least one event arrives
@@ -551,6 +608,19 @@ async fn run() -> Result<bool> {
     terminal.show_cursor().context("showing cursor")?;
 
     Ok(app.restart_requested())
+}
+
+/// Session host status title: `gaviero-session:<idle|busy|attention>`
+/// (OSC 2), parsed by `session_host::session::parse_status`. Written only
+/// when `GAVIERO_SESSION_HOST` is set.
+fn write_session_status(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    status: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let backend = terminal.backend_mut();
+    write!(backend, "\x1b]2;gaviero-session:{status}\x07")?;
+    backend.flush()
 }
 
 /// What to watch for a `.gaviero/skills` directory: the directory itself,
