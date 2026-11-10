@@ -315,6 +315,11 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     .starts_with("/remember")
                 {
                     app.handle_remember_command();
+                } else if app.chat_state.text_input.text.split_whitespace().next()
+                    == Some("/add-dir")
+                {
+                    // First-token match: `/add-dirx` stays an unknown command.
+                    app.handle_add_dir_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/attach") {
                     app.handle_attach_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/detach") {
@@ -2537,6 +2542,23 @@ pub(crate) fn dispatch_prompt_core(
             app.chat_state.add_system_message_at(conv_idx, &notice);
         }
     }
+    // `/add-dir` grants the provider cannot enforce: say so once per
+    // conversation, same idempotent-by-content rule as above.
+    if !app.chat_state.conversations[conv_idx]
+        .session_read_folders
+        .is_empty()
+        && let Some(notice) = crate::panels::agent_chat::add_dir_unsupported_notice(
+            app.chat_state.effective_model_at(conv_idx),
+        )
+    {
+        let announced = app.chat_state.conversations[conv_idx]
+            .messages
+            .iter()
+            .any(|m| m.role == crate::panels::agent_chat::ChatRole::System && m.content == notice);
+        if !announced {
+            app.chat_state.add_system_message_at(conv_idx, notice);
+        }
+    }
     // Shell policy from the same cascade, handed to the session so the
     // in-process tool-agent and the Codex command gate never re-read the
     // settings file themselves.
@@ -2565,6 +2587,10 @@ pub(crate) fn dispatch_prompt_core(
             Some(&root),
         )),
         resume_session_id,
+        // `/add-dir` grants: read-only folders for this conversation.
+        session_read_folders: app.chat_state.conversations[conv_idx]
+            .session_read_folders
+            .clone(),
         ..gaviero_core::acp::session::AgentOptions::default()
     };
 

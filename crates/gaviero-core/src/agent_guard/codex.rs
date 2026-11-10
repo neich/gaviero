@@ -70,12 +70,18 @@ fn state_floor_entries(dir: &Path) -> Vec<PathBuf> {
 /// sensitive-file globs are not repeated under them: globs below an
 /// absolute path are undocumented, and an entry Codex rejects fails the
 /// thread.
+///
+/// `session_read_folders` are the conversation's TUI chat `/add-dir` grants
+/// ([`SensitivePolicy::with_session_read_folders`]); they get the same
+/// `"read"` entries. Empty outside TUI chat.
 pub fn codex_thread_config(
     workspace_root: &Path,
     additional_roots: &[PathBuf],
+    session_read_folders: &[PathBuf],
     allow_network: bool,
 ) -> Value {
-    let policy = SensitivePolicy::resolve(workspace_root);
+    let policy =
+        SensitivePolicy::resolve(workspace_root).with_session_read_folders(session_read_folders);
     let mut in_roots = Map::new();
     let mut deny = |glob: String| {
         in_roots.insert(glob, json!("deny"));
@@ -154,7 +160,7 @@ mod tests {
     #[test]
     fn codex_thread_config_selects_the_gaviero_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let v = codex_thread_config(dir.path(), &[], false);
+        let v = codex_thread_config(dir.path(), &[], &[], false);
         assert_eq!(v["default_permissions"], "gaviero");
         let profile = &v["permissions"]["gaviero"];
         assert_eq!(profile["extends"], ":read-only");
@@ -181,7 +187,7 @@ mod tests {
             r#"{"agent":{"permissions":{"read":{"deny":["private/**","missing.txt"]}}}}"#,
         )
         .unwrap();
-        let v = codex_thread_config(dir.path(), &[], true);
+        let v = codex_thread_config(dir.path(), &[], &[], true);
         let fs = &v["permissions"]["gaviero"]["filesystem"];
         assert_eq!(fs[":workspace_roots"]["private/**"], "deny");
         assert_eq!(v["permissions"]["gaviero"]["network"]["enabled"], true);
@@ -209,11 +215,28 @@ mod tests {
             r#"{"agent":{"permissions":{"read":{"extraFolders":["../docs","../gone"]}}}}"#,
         )
         .unwrap();
-        let v = codex_thread_config(&ws, &[], false);
+        let v = codex_thread_config(&ws, &[], &[], false);
         let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
         let key = docs.to_string_lossy().replace('\\', "/");
         assert_eq!(fs[key.as_str()], "read");
         assert!(!fs.keys().any(|k| k.ends_with("/gone")));
+    }
+
+    #[test]
+    fn codex_thread_config_grants_read_on_session_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(ws.join(".gaviero/settings.json"), "{}").unwrap();
+        let v = codex_thread_config(&ws, &[], std::slice::from_ref(&docs), false);
+        let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
+        let key = docs.to_string_lossy().replace('\\', "/");
+        assert_eq!(fs[key.as_str()], "read");
+        // Without the grant the folder is not listed.
+        let v = codex_thread_config(&ws, &[], &[], false);
+        assert!(v["permissions"]["gaviero"]["filesystem"].get(key.as_str()).is_none());
     }
 
     #[test]
@@ -228,7 +251,7 @@ mod tests {
             r#"{"agent":{"permissions":{"scratchFolders":["../scratch"]}}}"#,
         )
         .unwrap();
-        let v = codex_thread_config(&ws, &[], false);
+        let v = codex_thread_config(&ws, &[], &[], false);
         let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
         let key = scratch.to_string_lossy().replace('\\', "/");
         assert_eq!(fs[key.as_str()], "read");
@@ -242,7 +265,7 @@ mod tests {
         std::fs::create_dir_all(state.join("history")).unwrap();
         std::fs::write(state.join("memory.db"), "").unwrap();
         std::fs::write(state.join("memory.db-wal"), "").unwrap();
-        let v = codex_thread_config(&app, &[lib], false);
+        let v = codex_thread_config(&app, &[lib], &[], false);
         let fs = v["permissions"]["gaviero"]["filesystem"].as_object().unwrap();
         let key = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
         assert_eq!(fs[key(state.clone()).as_str()], "read");

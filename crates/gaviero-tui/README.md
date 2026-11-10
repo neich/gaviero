@@ -71,6 +71,7 @@ Pending reviews survive a restart. The phone (remote) has the same four decision
 | `/skills [search <q>]` | List or search loaded skills |
 | `/mcp` / `/mcp probe` | MCP reach record + endpoint; probe pointer (CLI) |
 | `/attach <path>` / `/detach` | Add/remove file context |
+| `/add-dir [path]` | Let the agent read a folder outside the workspace (read-only) for this conversation until `/reset`, `/clear` or `/handoff`; bare form lists the grants. Enforced for `claude:`, `codex:`, `cursor:` (prompt only, like `read.extraFolders`) and `deepseek:`; not for `dsh:`, `ollama:`, `local:`. Desktop only. |
 | `/lite` | Minimal-context turn (topology only) |
 | `/compact [text\|N]` | Claude: the CLI compacts its own session (optional extra guidance). Other providers: keep the last N messages of the transcript gaviero replays |
 | `/clear` | Clear agent context (alias of `/reset`) |

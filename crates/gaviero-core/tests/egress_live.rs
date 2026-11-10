@@ -225,7 +225,7 @@ fn codex_thread_config_accepted() {
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": {
         "cwd": dir.path().to_string_lossy(),
         "approvalPolicy": "on-request",
-        "config": agent_guard::codex::codex_thread_config(dir.path(), &[], false),
+        "config": agent_guard::codex::codex_thread_config(dir.path(), &[], &[], false),
     }}));
     let reply = wait_for(2);
     // The app-server is a launcher plus the native binary: kill the tree, or

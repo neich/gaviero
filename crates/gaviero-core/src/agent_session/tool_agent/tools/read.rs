@@ -162,6 +162,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_read_folders_are_readable_not_writable() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(ws.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "hello\n").unwrap();
+        std::fs::write(docs.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(ws.join(".gaviero/settings.json"), "{}").unwrap();
+        let ctx = ToolCtx {
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&ws)
+                .with_session_read_folders(std::slice::from_ref(&docs)),
+            ..ctx_for(&ws)
+        };
+        let guide = docs.join("guide.md");
+        assert!(ctx.confine_read(&guide.to_string_lossy()).is_ok());
+        assert!(ctx.confine(&guide.to_string_lossy()).is_err());
+        let out = ReadTool
+            .run(json!({ "file_path": guide.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        // Sensitive files stay blocked inside a granted folder.
+        let env = docs.join(".env");
+        let out = ReadTool
+            .run(json!({ "file_path": env.to_string_lossy() }), &ctx)
+            .await;
+        assert!(out.is_error);
+        // Without the grant the folder is out of reach.
+        let plain = ToolCtx {
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(&ws),
+            ..ctx_for(&ws)
+        };
+        assert!(plain.confine_read(&guide.to_string_lossy()).is_err());
+    }
+
+    #[tokio::test]
     async fn scratch_folders_are_readable_and_writable() {
         let dir = tempdir().unwrap();
         let ws = dir.path().join("ws");

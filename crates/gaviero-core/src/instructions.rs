@@ -261,8 +261,24 @@ pub fn append_to_system_prompt(
     primary: &Path,
     additional: &[PathBuf],
 ) -> String {
+    append_to_system_prompt_with_grants(system_prompt, primary, additional, &[])
+}
+
+/// [`append_to_system_prompt`] with the conversation's TUI chat `/add-dir`
+/// grants listed among the read-only folders
+/// ([`crate::agent_guard::outside_folders_prompt_with_grants`]).
+pub fn append_to_system_prompt_with_grants(
+    system_prompt: String,
+    primary: &Path,
+    additional: &[PathBuf],
+    session_read_folders: &[PathBuf],
+) -> String {
     let mut out = append_with_global(system_prompt, primary, additional, global_file().as_deref());
-    if let Some(block) = crate::agent_guard::outside_folders_prompt(primary, additional) {
+    if let Some(block) = crate::agent_guard::outside_folders_prompt_with_grants(
+        primary,
+        additional,
+        session_read_folders,
+    ) {
         out.push_str("\n\n");
         out.push_str(&block);
     }

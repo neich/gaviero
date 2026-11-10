@@ -628,6 +628,11 @@ pub struct Conversation {
     /// exchanges, rendered). Sent with the prompt whenever the planner would
     /// re-inline the transcript; cleared by `/reset`.
     pub carried_context: Option<String>,
+    /// `/add-dir` grants: absolute folders outside the workspace this
+    /// conversation's agent may read (read-only). Passed to every provider
+    /// session as `AgentOptions::session_read_folders`; persisted with the
+    /// conversation; cleared by `/reset`, `/clear` and `/handoff`.
+    pub session_read_folders: Vec<std::path::PathBuf>,
 }
 
 impl Conversation {
@@ -675,6 +680,7 @@ impl Conversation {
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
             carried_context: None,
+            session_read_folders: Vec::new(),
         }
     }
 
@@ -1177,6 +1183,7 @@ impl AgentChatState {
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
             carried_context: None,
+            session_read_folders: Vec::new(),
         };
         Self {
             conversations: vec![conv],
@@ -2714,6 +2721,7 @@ impl AgentChatState {
                      /context mode <mode>     — Set bootstrap mode for this conversation (auto|minimal|manual|none)\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
+                     /add-dir [path]          — Let the agent read a folder outside the workspace (read-only) until /reset, /clear or /handoff; bare form lists the granted folders (desktop only)\n\
                      /keep [clear]            — List (or unmark) the exchanges marked to keep. Mark them in browse mode: Ctrl+C with nothing selected, ↑/↓, Space\n\
                      /handoff [to <tab|new>]  — Start a fresh session carrying only the kept exchanges, verbatim (detours left out). Default: this tab. `to <n|title>` seeds another tab (this one is left untouched), `to new` opens one\n\
                      /compact [text|N]        — Claude: compact the session natively (optional extra guidance). Other providers: keep the last N messages of the replayed transcript (default 6)\n\n\
@@ -3091,6 +3099,9 @@ impl AgentChatState {
         // A plain reset drops whatever an earlier `/handoff` carried;
         // `/handoff` sets its block again right after resetting.
         conv.carried_context = None;
+        // `/add-dir` grants last until `/reset`, `/clear` or `/handoff` —
+        // all three come through here.
+        conv.session_read_folders.clear();
         // Host-side replay watermark: visible pre-reset turns stay in the
         // panel but must not re-enter `Turn.replay_history` once
         // `transcript_inline_mode` returns to `Auto`. `deepseek:` keeps
@@ -4554,6 +4565,7 @@ impl AgentChatState {
                     last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
                     last_memory_injection_tokens: 0,
                     carried_context: stored.carried_context,
+                    session_read_folders: stored.session_read_folders,
                 });
             }
         }
@@ -4710,6 +4722,7 @@ impl AgentChatState {
                     .and_then(|l| l.continuity_handle.clone()),
                 last_token_usage: conv.last_token_usage.as_ref().map(Into::into),
                 carried_context: conv.carried_context.clone(),
+                session_read_folders: conv.session_read_folders.clone(),
                 // Restore renumbers `seq` from 1, so the boundary travels as
                 // an index; without it a restart re-inlines everything
                 // `/reset` or `/handoff` dropped.
@@ -5877,6 +5890,19 @@ const HANDOFF_USAGE: &str = "Usage: /handoff [to <tab|new>] — <tab> is the sta
 /// `research/cross-agent-session-compaction-2026-10-05.md`).
 const COMPACT_INSTRUCTIONS: &str = "Keep verbatim: file paths, commands, error messages, \
      decisions and their reasons, the user's constraints, and open questions and next steps.";
+
+/// Shown when a conversation holds `/add-dir` grants but its model's
+/// provider cannot enforce them.
+pub(crate) const ADD_DIR_UNSUPPORTED_NOTICE: &str = "/add-dir grants are not enforced for dsh:, \
+     ollama: or local: models (dsh cannot take extra directories; ollama/local have no file \
+     tools). Switch to claude:, codex:, cursor: or deepseek: to use them.";
+
+/// Notice for providers that cannot enforce `/add-dir` grants, by the model
+/// spec's provider prefix; `None` when the provider honours them.
+pub(crate) fn add_dir_unsupported_notice(model: &str) -> Option<&'static str> {
+    let provider = model.split_once(':').map(|(p, _)| p).unwrap_or(model);
+    matches!(provider, "dsh" | "ollama" | "local").then_some(ADD_DIR_UNSUPPORTED_NOTICE)
+}
 
 /// The task text a turn sends: the user's prompt, plus `/handoff`'s carried
 /// exchanges when the planner would re-inline the transcript
@@ -7575,6 +7601,82 @@ mod tests {
                 "<assistant>\nPart one\n</assistant>\n<assistant>\nPart two\n</assistant>"
             )
         );
+    }
+
+    #[test]
+    fn reset_drops_add_dir_grants() {
+        let mut state = AgentChatState::new();
+        let idx = state.active_conv;
+        state.conversations[idx]
+            .session_read_folders
+            .push(std::path::PathBuf::from("/srv/docs"));
+        state.reset_conversation_at(idx);
+        assert!(state.conversations[idx].session_read_folders.is_empty());
+    }
+
+    #[test]
+    fn handoff_in_place_drops_add_dir_grants() {
+        let mut state = AgentChatState::new();
+        let idx = session_with_detour(&mut state);
+        state.active_conv = idx;
+        state.conversations[idx].toggle_keep_exchange(1);
+        state.conversations[idx]
+            .session_read_folders
+            .push(std::path::PathBuf::from("/srv/docs"));
+        assert!(state.apply_slash_line(idx, "/handoff", SlashOrigin::Desktop));
+        assert!(state.conversations[idx].carried_context.is_some(), "handoff ran");
+        assert!(state.conversations[idx].session_read_folders.is_empty());
+    }
+
+    #[test]
+    fn handoff_to_other_tab_keeps_add_dir_grants() {
+        let mut state = AgentChatState::new();
+        let source = session_with_detour(&mut state);
+        state.active_conv = source;
+        state.conversations[source].toggle_keep_exchange(1);
+        let grant = std::path::PathBuf::from("/srv/docs");
+        state.conversations[source].session_read_folders.push(grant.clone());
+        assert!(state.apply_slash_line(source, "/handoff to new", SlashOrigin::Desktop));
+        assert_eq!(state.conversations.len(), 2, "a new tab was opened");
+        let target = (0..state.conversations.len()).find(|&i| i != source).unwrap();
+        assert!(state.conversations[target].carried_context.is_some(), "handoff ran");
+        assert_eq!(state.conversations[source].session_read_folders, vec![grant]);
+        assert!(state.conversations[target].session_read_folders.is_empty());
+    }
+
+    #[test]
+    fn add_dir_grants_survive_save_and_load() {
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+        let conv_id = state.conversations[0].id.clone();
+        state.add_user_message_at(0, "a prompt");
+        let grant = std::path::PathBuf::from("/srv/docs");
+        state.conversations[0].session_read_folders.push(grant.clone());
+        state.save_conversations(&scratch.key);
+
+        let mut reloaded = AgentChatState::new();
+        reloaded.load_conversations(&scratch.key);
+        let idx = reloaded.find_conv_idx(&conv_id).expect("conversation loads");
+        assert_eq!(reloaded.conversations[idx].session_read_folders, vec![grant]);
+    }
+
+    #[test]
+    fn add_dir_unsupported_notice_by_provider() {
+        for model in ["dsh:deepseek-flash", "ollama:llama3", "local:x"] {
+            assert_eq!(
+                add_dir_unsupported_notice(model),
+                Some(ADD_DIR_UNSUPPORTED_NOTICE),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude:opus",
+            "codex:gpt-5.6-sol",
+            "cursor:auto",
+            "deepseek:deepseek-flash",
+        ] {
+            assert_eq!(add_dir_unsupported_notice(model), None, "{model}");
+        }
     }
 
     #[test]

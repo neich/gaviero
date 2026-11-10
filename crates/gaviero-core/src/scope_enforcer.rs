@@ -318,7 +318,7 @@ fn non_blank(list: Vec<String>) -> Vec<String> {
 /// `~` / `~/x` is the home directory, a relative entry is taken from
 /// `base` (the folder holding the `.gaviero/settings.json` that set it), and `.` / `..` are
 /// resolved without touching the disk.
-fn resolve_read_folder(raw: &str, base: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_read_folder(raw: &str, base: &Path) -> Option<PathBuf> {
     let raw = raw.trim();
     let path = if raw == "~" {
         dirs::home_dir()?
@@ -418,6 +418,14 @@ impl SensitivePolicy {
         policy
     }
 
+    /// Append per-conversation `/add-dir` read grants (absolute paths) to the
+    /// read-only folders. Applied after [`Self::resolve`] and kept even when a
+    /// settings layer does not parse: the user typed them in this session.
+    pub fn with_session_read_folders(mut self, folders: &[PathBuf]) -> Self {
+        self.read_folders.extend(folders.iter().cloned());
+        self
+    }
+
     /// `agent.permissions.scratchFolders` as absolute paths, unfiltered.
     /// Sessions use [`crate::agent_guard::scratch_folders`], which keeps
     /// only existing folders outside the workspace.
@@ -437,9 +445,11 @@ impl SensitivePolicy {
         &self.read_deny
     }
 
-    /// `agent.permissions.read.extraFolders` as absolute paths, unfiltered.
-    /// Sessions use [`crate::agent_guard::read_only_folders`], which keeps
-    /// only existing folders outside the workspace.
+    /// `agent.permissions.read.extraFolders` as absolute paths, unfiltered,
+    /// followed by any `/add-dir` grants added with
+    /// [`Self::with_session_read_folders`]. Sessions use
+    /// [`crate::agent_guard::read_only_folders`], which keeps only existing
+    /// folders outside the workspace.
     pub fn read_folders(&self) -> &[PathBuf] {
         &self.read_folders
     }
@@ -962,6 +972,29 @@ mod tests {
             Some(dir.path().join(".gaviero").as_path())
         );
         assert!(SensitivePolicy::resolve(&dir.path().join("none")).settings_dir().is_none());
+    }
+
+    #[test]
+    fn session_read_folders_extend_read_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
+        let grant = dir.path().join("..").join("docs");
+        let policy = SensitivePolicy::resolve(dir.path())
+            .with_session_read_folders(std::slice::from_ref(&grant));
+        assert!(policy.read_folders().contains(&grant));
+    }
+
+    #[test]
+    fn session_read_folders_survive_broken_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{ not json").unwrap();
+        let grant = PathBuf::from("/srv/docs");
+        assert!(SensitivePolicy::resolve(dir.path()).read_folders().is_empty());
+        let policy = SensitivePolicy::resolve(dir.path())
+            .with_session_read_folders(std::slice::from_ref(&grant));
+        assert_eq!(policy.read_folders(), [grant]);
     }
 
     #[test]

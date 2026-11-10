@@ -1352,3 +1352,188 @@ pub(super) fn handle_detach_command(app: &mut App) {
             .add_system_message(&format!("No attachment named: {}", arg));
     }
 }
+
+/// `/add-dir [path]`: grant the active conversation's agent read-only access
+/// to a folder outside the workspace until `/reset`, `/clear` or `/handoff`
+/// (`Conversation::session_read_folders`). The bare form lists the grants.
+/// Desktop only: `/add-dir` is not in the remote allow-list.
+pub(super) fn handle_add_dir_command(app: &mut App) {
+    use gaviero_core::agent_guard::{SessionReadFolderCheck, check_session_read_folder};
+
+    let input = app.chat_state.take_input();
+    let arg = input
+        .trim()
+        .strip_prefix("/add-dir")
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    app.chat_state.add_user_message(&input);
+    let idx = app.chat_state.active_conv;
+
+    if arg.is_empty() {
+        let grants = &app.chat_state.conversations[idx].session_read_folders;
+        let msg = if grants.is_empty() {
+            "No folders granted to this conversation.\n\
+             Usage: /add-dir <path>  — let the agent read a folder outside the workspace \
+             (read-only) until /reset, /clear or /handoff."
+                .to_string()
+        } else {
+            let list: Vec<String> = grants
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect();
+            format!(
+                "Folders this conversation's agent may read (read-only):\n{}\n\
+                 /reset, /clear or /handoff removes them.",
+                list.join("\n")
+            )
+        };
+        app.chat_state.add_system_message_at(idx, &msg);
+        return;
+    }
+
+    let root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let additional_roots: Vec<std::path::PathBuf> = app
+        .workspace
+        .folders()
+        .iter()
+        .map(|f| f.path.clone())
+        .filter(|p| p != &root)
+        .collect();
+
+    let checked = check_session_read_folder(
+        &arg,
+        &root,
+        &additional_roots,
+        &app.chat_state.conversations[idx].session_read_folders,
+    );
+    match checked {
+        Err(reason) => {
+            app.chat_state
+                .add_system_message_at(idx, &format!("Cannot grant access: {reason}"));
+        }
+        Ok(SessionReadFolderCheck::AlreadyReadable(path, why)) => {
+            app.chat_state.add_system_message_at(
+                idx,
+                &format!("{} is already readable: {why}.", path.display()),
+            );
+        }
+        Ok(SessionReadFolderCheck::Grant(path)) => {
+            let msg = format!(
+                "Read access granted for this conversation: {}\n\
+                 The agent can read and search it from the next prompt but cannot write \
+                 there. /reset, /clear or /handoff removes it; /add-dir lists the granted \
+                 folders.",
+                path.display()
+            );
+            let conv = &mut app.chat_state.conversations[idx];
+            conv.session_read_folders.push(path);
+            conv.bump_revision();
+            app.chat_state.add_system_message_at(idx, &msg);
+            let model = app.chat_state.effective_model_at(idx).to_string();
+            if let Some(notice) = crate::panels::agent_chat::add_dir_unsupported_notice(&model) {
+                app.chat_state.add_system_message_at(idx, notice);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod add_dir_tests {
+    use super::*;
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
+        let ws = gaviero_core::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(ws, tx);
+        app.chat_state.new_conversation();
+        (dir, app)
+    }
+
+    fn run(app: &mut App, line: &str) {
+        app.chat_state.text_input.text = line.to_string();
+        handle_add_dir_command(app);
+    }
+
+    fn last_system(app: &App) -> String {
+        let idx = app.chat_state.active_conv;
+        app.chat_state.conversations[idx]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::panels::agent_chat::ChatRole::System)
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+
+    fn grants(app: &App) -> Vec<std::path::PathBuf> {
+        let idx = app.chat_state.active_conv;
+        app.chat_state.conversations[idx].session_read_folders.clone()
+    }
+
+    #[test]
+    fn add_dir_grants_an_outside_folder() {
+        let (_ws, mut app) = test_app();
+        let outside = tempfile::tempdir().unwrap();
+        run(&mut app, &format!("/add-dir {}", outside.path().display()));
+        assert_eq!(grants(&app), vec![outside.path().to_path_buf()]);
+        let idx = app.chat_state.active_conv;
+        assert!(
+            app.chat_state.conversations[idx]
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with("Read access granted")),
+            "{}",
+            last_system(&app)
+        );
+    }
+
+    #[test]
+    fn add_dir_refuses_a_missing_folder() {
+        let (_ws, mut app) = test_app();
+        let outside = tempfile::tempdir().unwrap();
+        run(
+            &mut app,
+            &format!("/add-dir {}", outside.path().join("nope").display()),
+        );
+        assert!(grants(&app).is_empty());
+        assert!(last_system(&app).starts_with("Cannot grant access"), "{}", last_system(&app));
+    }
+
+    #[test]
+    fn add_dir_inside_workspace_is_already_readable() {
+        let (ws, mut app) = test_app();
+        std::fs::create_dir(ws.path().join("src")).unwrap();
+        run(&mut app, "/add-dir src");
+        assert!(grants(&app).is_empty());
+        assert!(last_system(&app).contains("already readable"), "{}", last_system(&app));
+    }
+
+    #[test]
+    fn bare_add_dir_lists_grants() {
+        let (_ws, mut app) = test_app();
+        run(&mut app, "/add-dir");
+        assert!(last_system(&app).starts_with("No folders granted"));
+        let outside = tempfile::tempdir().unwrap();
+        run(&mut app, &format!("/add-dir {}", outside.path().display()));
+        run(&mut app, "/add-dir");
+        assert!(
+            last_system(&app).contains(&outside.path().display().to_string()),
+            "{}",
+            last_system(&app)
+        );
+    }
+
+    #[test]
+    fn add_dir_is_not_allowed_remotely() {
+        assert!(!crate::app::remote::REMOTE_ALLOWED_SLASH.contains(&"/add-dir"));
+    }
+}

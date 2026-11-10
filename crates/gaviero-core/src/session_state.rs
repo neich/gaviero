@@ -328,6 +328,10 @@ pub struct StoredConversation {
     /// `None` = replay from the start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_from_index: Option<usize>,
+    /// TUI chat `/add-dir` read grants of this conversation (absolute
+    /// folders). Cleared by `/reset`, `/clear` and `/handoff`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_read_folders: Vec<PathBuf>,
 }
 
 /// Serializable mirror of [`crate::acp::protocol::TokenUsage`] for on-disk
@@ -653,6 +657,23 @@ mod tests {
         assert_eq!(back.replay_from_index, Some(1));
     }
 
+    /// `/add-dir` grants survive a round trip, stay out of the file when
+    /// empty, and records written before them load with none.
+    #[test]
+    fn stored_conversation_round_trips_session_read_folders() {
+        let old = r#"{"id":"c","title":"t","messages":[],"created":1,"updated":2}"#;
+        let mut stored: StoredConversation = serde_json::from_str(old).unwrap();
+        assert!(stored.session_read_folders.is_empty());
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(!json.contains("session_read_folders"), "{json}");
+
+        stored.session_read_folders = vec![PathBuf::from("/srv/docs")];
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(json.contains("session_read_folders"), "{json}");
+        let back: StoredConversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_read_folders, vec![PathBuf::from("/srv/docs")]);
+    }
+
     #[test]
     fn save_conversation_leaves_a_readable_file_after_repeated_saves() {
         // Guards the truncation failure mode: the second save must never be
@@ -679,6 +700,7 @@ mod tests {
             last_token_usage: None,
             carried_context: None,
             replay_from_index: None,
+            session_read_folders: Vec::new(),
         };
         save_conversation(key, &conv).unwrap();
 
@@ -766,6 +788,7 @@ mod tests {
             last_token_usage: None,
             carried_context: None,
             replay_from_index: None,
+            session_read_folders: Vec::new(),
         };
 
         let json = serde_json::to_string(&stored).unwrap();
@@ -806,6 +829,7 @@ mod tests {
             last_token_usage: None,
             carried_context: None,
             replay_from_index: None,
+            session_read_folders: Vec::new(),
         };
 
         let json = serde_json::to_string(&stored).unwrap();
@@ -842,6 +866,7 @@ mod tests {
             }),
             carried_context: None,
             replay_from_index: None,
+            session_read_folders: Vec::new(),
         };
         let json = serde_json::to_string(&stored).unwrap();
         assert!(
