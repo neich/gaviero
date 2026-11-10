@@ -13,8 +13,15 @@
   terminal command, unsaved file or dialog is pending. Session state (tabs,
   layout, conversations, pending turn reviews) is restored.
 
+  A session host (gaviero --sessions) is supervised the same way: once no tab
+  has an agent, swarm or shell command running or unsaved files, and the host
+  has not been typed into for 15 s, it restarts itself and every tab onto the
+  new build, reopening the same tabs. Its tabs leave restarting to the host.
+  A host started before this behaviour existed has no supervisor: quit it
+  and start gaviero --sessions again once.
+
 .EXAMPLE
-  ./scripts/deploy.ps1                 # build + install; running TUIs restart when idle
+  ./scripts/deploy.ps1                 # build + install; running TUIs and session hosts restart when idle
   ./scripts/deploy.ps1 -NoBuild        # install the last release build only
   ./scripts/deploy.ps1 -StopRunning    # hard-kill running copies instead (loses unsaved session state)
 #>
@@ -89,7 +96,7 @@ $live = Get-Process -Name $bins -ErrorAction SilentlyContinue |
 if ($live) {
     Write-Host ("Still running the previous build: " +
         (($live | Group-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ') +
-        ". Supervised gaviero TUIs restart once idle.")
+        ". Supervised gaviero TUIs and session hosts restart once idle.")
 }
 
 Get-Item ($bins | ForEach-Object { Join-Path $Destination "$_.exe" }) |

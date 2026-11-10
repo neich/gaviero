@@ -35,6 +35,15 @@ impl Pty {
     /// Start the `gaviero` binary with `args` and extra `envs` in a
     /// `ROWS` × `COLS` pseudo console.
     pub fn spawn(args: &[&OsStr], envs: &[(&str, &OsStr)], cwd: &Path) -> Pty {
+        // Never let the binary under test become a supervisor.
+        let mut envs = envs.to_vec();
+        envs.push(("GAVIERO_NO_SUPERVISOR", OsStr::new("1")));
+        Pty::spawn_exe(Path::new(env!("CARGO_BIN_EXE_gaviero")), args, &envs, cwd)
+    }
+
+    /// Start `exe` (a copy of the binary, say) as is: it supervises itself
+    /// unless `envs` opt out.
+    pub fn spawn_exe(exe: &Path, args: &[&OsStr], envs: &[(&str, &OsStr)], cwd: &Path) -> Pty {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -43,15 +52,13 @@ impl Pty {
                 pixel_height: 0,
             })
             .expect("open pty");
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_gaviero"));
+        let mut cmd = CommandBuilder::new(exe);
         for arg in args {
             cmd.arg(arg);
         }
         for (key, value) in envs {
             cmd.env(key, value);
         }
-        // Never let the binary under test become a supervisor.
-        cmd.env("GAVIERO_NO_SUPERVISOR", "1");
         cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd).expect("spawn gaviero");
         drop(pair.slave);
@@ -161,6 +168,18 @@ impl Pty {
     /// Wait until the screen contains `needle`.
     pub fn wait_text(&self, needle: &str) {
         self.wait_for(needle, |s, _| s.contains(needle));
+    }
+
+    /// [`Pty::wait_text`] with its own time limit.
+    pub fn wait_text_within(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.contents().contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {needle}; screen:\n{}", self.contents());
     }
 
     /// Wait up to `timeout` for the child to exit; its exit code.

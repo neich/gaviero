@@ -8,6 +8,7 @@ pub(crate) mod picker;
 pub(crate) mod input_windows;
 pub(crate) mod probe;
 pub(crate) mod render;
+pub(crate) mod restart;
 pub(crate) mod session;
 pub(crate) mod state;
 
@@ -32,6 +33,11 @@ pub(crate) const HOST_ENV: &str = "GAVIERO_SESSION_HOST";
 /// Set on every session child: a file the host writes `quit` into to ask
 /// the child to quit through its normal path (quit all).
 pub(crate) const CONTROL_ENV: &str = "GAVIERO_SESSION_CONTROL";
+
+/// Set on every session child of a supervised host: the host restarts the
+/// child onto a new build (with every other tab, once all are idle), so the
+/// child never acts on a new build itself (`app/restart.rs`).
+pub(crate) const HOST_RESTARTS_ENV: &str = "GAVIERO_SESSION_HOST_RESTARTS";
 
 /// Everything the host loop reacts to, on one channel.
 #[derive(Debug)]
@@ -96,18 +102,28 @@ pub(crate) enum Chord {
     Next,
     /// Alt+N: open the new-session picker.
     New,
-    /// Alt+X: close the active tab and end its session.
+    /// Alt+Q: close the active tab and end its session (asks first).
     Close,
-    /// Alt+Q (or Alt+Shift+Q): quit the host, keeping every tab for the
-    /// next start (asks first).
+    /// Ctrl+Q: quit the host, keeping every tab for the next start (asks
+    /// first). A session never sees Ctrl+Q, so it never quits on its own.
     QuitAll,
 }
 
-/// The host chord a Windows key record is, if any. Key-down only; Alt
-/// without Ctrl, so AltGr (`RIGHT_ALT | LEFT_CTRL`) chords stay text.
+const VK_Q: u16 = 0x51;
+
+/// The host chord a Windows key record is, if any. Key-down only. Ctrl+Q
+/// is Ctrl without Alt and the rest Alt without Ctrl, so AltGr
+/// (`RIGHT_ALT | LEFT_CTRL`) chords stay text. Alt+X is never a chord:
+/// Windows keeps it for itself.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn host_chord(r: &encode::KeyRecord) -> Option<Chord> {
-    if !r.key_down || !encode::alt_only(r.ctrl_state) {
+    if !r.key_down {
+        return None;
+    }
+    if encode::ctrl_only(r.ctrl_state) {
+        return (r.vk == VK_Q).then_some(Chord::QuitAll);
+    }
+    if !encode::alt_only(r.ctrl_state) {
         return None;
     }
     let shift = r.ctrl_state & encode::SHIFT != 0;
@@ -115,15 +131,20 @@ pub(crate) fn host_chord(r: &encode::KeyRecord) -> Option<Chord> {
         0x25 => Some(Chord::Prev),
         0x27 => Some(Chord::Next),
         0x4E if !shift => Some(Chord::New),
-        0x58 => Some(Chord::Close),
-        0x51 => Some(Chord::QuitAll),
+        VK_Q => Some(Chord::Close),
         _ => None,
     }
 }
 
 /// The host chord a crossterm key event is, if any (Unix input path).
 fn term_chord(k: &KeyEvent) -> Option<Chord> {
-    if !k.modifiers.contains(KeyModifiers::ALT) || k.modifiers.contains(KeyModifiers::CONTROL) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let q = matches!(k.code, KeyCode::Char('q') | KeyCode::Char('Q'));
+    if ctrl && !alt {
+        return q.then_some(Chord::QuitAll);
+    }
+    if !alt || ctrl {
         return None;
     }
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
@@ -131,8 +152,7 @@ fn term_chord(k: &KeyEvent) -> Option<Chord> {
         KeyCode::Left => Some(Chord::Prev),
         KeyCode::Right => Some(Chord::Next),
         KeyCode::Char('n') if !shift => Some(Chord::New),
-        KeyCode::Char('x') | KeyCode::Char('X') => Some(Chord::Close),
-        KeyCode::Char('q') | KeyCode::Char('Q') => Some(Chord::QuitAll),
+        _ if q => Some(Chord::Close),
         _ => None,
     }
 }
@@ -140,9 +160,9 @@ fn term_chord(k: &KeyEvent) -> Option<Chord> {
 /// A question the host asks before it ends work in progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Confirm {
-    /// Close the tab of session `id` (Alt+X or its close button).
+    /// Close the tab of session `id` (Alt+Q or its close button).
     Close { id: u64 },
-    /// Quit the host (Alt+Q).
+    /// Quit the host (Ctrl+Q).
     Quit,
 }
 
@@ -194,6 +214,8 @@ pub(crate) struct Host {
     picker: Option<picker::Picker>,
     /// Where relative paths typed in the picker are resolved.
     cwd: PathBuf,
+    /// Restart-on-new-build for the host and all its tabs.
+    restart: restart::HostRestart,
 }
 
 impl Host {
@@ -224,6 +246,7 @@ impl Host {
             dirty: true,
             picker: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            restart: restart::HostRestart::new(),
         }
     }
 
@@ -263,10 +286,22 @@ impl Host {
 
     /// Start a session for `path` in a new tab and make it active.
     fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        self.open_with(path, None)
+    }
+
+    /// [`Host::open`], with the tab's launch-state file seeded from `launch`
+    /// (what a restarting host recorded for it).
+    fn open_with(&mut self, path: PathBuf, launch: Option<&str>) -> anyhow::Result<()> {
         let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
         let label = session::label_for(&path, &taken);
         let id = self.next_id;
         self.next_id += 1;
+        if let Some(text) = launch {
+            let file = session::launch_state_path(&self.state_dir, id);
+            if let Err(e) = std::fs::write(&file, text) {
+                tracing::warn!(id, "could not restore the launch choice: {e}");
+            }
+        }
         let s = session::spawn(
             id,
             &path,
@@ -275,6 +310,7 @@ impl Host {
             self.cols,
             &self.state_dir,
             self.tx.clone(),
+            self.restart.supervised(),
         )?;
         tracing::info!(id, path = %path.display(), "session opened");
         self.sessions.push(s);
@@ -365,6 +401,9 @@ impl Host {
     }
 
     fn handle(&mut self, event: HostEvent) {
+        if is_input(&event) {
+            self.restart.note_input();
+        }
         match event {
             HostEvent::Output { id, bytes } => self.on_output(id, &bytes),
             HostEvent::Exited { id, code } => {
@@ -454,6 +493,7 @@ impl Host {
             self.cols,
             &self.state_dir,
             self.tx.clone(),
+            self.restart.supervised(),
         ) {
             Ok(fresh) => {
                 tracing::info!(id, "session restarted onto a new build");
@@ -501,7 +541,7 @@ impl Host {
         retire(old);
     }
 
-    /// Alt+X or the tab's close button: the tab goes now; its child is asked
+    /// Alt+Q or the tab's close button: the tab goes now; its child is asked
     /// to exit (saving its session state, no question) and killed if it is
     /// still running after `EXIT_GRACE`.
     fn close_session(&mut self, i: usize) {
@@ -522,6 +562,63 @@ impl Host {
 
     fn quitting(&self) -> bool {
         self.quit_deadline.is_some()
+    }
+
+    /// Restart-on-new-build: once a new build is installed and nothing is in
+    /// the way, record the tabs and quit with the restart code (supervised),
+    /// or say a restart by hand is needed (not supervised).
+    fn check_new_build(&mut self) {
+        if self.quitting() {
+            return;
+        }
+        let tabs: Vec<restart::TabWork<'_>> = self
+            .sessions
+            .iter()
+            .map(|s| restart::TabWork {
+                label: &s.label,
+                work: &s.work,
+            })
+            .collect();
+        let modal_open = self.modal_open();
+        let step = self
+            .restart
+            .check(Instant::now(), |since_input| {
+                restart::blocker(&tabs, modal_open, since_input)
+            });
+        match step {
+            restart::Step::Nothing => {}
+            restart::Step::Notify(text) => self.notify(text),
+            restart::Step::Restart => self.restart_host(),
+        }
+    }
+
+    /// Record every tab for the next host, then quit like Ctrl+Q does.
+    fn restart_host(&mut self) {
+        let Some(path) = self.restart.record.clone() else {
+            return;
+        };
+        let record = restart::RestartRecord {
+            tabs: self
+                .sessions
+                .iter()
+                .map(|s| restart::RestartTab {
+                    path: s.path.clone(),
+                    launch: std::fs::read_to_string(&s.launch_state).ok(),
+                })
+                .collect(),
+            active: self.active,
+        };
+        if let Err(e) = restart::save_record(&path, &record) {
+            tracing::error!("could not record the tabs for a restart: {e}");
+            self.restart.give_up();
+            self.notify(format!(
+                "New gaviero build installed, but the tabs could not be saved for a restart ({e}); restart by hand"
+            ));
+            return;
+        }
+        tracing::info!(tabs = record.tabs.len(), "new build installed and every tab idle: restarting the host");
+        self.restart.requested = true;
+        self.quit_host();
     }
 
     /// The host quits: every tab is kept for the next start and every child
@@ -811,6 +908,16 @@ fn term_mouse_report(m: &MouseEvent, row_offset: u16) -> Option<String> {
     ))
 }
 
+/// Keyboard and mouse events: the user is working in the host.
+fn is_input(event: &HostEvent) -> bool {
+    match event {
+        #[cfg(windows)]
+        HostEvent::Key(_) | HostEvent::Mouse(_) => true,
+        HostEvent::Term(e) => matches!(e, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)),
+        _ => false,
+    }
+}
+
 /// The current tab after removing tab `removed`, `len` tabs left: the one
 /// before a removed current tab, otherwise the same session as before.
 fn previous_active(active: usize, removed: usize, len: usize) -> usize {
@@ -922,12 +1029,25 @@ pub(crate) fn run(launch: HostLaunch) -> i32 {
     init_logging();
     let state_path = state::state_path();
     let mut saved = state_path.as_deref().map(state::load).unwrap_or_default();
-    let initial = match initial_paths(&launch, &saved) {
-        Ok(paths) => paths,
-        Err(msg) => {
-            eprintln!("gaviero: {msg}");
-            return 2;
-        }
+    // After a restart onto a new build: the tabs the previous host had,
+    // whatever this host was launched with.
+    let restarted = crate::supervisor::host_restart_record()
+        .and_then(|path| restart::take_record(&path));
+    let initial = match restarted {
+        Some(record) => record,
+        None => match initial_paths(&launch, &saved) {
+            Ok(paths) => restart::RestartRecord {
+                tabs: paths
+                    .into_iter()
+                    .map(|path| restart::RestartTab { path, launch: None })
+                    .collect(),
+                active: usize::MAX,
+            },
+            Err(msg) => {
+                eprintln!("gaviero: {msg}");
+                return 2;
+            }
+        },
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -964,8 +1084,12 @@ pub(crate) fn run(launch: HostLaunch) -> i32 {
     }
 }
 
+/// Runs the host until it ends; the exit code (the restart code when it
+/// ends to restart onto a new build). `initial.active` is the tab to make
+/// current after a restart, `usize::MAX` on a normal start (the last tab
+/// opened stays current).
 async fn host_loop(
-    initial: Vec<PathBuf>,
+    initial: restart::RestartRecord,
     state_dir: PathBuf,
     saved: state::HostState,
     state_path: Option<PathBuf>,
@@ -994,15 +1118,22 @@ async fn host_loop(
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
     let mut host = Host::new(rows, cols, state_dir, tx, saved, state_path);
     let mut last_error = None;
-    for path in initial {
-        if let Err(e) = host.open(path.clone()) {
-            tracing::error!(path = %path.display(), "opening the session failed: {e:#}");
-            host.notify(format!("could not open {}: {e}", path.display()));
+    let restarted = initial.active != usize::MAX;
+    for tab in initial.tabs {
+        if let Err(e) = host.open_with(tab.path.clone(), tab.launch.as_deref()) {
+            tracing::error!(path = %tab.path.display(), "opening the session failed: {e:#}");
+            host.notify(format!("could not open {}: {e}", tab.path.display()));
             last_error = Some(e);
         }
     }
     if host.sessions.is_empty() {
         return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no session to open")));
+    }
+    if restarted {
+        host.switch_to(initial.active.min(host.sessions.len() - 1));
+        if last_error.is_none() {
+            host.notify("restarted onto a new build".to_string());
+        }
     }
 
     let mut tick = tokio::time::interval(RENDER_EVERY);
@@ -1034,6 +1165,7 @@ async fn host_loop(
         if last_poll.elapsed() >= EXIT_POLL_EVERY {
             host.poll_exits();
             host.expire_message();
+            host.check_new_build();
             last_poll = Instant::now();
         }
         if host.finish_quit() || host.sessions.is_empty() {
@@ -1043,7 +1175,11 @@ async fn host_loop(
     drop(terminal);
     crate::restore_terminal().context("restoring terminal")?;
     wait_for_ending(std::mem::take(&mut host.ending));
-    Ok(0)
+    Ok(if host.restart.requested {
+        crate::supervisor::RESTART_EXIT_CODE
+    } else {
+        0
+    })
 }
 
 #[cfg(test)]
@@ -1093,19 +1229,26 @@ mod tests {
     }
 
     #[test]
-    fn host_chords_are_alt_keys() {
-        use encode::{LEFT_ALT, RIGHT_ALT, SHIFT};
+    fn host_chords_are_alt_keys_and_ctrl_q() {
+        use encode::{LEFT_ALT, LEFT_CTRL, RIGHT_ALT, RIGHT_CTRL, SHIFT};
         assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT)), Some(Chord::Prev));
         assert_eq!(host_chord(&down(0x27, 0, RIGHT_ALT)), Some(Chord::Next));
         assert_eq!(host_chord(&down(0x4E, 'n' as u16, LEFT_ALT)), Some(Chord::New));
+        assert_eq!(host_chord(&down(0x51, 'q' as u16, LEFT_ALT)), Some(Chord::Close));
         assert_eq!(
             host_chord(&down(0x51, 'Q' as u16, LEFT_ALT | SHIFT)),
-            Some(Chord::QuitAll)
+            Some(Chord::Close)
         );
-        assert_eq!(host_chord(&down(0x51, 'q' as u16, LEFT_ALT)), Some(Chord::QuitAll));
-        assert_eq!(host_chord(&down(0x58, 'x' as u16, LEFT_ALT)), Some(Chord::Close));
+        assert_eq!(host_chord(&down(0x51, 17, LEFT_CTRL)), Some(Chord::QuitAll));
+        assert_eq!(host_chord(&down(0x51, 17, RIGHT_CTRL)), Some(Chord::QuitAll));
+        // Alt+X belongs to Windows; other Ctrl keys belong to the session.
+        assert_eq!(host_chord(&down(0x58, 'x' as u16, LEFT_ALT)), None);
+        assert_eq!(host_chord(&down(0x53, 19, LEFT_CTRL)), None);
         // Key-up records never trigger a chord.
         let mut up = down(0x25, 0, LEFT_ALT);
+        up.key_down = false;
+        assert_eq!(host_chord(&up), None);
+        let mut up = down(0x51, 17, LEFT_CTRL);
         up.key_down = false;
         assert_eq!(host_chord(&up), None);
     }
@@ -1114,7 +1257,10 @@ mod tests {
     fn altgr_and_plain_keys_are_not_chords() {
         use encode::{LEFT_CTRL, RIGHT_ALT};
         assert_eq!(host_chord(&down(0x4E, 'n' as u16, RIGHT_ALT | LEFT_CTRL)), None);
+        // AltGr+Q is '@' on German layouts: text, not quit.
+        assert_eq!(host_chord(&down(0x51, '@' as u16, RIGHT_ALT | LEFT_CTRL)), None);
         assert_eq!(host_chord(&down(0x4E, 'n' as u16, 0)), None);
+        assert_eq!(host_chord(&down(0x51, 'q' as u16, 0)), None);
         assert_eq!(host_chord(&down(0x25, 0, 0)), None);
     }
 
@@ -1124,9 +1270,19 @@ mod tests {
         assert_eq!(term_chord(&alt(KeyCode::Left)), Some(Chord::Prev));
         assert_eq!(term_chord(&alt(KeyCode::Right)), Some(Chord::Next));
         assert_eq!(term_chord(&alt(KeyCode::Char('n'))), Some(Chord::New));
-        assert_eq!(term_chord(&alt(KeyCode::Char('Q'))), Some(Chord::QuitAll));
-        assert_eq!(term_chord(&alt(KeyCode::Char('q'))), Some(Chord::QuitAll));
-        assert_eq!(term_chord(&alt(KeyCode::Char('x'))), Some(Chord::Close));
+        assert_eq!(term_chord(&alt(KeyCode::Char('Q'))), Some(Chord::Close));
+        assert_eq!(term_chord(&alt(KeyCode::Char('q'))), Some(Chord::Close));
+        assert_eq!(term_chord(&alt(KeyCode::Char('x'))), None);
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        assert_eq!(term_chord(&ctrl(KeyCode::Char('q'))), Some(Chord::QuitAll));
+        assert_eq!(term_chord(&ctrl(KeyCode::Char('s'))), None);
+        assert_eq!(
+            term_chord(&KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            None
+        );
         assert_eq!(
             term_chord(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
             None

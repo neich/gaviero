@@ -17,6 +17,12 @@
 //!   (`app/restart.rs`) waits until nothing is running and then quits through
 //!   the normal save path, exiting with the restart code.
 //!
+//! The session host (`gaviero --sessions`) gets the same treatment from
+//! [`supervise_host`]: it watches its executable too, and once every tab is
+//! idle it records its tabs, ends them and exits with the restart code; the
+//! new host reopens the same tabs on the new build (`session_host/restart.rs`).
+//! Its tabs then leave restarting to the host.
+//!
 //! Windows refuses to overwrite a running `.exe` but allows renaming it, so
 //! an installer has to move the old file aside first — `scripts/deploy.ps1`
 //! does that. The supervisor keeps running its old image the whole time; it
@@ -64,10 +70,23 @@ pub(crate) fn child_env(launch_state: &Path) -> [(&'static str, OsString); 2] {
     ]
 }
 
+/// Set on a supervised session host (`gaviero --sessions`): a file, private
+/// to its supervisor, where the host records its tabs before it exits to
+/// restart, so the new build reopens exactly those tabs
+/// ([`host_restart_record`]).
+pub(crate) const HOST_RESTART_ENV: &str = "GAVIERO_SESSION_HOST_RESTART";
+
 /// True in the TUI child of a supervisor — only then may the TUI exit with
 /// [`RESTART_EXIT_CODE`] and expect to come back.
 pub fn is_supervised() -> bool {
     std::env::var_os(CHILD_ENV).is_some()
+}
+
+/// Whether a supervisor may start here: not opted out, on a terminal.
+fn may_supervise() -> bool {
+    std::env::var_os(OPT_OUT_ENV).is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
 }
 
 /// Act as the supervisor when this process should be one.
@@ -76,27 +95,65 @@ pub fn is_supervised() -> bool {
 /// `None` when the caller should run the TUI itself: already a child, opted
 /// out, no terminal, or the executable path is unknown.
 pub fn supervise() -> Option<i32> {
-    if is_supervised() || std::env::var_os(OPT_OUT_ENV).is_some() {
-        return None;
-    }
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+    if is_supervised() || !may_supervise() {
         return None;
     }
     let exe = std::env::current_exe().ok()?;
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let launch_state = launch_state_path();
+    let launch_state = launch_state_path("launch", "state");
+    let mut env = vec![(CHILD_ENV, OsString::from("1"))];
+    if let Some(path) = &launch_state {
+        env.push((LAUNCH_STATE_ENV, path.as_os_str().to_owned()));
+    }
+    let code = run_supervised(&exe, &args, &env);
+    if let Some(path) = &launch_state {
+        let _ = std::fs::remove_file(path);
+    }
+    Some(code)
+}
 
+/// [`supervise`] for the session host: the `gaviero --sessions` a user
+/// starts runs the real host as a child (same arguments) and starts it again
+/// when it exits with [`RESTART_EXIT_CODE`] after a new build is installed.
+/// The child records its tabs in the [`host_restart_record`] file first and
+/// the new host reopens them. `None` when the caller should run the host
+/// itself: already the child, opted out, or no terminal.
+pub fn supervise_host() -> Option<i32> {
+    if host_restart_record().is_some() || !may_supervise() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let record = launch_state_path("session-host-restart", "json")?;
+    // Ours by pid: anything already there was left by a dead supervisor.
+    let _ = std::fs::remove_file(&record);
+    let env = [(HOST_RESTART_ENV, record.as_os_str().to_owned())];
+    let code = run_supervised(&exe, &args, &env);
+    let _ = std::fs::remove_file(&record);
+    Some(code)
+}
+
+/// In a supervised session host: the file to record its tabs in before it
+/// exits to restart, and to reopen them from at startup. `None` when the
+/// host is not supervised — then nothing would start it again.
+pub(crate) fn host_restart_record() -> Option<PathBuf> {
+    std::env::var_os(HOST_RESTART_ENV).map(PathBuf::from)
+}
+
+/// Run `exe` with `args` and `env` until it exits with something other
+/// than [`RESTART_EXIT_CODE`]; that exit code.
+fn run_supervised(exe: &Path, args: &[OsString], env: &[(&str, OsString)]) -> i32 {
     // The child owns the keyboard. A Ctrl+C / Ctrl+Break console event must
     // not kill this parent out from under it (closing the window still does).
     crate::platform::ignore_console_interrupts();
 
-    let code = loop {
+    loop {
         let started = Instant::now();
-        let status = match run_child(&exe, &args, launch_state.as_deref()) {
+        let status = match run_child(exe, args, env) {
             Ok(status) => status,
             Err(e) => {
                 eprintln!("gaviero: could not start {}: {e}", exe.display());
-                break 1;
+                return 1;
             }
         };
         match status.code() {
@@ -106,32 +163,28 @@ pub fn supervise() -> Option<i32> {
                     std::thread::sleep(RESTART_BACKOFF);
                 }
             }
-            Some(code) => break code,
+            Some(code) => return code,
             // Killed by a signal (Unix): report failure like a shell would.
-            None => break 1,
+            None => return 1,
         }
-    };
-    if let Some(path) = &launch_state {
-        let _ = std::fs::remove_file(path);
     }
-    Some(code)
 }
 
-/// This supervisor's launch-state file: under the cache dir, keyed by pid.
-/// A stale file left by a killed supervisor whose pid is later reused is
-/// harmless — every record names the launch path it answers for.
-fn launch_state_path() -> Option<PathBuf> {
+/// A file private to this supervisor: under the cache dir, keyed by pid.
+/// A stale launch-state file left by a killed supervisor whose pid is later
+/// reused is harmless — every record names the launch path it answers for.
+fn launch_state_path(stem: &str, ext: &str) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("gaviero");
-    Some(dir.join(format!("launch-{}.state", std::process::id())))
+    Some(dir.join(format!("{stem}-{}.{ext}", std::process::id())))
 }
 
-fn run_child(exe: &Path, args: &[OsString], launch_state: Option<&Path>) -> std::io::Result<ExitStatus> {
+fn run_child(exe: &Path, args: &[OsString], env: &[(&str, OsString)]) -> std::io::Result<ExitStatus> {
     let deadline = Instant::now() + EXE_WAIT;
     loop {
         let mut cmd = Command::new(exe);
-        cmd.args(args).env(CHILD_ENV, "1");
-        if let Some(path) = launch_state {
-            cmd.env(LAUNCH_STATE_ENV, path);
+        cmd.args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         match cmd.status() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {

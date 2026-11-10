@@ -54,7 +54,8 @@ struct Cli {
     folder: bool,
 
     /// Run a session host: several gaviero sessions in this terminal,
-    /// switched with Alt+Left/Right (Alt+N opens one, Alt+Shift+Q quits all).
+    /// switched with Alt+Left/Right (Alt+N opens one, Alt+Q closes one,
+    /// Ctrl+Q quits all and reopens them next time).
     /// With PATH, opens only PATH; without, reopens the last set.
     #[arg(long, conflicts_with_all = ["workspace", "folder"])]
     sessions: bool,
@@ -233,6 +234,12 @@ fn main() -> Result<()> {
         if std::env::var_os(session_host::HOST_ENV).is_some() {
             eprintln!("gaviero: --sessions cannot run inside a session host");
             std::process::exit(2);
+        }
+        // Restart-on-new-build for the host itself: the process a user
+        // starts supervises the real host and relaunches it, with the same
+        // tabs, after a deploy.
+        if let Some(code) = supervisor::supervise_host() {
+            std::process::exit(code);
         }
         std::process::exit(session_host::run(launch));
     }

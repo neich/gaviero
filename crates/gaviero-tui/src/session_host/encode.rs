@@ -49,6 +49,11 @@ pub fn alt_only(ctrl_state: u32) -> bool {
     ctrl_state & ANY_ALT != 0 && ctrl_state & ANY_CTRL == 0
 }
 
+/// Some Ctrl key is held and no Alt key, so AltGr never counts here either.
+pub fn ctrl_only(ctrl_state: u32) -> bool {
+    ctrl_state & ANY_CTRL != 0 && ctrl_state & ANY_ALT == 0
+}
+
 /// One Windows `MOUSE_EVENT_RECORD` (0-based col/row, raw fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseRecord {
