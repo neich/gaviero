@@ -1113,6 +1113,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     titles: &titles,
                     active: app.active_buffer,
                     closable: false,
+                    badges: None,
                 };
                 if let Some(idx) = tab_bar.tab_at_x(col, app.layout.tab_area.x)
                     && idx < app.buffers.len()

@@ -121,6 +121,16 @@ impl Pty {
             .to_string()
     }
 
+    /// Symbol and foreground colour of the cell at `row`, `col`.
+    pub fn cell(&self, row: u16, col: u16) -> (String, vt100::Color) {
+        let parser = self.parser.lock().unwrap();
+        parser
+            .screen()
+            .cell(row, col)
+            .map(|c| (c.contents().to_string(), c.fgcolor()))
+            .unwrap_or_else(|| (String::new(), vt100::Color::Default))
+    }
+
     /// Poll every 50 ms until `pred(screen contents, title)` holds; panic
     /// with the screen after 15 s.
     pub fn wait_for(&self, what: &str, pred: impl Fn(&str, Option<&str>) -> bool) {
