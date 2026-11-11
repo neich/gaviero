@@ -833,7 +833,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         if is_file {
                             if let Some(path) = app.file_tree.selected_path() {
                                 let path = path.to_path_buf();
-                                app.open_file(&path);
+                                click_tree_file(app, path);
                             }
                         } else {
                             app.file_tree.toggle_expand();
@@ -844,7 +844,19 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             app.search_panel.editing = true;
                             return;
                         }
-                        let header = crate::panels::search::SearchPanelState::HEADER_ROWS;
+                        type Search = crate::panels::search::SearchPanelState;
+                        if relative_row == Search::MODE_ROW {
+                            let rel_col = (col - area.x) as usize;
+                            if let Some(mode) = Search::mode_at_column(rel_col)
+                                && mode != app.search_panel.mode
+                            {
+                                app.search_panel.toggle_mode();
+                                app.search_panel.editing = true;
+                                app.run_search_from_input();
+                            }
+                            return;
+                        }
+                        let header = Search::HEADER_ROWS;
                         if relative_row < header {
                             return;
                         }
@@ -1114,6 +1126,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     active: app.active_buffer,
                     closable: false,
                     badges: None,
+                    palette: crate::widgets::tabs::EDITOR_PALETTE,
                 };
                 if let Some(idx) = tab_bar.tab_at_x(col, app.layout.tab_area.x)
                     && idx < app.buffers.len()
@@ -2460,6 +2473,13 @@ pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
 }
 
 pub(super) fn open_file(app: &mut App, path: &Path) {
+    try_open_file(app, path);
+}
+
+/// Open `path` in a tab (or switch to the tab already showing it). Returns
+/// false when the editor cannot open it — not UTF-8 text, or unreadable —
+/// after logging why and putting it on the status bar.
+pub(super) fn try_open_file(app: &mut App, path: &Path) -> bool {
     let path = Buffer::resolve_editor_path(path);
     for (i, buf) in app.buffers.iter().enumerate() {
         if buf
@@ -2469,7 +2489,7 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
         {
             app.active_buffer = i;
             sync_preview_mode_for_active_buffer(app);
-            return;
+            return true;
         }
     }
 
@@ -2522,11 +2542,59 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
             app.active_buffer = app.buffers.len() - 1;
             super::settings_overlay::tag_buffer(app, app.active_buffer);
             sync_preview_mode_for_active_buffer(app);
+            true
         }
         Err(e) => {
-            tracing::error!("Failed to open file {}: {}", path.display(), e);
+            tracing::error!("Failed to open file {}: {:#}", path.display(), e);
+            app.status_message = Some((
+                format!("Cannot open {} as text", display_name(&path)),
+                std::time::Instant::now(),
+            ));
+            false
         }
     }
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Two clicks on the same explorer entry within this window are a double-click.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// A left click on an explorer file. A double-click on a file the editor
+/// cannot open shows it selected in the OS file manager, where the user can
+/// open it with an external app.
+fn click_tree_file(app: &mut App, path: std::path::PathBuf) {
+    let now = std::time::Instant::now();
+    let is_double_click = app
+        .last_tree_click
+        .as_ref()
+        .is_some_and(|(p, t)| *p == path && now.duration_since(*t) < DOUBLE_CLICK_WINDOW);
+    app.last_tree_click = if is_double_click {
+        None
+    } else {
+        Some((path.clone(), now))
+    };
+
+    if try_open_file(app, &path) {
+        return;
+    }
+    let name = display_name(&path);
+    let msg = if !is_double_click {
+        format!("Cannot open {name} as text — double-click to show it in the file manager")
+    } else {
+        match crate::platform::reveal_in_file_manager(&path) {
+            Ok(()) => format!("Showing {name} in the file manager"),
+            Err(e) => {
+                tracing::warn!("reveal {} in file manager failed: {e}", path.display());
+                format!("Could not open the file manager: {e}")
+            }
+        }
+    };
+    app.status_message = Some((msg, now));
 }
 
 pub(super) fn cycle_tab(app: &mut App, delta: i32) {
@@ -2724,6 +2792,31 @@ mod tests {
             .as_ref()
             .map(|(m, _)| m.clone())
             .unwrap_or_default()
+    }
+
+    /// A first click on a file the editor cannot read as text opens no tab and
+    /// says how to reach it; the click is remembered for the double-click.
+    /// (The second click is not driven here: it would launch the real file
+    /// manager.)
+    #[test]
+    fn explorer_click_on_a_binary_file_hints_at_the_file_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = agent_edit_app(dir.path());
+        let png = dir.path().join("logo.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff]).unwrap();
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+        let tabs = app.buffers.len();
+
+        click_tree_file(&mut app, png.clone());
+        assert_eq!(app.buffers.len(), tabs, "a binary file must not open a tab");
+        assert!(status_text(&app).contains("double-click"), "{}", status_text(&app));
+        assert_eq!(app.last_tree_click.as_ref().map(|(p, _)| p), Some(&png));
+
+        click_tree_file(&mut app, text.clone());
+        assert_eq!(app.buffers.len(), tabs + 1, "a text file opens on one click");
+        assert_eq!(app.last_tree_click.as_ref().map(|(p, _)| p), Some(&text));
+        cleanup_session(dir.path());
     }
 
     #[test]

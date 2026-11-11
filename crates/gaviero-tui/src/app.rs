@@ -168,6 +168,8 @@ pub struct App {
     mouse_dragging: bool,
     scrollbar_dragging: Option<ScrollbarTarget>,
     last_click: Option<(u16, u16, std::time::Instant)>, // (col, row, time) for double-click
+    /// Explorer entry clicked last and when, for double-click on a file.
+    last_tree_click: Option<(std::path::PathBuf, std::time::Instant)>,
 
     // Transient status message (shown for a few seconds, then cleared)
     status_message: Option<(String, std::time::Instant)>,
@@ -532,6 +534,7 @@ impl App {
             mouse_dragging: false,
             scrollbar_dragging: None,
             last_click: None,
+            last_tree_click: None,
             status_message: None,
             agent_notice_banner: None,
             terminal_has_focus: true,

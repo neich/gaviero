@@ -413,6 +413,144 @@ fn spawn_external(_url: &str) -> std::io::Result<()> {
     ))
 }
 
+/// Show `path` selected in the OS file manager (Explorer, Finder, or the
+/// freedesktop file manager), so the user can open it with an external app.
+///
+/// Fire-and-forget: the call never waits on the file manager. On Linux the
+/// file manager is asked over D-Bus (`org.freedesktop.FileManager1.ShowItems`)
+/// on a detached thread; when nothing answers, the parent folder is opened
+/// with `xdg-open` instead, without a selection.
+pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    let path = std::path::absolute(path)?;
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file no longer exists",
+        ));
+    }
+    spawn_reveal(&path)
+}
+
+/// Explorer does not understand `\\?\` verbatim paths (what `canonicalize`
+/// returns on Windows): `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\x` → `\\srv\x`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}").into()
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.into()
+    } else {
+        path.into()
+    }
+}
+
+#[cfg(windows)]
+fn spawn_reveal(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let text = path.to_string_lossy();
+    let target = strip_verbatim_prefix(&text);
+    // `/select,"<path>"` must reach Explorer verbatim: the standard argument
+    // quoting turns it into `"/select,<path>"`, which Explorer misreads when
+    // the path has spaces or commas. A Windows path cannot contain `"`.
+    Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{target}\""))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        // Explorer's exit code means nothing (it is 1 on success).
+        .map(drop)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_reveal(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_reveal(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let uri = file_uri(path);
+    let parent = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    std::thread::spawn(move || {
+        let shown = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--reply-timeout=3000",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("array:string:{uri}"))
+            .arg("string:")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !shown {
+            let _ = Command::new("xdg-open")
+                .arg(&parent)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn spawn_reveal(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no file manager on this platform",
+    ))
+}
+
+/// `file://` URI for an absolute Unix path. Every byte outside the RFC 3986
+/// unreserved set (and `/`) is percent-encoded — commas included, because
+/// `dbus-send` splits `array:string:` items on them.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn file_uri(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+
+    let mut uri = String::from("file://");
+    for b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
 /// The filesystem roots a folder browser offers at the top: every mounted
 /// drive (`C:\`, `D:\`, …) on Windows, `/` elsewhere. Asks the OS for the
 /// drive bitmask instead of probing each letter, so a disconnected network
@@ -558,5 +696,26 @@ mod tests {
         assert!(is_safe_external_url("mailto:a@b.c"));
         let err = open_external("javascript:alert(1)").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_explorer() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\a b\x.png"), r"C:\a b\x.png");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\srv\share\x"), r"\\srv\share\x");
+        assert_eq!(strip_verbatim_prefix(r"C:\plain"), r"C:\plain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_escapes_spaces_commas_and_non_ascii() {
+        let uri = file_uri(std::path::Path::new("/home/u/a b,c/ñ.pdf"));
+        assert_eq!(uri, "file:///home/u/a%20b%2Cc/%C3%B1.pdf");
+    }
+
+    #[test]
+    fn reveal_refuses_a_missing_file() {
+        let err = reveal_in_file_manager(std::path::Path::new("definitely/not/here.bin"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

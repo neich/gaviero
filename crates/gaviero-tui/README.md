@@ -97,6 +97,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+T / Ctrl+W | New tab / close tab |
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |
+| Double-click (explorer) | On a file the editor cannot open as text (images, PDFs, archives, …): show it selected in the OS file manager (Explorer / Finder / the freedesktop file manager) so you can open it with another app |
 | Alt+Left/Right (`--sessions` host) | Previous / next session |
 | Alt+Shift+Left/Right (`--sessions` host) | Move the current tab one place left / right (stops at the ends; the order is kept for the next start) |
 | Alt+N (`--sessions` host) | New session picker |
