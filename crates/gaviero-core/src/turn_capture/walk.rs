@@ -2,12 +2,13 @@
 //!
 //! Honours `.gitignore` / `.ignore` files as plain pattern files
 //! (`require_git(false)` — no repository needed) plus the host's
-//! `files.exclude` globs, and always skips `.git/` and `.gaviero/`. Four
+//! `files.exclude` globs, and always skips `.git/` and `.gaviero/`. Five
 //! carve-outs are added back because an agent changing them is exactly what a
 //! reviewer must see:
 //!
 //! * `<root>/.gaviero/settings.json` — tool permissions live there;
 //! * `<root>/.gaviero/dsl/` — workflow scripts, which launch agents;
+//! * `<root>/.gaviero/skills/` — skills, injected into agent prompts;
 //! * sensitive paths (`.env`, keys, credentials — [`sensitive_match`]), which
 //!   are usually gitignored. Every walked directory is swept for direct
 //!   children with a sensitive name, and a sensitive directory is listed whole;
@@ -105,11 +106,17 @@ fn walk_root(root: &Path, scope: &CaptureScope, out: &mut BTreeMap<PathBuf, Obse
         push(out, root, &settings);
     }
 
-    let scripts = root.join(".gaviero").join(crate::scripts::SCRIPTS_SUBDIR);
-    if scripts.is_dir() {
-        walk_included(root, &scripts, &excluder, out);
+    for sub in GAVIERO_CONTENT_DIRS {
+        let dir = root.join(".gaviero").join(sub);
+        if dir.is_dir() {
+            walk_included(root, &dir, &excluder, out);
+        }
     }
 }
+
+/// `.gaviero/` subfolders that hold user content steering agents (workflow
+/// scripts, skills), walked whole. The rest of `.gaviero/` is runtime state.
+const GAVIERO_CONTENT_DIRS: &[&str] = &[crate::scripts::SCRIPTS_SUBDIR, "skills"];
 
 /// `folder` resolved under `root`, if it is a root-relative path to an
 /// existing directory. Absolute paths and `..` are refused so an entry can
@@ -290,12 +297,19 @@ mod tests {
             ".gaviero/memory.db",
             ".gaviero/dsl/audit/audit.gaviero",
             ".gaviero/dsl/profiles/claude.gaviero",
+            ".gaviero/skills/plan/SKILL.md",
+            ".gaviero/turns/baseline.json",
             ".git/HEAD",
         ] {
             write(root, rel);
         }
 
         let got = rels(&scope(root));
+        assert!(
+            got.contains(&".gaviero/skills/plan/SKILL.md".to_string()),
+            "skills are injected into agent prompts, so edits to them are reviewed: {got:?}"
+        );
+        assert!(!got.iter().any(|r| r.starts_with(".gaviero/turns/")), "{got:?}");
         assert!(
             got.contains(&".gaviero/dsl/audit/audit.gaviero".to_string()),
             "scripts launch agents, so edits to them are reviewed: {got:?}"
@@ -345,6 +359,27 @@ mod tests {
         assert!(got.contains(&"plans/deep/run.log".to_string()), "{got:?}");
         assert!(got.contains(&"docs/private/notes.md".to_string()), "{got:?}");
         assert!(!got.iter().any(|r| r.starts_with("data/")), "{got:?}");
+    }
+
+    /// `.gaviero/` is skipped wholesale, but a folder in it named in
+    /// `turnReview.includeIgnored` is captured — even when `.gaviero/` is a
+    /// git repository of its own with an ignore-everything `.gitignore`.
+    #[test]
+    fn included_ignored_folders_reach_inside_dot_gaviero() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, ".gaviero/.git/HEAD");
+        std::fs::write(root.join(".gaviero/.gitignore"), "/*\n!/skills/\n").unwrap();
+        write(root, ".gaviero/plans/next/plan.md");
+        write(root, ".gaviero/history/turns.ndjson");
+
+        let got = rels(&CaptureScope {
+            include_ignored: vec![".gaviero/plans".into()],
+            ..scope(root)
+        });
+        assert!(got.contains(&".gaviero/plans/next/plan.md".to_string()), "{got:?}");
+        assert!(!got.iter().any(|r| r.starts_with(".gaviero/history/")), "{got:?}");
+        assert!(!got.iter().any(|r| r.starts_with(".gaviero/.git/")), "{got:?}");
     }
 
     #[test]
