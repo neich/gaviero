@@ -1,7 +1,8 @@
 //! OSC sequence parser for extracting shell integration markers from the PTY
 //! byte stream before feeding it to vt100.
 //!
-//! Handles OSC 133 (FinalTerm semantic prompts) and OSC 7 (CWD reporting).
+//! Handles OSC 133 (FinalTerm semantic prompts), OSC 7 (CWD reporting),
+//! OSC 0/2 (title), notification requests (OSC 9 / 777 / 99) and bare BELs.
 //! Sequences may be split across multiple `feed()` calls.
 
 /// Result of parsing an OSC sequence from the byte stream.
@@ -13,6 +14,11 @@ pub enum OscResult {
     Osc7(String),
     /// OSC 0 or 2 — window title.
     Title(String),
+    /// A bare BEL (`\x07`) outside any OSC sequence. Still passed through.
+    Bell,
+    /// A desktop-notification request: OSC 9 (iTerm2; not `9;4`, ConEmu
+    /// progress), OSC 777 `notify`, or OSC 99 (kitty).
+    Notify,
 }
 
 /// OSC 133 FinalTerm semantic prompt markers.
@@ -75,6 +81,9 @@ impl OscParser {
                     if byte == 0x1b {
                         self.state = State::Esc;
                     } else {
+                        if byte == 0x07 {
+                            results.push(OscResult::Bell);
+                        }
                         clean.push(byte);
                     }
                 }
@@ -155,6 +164,16 @@ impl OscParser {
         }
         if let Some(title) = body.strip_prefix("2;") {
             return Some(OscResult::Title(title.to_string()));
+        }
+        // Notifications: a program asking for the user.
+        if let Some(rest) = body.strip_prefix("9;")
+            && !rest.starts_with("4;")
+            && rest != "4"
+        {
+            return Some(OscResult::Notify);
+        }
+        if body.starts_with("777;notify") || body.starts_with("99;") {
+            return Some(OscResult::Notify);
         }
 
         None
@@ -290,11 +309,11 @@ mod tests {
     #[test]
     fn unknown_osc_passed_through() {
         let mut parser = OscParser::new();
-        let input = b"\x1b]99;unknown\x07";
+        let input = b"\x1b]4242;unknown\x07";
         let (results, clean) = parser.feed(input);
         assert!(results.is_empty());
         // Unknown OSC is passed through to vt100
-        assert_eq!(clean, b"\x1b]99;unknown\x07");
+        assert_eq!(clean, b"\x1b]4242;unknown\x07");
     }
 
     #[test]
@@ -340,5 +359,35 @@ mod tests {
                 exit_code: Some(127)
             })
         );
+    }
+
+    #[test]
+    fn a_bare_bell_is_reported_and_passed_through() {
+        let mut parser = OscParser::new();
+        let (results, clean) = parser.feed(b"Continue?\x07 ");
+        assert_eq!(results, vec![OscResult::Bell]);
+        assert_eq!(clean, b"Continue?\x07 ");
+        // A BEL that ends an OSC sequence is not a bell.
+        let (results, _) = parser.feed(b"\x1b]133;A\x07");
+        assert_eq!(results, vec![OscResult::Osc133(Osc133Marker::PromptStart)]);
+        let (results, _) = parser.feed(b"\x1b]8;;http://x\x07link\x1b]8;;\x07");
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[test]
+    fn notification_requests_are_recognised() {
+        let mut parser = OscParser::new();
+        for input in [
+            &b"\x1b]9;Claude needs your input\x07"[..],
+            b"\x1b]777;notify;title;body\x07",
+            b"\x1b]99;;hello\x1b\\",
+        ] {
+            let (results, _) = parser.feed(input);
+            assert_eq!(results, vec![OscResult::Notify], "{input:?}");
+        }
+        // ConEmu / Windows Terminal progress is not a notification.
+        let (results, clean) = parser.feed(b"\x1b]9;4;1;50\x07");
+        assert!(results.is_empty());
+        assert_eq!(clean, b"\x1b]9;4;1;50\x07");
     }
 }

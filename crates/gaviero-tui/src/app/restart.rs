@@ -121,6 +121,16 @@ fn agent_running(app: &App) -> bool {
             .any(|c| c.is_streaming || c.has_running_background_agents())
 }
 
+/// A command in one of the shells seems to wait for the user
+/// (`TerminalInstance::awaiting_input`).
+pub(super) fn terminal_awaiting_input(app: &App) -> bool {
+    app.terminal_manager.tab_order().iter().any(|id| {
+        app.terminal_manager
+            .instance(*id)
+            .is_some_and(|inst| inst.awaiting_input())
+    })
+}
+
 fn terminal_busy(app: &App) -> bool {
     app.terminal_manager.tab_order().iter().any(|id| {
         app.terminal_manager

@@ -1257,7 +1257,9 @@ impl App {
     /// in the window title, only under a host, followed by `:` and the work
     /// closing this session would cut off (`restart::work_in_progress`), so
     /// the host can warn before it closes the tab: `busy:agent,unsaved`.
-    /// Not `;`: terminals split OSC parameters on it.
+    /// Not `;`: terminals split OSC parameters on it. `shell-input` is
+    /// added when a shell command seems to wait for the user, for the
+    /// host's shell circle; it is not work the close guard lists.
     pub(crate) fn session_host_status(&self) -> String {
         let waiting = self
             .chat_state
@@ -1272,7 +1274,10 @@ impl App {
         } else {
             "idle"
         };
-        let work = restart::work_in_progress(self);
+        let mut work = restart::work_in_progress(self);
+        if restart::terminal_awaiting_input(self) {
+            work.push("shell-input");
+        }
         if work.is_empty() {
             status.to_string()
         } else {

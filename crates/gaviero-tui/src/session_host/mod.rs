@@ -93,6 +93,33 @@ pub(crate) fn sessions_requested(args: &[OsString]) -> Option<Result<HostLaunch,
     })
 }
 
+/// Shown when another session host already runs: every `gaviero --sessions`
+/// reopens the same saved tabs, so a second host would run each session
+/// twice.
+pub(crate) const ALREADY_RUNNING: &str = "gaviero: warning: a session host (gaviero --sessions) is already running in another terminal.\n\
+     Switch to that terminal (Alt+N opens a new tab there), or quit it with Ctrl+Q first.\n\
+     Refusing to start a second one.";
+
+/// Claim the one session host this user may run. `Ok(lock)`: keep it for
+/// the life of the process (`None` when the lock could not be tried; the
+/// host then starts anyway, as it did before). `Err`: another host holds it.
+pub(crate) fn claim_instance() -> Result<Option<state::InstanceLock>, ()> {
+    let Some(state) = state::state_path() else {
+        return Ok(None);
+    };
+    match state::lock_instance(&state) {
+        Ok(Some(lock)) => Ok(Some(lock)),
+        Ok(None) => Err(()),
+        Err(e) => {
+            eprintln!(
+                "gaviero: could not check for another session host ({}): {e}",
+                state::lock_path(&state).display()
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// A key the host keeps for itself instead of forwarding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Chord {

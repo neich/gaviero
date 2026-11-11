@@ -338,6 +338,11 @@ impl TerminalManager {
                         inst.title = title;
                     }
                 }
+                OscResult::Bell | OscResult::Notify => {
+                    if let Some(inst) = self.terminals.get_mut(&id) {
+                        inst.note_attention_request();
+                    }
+                }
             }
         }
     }

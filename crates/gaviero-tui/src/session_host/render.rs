@@ -42,8 +42,10 @@ const BLUE: Color = Color::Rgb(0, 0, 204);
 const AGENT_RUNNING: Color = GREEN;
 const AGENT_WAITING: Color = YELLOW;
 const AGENT_DONE: Color = BLUE;
-/// Shell circle: a command is running / one finished while out of view.
+/// Shell circle: a command is running / seems to wait for the user (a bell,
+/// a notification, or a quiet prompt line) / finished while out of view.
 const SHELL_RUNNING: Color = GREEN;
+const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
 
 pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
@@ -69,7 +71,9 @@ pub(crate) fn badges(
     } else {
         None
     };
-    let shell = if activity.shell {
+    let shell = if activity.shell_waiting {
+        Some(SHELL_WAITING)
+    } else if activity.shell {
         Some(SHELL_RUNNING)
     } else if shell_done_unseen {
         Some(SHELL_DONE)
@@ -217,7 +221,7 @@ mod tests {
     #[test]
     fn badges_show_agent_and_shell_state() {
         let none = Activity::default();
-        let running = Activity { waiting: false, agent: true, shell: true };
+        let running = Activity { waiting: false, agent: true, shell: true, shell_waiting: false };
         let asking = Activity { waiting: true, ..running };
         assert_eq!(badges(none, false, false), [None, None]);
         assert_eq!(
@@ -236,5 +240,8 @@ mod tests {
             badges(running, true, true),
             [Some(AGENT_RUNNING), Some(SHELL_RUNNING)]
         );
+        // A shell command waiting for the user wins over running.
+        let prompting = Activity { shell_waiting: true, ..running };
+        assert_eq!(badges(prompting, false, true)[1], Some(SHELL_WAITING));
     }
 }
