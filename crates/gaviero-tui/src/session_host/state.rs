@@ -57,6 +57,41 @@ pub(crate) fn save(path: &Path, state: &HostState) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Proof that this process is the only session host using a state file:
+/// an exclusive OS lock on `session-host.lock` beside it. The OS drops the
+/// lock when the process ends, however it ends, so a crashed host never
+/// leaves a stale lock behind.
+#[derive(Debug)]
+pub(crate) struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// The lock file guarding the state file at `state`.
+pub(crate) fn lock_path(state: &Path) -> PathBuf {
+    state.with_extension("lock")
+}
+
+/// Take the instance lock for the state file at `state`: `Ok(Some)` when
+/// this process is now the only host, `Ok(None)` when another process
+/// holds it, `Err` when the lock could not be tried at all.
+pub(crate) fn lock_instance(state: &Path) -> std::io::Result<Option<InstanceLock>> {
+    let path = lock_path(state);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // No truncate: another host may hold the lock on this file.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(InstanceLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// A saved path that can still be opened: a folder, or a
 /// `.gaviero-workspace` file.
 pub(crate) fn still_openable(path: &Path) -> bool {
@@ -183,6 +218,30 @@ mod tests {
         assert_eq!(load(&path), HostState::default());
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(load(&path), HostState::default());
+    }
+
+    #[test]
+    fn a_second_host_cannot_take_the_instance_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("sub").join("session-host.json");
+        let first = lock_instance(&state).unwrap();
+        assert!(first.is_some(), "the first host gets the lock");
+        assert!(lock_path(&state).exists());
+        assert!(
+            lock_instance(&state).unwrap().is_none(),
+            "a second host is refused while the first runs"
+        );
+        drop(first);
+        assert!(
+            lock_instance(&state).unwrap().is_some(),
+            "the lock is free once the first host is gone"
+        );
+        let other = dir.path().join("other.json");
+        let _held = lock_instance(&state).unwrap();
+        assert!(
+            lock_instance(&other).unwrap().is_some(),
+            "a host with its own state file is independent"
+        );
     }
 
     #[test]

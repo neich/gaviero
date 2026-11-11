@@ -236,6 +236,23 @@ fn main() -> Result<()> {
             eprintln!("gaviero: --sessions cannot run inside a session host");
             std::process::exit(2);
         }
+        // One session host per user (per state file): every host reopens
+        // the same saved tabs, so a second one — e.g. a shell profile that
+        // runs `gaviero --sessions` in each new terminal — would run every
+        // session twice. The process the user started takes the lock and
+        // keeps it across restarts onto a new build; its supervised host
+        // child (`HOST_RESTART_ENV`) runs under it and skips the check.
+        let _instance = if supervisor::host_restart_record().is_none() {
+            match session_host::claim_instance() {
+                Ok(lock) => lock,
+                Err(()) => {
+                    eprintln!("{}", session_host::ALREADY_RUNNING);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
         // Restart-on-new-build for the host itself: the process a user
         // starts supervises the real host and relaunches it, with the same
         // tabs, after a deploy.
@@ -553,12 +570,15 @@ async fn run() -> Result<bool> {
             terminal.draw(|frame| app.render(frame))?;
             render_scheduler.record_render(&app);
             needs_render = false;
-            if let Some(last) = &session_status {
-                let status = app.session_host_status();
-                if status != *last {
-                    write_session_status(&mut terminal, &status)?;
-                    session_status = Some(status);
-                }
+        }
+        // After every event, ticks included: a shell command counts as
+        // waiting for input only after it has been quiet for a while, with
+        // no event of its own to mark the moment.
+        if let Some(last) = &session_status {
+            let status = app.session_host_status();
+            if status != *last {
+                write_session_status(&mut terminal, &status)?;
+                session_status = Some(status);
             }
         }
 

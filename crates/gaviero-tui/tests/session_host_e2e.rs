@@ -418,6 +418,47 @@ fn alt_shift_arrows_reorder_tabs_and_the_order_is_kept() {
     assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
 }
 
+/// Only one host runs per state file: a second `gaviero --sessions` (e.g. a
+/// shell profile in a new terminal) warns and exits without opening any
+/// tab, and the first keeps running. Once the first quits, a host starts.
+#[test]
+fn a_second_host_refuses_to_start() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    std::fs::create_dir(&a).unwrap();
+    let la = name_of(&a);
+    let state = root.path().join("state.json");
+    let mut first = host(
+        &[OsStr::new("--sessions"), a.as_os_str()],
+        &state,
+        root.path(),
+    );
+    first.wait_for("A's tab", |_, _| first.row(0).contains(&la));
+
+    let mut second = host(&[OsStr::new("--sessions")], &state, root.path());
+    let code = second.wait_exit(Duration::from_secs(10));
+    assert_eq!(code, Some(1), "screen:\n{}", second.contents());
+    assert!(
+        second.contents().contains("already running"),
+        "screen:\n{}",
+        second.contents()
+    );
+    drop(second);
+    assert_eq!(open_names(&state), [la.as_str()], "the open set is untouched");
+
+    // The first host is still live.
+    first.send(&tap(0x58, 0x2D, 'x' as u16, 0));
+    first.wait_text("KEY Char('x')");
+    first.send(&ctrl_q());
+    assert_eq!(first.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(first);
+
+    let mut again = host(&[OsStr::new("--sessions")], &state, root.path());
+    again.wait_for("A's tab again", |_, _| again.row(0).contains(&la));
+    again.send(&ctrl_q());
+    assert_eq!(again.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
 /// A deploy (`scripts/deploy.ps1`) restarts a supervised host onto the new
 /// build with the same tabs. The host runs from a copy of the binary, so the
 /// test can install over it: rename the running file aside, put a new one
