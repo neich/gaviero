@@ -30,7 +30,9 @@ const NOTICE_EVERY: Duration = Duration::from_secs(30);
 /// One tab of a host that is restarting.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RestartTab {
-    pub path: PathBuf,
+    /// What the tab runs (a local path or an SSH target; the field keeps
+    /// its old name so records from older builds still load).
+    pub path: super::target::Target,
     /// The tab's launch-state file (`supervisor::remember_launch_choice`),
     /// verbatim, so the restarted tab does not ask again.
     #[serde(default)]
@@ -188,6 +190,7 @@ impl HostRestart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_host::target::Target;
 
     #[test]
     fn work_in_any_tab_blocks_the_restart() {
@@ -225,8 +228,12 @@ mod tests {
         let path = dir.path().join("cache").join("restart.json");
         let record = RestartRecord {
             tabs: vec![
-                RestartTab { path: a.clone(), launch: None },
-                RestartTab { path: b.clone(), launch: Some("x\nfolder\n".into()) },
+                RestartTab { path: Target::Local(a.clone()), launch: None },
+                RestartTab { path: Target::Local(b.clone()), launch: Some("x\nfolder\n".into()) },
+                RestartTab {
+                    path: Target::Ssh { host: "vps".into(), path: Some("/srv/p".into()) },
+                    launch: None,
+                },
             ],
             active: 1,
         };
@@ -244,7 +251,7 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&c).unwrap();
         let path = dir.path().join("restart.json");
-        let tab = |p: &Path| RestartTab { path: p.to_path_buf(), launch: None };
+        let tab = |p: &Path| RestartTab { path: Target::Local(p.to_path_buf()), launch: None };
         let record = RestartRecord {
             tabs: vec![tab(&a), tab(&dir.path().join("gone")), tab(&c)],
             active: 2,

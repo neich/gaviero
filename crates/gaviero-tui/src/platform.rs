@@ -188,6 +188,51 @@ pub fn ignore_console_interrupts() {
 #[cfg(not(windows))]
 pub fn ignore_console_interrupts() {}
 
+/// Set once SIGHUP or SIGTERM arrived ([`install_hangup_forwarder`]).
+static HUNG_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The terminal hung up or the process was asked to terminate: drawing will
+/// fail from now on, and the TUI should only save and leave.
+pub fn hung_up() -> bool {
+    HUNG_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Unix: turn SIGHUP (the terminal went away — an SSH tab closed or its
+/// connection dropped) and SIGTERM into [`crate::event::Event::HangUp`], so
+/// the TUI quits through its normal exit path and saves its session instead
+/// of dying on the default signal action. Must run inside the tokio runtime.
+#[cfg(unix)]
+pub fn install_hangup_forwarder(tx: tokio::sync::mpsc::UnboundedSender<crate::event::Event>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("could not watch for SIGHUP: {e}");
+            return;
+        }
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("could not watch for SIGTERM: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = hangup.recv() => tracing::info!("SIGHUP: quitting through the normal exit path"),
+            _ = terminate.recv() => tracing::info!("SIGTERM: quitting through the normal exit path"),
+        }
+        HUNG_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tx.send(crate::event::Event::HangUp);
+    });
+}
+
+/// Windows: a closed console arrives as `CTRL_CLOSE_EVENT` instead (see
+/// [`install_console_ctrl_forwarder`]); nothing to install.
+#[cfg(not(unix))]
+pub fn install_hangup_forwarder(_tx: tokio::sync::mpsc::UnboundedSender<crate::event::Event>) {}
+
 #[cfg(windows)]
 mod console_ctrl {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

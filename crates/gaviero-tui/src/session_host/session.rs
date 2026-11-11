@@ -1,6 +1,7 @@
 //! One session: a `gaviero` child in a pseudo-terminal, its emulated screen,
 //! and the status it reports through its window title.
 
+use super::target::Target;
 use super::{CONTROL_ENV, HOST_ENV, HOST_RESTARTS_ENV, HostEvent, encode};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -12,15 +13,32 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Title prefix a session child uses to report its status (`main.rs`).
 const STATUS_TITLE_PREFIX: &str = "gaviero-session:";
 
-/// Keeps the last window title (OSC 0 / OSC 2) the child set.
+/// Keeps the last window title (OSC 0 / OSC 2) the child set, and the
+/// folder it reported last (OSC 7, `super::osc7`) until the host takes it.
 #[derive(Default)]
 pub(crate) struct TitleCb {
     pub title: Option<String>,
+    pub reported_path: Option<String>,
+    /// Base64 text the child asked to copy (OSC 52), until the host takes it.
+    pub copied: Option<Vec<u8>>,
 }
 
 impl vt100::Callbacks for TitleCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        self.copied = Some(data.to_vec());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() == Some(&&b"7"[..]) {
+            let url = params[1..].join(&b";"[..]);
+            if let Some(path) = super::osc7::decode_file_url(&url) {
+                self.reported_path = Some(path);
+            }
+        }
     }
 }
 
@@ -96,18 +114,18 @@ fn status_fields(title: Option<&str>) -> Option<(&str, &str)> {
 
 /// The tab label for `path`: a workspace file's stem, a folder's name;
 /// ` (2)`, ` (3)`, … when `taken` already holds that label.
-pub(crate) fn label_for(path: &Path, taken: &[String]) -> String {
-    let is_workspace = path
-        .extension()
-        .is_some_and(|ext| ext == "gaviero-workspace");
-    let name = if is_workspace {
-        path.file_stem()
-    } else {
-        path.file_name()
+pub(crate) fn label_for(target: &Target, taken: &[String]) -> String {
+    let base = match target {
+        Target::Local(path) => local_label(path),
+        Target::Ssh { host, path } => {
+            let name = path
+                .as_deref()
+                .and_then(|p| p.trim_end_matches('/').rsplit('/').next())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("~");
+            format!("{host}:{name}")
+        }
     };
-    let base = name
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
     if !taken.contains(&base) {
         return base;
     }
@@ -117,9 +135,23 @@ pub(crate) fn label_for(path: &Path, taken: &[String]) -> String {
         .expect("an unused label")
 }
 
+/// A local tab's label: the folder name, or a workspace file's stem.
+fn local_label(path: &Path) -> String {
+    let is_workspace = path
+        .extension()
+        .is_some_and(|ext| ext == "gaviero-workspace");
+    let name = if is_workspace {
+        path.file_stem()
+    } else {
+        path.file_name()
+    };
+    name.map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 pub(crate) struct Session {
     pub id: u64,
-    pub path: PathBuf,
+    pub target: Target,
     pub label: String,
     pub parser: vt100::Parser<TitleCb>,
     master: Box<dyn MasterPty + Send>,
@@ -139,6 +171,73 @@ pub(crate) struct Session {
     /// Exited for a restart too soon after starting; a delayed
     /// [`HostEvent::Relaunch`] is on its way.
     pub restart_pending: bool,
+    /// An SSH tab whose connection was lost (`ssh` exited with 255): kept
+    /// with its last screen until the user reconnects (Enter) or closes it.
+    pub disconnected: bool,
+}
+
+/// The largest copy taken from a session (OSC 52), decoded.
+const COPY_LIMIT: usize = 1 << 20;
+
+/// The text in an OSC 52 copy: base64 of UTF-8, at most [`COPY_LIMIT`]
+/// bytes once decoded.
+fn copied_text(data: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    if bytes.len() > COPY_LIMIT {
+        tracing::warn!(bytes = bytes.len(), "ignoring an oversized clipboard copy");
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// `gaviero <path>` as a supervised session-host child.
+fn local_command(
+    path: &Path,
+    launch_state: &Path,
+    control: &Path,
+    host_restarts: bool,
+) -> Result<CommandBuilder> {
+    let exe = std::env::current_exe().context("locating the gaviero executable")?;
+    let mut cmd = CommandBuilder::new(exe);
+    cmd.arg(path);
+    let cwd = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    cmd.cwd(cwd);
+    for (key, value) in crate::supervisor::child_env(launch_state) {
+        cmd.env(key, value);
+    }
+    cmd.env(HOST_ENV, "1");
+    cmd.env(CONTROL_ENV, control);
+    // The host's own restart file is no business of its tabs.
+    cmd.env_remove(crate::supervisor::HOST_RESTART_ENV);
+    if host_restarts {
+        cmd.env(HOST_RESTARTS_ENV, "1");
+    }
+    Ok(cmd)
+}
+
+/// The system `ssh` running gaviero on `host` ([`Target::remote_command`]).
+/// None of the session-host variables are set: they would only reach the
+/// local `ssh`, and the remote gaviero gets `GAVIERO_SESSION_HOST` from the
+/// remote command. It supervises itself there, so a remote build update
+/// restarts it on the remote side.
+fn ssh_command(target: &Target, host: &str, gaviero_override: Option<&str>) -> Result<CommandBuilder> {
+    let remote = target
+        .remote_command(gaviero_override)
+        .map_err(anyhow::Error::msg)?;
+    let mut cmd = CommandBuilder::new(super::target::ssh_program());
+    for arg in super::target::ssh_args(host, &remote) {
+        cmd.arg(arg);
+    }
+    if let Some(home) = dirs::home_dir().or_else(|| std::env::current_dir().ok()) {
+        cmd.cwd(home);
+    }
+    cmd.env_remove(crate::supervisor::HOST_RESTART_ENV);
+    Ok(cmd)
 }
 
 /// Session `id`'s launch-state file (`supervisor::LAUNCH_STATE_ENV`).
@@ -146,25 +245,35 @@ pub(crate) fn launch_state_path(state_dir: &Path, id: u64) -> PathBuf {
     state_dir.join(format!("{id}.launch"))
 }
 
-/// Start `gaviero <path>` in a `rows` × `cols` pseudo-terminal. Output and
-/// end-of-output arrive on `tx` as [`HostEvent::Output`] / [`HostEvent::Exited`].
+/// Start a session in a `rows` × `cols` pseudo-terminal: `gaviero <path>`
+/// for a local target, the system `ssh` running gaviero on the remote for
+/// an SSH one. Output and end-of-output arrive on `tx` as
+/// [`HostEvent::Output`] / [`HostEvent::Exited`].
 /// `host_restarts`: the host restarts this child onto a new build, so the
 /// child must not do it itself ([`HOST_RESTARTS_ENV`]).
+/// `gaviero_override`: where gaviero is on an SSH target's machine
+/// (`sshHosts.<host>.gaviero`); ignored for local targets.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     id: u64,
-    path: &Path,
+    target: &Target,
     label: String,
     rows: u16,
     cols: u16,
     state_dir: &Path,
     tx: UnboundedSender<HostEvent>,
     host_restarts: bool,
+    gaviero_override: Option<&str>,
 ) -> Result<Session> {
     let rows = rows.max(2);
     let cols = cols.max(10);
     let launch_state = launch_state_path(state_dir, id);
     let control = state_dir.join(format!("{id}.ctl"));
+
+    let cmd = match target {
+        Target::Local(path) => local_command(path, &launch_state, &control, host_restarts)?,
+        Target::Ssh { host, .. } => ssh_command(target, host, gaviero_override)?,
+    };
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -176,31 +285,11 @@ pub(crate) fn spawn(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("opening a pseudo-terminal")?;
 
-    let exe = std::env::current_exe().context("locating the gaviero executable")?;
-    let mut cmd = CommandBuilder::new(exe);
-    cmd.arg(path);
-    let cwd = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
-    cmd.cwd(cwd);
-    for (key, value) in crate::supervisor::child_env(&launch_state) {
-        cmd.env(key, value);
-    }
-    cmd.env(HOST_ENV, "1");
-    cmd.env(CONTROL_ENV, &control);
-    // The host's own restart file is no business of its tabs.
-    cmd.env_remove(crate::supervisor::HOST_RESTART_ENV);
-    if host_restarts {
-        cmd.env(HOST_RESTARTS_ENV, "1");
-    }
-
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("starting gaviero for {}", path.display()))?;
+        .with_context(|| format!("starting a session for {}", target.display()))?;
     drop(pair.slave);
 
     let mut reader = pair
@@ -251,7 +340,7 @@ pub(crate) fn spawn(
 
     Ok(Session {
         id,
-        path: path.to_path_buf(),
+        target: target.clone(),
         label,
         parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TitleCb::default()),
         master: pair.master,
@@ -265,6 +354,7 @@ pub(crate) fn spawn(
         agent_done_unseen: false,
         shell_done_unseen: false,
         restart_pending: false,
+        disconnected: false,
     })
 }
 
@@ -285,6 +375,16 @@ impl Session {
         let title = self.parser.callbacks().title.as_deref();
         self.activity = parse_activity(title);
         self.work = parse_work(title);
+        if let Some(data) = self.parser.callbacks_mut().copied.take()
+            && let Some(text) = copied_text(&data)
+        {
+            super::clipboard::set_text(&text);
+        }
+    }
+
+    /// The folder the child reported since the last call (OSC 7), if any.
+    pub fn take_reported_path(&mut self) -> Option<String> {
+        self.parser.callbacks_mut().reported_path.take()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -405,15 +505,37 @@ mod tests {
 
     #[test]
     fn labels_use_the_folder_name_and_workspace_stem() {
-        let folder = Path::new("C:\\work").join("alpha");
+        let folder = Target::Local(Path::new("C:\\work").join("alpha"));
         assert_eq!(label_for(&folder, &[]), "alpha");
-        let ws = Path::new("C:\\work").join("team.gaviero-workspace");
+        let ws = Target::Local(Path::new("C:\\work").join("team.gaviero-workspace"));
         assert_eq!(label_for(&ws, &[]), "team");
     }
 
     #[test]
+    fn ssh_labels_name_the_host_and_folder() {
+        let ssh = |path: Option<&str>| Target::Ssh {
+            host: "vps".into(),
+            path: path.map(str::to_string),
+        };
+        assert_eq!(label_for(&ssh(None), &[]), "vps:~");
+        assert_eq!(label_for(&ssh(Some("~")), &[]), "vps:~");
+        assert_eq!(label_for(&ssh(Some("/srv/my proj")), &[]), "vps:my proj");
+        assert_eq!(label_for(&ssh(Some("/srv/proj/")), &[]), "vps:proj");
+        assert_eq!(label_for(&ssh(Some("~/code")), &[]), "vps:code");
+        let taken = vec!["vps:proj".to_string()];
+        assert_eq!(label_for(&ssh(Some("/srv/proj")), &taken), "vps:proj (2)");
+    }
+
+    #[test]
+    fn osc52_copies_decode_to_text() {
+        assert_eq!(copied_text(b"cHJvYmUtY29weQ==").as_deref(), Some("probe-copy"));
+        assert_eq!(copied_text(b"not base64!"), None);
+        assert_eq!(copied_text(b"/w=="), None, "not UTF-8");
+    }
+
+    #[test]
     fn duplicate_labels_are_numbered() {
-        let folder = Path::new("C:\\a").join("alpha");
+        let folder = Target::Local(Path::new("C:\\a").join("alpha"));
         let taken = vec!["alpha".to_string()];
         assert_eq!(label_for(&folder, &taken), "alpha (2)");
         let taken = vec!["alpha".to_string(), "alpha (2)".to_string()];

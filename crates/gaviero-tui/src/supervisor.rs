@@ -89,23 +89,24 @@ fn may_supervise() -> bool {
         && std::io::stdout().is_terminal()
 }
 
-/// Act as the supervisor when this process should be one.
+/// Act as the supervisor when this process should be one, running the TUI
+/// child with `args` (the program's own arguments, after any rewriting such
+/// as `--pick` resolving to the chosen path, so a restart never asks again).
 ///
 /// Returns `Some(exit code)` after supervising (the caller exits with it), or
 /// `None` when the caller should run the TUI itself: already a child, opted
 /// out, no terminal, or the executable path is unknown.
-pub fn supervise() -> Option<i32> {
+pub fn supervise(args: &[OsString]) -> Option<i32> {
     if is_supervised() || !may_supervise() {
         return None;
     }
     let exe = std::env::current_exe().ok()?;
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let launch_state = launch_state_path("launch", "state");
     let mut env = vec![(CHILD_ENV, OsString::from("1"))];
     if let Some(path) = &launch_state {
         env.push((LAUNCH_STATE_ENV, path.as_os_str().to_owned()));
     }
-    let code = run_supervised(&exe, &args, &env);
+    let code = run_supervised(&exe, args, &env);
     if let Some(path) = &launch_state {
         let _ = std::fs::remove_file(path);
     }

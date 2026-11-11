@@ -2,7 +2,9 @@
 //! ended (reopened by `gaviero --sessions` with no path) and the recently
 //! opened paths offered by the new-session picker.
 
+use super::target::Target;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Overrides the state file location (tests).
@@ -15,10 +17,23 @@ const RECENT_CAP: usize = 20;
 pub(crate) struct HostState {
     /// Open sessions, in tab order.
     #[serde(default)]
-    pub open: Vec<PathBuf>,
+    pub open: Vec<Target>,
     /// Recently opened paths, most recent first.
     #[serde(default)]
-    pub recent: Vec<PathBuf>,
+    pub recent: Vec<Target>,
+    /// Per-host settings for SSH tabs, edited by hand (`sshHosts`). The
+    /// host never changes them: it re-reads them before every save.
+    #[serde(default, rename = "sshHosts", skip_serializing_if = "BTreeMap::is_empty")]
+    pub ssh_hosts: BTreeMap<String, SshHost>,
+}
+
+/// Settings for one SSH host (`sshHosts.<host>` in the state file).
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHost {
+    /// Where gaviero is on that machine when it is not on the login PATH
+    /// (`~/` is the remote home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gaviero: Option<String>,
 }
 
 /// `GAVIERO_SESSION_HOST_STATE` if set, else
@@ -92,9 +107,17 @@ pub(crate) fn lock_instance(state: &Path) -> std::io::Result<Option<InstanceLock
     }
 }
 
-/// A saved path that can still be opened: a folder, or a
-/// `.gaviero-workspace` file.
-pub(crate) fn still_openable(path: &Path) -> bool {
+/// A saved target that can still be opened: a folder, or a
+/// `.gaviero-workspace` file. SSH targets cannot be checked from here and
+/// always count as openable.
+pub(crate) fn still_openable(target: &Target) -> bool {
+    match target {
+        Target::Local(path) => local_openable(path),
+        Target::Ssh { .. } => true,
+    }
+}
+
+fn local_openable(path: &Path) -> bool {
     path.is_dir()
         || (path.is_file()
             && path
@@ -103,21 +126,44 @@ pub(crate) fn still_openable(path: &Path) -> bool {
 }
 
 impl HostState {
-    /// `path` was opened in a tab: first in `recent`, and in `open`.
-    pub fn note_opened(&mut self, path: &Path) {
-        self.recent.retain(|p| p != path);
-        self.recent.insert(0, path.to_path_buf());
+    /// `target` was opened in a tab: first in `recent`, and in `open`.
+    pub fn note_opened(&mut self, target: &Target) {
+        self.recent.retain(|p| p != target);
+        self.recent.insert(0, target.clone());
         self.recent.truncate(RECENT_CAP);
-        if !self.open.iter().any(|p| p == path) {
-            self.open.push(path.to_path_buf());
+        if !self.open.iter().any(|p| p == target) {
+            self.open.push(target.clone());
+        }
+    }
+
+    /// A tab's target changed from `old` to `new` (an SSH tab learned its
+    /// remote folder): `new` takes `old`'s place in `open`, or is added
+    /// when `old` is not there. Never listed twice.
+    pub fn replace_open(&mut self, old: &Target, new: &Target) {
+        if old == new {
+            return;
+        }
+        match self.open.iter().position(|p| p == old) {
+            Some(pos) => {
+                if self.open.iter().any(|p| p == new) {
+                    self.open.remove(pos);
+                } else {
+                    self.open[pos] = new.clone();
+                }
+            }
+            None => {
+                if !self.open.iter().any(|p| p == new) {
+                    self.open.push(new.clone());
+                }
+            }
         }
     }
 
     /// The tabs were reordered: `open` follows `tabs` (one entry per path,
     /// at its first tab). Paths in `open` with no tab keep their order after
     /// the rest.
-    pub fn reorder_open(&mut self, tabs: &[PathBuf]) {
-        let mut open: Vec<PathBuf> = Vec::with_capacity(self.open.len());
+    pub fn reorder_open(&mut self, tabs: &[Target]) {
+        let mut open: Vec<Target> = Vec::with_capacity(self.open.len());
         for path in tabs.iter().chain(self.open.iter()) {
             if !open.contains(path) {
                 open.push(path.clone());
@@ -126,16 +172,16 @@ impl HostState {
         self.open = open;
     }
 
-    /// The tab for `path` closed.
-    pub fn note_closed(&mut self, path: &Path) {
-        self.open.retain(|p| p != path);
+    /// The tab for `target` closed.
+    pub fn note_closed(&mut self, target: &Target) {
+        self.open.retain(|p| p != target);
     }
 
     /// The tab for `path` ended. During a quit all the open set is frozen,
     /// so the next `gaviero --sessions` reopens what was quit.
-    pub fn note_tab_ended(&mut self, path: &Path, quitting_all: bool) {
+    pub fn note_tab_ended(&mut self, target: &Target, quitting_all: bool) {
         if !quitting_all {
-            self.note_closed(path);
+            self.note_closed(target);
         }
     }
 }
@@ -144,52 +190,57 @@ impl HostState {
 mod tests {
     use super::*;
 
+    /// A local target.
+    fn l(path: impl AsRef<Path>) -> Target {
+        Target::Local(path.as_ref().to_path_buf())
+    }
+
     #[test]
     fn recents_are_most_recent_first_deduplicated_and_capped() {
         let mut state = HostState::default();
         for i in 0..25 {
-            state.note_opened(Path::new(&format!("p{i}")));
+            state.note_opened(&l(&format!("p{i}")));
         }
         assert_eq!(state.recent.len(), RECENT_CAP);
-        assert_eq!(state.recent[0], PathBuf::from("p24"));
-        assert_eq!(state.recent[19], PathBuf::from("p5"));
+        assert_eq!(state.recent[0], l("p24"));
+        assert_eq!(state.recent[19], l("p5"));
 
-        state.note_opened(Path::new("p10"));
-        assert_eq!(state.recent[0], PathBuf::from("p10"));
-        assert_eq!(state.recent.iter().filter(|p| *p == Path::new("p10")).count(), 1);
+        state.note_opened(&l("p10"));
+        assert_eq!(state.recent[0], l("p10"));
+        assert_eq!(state.recent.iter().filter(|p| **p == l("p10")).count(), 1);
         assert_eq!(state.recent.len(), RECENT_CAP);
         assert_eq!(state.open.len(), 25, "open keeps every tab, in order");
-        assert_eq!(state.open[0], PathBuf::from("p0"));
+        assert_eq!(state.open[0], l("p0"));
     }
 
     #[test]
     fn closing_removes_from_open_only() {
         let mut state = HostState::default();
-        state.note_opened(Path::new("a"));
-        state.note_opened(Path::new("b"));
-        state.note_closed(Path::new("a"));
-        assert_eq!(state.open, vec![PathBuf::from("b")]);
-        assert_eq!(state.recent, vec![PathBuf::from("b"), PathBuf::from("a")]);
+        state.note_opened(&l("a"));
+        state.note_opened(&l("b"));
+        state.note_closed(&l("a"));
+        assert_eq!(state.open, vec![l("b")]);
+        assert_eq!(state.recent, vec![l("b"), l("a")]);
     }
 
     #[test]
     fn open_set_is_kept_while_quitting_all() {
         let mut state = HostState::default();
-        state.note_opened(Path::new("a"));
-        state.note_opened(Path::new("b"));
-        state.note_tab_ended(Path::new("b"), true);
-        state.note_tab_ended(Path::new("a"), true);
-        assert_eq!(state.open, vec![PathBuf::from("a"), PathBuf::from("b")]);
-        state.note_tab_ended(Path::new("a"), false);
-        assert_eq!(state.open, vec![PathBuf::from("b")]);
+        state.note_opened(&l("a"));
+        state.note_opened(&l("b"));
+        state.note_tab_ended(&l("b"), true);
+        state.note_tab_ended(&l("a"), true);
+        assert_eq!(state.open, vec![l("a"), l("b")]);
+        state.note_tab_ended(&l("a"), false);
+        assert_eq!(state.open, vec![l("b")]);
     }
 
     #[test]
     fn reordering_follows_the_tabs_once_per_path() {
-        let p = |s: &str| PathBuf::from(s);
+        let p = |s: &str| l(s);
         let mut state = HostState::default();
         for name in ["a", "b", "c"] {
-            state.note_opened(Path::new(name));
+            state.note_opened(&l(name));
         }
         let recent = state.recent.clone();
         state.reorder_open(&[p("b"), p("a"), p("c")]);
@@ -205,7 +256,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("state.json");
         let mut state = HostState::default();
-        state.note_opened(Path::new("a"));
+        state.note_opened(&l("a"));
         save(&path, &state).unwrap();
         assert_eq!(load(&path), state);
         assert!(!path.with_extension("json.tmp").exists());
@@ -251,9 +302,62 @@ mod tests {
         let txt = dir.path().join("x.txt");
         std::fs::write(&ws, "{}").unwrap();
         std::fs::write(&txt, "").unwrap();
-        assert!(still_openable(dir.path()));
-        assert!(still_openable(&ws));
-        assert!(!still_openable(&txt));
-        assert!(!still_openable(&dir.path().join("gone")));
+        assert!(still_openable(&l(dir.path())));
+        assert!(still_openable(&l(&ws)));
+        assert!(!still_openable(&l(&txt)));
+        assert!(!still_openable(&l(dir.path().join("gone"))));
+        let remote = Target::Ssh { host: "vps".into(), path: Some("/gone".into()) };
+        assert!(still_openable(&remote), "remote targets cannot be checked here");
+    }
+
+    #[test]
+    fn a_legacy_state_file_loads_local_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"open":["C:\\a"],"recent":["C:\\a","/b"]}"#).unwrap();
+        let state = load(&path);
+        assert_eq!(state.open, vec![l("C:\\a")]);
+        assert_eq!(state.recent, vec![l("C:\\a"), l("/b")]);
+        assert!(state.ssh_hosts.is_empty());
+    }
+
+    #[test]
+    fn ssh_targets_and_ssh_hosts_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = HostState::default();
+        let remote = Target::Ssh { host: "vps".into(), path: Some("/srv/a b".into()) };
+        state.note_opened(&remote);
+        state.ssh_hosts.insert(
+            "vps".into(),
+            SshHost { gaviero: Some("~/.cargo/bin/gaviero".into()) },
+        );
+        save(&path, &state).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"ssh://vps/srv/a b\""), "{text}");
+        assert!(text.contains("\"sshHosts\""), "{text}");
+        assert_eq!(load(&path), state);
+        // No hosts: the key is left out.
+        save(&path, &HostState::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("sshHosts"));
+    }
+
+    #[test]
+    fn replacing_an_open_target_keeps_its_place() {
+        let mut state = HostState::default();
+        let picking = Target::Ssh { host: "vps".into(), path: None };
+        let picked = Target::Ssh { host: "vps".into(), path: Some("/srv".into()) };
+        state.note_opened(&l("a"));
+        state.note_opened(&picking);
+        state.note_opened(&l("b"));
+        state.replace_open(&picking, &picked);
+        assert_eq!(state.open, vec![l("a"), picked.clone(), l("b")]);
+        // Already there: the old entry just goes.
+        state.note_opened(&picking);
+        state.replace_open(&picking, &picked);
+        assert_eq!(state.open, vec![l("a"), picked.clone(), l("b")]);
+        // Old one gone: the new one is added once.
+        state.replace_open(&l("zzz"), &l("c"));
+        assert_eq!(state.open.last(), Some(&l("c")));
     }
 }

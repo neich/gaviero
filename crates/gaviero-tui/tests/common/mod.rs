@@ -12,15 +12,23 @@ pub const ROWS: u16 = 30;
 pub const COLS: u16 = 100;
 const WAIT: Duration = Duration::from_secs(15);
 
-/// Keeps the last window title (OSC 0 / OSC 2) the child set.
+/// Keeps the last window title (OSC 0 / OSC 2) and the last folder report
+/// (OSC 7 URL) the child sent.
 #[derive(Default)]
 pub struct TitleCb {
     pub title: Option<String>,
+    pub osc7: Option<String>,
 }
 
 impl vt100::Callbacks for TitleCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() == Some(&&b"7"[..]) {
+            self.osc7 = Some(String::from_utf8_lossy(&params[1..].join(&b";"[..])).into_owned());
+        }
     }
 }
 
@@ -110,6 +118,16 @@ impl Pty {
         let mut w = self.writer.lock().unwrap();
         w.write_all(bytes.as_bytes()).expect("write pty");
         w.flush().expect("flush pty");
+    }
+
+    /// The child's process id, while known.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// The last OSC 7 URL the child sent.
+    pub fn osc7(&self) -> Option<String> {
+        self.parser.lock().unwrap().callbacks().osc7.clone()
     }
 
     pub fn contents(&self) -> String {

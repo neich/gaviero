@@ -60,6 +60,23 @@ struct Cli {
     /// With PATH, opens only PATH; without, reopens the last set.
     #[arg(long, conflicts_with_all = ["workspace", "folder"])]
     sessions: bool,
+
+    /// Choose the folder to open in a folder browser first; PATH is where
+    /// browsing starts. The session host's SSH tabs run this on the remote.
+    #[arg(long, conflicts_with_all = ["sessions", "workspace", "folder"])]
+    pick: bool,
+}
+
+/// The arguments a `--pick` launch continues with once `picked` was chosen:
+/// every flag but `--pick`, and `picked` as the only path.
+fn rewrite_pick_args(args: &[std::ffi::OsString], picked: &Path) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = args
+        .iter()
+        .filter(|a| *a != "--pick" && a.to_string_lossy().starts_with('-'))
+        .cloned()
+        .collect();
+    out.push(picked.as_os_str().to_owned());
+    out
 }
 
 /// C1: synchronous yes/no prompt on stdin/stderr asking the user to
@@ -269,19 +286,39 @@ fn main() -> Result<()> {
         return session_host::probe::run_probe();
     }
 
+    // `--pick`: choose the folder first, then carry on as if it had been
+    // given. Before the supervisor, which then runs the child on the chosen
+    // path, so a restart onto a new build never shows the browser again.
+    let mut args = args;
+    if args.iter().any(|a| a == "--pick") {
+        let start = match args.iter().find(|a| !a.to_string_lossy().starts_with('-')) {
+            Some(path) => PathBuf::from(path),
+            None => std::env::current_dir().context("reading the current directory")?,
+        };
+        match session_host::picker::run_standalone(&start) {
+            Ok(Some(picked)) => args = rewrite_pick_args(&args, &picked),
+            Ok(None) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("gaviero: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Restart-on-new-build: the process a user starts supervises the real
     // TUI and relaunches it in place after a deploy (`supervisor`). It runs
     // before the runtime, logging, or argument parsing — the child does all
     // of that.
-    if let Some(code) = supervisor::supervise() {
+    if let Some(code) = supervisor::supervise(&args) {
         std::process::exit(code);
     }
 
+    let cli = Cli::parse_from(std::iter::once(std::ffi::OsString::from("gaviero")).chain(args));
     let restart = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?
-        .block_on(run())?;
+        .block_on(run(cli))?;
     if restart {
         std::process::exit(supervisor::RESTART_EXIT_CODE);
     }
@@ -326,7 +363,7 @@ fn folder_launch_workspace(path: &Path) -> Result<Option<PathBuf>> {
 
 /// The TUI itself. Returns true when it quit to restart into a newly
 /// installed build.
-async fn run() -> Result<bool> {
+async fn run(cli: Cli) -> Result<bool> {
     // Write tracing output to a log file (stderr is hidden in TUI mode)
     let log_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -343,7 +380,6 @@ async fn run() -> Result<bool> {
         )
         .init();
 
-    let cli = Cli::parse();
     // `--sessions` is documented here for `--help` only: `main` hands it to
     // the session host before this point.
     if cli.sessions {
@@ -386,6 +422,10 @@ async fn run() -> Result<bool> {
         workspace_file = outcome.workspace_file;
         editor_only = outcome.editor_only;
     }
+
+    // What a session host is told this session opened (OSC 7): the
+    // workspace file when one was chosen, else the folder.
+    let reported_path: PathBuf = workspace_file.clone().unwrap_or_else(|| path.clone());
 
     let workspace = match &workspace_file {
         Some(file) => gaviero_core::workspace::Workspace::load(file)?,
@@ -472,6 +512,9 @@ async fn run() -> Result<bool> {
     // TUI — swallow them and re-route into the normal key path (see
     // `platform::install_console_ctrl_forwarder`). No-op elsewhere.
     platform::install_console_ctrl_forwarder(event_loop.tx());
+    // Unix: SIGHUP (the terminal went away) and SIGTERM quit through the
+    // save path below instead of killing the process. No-op elsewhere.
+    platform::install_hangup_forwarder(event_loop.tx());
 
     // Spawn background event producers
     event_loop.spawn_crossterm_reader();
@@ -557,17 +600,38 @@ async fn run() -> Result<bool> {
     let mut session_status: Option<String> = None;
     if std::env::var_os(session_host::HOST_ENV).is_some() {
         let status = app.session_host_status();
-        write_session_status(&mut terminal, &status)?;
+        let reported = write_session_path(&mut terminal, &reported_path)
+            .and_then(|()| write_session_status(&mut terminal, &status));
+        if let Err(e) = reported
+            && !platform::hung_up()
+        {
+            return Err(e.into());
+        }
         session_status = Some(status);
     }
+    // Writes to the terminal fail once it has hung up (`platform::hung_up`):
+    // then the loop just ends, so the session is still saved below.
     loop {
+        if platform::hung_up() {
+            break;
+        }
         if app.needs_full_redraw {
-            terminal.clear()?;
+            if let Err(e) = terminal.clear() {
+                if platform::hung_up() {
+                    break;
+                }
+                return Err(e.into());
+            }
             app.needs_full_redraw = false;
             needs_render = true;
         }
         if needs_render {
-            terminal.draw(|frame| app.render(frame))?;
+            if let Err(e) = terminal.draw(|frame| app.render(frame)) {
+                if platform::hung_up() {
+                    break;
+                }
+                return Err(e.into());
+            }
             render_scheduler.record_render(&app);
             needs_render = false;
         }
@@ -577,7 +641,12 @@ async fn run() -> Result<bool> {
         if let Some(last) = &session_status {
             let status = app.session_host_status();
             if status != *last {
-                write_session_status(&mut terminal, &status)?;
+                if let Err(e) = write_session_status(&mut terminal, &status) {
+                    if platform::hung_up() {
+                        break;
+                    }
+                    return Err(e.into());
+                }
                 session_status = Some(status);
             }
         }
@@ -629,6 +698,12 @@ async fn run() -> Result<bool> {
     // Land queued turn-review saves/archives, or a finished review would
     // reopen as pending next launch.
     app.turn_capture.flush();
+    tracing::info!("exit: session state saved");
+
+    // The terminal is gone: nothing to restore, and trying would only fail.
+    if platform::hung_up() {
+        return Ok(false);
+    }
 
     // Explicit call so errors are reported on the happy path (the guard will
     // run it again, but that's harmless — the calls are idempotent).
@@ -648,6 +723,21 @@ fn write_session_status(
     use std::io::Write;
     let backend = terminal.backend_mut();
     write!(backend, "\x1b]2;gaviero-session:{status}\x07")?;
+    backend.flush()
+}
+
+/// Session host folder report: the opened folder or workspace file as an
+/// OSC 7 `file://` URL, once at startup (`session_host::osc7`). An SSH tab
+/// learns from it which remote folder was picked. Written only when
+/// `GAVIERO_SESSION_HOST` is set.
+fn write_session_path(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    path: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let url = session_host::osc7::encode_file_url(&path.to_string_lossy());
+    let backend = terminal.backend_mut();
+    write!(backend, "\x1b]7;{url}\x07")?;
     backend.flush()
 }
 
@@ -764,4 +854,33 @@ fn start_agent_services(
         app.workspace.clone(),
         event_loop.tx(),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn os(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn rewrite_pick_args_replaces_the_start_folder_with_the_pick() {
+        let picked = Path::new("/x");
+        assert_eq!(rewrite_pick_args(&os(&["--pick", "/start"]), picked), os(&["/x"]));
+        assert_eq!(rewrite_pick_args(&os(&["--pick"]), picked), os(&["/x"]));
+        assert_eq!(
+            rewrite_pick_args(&os(&["/start", "--pick", "--folder"]), picked),
+            os(&["--folder", "/x"])
+        );
+    }
+
+    #[test]
+    fn rewritten_pick_args_parse_without_pick() {
+        let args = rewrite_pick_args(&os(&["--pick", "/start"]), Path::new("/x"));
+        let cli = Cli::parse_from(std::iter::once(OsString::from("gaviero")).chain(args));
+        assert!(!cli.pick);
+        assert_eq!(cli.path, PathBuf::from("/x"));
+    }
 }

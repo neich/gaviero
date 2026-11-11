@@ -129,7 +129,19 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
     if let Some(session) = host.sessions.get(host.active) {
         let screen = session.parser.screen();
         render_screen(screen, body, frame.buffer_mut());
-        if !host.modal_open() && !screen.hide_cursor() {
+        if session.disconnected {
+            let host_name = session.target.host().unwrap_or_default();
+            draw_confirm(
+                " Disconnected ",
+                &[
+                    format!("Connection to {host_name} lost."),
+                    String::new(),
+                    "Enter reconnect · Alt+Q close".to_string(),
+                ],
+                area,
+                frame.buffer_mut(),
+            );
+        } else if !host.modal_open() && !screen.hide_cursor() {
             let (row, col) = screen.cursor_position();
             if row < body.height && col < body.width {
                 frame.set_cursor_position((body.x + col, body.y + row));

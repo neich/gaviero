@@ -271,6 +271,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.maybe_reassert_vt_mouse(true);
             }
         }
+        // The terminal is gone (SSH tab closed, connection lost): leave
+        // through the normal exit path now, without asking — the same as
+        // the session host's `exit` control.
+        Event::HangUp => app.should_quit = true,
         Event::FileChanged(path) => {
             // Queue the path for the folder's graph writer (never blocks).
             app.graph_services.notify_changed(std::slice::from_ref(&path));

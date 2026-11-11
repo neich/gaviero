@@ -7,6 +7,11 @@
 //! through a pseudo console. Ctrl+Q exits; Ctrl+B / Ctrl+D report work in
 //! progress / none in the status title; Ctrl+E reports work in progress
 //! that ends by itself [`WORK_LASTS`] later.
+//!
+//! As a fake `ssh` for SSH tabs (`GAVIERO_SSH` pointing at this binary):
+//! `GAVIERO_PROBE_ARGS` names a file that receives its arguments, one per
+//! line; Ctrl+K exits with 255 (a lost connection), Ctrl+O reports the
+//! folder `/srv/my proj` (OSC 7) and Ctrl+Y copies `probe-copy` (OSC 52).
 
 use crossterm::event::{Event, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -18,6 +23,10 @@ use std::time::Duration;
 const WORK_LASTS: Duration = Duration::from_secs(2);
 
 pub(crate) fn run_probe() -> anyhow::Result<()> {
+    if let Some(file) = std::env::var_os("GAVIERO_PROBE_ARGS") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::fs::write(file, args.join("\n"))?;
+    }
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -57,6 +66,18 @@ fn probe_loop(stdout: &mut std::io::Stdout) -> anyhow::Result<()> {
                         let _ = out.flush();
                     });
                     "STATUS busy".to_string()
+                } else if ctrl && k.code == KeyCode::Char('k') {
+                    // A dropped SSH connection: ssh exits with 255.
+                    let _ = crate::restore_terminal();
+                    std::process::exit(255);
+                } else if ctrl && k.code == KeyCode::Char('o') {
+                    stdout.write_all(b"\x1b]7;file:///srv/my%20proj\x07")?;
+                    "STATUS osc7".to_string()
+                } else if ctrl && k.code == KeyCode::Char('y') {
+                    use base64::Engine;
+                    let data = base64::engine::general_purpose::STANDARD.encode("probe-copy");
+                    write!(stdout, "\x1b]52;c;{data}\x07")?;
+                    "STATUS osc52".to_string()
                 } else if ctrl && k.code == KeyCode::Char('d') {
                     stdout.write_all(b"\x1b]2;gaviero-session:idle\x07")?;
                     "STATUS idle".to_string()
