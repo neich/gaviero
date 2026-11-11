@@ -552,6 +552,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::Paste(_)
         | Event::Resize(_, _)
         | Event::TerminalFocus(_)
+        | Event::HangUp
         | Event::FileChanged(_)
         | Event::FileTreeChanged(_)
         | Event::Terminal(_)

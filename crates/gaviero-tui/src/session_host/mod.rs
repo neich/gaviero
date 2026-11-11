@@ -1,16 +1,19 @@
 //! Session host (`gaviero --sessions`): several gaviero sessions in one
 //! terminal, each an unmodified `gaviero` child in a pseudo-terminal.
 
+pub(crate) mod clipboard;
 pub(crate) mod encode;
 pub(crate) mod input_term;
 pub(crate) mod picker;
 #[cfg(windows)]
 pub(crate) mod input_windows;
+pub(crate) mod osc7;
 pub(crate) mod probe;
 pub(crate) mod render;
 pub(crate) mod restart;
 pub(crate) mod session;
 pub(crate) mod state;
+pub(crate) mod target;
 
 use anyhow::Context;
 use crossterm::event::{
@@ -24,6 +27,7 @@ use session::Session;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use target::Target;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 /// Set on every session child: the child knows it runs under a host (status
@@ -202,6 +206,8 @@ pub(crate) enum Confirm {
 }
 
 const VK_Y: u16 = 0x59;
+#[cfg_attr(not(windows), allow(dead_code))]
+const VK_V: u16 = 0x56;
 
 /// Renders are coalesced to at most one per this interval.
 const RENDER_EVERY: Duration = Duration::from_millis(16);
@@ -210,6 +216,9 @@ const RENDER_EVERY: Duration = Duration::from_millis(16);
 const EXIT_POLL_EVERY: Duration = Duration::from_millis(250);
 /// How long a session asked to exit gets before the host kills it.
 const EXIT_GRACE: Duration = Duration::from_secs(3);
+/// `ssh`'s exit code for its own failures — a lost or refused connection —
+/// as opposed to the remote command's exit code, which it passes through.
+const SSH_CONNECTION_LOST: u32 = 255;
 /// How long a bar message stays up.
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
 
@@ -289,7 +298,14 @@ impl Host {
     }
 
     fn open_picker(&mut self) {
-        self.picker = Some(picker::Picker::new(self.state.recent.clone(), &self.cwd));
+        let ssh_hosts = dirs::home_dir()
+            .map(|home| picker::ssh_config_hosts(&home.join(".ssh").join("config")))
+            .unwrap_or_default();
+        self.picker = Some(picker::Picker::new_with_ssh(
+            self.state.recent.clone(),
+            ssh_hosts,
+            &self.cwd,
+        ));
         self.dirty = true;
     }
 
@@ -302,11 +318,11 @@ impl Host {
         match p.on_key(key, &self.cwd) {
             picker::PickerOutcome::Stay => {}
             picker::PickerOutcome::Close => self.picker = None,
-            picker::PickerOutcome::Open(path) => {
+            picker::PickerOutcome::Open(target) => {
                 self.picker = None;
-                if let Err(e) = self.open(path.clone()) {
-                    tracing::error!(path = %path.display(), "opening the session failed: {e:#}");
-                    self.notify(format!("could not open {}: {e}", path.display()));
+                if let Err(e) = self.open(target.clone()) {
+                    tracing::error!(target = %target.display(), "opening the session failed: {e:#}");
+                    self.notify(format!("could not open {}: {e}", target.display()));
                 }
             }
         }
@@ -317,16 +333,16 @@ impl Host {
         self.rows.saturating_sub(1)
     }
 
-    /// Start a session for `path` in a new tab and make it active.
-    fn open(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.open_with(path, None)
+    /// Start a session for `target` in a new tab and make it active.
+    fn open(&mut self, target: Target) -> anyhow::Result<()> {
+        self.open_with(target, None)
     }
 
     /// [`Host::open`], with the tab's launch-state file seeded from `launch`
     /// (what a restarting host recorded for it).
-    fn open_with(&mut self, path: PathBuf, launch: Option<&str>) -> anyhow::Result<()> {
+    fn open_with(&mut self, target: Target, launch: Option<&str>) -> anyhow::Result<()> {
         let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
-        let label = session::label_for(&path, &taken);
+        let label = session::label_for(&target, &taken);
         let id = self.next_id;
         self.next_id += 1;
         if let Some(text) = launch {
@@ -335,30 +351,45 @@ impl Host {
                 tracing::warn!(id, "could not restore the launch choice: {e}");
             }
         }
+        let program = self.gaviero_override(&target);
         let s = session::spawn(
             id,
-            &path,
+            &target,
             label,
             self.session_rows(),
             self.cols,
             &self.state_dir,
             self.tx.clone(),
             self.restart.supervised(),
+            program.as_deref(),
         )?;
-        tracing::info!(id, path = %path.display(), "session opened");
+        tracing::info!(id, target = %target.display(), "session opened");
         self.sessions.push(s);
         self.switch_to(self.sessions.len() - 1);
-        self.state.note_opened(&path);
+        self.state.note_opened(&target);
         self.save_state();
         Ok(())
     }
 
-    fn save_state(&self) {
-        if let Some(path) = &self.state_path
-            && let Err(e) = state::save(path, &self.state)
-        {
+    fn save_state(&mut self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        // `sshHosts` is edited by hand, possibly while the host runs: keep
+        // whatever the file holds now rather than an older copy.
+        self.state.ssh_hosts = state::load(path).ssh_hosts;
+        if let Err(e) = state::save(path, &self.state) {
             tracing::warn!("saving {}: {e}", path.display());
         }
+    }
+
+    /// Where gaviero is on an SSH target's machine, when the state file says
+    /// (`sshHosts.<host>.gaviero`); read fresh, so a hand edit applies to
+    /// the next connection.
+    fn gaviero_override(&self, target: &Target) -> Option<String> {
+        let host = target.host()?;
+        let path = self.state_path.as_ref()?;
+        state::load(path).ssh_hosts.get(host)?.gaviero.clone()
     }
 
     fn index_of(&self, id: u64) -> Option<usize> {
@@ -471,9 +502,12 @@ impl Host {
             return;
         };
         let active = i == self.active;
+        let before = self.sessions[i].activity;
+        self.sessions[i].feed(bytes);
+        if let Some(path) = self.sessions[i].take_reported_path() {
+            self.adopt_reported_path(i, path);
+        }
         let s = &mut self.sessions[i];
-        let before = s.activity;
-        s.feed(bytes);
         let changed = s.activity != before;
         if changed && !active {
             // Work that ends in a background tab is marked finished until
@@ -492,10 +526,43 @@ impl Host {
         }
     }
 
+    /// An SSH tab's remote gaviero reported the folder it opened (picked on
+    /// the remote, or the workspace file chosen there): the tab is named
+    /// after it and remembered as that target, so reopening goes straight
+    /// there. Local tabs already know their path and ignore reports.
+    fn adopt_reported_path(&mut self, i: usize, path: String) {
+        let Target::Ssh { host, path: known } = &self.sessions[i].target else {
+            return;
+        };
+        if known.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let old = self.sessions[i].target.clone();
+        let new = Target::Ssh {
+            host: host.clone(),
+            path: Some(path),
+        };
+        let taken: Vec<String> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.label.clone())
+            .collect();
+        let s = &mut self.sessions[i];
+        s.label = session::label_for(&new, &taken);
+        s.target = new.clone();
+        tracing::info!(id = s.id, target = %new.display(), "SSH session reported its folder");
+        self.state.replace_open(&old, &new);
+        self.state.note_opened(&new);
+        self.save_state();
+        self.dirty = true;
+    }
+
     /// Handle every session whose child has exited.
     fn poll_exits(&mut self) {
         for i in (0..self.sessions.len()).rev() {
-            if self.sessions[i].restart_pending {
+            if self.sessions[i].restart_pending || self.sessions[i].disconnected {
                 continue;
             }
             if let Some(code) = self.sessions[i].exit_code() {
@@ -505,6 +572,16 @@ impl Host {
     }
 
     fn on_exit(&mut self, i: usize, code: u32) {
+        if code == SSH_CONNECTION_LOST && self.sessions[i].target.is_ssh() && !self.quitting() {
+            let s = &mut self.sessions[i];
+            s.disconnected = true;
+            s.work.clear();
+            s.activity = session::Activity::default();
+            let label = s.label.clone();
+            tracing::info!(id = s.id, "SSH connection lost");
+            self.notify(format!("{label}: connection lost"));
+            return;
+        }
         if code == crate::supervisor::RESTART_EXIT_CODE as u32 && !self.quitting() {
             let s = &mut self.sessions[i];
             if s.started.elapsed() < crate::supervisor::MIN_RUN {
@@ -526,19 +603,21 @@ impl Host {
 
     /// Start the session at `i` again, in the same tab with the same id.
     fn relaunch(&mut self, i: usize) {
-        let (id, path, label) = {
+        let (id, target, label) = {
             let s = &self.sessions[i];
-            (s.id, s.path.clone(), s.label.clone())
+            (s.id, s.target.clone(), s.label.clone())
         };
+        let program = self.gaviero_override(&target);
         match session::spawn(
             id,
-            &path,
+            &target,
             label.clone(),
             self.session_rows(),
             self.cols,
             &self.state_dir,
             self.tx.clone(),
             self.restart.supervised(),
+            program.as_deref(),
         ) {
             Ok(fresh) => {
                 tracing::info!(id, "session restarted onto a new build");
@@ -554,6 +633,57 @@ impl Host {
         }
     }
 
+    /// Enter on a disconnected SSH tab: connect again, in the same tab. The
+    /// remote gaviero restores the session it saved when the link dropped.
+    fn reconnect(&mut self, i: usize) {
+        let (id, target, label) = {
+            let s = &self.sessions[i];
+            (s.id, s.target.clone(), s.label.clone())
+        };
+        let program = self.gaviero_override(&target);
+        match session::spawn(
+            id,
+            &target,
+            label.clone(),
+            self.session_rows(),
+            self.cols,
+            &self.state_dir,
+            self.tx.clone(),
+            self.restart.supervised(),
+            program.as_deref(),
+        ) {
+            Ok(fresh) => {
+                tracing::info!(id, "reconnecting the SSH session");
+                let old = std::mem::replace(&mut self.sessions[i], fresh);
+                retire(old);
+                self.dirty = true;
+                self.notify(format!("{label}: reconnecting"));
+            }
+            Err(e) => {
+                tracing::error!(id, "reconnecting failed: {e:#}");
+                self.notify(format!("{label} could not reconnect: {e}"));
+            }
+        }
+    }
+
+    /// Ctrl+V in an SSH tab: the remote gaviero would read the remote
+    /// machine's clipboard, so paste this machine's text instead (as a
+    /// bracketed paste when the remote asked for one). Images do not cross.
+    fn paste_local_clipboard(&self) {
+        let Some(text) = clipboard::get_text().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if let Some(s) = self.active_session() {
+            let bracketed = s.parser.screen().bracketed_paste();
+            s.send(crate::panels::terminal::paste_bytes(bracketed, &text));
+        }
+    }
+
+    /// The active tab is an SSH tab whose connection was lost.
+    fn active_disconnected(&self) -> bool {
+        self.active_session().is_some_and(|s| s.disconnected)
+    }
+
     /// Remove the tab at `i` and return its session. The open set forgets
     /// it unless the host is quitting. When the current tab goes, the one
     /// before it becomes current.
@@ -565,7 +695,7 @@ impl Host {
         }
         // Launch answers are kept across restarts of a tab, not after it.
         let _ = std::fs::remove_file(&old.launch_state);
-        self.state.note_tab_ended(&old.path, self.quitting());
+        self.state.note_tab_ended(&old.target, self.quitting());
         self.save_state();
         self.active = previous_active(self.active, i, self.sessions.len());
         let active = self.active;
@@ -595,12 +725,15 @@ impl Host {
         }
         let old = self.remove_tab(i);
         tracing::info!(id = old.id, "session closed by the user");
-        if let Err(e) = std::fs::write(&old.control, "exit") {
+        if !old.target.is_ssh()
+            && let Err(e) = std::fs::write(&old.control, "exit")
+        {
             tracing::warn!(id = old.id, "could not ask the session to exit: {e}");
         }
         self.notify(format!("closed {}", old.label));
         self.ending.retain(|h| !h.is_finished());
-        if let Some(handle) = end_session(old, EXIT_GRACE) {
+        let grace = close_grace(&old.target);
+        if let Some(handle) = end_session(old, grace) {
             self.ending.push(handle);
         }
     }
@@ -647,8 +780,13 @@ impl Host {
                 .sessions
                 .iter()
                 .map(|s| restart::RestartTab {
-                    path: s.path.clone(),
-                    launch: std::fs::read_to_string(&s.launch_state).ok(),
+                    path: s.target.clone(),
+                    // Launch answers belong to local tabs; an SSH tab's
+                    // remote gaviero keeps its own.
+                    launch: match s.target {
+                        Target::Local(_) => std::fs::read_to_string(&s.launch_state).ok(),
+                        Target::Ssh { .. } => None,
+                    },
                 })
                 .collect(),
             active: self.active,
@@ -672,8 +810,12 @@ impl Host {
         tracing::info!(sessions = self.sessions.len(), "quitting the host");
         self.quit_deadline = Some(Instant::now() + EXIT_GRACE);
         self.save_state();
-        for s in &self.sessions {
-            if let Err(e) = std::fs::write(&s.control, "exit") {
+        for s in &mut self.sessions {
+            if s.target.is_ssh() {
+                // No control file reaches the remote: ending `ssh` hangs up
+                // the remote gaviero, which saves and exits (SIGHUP).
+                s.kill();
+            } else if let Err(e) = std::fs::write(&s.control, "exit") {
                 tracing::warn!(id = s.id, "could not ask the session to exit: {e}");
             }
         }
@@ -728,7 +870,7 @@ impl Host {
         self.sessions.swap(self.active, to);
         self.active = to;
         self.dirty = true;
-        let order: Vec<PathBuf> = self.sessions.iter().map(|s| s.path.clone()).collect();
+        let order: Vec<Target> = self.sessions.iter().map(|s| s.target.clone()).collect();
         self.state.reorder_open(&order);
         self.save_state();
     }
@@ -822,6 +964,24 @@ impl Host {
             self.run_chord(chord);
             return;
         }
+        if self.active_disconnected() {
+            // Nothing to type into: Enter reconnects, the rest is dropped.
+            if r.key_down && r.vk == 0x0D && r.ctrl_state & 0x1F == 0 {
+                self.swallow_keyup(0x0D);
+                self.reconnect(self.active);
+            }
+            return;
+        }
+        if r.key_down
+            && r.vk == VK_V
+            && encode::ctrl_only(r.ctrl_state)
+            && r.ctrl_state & encode::SHIFT == 0
+            && self.active_session().is_some_and(|s| s.target.is_ssh())
+        {
+            self.swallow_keyup(VK_V);
+            self.paste_local_clipboard();
+            return;
+        }
         let bytes = self.keys.encode(&r);
         if !bytes.is_empty() {
             self.send_active(bytes);
@@ -838,6 +998,9 @@ impl Host {
             if press {
                 self.click_tab_bar(m.col);
             }
+            return;
+        }
+        if self.active_disconnected() {
             return;
         }
         for report in self.mouse.translate(&m, 1) {
@@ -877,7 +1040,7 @@ impl Host {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_term_key(k),
             Event::Mouse(m) => self.on_term_mouse(m),
             Event::Paste(text) => {
-                if let Some(s) = self.active_session() {
+                if let Some(s) = self.active_session().filter(|s| !s.disconnected) {
                     let bracketed = s.parser.screen().bracketed_paste();
                     s.send(crate::panels::terminal::paste_bytes(bracketed, &text));
                 }
@@ -905,6 +1068,19 @@ impl Host {
             self.run_chord(chord);
             return;
         }
+        if self.active_disconnected() {
+            if k.code == KeyCode::Enter && k.modifiers.is_empty() {
+                self.reconnect(self.active);
+            }
+            return;
+        }
+        if matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && k.modifiers == KeyModifiers::CONTROL
+            && self.active_session().is_some_and(|s| s.target.is_ssh())
+        {
+            self.paste_local_clipboard();
+            return;
+        }
         if let Some(s) = self.active_session() {
             let app_cursor = s.parser.screen().application_cursor();
             s.send(crate::panels::terminal::key_event_to_bytes(&k, app_cursor));
@@ -919,6 +1095,9 @@ impl Host {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.click_tab_bar(m.column);
             }
+            return;
+        }
+        if self.active_disconnected() {
             return;
         }
         if let Some(report) = term_mouse_report(&m, 1) {
@@ -1004,6 +1183,17 @@ fn previous_active(active: usize, removed: usize, len: usize) -> usize {
     active.min(len.saturating_sub(1))
 }
 
+/// How long a closed tab's child gets to exit on its own before it is
+/// killed. A local gaviero was asked to exit through its control file; an
+/// SSH tab has no such channel, and ending `ssh` at once is what tells the
+/// remote gaviero to save and exit (it gets SIGHUP).
+fn close_grace(target: &Target) -> Duration {
+    match target {
+        Target::Local(_) => EXIT_GRACE,
+        Target::Ssh { .. } => Duration::ZERO,
+    }
+}
+
 /// End a closed session off the host loop: give its child `grace` to exit
 /// on its own (it was asked to), then kill it.
 fn end_session(mut session: Session, grace: Duration) -> Option<std::thread::JoinHandle<()>> {
@@ -1056,21 +1246,21 @@ fn spawn_input_reader(tx: UnboundedSender<HostEvent>) {
     input_term::spawn_crossterm_reader(tx);
 }
 
-/// The paths the host opens at startup: the given path, or the sessions
-/// still open when the host last ended (those that still exist), else the
-/// current directory.
-fn initial_paths(launch: &HostLaunch, saved: &state::HostState) -> Result<Vec<PathBuf>, String> {
+/// What the host opens at startup: the given path, or the sessions still
+/// open when the host last ended (local ones that still exist, and every
+/// SSH one), else the current directory.
+fn initial_paths(launch: &HostLaunch, saved: &state::HostState) -> Result<Vec<Target>, String> {
     let cwd = || {
         std::env::current_dir()
-            .map(|p| vec![p])
+            .map(|p| vec![Target::Local(p)])
             .map_err(|e| format!("reading the current directory: {e}"))
     };
     match launch {
         HostLaunch::Path(p) => gaviero_core::util::fs::canonicalize_simplified(p)
-            .map(|p| vec![p])
+            .map(|p| vec![Target::Local(p)])
             .map_err(|e| format!("resolving path {}: {e}", p.display())),
         HostLaunch::Reopen => {
-            let open: Vec<PathBuf> = saved
+            let open: Vec<Target> = saved
                 .open
                 .iter()
                 .filter(|p| state::still_openable(p))
@@ -1196,7 +1386,7 @@ async fn host_loop(
     let restarted = initial.active != usize::MAX;
     for tab in initial.tabs {
         if let Err(e) = host.open_with(tab.path.clone(), tab.launch.as_deref()) {
-            tracing::error!(path = %tab.path.display(), "opening the session failed: {e:#}");
+            tracing::error!(target = %tab.path.display(), "opening the session failed: {e:#}");
             host.notify(format!("could not open {}: {e}", tab.path.display()));
             last_error = Some(e);
         }
@@ -1263,6 +1453,16 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn ssh_tabs_are_ended_at_once_and_local_ones_get_the_grace() {
+        assert_eq!(close_grace(&Target::Local(PathBuf::from("a"))), EXIT_GRACE);
+        let ssh = Target::Ssh {
+            host: "vps".into(),
+            path: None,
+        };
+        assert_eq!(close_grace(&ssh), Duration::ZERO);
     }
 
     #[test]

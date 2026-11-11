@@ -1,4 +1,5 @@
-//! New-session picker (Alt+N): a folder browser over the whole disk.
+//! New-session picker (Alt+N): a folder browser over the whole disk, or —
+//! switched with Ctrl+T — an SSH destination (`host` or `host:/path`).
 //!
 //! An empty path box shows the *places* — recently opened paths, the folder
 //! the host was started in, the home folder and every filesystem root (each
@@ -9,6 +10,7 @@
 //! shows itself first so Enter can open it.
 
 use super::state;
+use super::target::Target;
 use crate::widgets::path_listing::{
     display_dir_prefix, ends_with_separator, expand_tilde, is_filesystem_query,
     list_filesystem_entries,
@@ -41,6 +43,15 @@ pub(crate) enum PickerKey {
     Tab,
     Enter,
     Esc,
+    /// Ctrl+T: switch between local folders and SSH.
+    ToggleMode,
+}
+
+/// What the picker offers: local folders or SSH destinations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PickerMode {
+    Local,
+    Ssh,
 }
 
 /// What the host does after a picker key.
@@ -48,7 +59,7 @@ pub(crate) enum PickerKey {
 pub(crate) enum PickerOutcome {
     Stay,
     Close,
-    Open(PathBuf),
+    Open(Target),
 }
 
 /// The picker key a Windows key-down record is, if any.
@@ -56,6 +67,12 @@ pub(crate) enum PickerOutcome {
 pub(crate) fn key_from_record(r: &super::encode::KeyRecord) -> Option<PickerKey> {
     if !r.key_down {
         return None;
+    }
+    if r.vk == 0x54
+        && super::encode::ctrl_only(r.ctrl_state)
+        && r.ctrl_state & super::encode::SHIFT == 0
+    {
+        return Some(PickerKey::ToggleMode);
     }
     Some(match r.vk {
         0x0D => PickerKey::Enter,
@@ -91,6 +108,12 @@ pub(crate) fn key_from_event(k: &KeyEvent) -> Option<PickerKey> {
         KeyCode::Right => PickerKey::Right,
         KeyCode::PageUp => PickerKey::PageUp,
         KeyCode::PageDown => PickerKey::PageDown,
+        KeyCode::Char('t' | 'T')
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            PickerKey::ToggleMode
+        }
         KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => PickerKey::Char(c),
         _ => return None,
     })
@@ -99,15 +122,32 @@ pub(crate) fn key_from_event(k: &KeyEvent) -> Option<PickerKey> {
 pub(crate) struct Picker {
     pub input: TextInput,
     pub list: FileAutocomplete,
-    recents: Vec<PathBuf>,
+    recents: Vec<Target>,
     /// Start folder, home folder and filesystem roots, shown after the
     /// recents while the path box is empty.
     places: Vec<PathBuf>,
     pub error: Option<String>,
+    pub mode: PickerMode,
+    /// Ctrl+T may switch to SSH (the session host's picker, not
+    /// `gaviero --pick`).
+    allow_ssh: bool,
+    /// `Host` aliases from `~/.ssh/config`, offered in SSH mode.
+    ssh_hosts: Vec<String>,
 }
 
 impl Picker {
-    pub fn new(recents: Vec<PathBuf>, cwd: &Path) -> Self {
+    /// A local-only picker (`gaviero --pick`).
+    pub fn new(recents: Vec<Target>, cwd: &Path) -> Self {
+        Self::build(recents, Vec::new(), cwd, false)
+    }
+
+    /// The session host's picker: local folders, or SSH destinations after
+    /// Ctrl+T, offering `ssh_hosts` and the recent SSH targets.
+    pub fn new_with_ssh(recents: Vec<Target>, ssh_hosts: Vec<String>, cwd: &Path) -> Self {
+        Self::build(recents, ssh_hosts, cwd, true)
+    }
+
+    fn build(recents: Vec<Target>, ssh_hosts: Vec<String>, cwd: &Path, allow_ssh: bool) -> Self {
         let mut places = Vec::new();
         places.push(gaviero_core::util::fs::canonicalize_simplified(cwd).unwrap_or_else(|_| cwd.to_path_buf()));
         places.extend(dirs::home_dir());
@@ -118,9 +158,76 @@ impl Picker {
             recents,
             places,
             error: None,
+            mode: PickerMode::Local,
+            allow_ssh,
+            ssh_hosts,
         };
         picker.refresh(cwd);
         picker
+    }
+
+    /// SSH mode's list: recent SSH targets, then the configured hosts,
+    /// filtered by the typed text (case-insensitive), an exact match first.
+    fn refresh_ssh(&mut self) {
+        let query = self.input.text.trim().to_string();
+        let needle = query.to_lowercase();
+        let mut matches: Vec<String> = Vec::new();
+        let candidates = self
+            .recents
+            .iter()
+            .filter(|t| t.is_ssh())
+            .map(Target::display)
+            .chain(self.ssh_hosts.iter().cloned());
+        for m in candidates {
+            if m.to_lowercase().contains(&needle) && !matches.contains(&m) {
+                matches.push(m);
+            }
+        }
+        if let Some(pos) = matches.iter().position(|m| *m == query) {
+            let m = matches.remove(pos);
+            matches.insert(0, m);
+        }
+        self.list.open(AutocompleteMode::DirPath, 0, &query);
+        self.list.matches = matches;
+        self.list.clamp_selection();
+    }
+
+    /// One key in SSH mode. Left/Right have nothing to browse.
+    fn on_ssh_key(&mut self, key: PickerKey) -> PickerOutcome {
+        match key {
+            PickerKey::Char(c) => {
+                self.input.insert_char(c);
+                self.error = None;
+                self.refresh_ssh();
+            }
+            PickerKey::Backspace => {
+                self.input.backspace();
+                self.error = None;
+                self.refresh_ssh();
+            }
+            PickerKey::Up => self.list.select_previous(),
+            PickerKey::Down => self.list.select_next(),
+            PickerKey::PageUp => self.list.move_selection(-(POPUP_ROWS as isize)),
+            PickerKey::PageDown => self.list.move_selection(POPUP_ROWS as isize),
+            PickerKey::Tab => {
+                if let Some(m) = self.selected().map(str::to_string) {
+                    self.input = TextInput::new();
+                    self.input.insert_str(&m);
+                    self.error = None;
+                    self.refresh_ssh();
+                }
+            }
+            PickerKey::Enter => {
+                let typed = self.input.text.clone();
+                let text = self.selected().map(str::to_string).unwrap_or(typed);
+                match Target::parse_ssh_input(&text) {
+                    Ok(target) => return PickerOutcome::Open(target),
+                    Err(msg) => self.error = Some(msg),
+                }
+            }
+            PickerKey::Left | PickerKey::Right | PickerKey::Esc | PickerKey::ToggleMode => {}
+        }
+        PickerOutcome::Stay
     }
 
     /// Recompute the match list for the typed text.
@@ -131,6 +238,10 @@ impl Picker {
     /// separator, then its folders and workspace files. A match that is
     /// exactly the typed path goes to the very top.
     pub fn refresh(&mut self, cwd: &Path) {
+        if self.mode == PickerMode::Ssh {
+            self.refresh_ssh();
+            return;
+        }
         let query = self.input.text.clone();
         let mut matches: Vec<String> = Vec::new();
         let push = |m: String, matches: &mut Vec<String>| {
@@ -139,13 +250,13 @@ impl Picker {
             }
         };
         if query.is_empty() {
-            for p in self.recents.iter().chain(&self.places) {
+            for p in self.local_recents().chain(self.places.iter()) {
                 push(dir_label(p), &mut matches);
             }
         } else {
             if !query.contains(['/', '\\']) {
                 let needle = query.to_lowercase();
-                for p in &self.recents {
+                for p in self.local_recents() {
                     let label = dir_label(p);
                     if label.to_lowercase().contains(&needle) {
                         push(label, &mut matches);
@@ -179,8 +290,26 @@ impl Picker {
 
     /// Apply one key. `Open` carries a resolved folder or workspace file.
     pub fn on_key(&mut self, key: PickerKey, cwd: &Path) -> PickerOutcome {
+        if key == PickerKey::Esc {
+            return PickerOutcome::Close;
+        }
+        if key == PickerKey::ToggleMode {
+            if self.allow_ssh {
+                self.mode = match self.mode {
+                    PickerMode::Local => PickerMode::Ssh,
+                    PickerMode::Ssh => PickerMode::Local,
+                };
+                self.input = TextInput::new();
+                self.error = None;
+                self.refresh(cwd);
+            }
+            return PickerOutcome::Stay;
+        }
+        if self.mode == PickerMode::Ssh {
+            return self.on_ssh_key(key);
+        }
         match key {
-            PickerKey::Esc => return PickerOutcome::Close,
+            PickerKey::Esc | PickerKey::ToggleMode => {}
             PickerKey::Char(c) => {
                 self.input.insert_char(c);
                 self.error = None;
@@ -213,12 +342,20 @@ impl Picker {
                 let typed = self.input.text.clone();
                 let target = self.selected().map(str::to_string).unwrap_or(typed);
                 match resolve(&target, cwd) {
-                    Some(path) => return PickerOutcome::Open(path),
+                    Some(path) => return PickerOutcome::Open(Target::Local(path)),
                     None => self.error = Some(NOT_OPENABLE.to_string()),
                 }
             }
         }
         PickerOutcome::Stay
+    }
+
+    /// The recent local paths (SSH recents are listed in SSH mode).
+    fn local_recents(&self) -> impl Iterator<Item = &PathBuf> {
+        self.recents.iter().filter_map(|t| match t {
+            Target::Local(path) => Some(path),
+            Target::Ssh { .. } => None,
+        })
     }
 
     fn set_input(&mut self, text: &str, cwd: &Path) {
@@ -257,10 +394,11 @@ impl Picker {
     /// A centered box over `area`: title, path box, error line, match list.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let width = area.width.saturating_sub(4).min(100);
+        let mode_rows = u16::from(self.allow_ssh);
         let height = area
             .height
             .saturating_sub(2)
-            .min(POPUP_ROWS as u16 + 4);
+            .min(POPUP_ROWS as u16 + 4 + mode_rows);
         if width < 10 || height < 4 {
             return;
         }
@@ -275,8 +413,13 @@ impl Picker {
             .borders(Borders::ALL)
             .title(" New session ")
             .style(Style::default().fg(Color::White).bg(Color::Rgb(35, 39, 46)));
-        let inner = block.inner(rect);
+        let mut inner = block.inner(rect);
         block.render(rect, buf);
+        if self.allow_ssh && inner.height > 2 {
+            self.render_mode_row(inner, buf);
+            inner.y += 1;
+            inner.height -= 1;
+        }
         if inner.height < 2 {
             return;
         }
@@ -290,7 +433,12 @@ impl Picker {
         let (note, style) = match &self.error {
             Some(err) => (err.as_str(), Style::default().fg(Color::Rgb(224, 108, 117))),
             None => (
-                "Enter open · → into folder · ← parent · Tab complete · Esc cancel",
+                match self.mode {
+                    PickerMode::Local => {
+                        "Enter open · → into folder · ← parent · Tab complete · Esc cancel"
+                    }
+                    PickerMode::Ssh => "Enter open · Tab complete · Esc cancel · host or host:/path",
+                },
                 Style::default().fg(Color::Rgb(99, 109, 131)),
             ),
         };
@@ -307,6 +455,98 @@ impl Picker {
     }
 }
 
+impl Picker {
+    /// The ` Local   SSH ` switch, the active one reversed, then the key.
+    fn render_mode_row(&self, inner: Rect, buf: &mut Buffer) {
+        let dim = Style::default().fg(Color::Rgb(99, 109, 131));
+        let active = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        let style = |mode: PickerMode| if self.mode == mode { active } else { dim };
+        let spans = [
+            (" Local ", style(PickerMode::Local)),
+            (" ", Style::default()),
+            (" SSH ", style(PickerMode::Ssh)),
+            ("   Ctrl+T: switch", dim),
+        ];
+        let mut x = inner.x;
+        for (text, style) in spans {
+            let room = (inner.x + inner.width).saturating_sub(x) as usize;
+            if room == 0 {
+                break;
+            }
+            let (end, _) = buf.set_stringn(x, inner.y, text, room, style);
+            x = end;
+        }
+    }
+}
+
+/// `Host` aliases in an OpenSSH client config file, in order, without
+/// patterns (`*`, `?`, `!`) or repeats. `Include` is not followed. A
+/// missing or unreadable file has none.
+pub(crate) fn ssh_config_hosts(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut hosts: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let Some(keyword) = words.next() else {
+            continue;
+        };
+        if !keyword.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for word in words {
+            if word.contains(['*', '?', '!']) || hosts.iter().any(|h| h == word) {
+                continue;
+            }
+            hosts.push(word.to_string());
+        }
+    }
+    hosts
+}
+
+/// `gaviero --pick`: the folder browser on its own, full screen, before
+/// anything else starts. Browsing begins at `start`. `Some(path)` for the
+/// folder or workspace file chosen with Enter, `None` when Esc closed it.
+/// The terminal is restored either way.
+pub(crate) fn run_standalone(start: &Path) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::Context;
+    use crossterm::event::{Event, KeyEventKind};
+
+    crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+    let _guard = crate::TerminalGuard;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        .context("entering the alternate screen")?;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+        .context("creating terminal")?;
+    let mut picker = Picker::new(Vec::new(), start);
+    let picked = loop {
+        terminal
+            .draw(|frame| picker.render(frame.area(), frame.buffer_mut()))
+            .context("drawing")?;
+        let event = crossterm::event::read().context("reading input")?;
+        let Event::Key(k) = event else {
+            continue;
+        };
+        if k.kind == KeyEventKind::Release {
+            continue;
+        }
+        let Some(key) = key_from_event(&k) else {
+            continue;
+        };
+        match picker.on_key(key, start) {
+            PickerOutcome::Stay => {}
+            PickerOutcome::Close => break None,
+            PickerOutcome::Open(Target::Local(path)) => break Some(path),
+            // A local-only picker never offers anything else.
+            PickerOutcome::Open(Target::Ssh { .. }) => {}
+        }
+    };
+    drop(terminal);
+    crate::restore_terminal().context("restoring terminal")?;
+    Ok(picked)
+}
+
 /// A typed or listed path, resolved against `cwd`, if it is a folder or a
 /// `.gaviero-workspace` file.
 fn resolve(text: &str, cwd: &Path) -> Option<PathBuf> {
@@ -315,7 +555,7 @@ fn resolve(text: &str, cwd: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = gaviero_core::util::fs::canonicalize_simplified(&absolute(text, cwd)).ok()?;
-    state::still_openable(&path).then_some(path)
+    state::still_openable(&Target::Local(path.clone())).then_some(path)
 }
 
 /// `text` with `~` expanded, joined onto `cwd` unless already absolute.
@@ -352,6 +592,91 @@ mod tests {
         for c in text.chars() {
             picker.on_key(PickerKey::Char(c), cwd);
         }
+    }
+
+    fn ssh_picker(dir: &Path) -> Picker {
+        Picker::new_with_ssh(
+            vec![Target::Ssh { host: "old".into(), path: Some("/srv/x".into()) }],
+            vec!["vps".into(), "box".into()],
+            dir,
+        )
+    }
+
+    #[test]
+    fn ctrl_t_switches_to_ssh_and_back() {
+        let dir = fixture();
+        let mut picker = ssh_picker(dir.path());
+        assert_eq!(picker.mode, PickerMode::Local);
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        assert_eq!(picker.mode, PickerMode::Ssh);
+        assert_eq!(picker.list.matches, vec!["old:/srv/x", "vps", "box"]);
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        assert_eq!(picker.mode, PickerMode::Local);
+    }
+
+    #[test]
+    fn a_local_only_picker_ignores_ctrl_t() {
+        let dir = fixture();
+        let mut picker = Picker::new(Vec::new(), dir.path());
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        assert_eq!(picker.mode, PickerMode::Local);
+    }
+
+    #[test]
+    fn ssh_mode_opens_a_typed_host_and_path() {
+        let dir = fixture();
+        let mut picker = ssh_picker(dir.path());
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        typed(&mut picker, "vps:/srv/a", dir.path());
+        assert_eq!(
+            picker.on_key(PickerKey::Enter, dir.path()),
+            PickerOutcome::Open(Target::Ssh { host: "vps".into(), path: Some("/srv/a".into()) })
+        );
+    }
+
+    #[test]
+    fn ssh_mode_filters_and_opens_the_selected_host() {
+        let dir = fixture();
+        let mut picker = ssh_picker(dir.path());
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        typed(&mut picker, "bo", dir.path());
+        assert_eq!(picker.list.matches, vec!["box"]);
+        assert_eq!(
+            picker.on_key(PickerKey::Enter, dir.path()),
+            PickerOutcome::Open(Target::Ssh { host: "box".into(), path: None })
+        );
+    }
+
+    #[test]
+    fn ssh_mode_refuses_a_relative_remote_path() {
+        let dir = fixture();
+        let mut picker = ssh_picker(dir.path());
+        picker.on_key(PickerKey::ToggleMode, dir.path());
+        typed(&mut picker, "vps:srv", dir.path());
+        assert_eq!(picker.on_key(PickerKey::Enter, dir.path()), PickerOutcome::Stay);
+        assert!(picker.error.is_some());
+    }
+
+    #[test]
+    fn ctrl_t_records_map_to_the_mode_switch() {
+        use super::super::encode::{KeyRecord, LEFT_CTRL};
+        let rec = KeyRecord { vk: 0x54, scan: 0x14, uchar: 0x14, key_down: true, ctrl_state: LEFT_CTRL, repeat: 1 };
+        assert_eq!(key_from_record(&rec), Some(PickerKey::ToggleMode));
+        let ev = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(key_from_event(&ev), Some(PickerKey::ToggleMode));
+    }
+
+    #[test]
+    fn ssh_config_hosts_skip_patterns_and_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            "Host vps alias2\n  Hostname x.example\nhost *.lan\nHost !bad ok vps\nHostname y\n",
+        )
+        .unwrap();
+        assert_eq!(ssh_config_hosts(&config), vec!["vps", "alias2", "ok"]);
+        assert!(ssh_config_hosts(&dir.path().join("missing")).is_empty());
     }
 
     fn canon(p: &Path) -> PathBuf {
@@ -413,7 +738,7 @@ mod tests {
         picker.on_key(PickerKey::Right, dir.path());
         assert_eq!(
             picker.on_key(PickerKey::Enter, dir.path()),
-            PickerOutcome::Open(canon(dir.path()))
+            PickerOutcome::Open(Target::Local(canon(dir.path())))
         );
     }
 
@@ -460,7 +785,7 @@ mod tests {
         let want = gaviero_core::util::fs::canonicalize_simplified(&dir.path().join("alpha")).unwrap();
         assert_eq!(
             picker.on_key(PickerKey::Enter, dir.path()),
-            PickerOutcome::Open(want)
+            PickerOutcome::Open(Target::Local(want))
         );
     }
 
@@ -481,7 +806,7 @@ mod tests {
     fn recents_rank_first() {
         let dir = fixture();
         let recent = dir.path().join("beta");
-        let mut picker = Picker::new(vec![recent.clone()], dir.path());
+        let mut picker = Picker::new(vec![Target::Local(recent.clone())], dir.path());
         assert_eq!(picker.list.matches[0], dir_label(&recent));
         typed(&mut picker, "be", dir.path());
         assert_eq!(picker.list.matches[0], dir_label(&recent));

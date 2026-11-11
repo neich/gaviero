@@ -19,6 +19,11 @@ pub enum Event {
     Resize(u16, u16),
     /// Host terminal gained or lost OS window focus (crossterm focus-change).
     TerminalFocus(bool),
+    /// The controlling terminal hung up (SIGHUP) or SIGTERM arrived: quit
+    /// now through the normal exit path, without drawing
+    /// (`platform::install_hangup_forwarder`).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    HangUp,
 
     // Filesystem
     FileChanged(PathBuf),
