@@ -201,12 +201,6 @@ pub(crate) enum Confirm {
     Quit,
 }
 
-/// Virtual-key codes of modifier keys: never an answer to a host question.
-#[cfg(windows)]
-fn is_modifier_vk(vk: u16) -> bool {
-    matches!(vk, 0x10..=0x12 | 0x14 | 0x5B | 0x5C | 0xA0..=0xA5)
-}
-
 const VK_Y: u16 = 0x59;
 
 /// Renders are coalesced to at most one per this interval.
@@ -227,6 +221,9 @@ pub(crate) struct Host {
     mouse: MouseTranslator,
     #[cfg_attr(not(windows), allow(dead_code))]
     swallow_keyups: Vec<u16>,
+    /// Key records → child input (text as UTF-8, the rest win32-input-mode).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    keys: encode::KeyEncoder,
     /// The close guard, while it asks.
     confirm: Option<Confirm>,
     /// The host is quitting: every session was asked to exit, and those
@@ -270,6 +267,7 @@ impl Host {
             next_id: 1,
             mouse: MouseTranslator::default(),
             swallow_keyups: Vec::new(),
+            keys: encode::KeyEncoder::default(),
             confirm: None,
             quit_deadline: None,
             ending: Vec::new(),
@@ -807,7 +805,7 @@ impl Host {
                 return;
             }
         } else if self.confirm.is_some() {
-            if !is_modifier_vk(r.vk) {
+            if !encode::is_modifier_vk(r.vk) {
                 self.swallow_keyup(r.vk);
                 let plain = r.ctrl_state & 0x0F == 0;
                 self.answer_confirm(r.vk == VK_Y && plain);
@@ -824,7 +822,10 @@ impl Host {
             self.run_chord(chord);
             return;
         }
-        self.send_active(encode::win32_key_seq(&r).into_bytes());
+        let bytes = self.keys.encode(&r);
+        if !bytes.is_empty() {
+            self.send_active(bytes);
+        }
     }
 
     #[cfg(windows)]
