@@ -506,6 +506,7 @@ pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
         active: app.active_buffer,
         closable: false,
         badges: None,
+        palette: crate::widgets::tabs::EDITOR_PALETTE,
     };
     tab_bar.render(area, frame.buffer_mut());
 }

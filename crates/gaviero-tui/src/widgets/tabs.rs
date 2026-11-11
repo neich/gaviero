@@ -22,6 +22,42 @@ pub enum TabKind {
 /// cell blank.
 pub type TabBadges = [Option<Color>; 2];
 
+/// Colours of a tab bar's `Normal` tabs, bar background and chrome.
+/// `DiffView` and `Global` tabs keep their own colours on any palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabPalette {
+    /// The bar row behind and after the tabs.
+    pub bar_bg: Color,
+    pub inactive_fg: Color,
+    pub inactive_bg: Color,
+    pub active_fg: Color,
+    pub active_bg: Color,
+    /// Separators, the overflow `...` and an inactive tab's close button.
+    pub dim: Color,
+}
+
+/// The editor's buffer tabs: cool grey-blue.
+pub const EDITOR_PALETTE: TabPalette = TabPalette {
+    bar_bg: Color::Rgb(35, 39, 46),
+    inactive_fg: Color::Rgb(157, 165, 180),
+    inactive_bg: Color::Rgb(35, 39, 46),
+    active_fg: Color::White,
+    active_bg: Color::Rgb(55, 60, 70),
+    dim: Color::Rgb(99, 109, 131),
+};
+
+/// The session host's tabs: warm dark bronze, so the host bar never reads
+/// as a second row of editor tabs when a gaviero tab draws its own below.
+/// No blue in it, so the blue "finished" circle still stands out.
+pub const HOST_PALETTE: TabPalette = TabPalette {
+    bar_bg: Color::Rgb(30, 25, 20),
+    inactive_fg: Color::Rgb(190, 170, 140),
+    inactive_bg: Color::Rgb(30, 25, 20),
+    active_fg: Color::Rgb(255, 238, 205),
+    active_bg: Color::Rgb(88, 64, 38),
+    dim: Color::Rgb(120, 100, 76),
+};
+
 pub struct TabBar<'a> {
     /// (name, modified, kind).
     pub titles: &'a [(String, bool, TabKind)],
@@ -31,6 +67,7 @@ pub struct TabBar<'a> {
     /// One entry per tab: when set, every tab keeps room for two circles
     /// after its label, drawn or not, so its width never changes with them.
     pub badges: Option<&'a [TabBadges]>,
+    pub palette: TabPalette,
 }
 
 /// The circle drawn for a set badge.
@@ -70,8 +107,8 @@ impl<'a> TabBar<'a> {
             return;
         }
 
-        // Background — slightly darker than terminal bg to separate from editor
-        let bg_style = Style::default().bg(Color::Rgb(35, 39, 46));
+        let p = self.palette;
+        let bg_style = Style::default().bg(p.bar_bg);
         for x in area.x..area.right() {
             buf[(x, area.y)].set_style(bg_style);
         }
@@ -87,7 +124,7 @@ impl<'a> TabBar<'a> {
                 if x + 3 <= area.right() {
                     let dots = Line::from(Span::styled(
                         "...",
-                        Style::default().fg(Color::Rgb(99, 109, 131)),
+                        Style::default().fg(p.dim),
                     ));
                     let dots_area = Rect {
                         x,
@@ -120,13 +157,11 @@ impl<'a> TabBar<'a> {
                 s
             } else if is_active {
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(55, 60, 70))
+                    .fg(p.active_fg)
+                    .bg(p.active_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(Color::Rgb(157, 165, 180))
-                    .bg(Color::Rgb(35, 39, 46))
+                Style::default().fg(p.inactive_fg).bg(p.inactive_bg)
             };
 
             let tab = Line::from(Span::styled(label, style));
@@ -139,11 +174,7 @@ impl<'a> TabBar<'a> {
             Widget::render(tab, tab_area, buf);
             if self.closable {
                 // The close button sits one cell in, after the leading pad.
-                let fg = if is_active {
-                    CLOSE_FG
-                } else {
-                    Color::Rgb(99, 109, 131)
-                };
+                let fg = if is_active { CLOSE_FG } else { p.dim };
                 buf[(x + 1, area.y)]
                     .set_symbol(CLOSE_MARK)
                     .set_style(Style::default().fg(fg));
@@ -165,7 +196,7 @@ impl<'a> TabBar<'a> {
             if x < area.right() {
                 buf[(x, area.y)]
                     .set_char('│')
-                    .set_style(Style::default().fg(Color::Rgb(99, 109, 131)));
+                    .set_style(Style::default().fg(p.dim));
                 x += 1;
             }
         }
@@ -231,6 +262,7 @@ mod tests {
             active: 0,
             closable: true,
             badges: None,
+            palette: EDITOR_PALETTE,
         };
         // Tab 0: " x ab " (cols 0..6) + separator at 6; tab 1 starts at 7.
         assert_eq!(bar.close_at_x(1, 0), Some(0));
@@ -249,6 +281,7 @@ mod tests {
             active: 0,
             closable: false,
             badges: None,
+            palette: EDITOR_PALETTE,
         };
         assert_eq!(plain.close_at_x(1, 0), None);
     }
@@ -267,6 +300,7 @@ mod tests {
             active: 0,
             closable: true,
             badges: Some(&badges),
+            palette: HOST_PALETTE,
         };
         // Tab 0: " x ab ●  " (cols 0..9) + separator at 9; tab 1 starts at 10.
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
@@ -288,5 +322,38 @@ mod tests {
             ..bar
         };
         assert_eq!(plain.close_at_x(8, 0), Some(1));
+    }
+
+    #[test]
+    fn each_bar_draws_in_its_own_palette() {
+        let titles = vec![
+            ("ab".to_string(), false, TabKind::Normal),
+            ("c".to_string(), false, TabKind::Normal),
+        ];
+        let draw = |palette| {
+            let bar = TabBar {
+                titles: &titles,
+                active: 0,
+                closable: false,
+                badges: None,
+                palette,
+            };
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            bar.render(Rect::new(0, 0, 20, 1), &mut buf);
+            buf
+        };
+        for p in [EDITOR_PALETTE, HOST_PALETTE] {
+            let buf = draw(p);
+            // " ab " active (0..4), separator at 4, " c " inactive (5..8).
+            assert_eq!(buf[(1, 0)].bg, p.active_bg);
+            assert_eq!(buf[(1, 0)].fg, p.active_fg);
+            assert_eq!(buf[(4, 0)].fg, p.dim);
+            assert_eq!(buf[(6, 0)].bg, p.inactive_bg);
+            assert_eq!(buf[(19, 0)].bg, p.bar_bg);
+        }
+        // The two bars stack in the session host: no shared colour.
+        assert_ne!(EDITOR_PALETTE.bar_bg, HOST_PALETTE.bar_bg);
+        assert_ne!(EDITOR_PALETTE.active_bg, HOST_PALETTE.active_bg);
+        assert_ne!(EDITOR_PALETTE.inactive_fg, HOST_PALETTE.inactive_fg);
     }
 }
