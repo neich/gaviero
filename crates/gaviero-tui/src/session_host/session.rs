@@ -35,6 +35,8 @@ pub(crate) struct Activity {
     pub agent: bool,
     /// A command is running in one of the session's shells.
     pub shell: bool,
+    /// A shell command seems to wait for the user (`shell-input`).
+    pub shell_waiting: bool,
 }
 
 /// The activity a child reports in its window title
@@ -52,6 +54,7 @@ pub(crate) fn parse_activity(title: Option<&str>) -> Activity {
         waiting: status == "attention",
         agent: agent || (status == "busy" && !shell),
         shell,
+        shell_waiting: shell && has("shell-input"),
     }
 }
 
@@ -326,38 +329,45 @@ mod tests {
         assert_eq!(parse_activity(None), Activity::default());
         assert_eq!(
             activity("gaviero-session:busy:agent,terminal"),
-            Activity { waiting: false, agent: true, shell: true }
+            Activity { waiting: false, agent: true, shell: true, shell_waiting: false }
         );
         assert_eq!(
             activity("gaviero-session:busy:swarm,unsaved"),
-            Activity { waiting: false, agent: true, shell: false }
+            Activity { waiting: false, agent: true, shell: false, shell_waiting: false }
         );
         assert_eq!(
             activity("gaviero-session:busy:terminal"),
-            Activity { waiting: false, agent: false, shell: true }
+            Activity { waiting: false, agent: false, shell: true, shell_waiting: false }
         );
         // A permission prompt or question while the agent runs.
         assert_eq!(
             activity("gaviero-session:attention:agent"),
-            Activity { waiting: true, agent: true, shell: false }
+            Activity { waiting: true, agent: true, shell: false, shell_waiting: false }
         );
         // A pending turn review after the turn.
         assert_eq!(
             activity("gaviero-session:attention"),
-            Activity { waiting: true, agent: false, shell: false }
+            Activity { waiting: true, agent: false, shell: false, shell_waiting: false }
         );
         // An older child: busy, no detail.
         assert_eq!(
             activity("gaviero-session:busy"),
-            Activity { waiting: false, agent: true, shell: false }
+            Activity { waiting: false, agent: true, shell: false, shell_waiting: false }
         );
         // Unsaved files alone are no activity.
         assert_eq!(activity("gaviero-session:idle:unsaved"), Activity::default());
+        // A shell command waiting for the user.
+        assert_eq!(
+            activity("gaviero-session:busy:terminal,shell-input"),
+            Activity { waiting: false, agent: false, shell: true, shell_waiting: true }
+        );
+        // `shell-input` without a running command means nothing.
+        assert_eq!(activity("gaviero-session:idle:shell-input"), Activity::default());
     }
 
     #[test]
     fn work_that_ends_is_reported_finished() {
-        let both = Activity { waiting: false, agent: true, shell: true };
+        let both = Activity { waiting: false, agent: true, shell: true, shell_waiting: false };
         let none = Activity::default();
         assert_eq!(finished(both, none), (true, true));
         assert_eq!(finished(none, both), (false, false));
@@ -365,7 +375,7 @@ mod tests {
         let shell_only = Activity { agent: false, ..both };
         assert_eq!(finished(both, shell_only), (true, false));
         // The turn ends into a turn review: the agent finished.
-        let review = Activity { waiting: true, agent: false, shell: false };
+        let review = Activity { waiting: true, agent: false, shell: false, shell_waiting: false };
         assert_eq!(finished(both, review), (true, true));
     }
 

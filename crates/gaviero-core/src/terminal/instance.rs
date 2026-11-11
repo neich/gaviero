@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use portable_pty::PtySize;
@@ -44,7 +44,17 @@ pub struct TerminalInstance {
     current_command_start: Option<Instant>,
     /// Text of the current running command (captured between OSC 133;B and C).
     current_command_text: Option<String>,
+    /// When the PTY last produced output / was last written to by the user.
+    last_output: Instant,
+    last_input: Instant,
+    /// The running command rang the bell or asked for a desktop
+    /// notification; cleared by the user's next input or the command's end.
+    attention_requested: bool,
 }
+
+/// How long a running command must stay quiet (no output, no input) before
+/// [`TerminalInstance::awaiting_input`] guesses it waits for the user.
+pub const INPUT_WAIT_QUIET: Duration = Duration::from_secs(5);
 
 impl TerminalInstance {
     /// Create a new instance (not yet spawned).
@@ -75,6 +85,9 @@ impl TerminalInstance {
             command_history: VecDeque::with_capacity(MAX_COMMAND_HISTORY),
             current_command_start: None,
             current_command_text: None,
+            last_output: Instant::now(),
+            last_input: Instant::now(),
+            attention_requested: false,
         }
     }
 
@@ -117,7 +130,45 @@ impl TerminalInstance {
         }
         self.respond_to_terminal_queries(data);
         self.is_dirty = true;
+        self.last_output = Instant::now();
         results
+    }
+
+    /// The running command rang the bell or asked for a notification: it
+    /// wants the user. Ignored at the prompt (a completion beep).
+    pub fn note_attention_request(&mut self) {
+        if self.shell_state.is_running() {
+            self.attention_requested = true;
+        }
+    }
+
+    /// Whether the running command seems to wait for the user. Certain
+    /// after a bell or notification; otherwise a guess, after
+    /// [`INPUT_WAIT_QUIET`] with no output and no input: a full-screen
+    /// program (alternate screen) sitting idle, or the cursor left after
+    /// text on its line, like `Password: ` or `[y/N] `. A silent command
+    /// whose output ended in a newline (`sleep 60`) does not count.
+    pub fn awaiting_input(&self) -> bool {
+        self.awaiting_input_at(Instant::now())
+    }
+
+    fn awaiting_input_at(&self, now: Instant) -> bool {
+        if !self.shell_state.is_running() {
+            return false;
+        }
+        if self.attention_requested {
+            return true;
+        }
+        let quiet_since = self.last_output.max(self.last_input);
+        if now.saturating_duration_since(quiet_since) < INPUT_WAIT_QUIET {
+            return false;
+        }
+        let screen = self.parser.screen();
+        if screen.alternate_screen() {
+            return true;
+        }
+        let (row, col) = screen.cursor_position();
+        col > 0 && !screen.contents_between(row, 0, row, col).trim().is_empty()
     }
 
     /// Answer terminal status queries the application sends us — we ARE
@@ -132,13 +183,13 @@ impl TerminalInstance {
             let (row, col) = self.parser.screen().cursor_position();
             let report = format!("\x1b[{};{}R", row + 1, col + 1);
             for _ in 0..dsr_queries {
-                self.write_input(report.as_bytes());
+                let _ = self.write_pty(report.as_bytes());
             }
         }
         // DA1 (`ESC[c` / `ESC[0c`): identify as a VT101-class terminal.
         let da1_queries = count_occurrences(data, b"\x1b[c") + count_occurrences(data, b"\x1b[0c");
         for _ in 0..da1_queries {
-            self.write_input(b"\x1b[?1;2c");
+            let _ = self.write_pty(b"\x1b[?1;2c");
         }
     }
 
@@ -147,8 +198,17 @@ impl TerminalInstance {
         let _ = self.try_write_input(data);
     }
 
-    /// Write input with delivery errors exposed to remote callers.
+    /// Write input with delivery errors exposed to remote callers. The user
+    /// has answered whatever the command was waiting for.
     pub fn try_write_input(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.last_input = Instant::now();
+        self.attention_requested = false;
+        self.write_pty(data)
+    }
+
+    /// Bytes to the PTY that are not the user's (answers to terminal
+    /// queries): they leave the input-wait state alone.
+    fn write_pty(&mut self, data: &[u8]) -> std::io::Result<()> {
         let writer = self.pty_writer.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "shell is not running")
         })?;
@@ -206,6 +266,7 @@ impl TerminalInstance {
     pub fn start_command(&mut self, command: String) {
         self.current_command_text = Some(command);
         self.current_command_start = Some(Instant::now());
+        self.attention_requested = false;
         self.shell_state = ShellState::Running {
             command: self.current_command_text.clone().unwrap_or_default(),
             started: Instant::now(),
@@ -243,6 +304,7 @@ impl TerminalInstance {
         }
 
         self.current_command_start = None;
+        self.attention_requested = false;
         self.shell_state = ShellState::Finished { exit_code };
     }
 
@@ -367,5 +429,60 @@ mod tests {
             inst.try_write_input(b"x").unwrap_err().kind(),
             std::io::ErrorKind::NotConnected
         );
+    }
+
+    fn later() -> Instant {
+        Instant::now() + INPUT_WAIT_QUIET + Duration::from_secs(1)
+    }
+
+    #[test]
+    fn a_quiet_prompt_line_is_awaiting_input() {
+        let (mut inst, _writer) = instance_with_capture();
+        inst.start_command("sudo true".into());
+        inst.process_output(b"[sudo] password: ");
+        assert!(!inst.awaiting_input_at(Instant::now()), "not quiet yet");
+        assert!(inst.awaiting_input_at(later()));
+        // Typing a password echoes nothing: still waiting once quiet again.
+        inst.try_write_input(b"x").unwrap();
+        assert!(!inst.awaiting_input_at(Instant::now()));
+        assert!(inst.awaiting_input_at(later()));
+        // The command ends: nothing is running.
+        inst.finish_command(Some(0));
+        assert!(!inst.awaiting_input_at(later()));
+    }
+
+    #[test]
+    fn a_silent_command_after_a_newline_is_not_awaiting_input() {
+        let (mut inst, _writer) = instance_with_capture();
+        inst.start_command("sleep 60".into());
+        inst.process_output(b"starting\r\n");
+        assert!(!inst.awaiting_input_at(later()));
+        // At the prompt nothing is awaited, whatever the cursor shows.
+        let (mut idle, _w) = instance_with_capture();
+        idle.process_output(b"$ ");
+        assert!(!idle.awaiting_input_at(later()));
+    }
+
+    #[test]
+    fn a_quiet_full_screen_program_is_awaiting_input() {
+        let (mut inst, _writer) = instance_with_capture();
+        inst.start_command("vim".into());
+        inst.process_output(b"\x1b[?1049h\x1b[H");
+        assert!(!inst.awaiting_input_at(Instant::now()));
+        assert!(inst.awaiting_input_at(later()));
+    }
+
+    #[test]
+    fn a_bell_while_running_waits_until_the_user_types() {
+        let (mut inst, _writer) = instance_with_capture();
+        // A completion beep at the prompt is not a request.
+        inst.note_attention_request();
+        assert!(!inst.attention_requested);
+        inst.start_command("claude".into());
+        inst.process_output(b"working\r\n");
+        inst.note_attention_request();
+        assert!(inst.awaiting_input_at(Instant::now()), "at once, no quiet needed");
+        inst.try_write_input(b"y").unwrap();
+        assert!(!inst.awaiting_input_at(Instant::now()));
     }
 }
