@@ -1009,7 +1009,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
                 crate::notify::notify(
                     &config,
-                    crate::notify::NotifyEvent::AgentFinished,
                     app.terminal_has_focus,
                     "Gaviero — agent finished",
                     &body,
@@ -1109,7 +1108,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     }
                     crate::notify::notify(
                         &config,
-                        crate::notify::NotifyEvent::AgentWaiting,
                         app.terminal_has_focus,
                         "Gaviero — agent needs you",
                         &notify_body,

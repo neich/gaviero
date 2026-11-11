@@ -164,38 +164,23 @@ Full setup: [docs/remote-relay.md](../../docs/remote-relay.md).
 
 ### Agent notifications
 
-Two chat milestones announce themselves, each with its own `enabled` / `sound` / `desktop` / `statusBar` switches (all default `true`):
+Two chat milestones announce themselves, each with its own `enabled` / `desktop` / `statusBar` switches (all default `true`). Notifications are silent: gaviero never rings the terminal bell or plays a system sound.
 
 | Setting group | Fires when |
 |---|---|
 | `notifications.agentFinished.*` | The turn ended — an answer (or an error) is on screen |
 | `notifications.agentWaiting.*` | The turn is blocked on you — a tool permission prompt or an `AskUserQuestion` |
 
-The two use different sounds, glyphs, and banner colours (`✓` green vs `?` amber) so they are distinguishable without looking.
+The two use different glyphs and banner colours (`✓` green vs `?` amber) so they are distinguishable at a glance.
 
-Focus handling differs per channel, by design:
-
-- **Sound ignores focus** — it fires even when gaviero is backgrounded or minimized, which is the case the alert exists for.
 - **Desktop toasts fire only while the terminal is unfocused** — with gaviero on screen the status-bar banner already carries the news. (No-op on Windows: see `spawn_desktop_notification`.)
 - **The status-bar banner and fullscreen toast** are drawn while you are looking, for 8s.
-
-`notifications.sound.style` picks how the sound is produced:
-
-| Value | Behaviour |
-|---|---|
-| `"auto"` (default) | Win32 system sound on Windows, terminal BEL elsewhere |
-| `"bell"` | Terminal BEL (`\x07`) only |
-| `"system"` | Platform system sound, falling back to BEL where none exists |
-| `"both"` | BEL *and* the system sound |
-
-Windows defaults to the system sound because BEL has to survive ConPTY plus any multiplexer, and Windows Terminal's `bellStyle` can silence it outright. Set `"bell"` if you route notifications through your terminal, or `"both"` if either channel might be dropped.
 
 ```json
 {
   "notifications": {
-    "agentFinished": { "sound": true, "desktop": false },
-    "agentWaiting": { "sound": true },
-    "sound": { "style": "both" }
+    "agentFinished": { "desktop": false },
+    "agentWaiting": { "statusBar": true }
   }
 }
 ```

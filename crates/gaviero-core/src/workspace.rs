@@ -353,7 +353,6 @@ pub mod settings {
 
     // Agent-finish notifications (TUI)
     pub const NOTIFICATIONS_AGENT_FINISHED_ENABLED: &str = "notifications.agentFinished.enabled";
-    pub const NOTIFICATIONS_AGENT_FINISHED_SOUND: &str = "notifications.agentFinished.sound";
     pub const NOTIFICATIONS_AGENT_FINISHED_DESKTOP: &str = "notifications.agentFinished.desktop";
     pub const NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR: &str =
         "notifications.agentFinished.statusBar";
@@ -363,15 +362,8 @@ pub mod settings {
     /// `agentFinished` because the two mean different things to the user — one
     /// is "come read this", the other is "the run is blocked on you".
     pub const NOTIFICATIONS_AGENT_WAITING_ENABLED: &str = "notifications.agentWaiting.enabled";
-    pub const NOTIFICATIONS_AGENT_WAITING_SOUND: &str = "notifications.agentWaiting.sound";
     pub const NOTIFICATIONS_AGENT_WAITING_DESKTOP: &str = "notifications.agentWaiting.desktop";
     pub const NOTIFICATIONS_AGENT_WAITING_STATUS_BAR: &str = "notifications.agentWaiting.statusBar";
-
-    /// How notification sounds are produced: `"auto"` (default — Win32 system
-    /// sound on Windows, terminal BEL elsewhere), `"bell"`, `"system"`, or
-    /// `"both"`. An escape hatch for hosts that swallow BEL (multiplexers,
-    /// `bellStyle: none`) or for muted Windows sound schemes.
-    pub const NOTIFICATIONS_SOUND_STYLE: &str = "notifications.sound.style";
 
     // Remote sidecar. gaviero-relay is the only transport: the sidecar binds
     // loopback only, terminates TLS with a per-machine private CA the pairing
@@ -1850,16 +1842,13 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 
         // Agent-finish notifications (TUI)
         settings::NOTIFICATIONS_AGENT_FINISHED_ENABLED => serde_json::json!(true),
-        settings::NOTIFICATIONS_AGENT_FINISHED_SOUND => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_FINISHED_DESKTOP => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR => serde_json::json!(true),
 
         // Agent-waiting notifications (TUI) — permission / AskUserQuestion
         settings::NOTIFICATIONS_AGENT_WAITING_ENABLED => serde_json::json!(true),
-        settings::NOTIFICATIONS_AGENT_WAITING_SOUND => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_WAITING_DESKTOP => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_WAITING_STATUS_BAR => serde_json::json!(true),
-        settings::NOTIFICATIONS_SOUND_STYLE => serde_json::json!("auto"),
 
         // Tier B / B5 — session consolidator + sleeptime
         settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),
