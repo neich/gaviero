@@ -4,7 +4,7 @@
 use super::Host;
 use super::session::Activity;
 use crate::panels::terminal::vt100_style_to_ratatui;
-use crate::widgets::tabs::{TabBadges, TabBar, TabKind};
+use crate::widgets::tabs::{HOST_PALETTE, TabBadges, TabBar, TabKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -91,7 +91,8 @@ pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
 }
 
 /// The host's tab bar: every tab has a close button and two activity
-/// circles.
+/// circles, drawn in the host's own palette so it never looks like the
+/// editor's tab row inside the session below it.
 pub(crate) fn tab_bar<'a>(
     host: &Host,
     titles: &'a [(String, bool, TabKind)],
@@ -102,6 +103,7 @@ pub(crate) fn tab_bar<'a>(
         active: host.active,
         closable: true,
         badges: Some(badges),
+        palette: HOST_PALETTE,
     }
 }
 

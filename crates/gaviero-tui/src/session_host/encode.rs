@@ -33,6 +33,81 @@ pub fn win32_key_seq(r: &KeyRecord) -> String {
     )
 }
 
+/// Turns the console's key records into the bytes a ConPTY child is sent.
+///
+/// Text keys go as plain UTF-8, everything else as [`win32_key_seq`]. ConPTY
+/// reads its input pipe in chunks, and the inbox conhost drops the start of
+/// a sequence that a chunk boundary splits and hands the rest to the child
+/// as typed text (microsoft/terminal#17738). A paste is a burst of records
+/// that fills the pipe, so the boundaries land inside sequences and the
+/// pasted text comes out as `;0;0;1_` garbage. Text has no sequence to
+/// split: conhost turns each character back into a key event, and it joins
+/// UTF-8 split across reads. For the same reason the key-ups of text keys
+/// and bare modifier records (a paste wraps every capital in Shift down/up)
+/// are not sent: no child reads them.
+#[derive(Debug, Default)]
+pub struct KeyEncoder {
+    /// The first half of a surrogate pair, until the second arrives.
+    high_surrogate: Option<u16>,
+}
+
+impl KeyEncoder {
+    pub fn encode(&mut self, r: &KeyRecord) -> Vec<u8> {
+        if r.uchar == 0 && is_modifier_vk(r.vk) {
+            return Vec::new();
+        }
+        let Some(unit) = text_unit(r) else {
+            self.high_surrogate = None;
+            return win32_key_seq(r).into_bytes();
+        };
+        if !r.key_down {
+            return Vec::new();
+        }
+        let c = match unit {
+            0xD800..=0xDBFF => {
+                self.high_surrogate = Some(unit);
+                return Vec::new();
+            }
+            0xDC00..=0xDFFF => {
+                let Some(high) = self.high_surrogate.take() else {
+                    return Vec::new();
+                };
+                char::decode_utf16([high, unit]).next().and_then(Result::ok)
+            }
+            _ => {
+                self.high_surrogate = None;
+                char::from_u32(unit as u32)
+            }
+        };
+        let Some(c) = c else {
+            return Vec::new();
+        };
+        let mut utf8 = [0u8; 4];
+        c.encode_utf8(&mut utf8).repeat(r.repeat.max(1) as usize).into_bytes()
+    }
+}
+
+/// The UTF-16 unit a key record types, when it can be sent as text: a
+/// printable character with no Ctrl/Alt, or with AltGr (`Ctrl + Alt`) when it
+/// is not a letter or digit — `Ctrl+Alt+letter` stays a chord. Enter and Tab
+/// only bare, so Shift+Enter and Shift+Tab keep their modifier.
+fn text_unit(r: &KeyRecord) -> Option<u16> {
+    let u = r.uchar;
+    let alt = r.ctrl_state & ANY_ALT != 0;
+    let ctrl = r.ctrl_state & ANY_CTRL != 0;
+    if u >= 0x20 && u != 0x7F {
+        let alnum = u < 0x80 && (u as u8).is_ascii_alphanumeric();
+        return ((!alt && !ctrl) || (alt && ctrl && !alnum)).then_some(u);
+    }
+    let bare = r.ctrl_state & (ANY_ALT | ANY_CTRL | SHIFT) == 0;
+    (bare && (u == b'\r' as u16 || u == b'\t' as u16)).then_some(u)
+}
+
+/// Virtual-key codes of modifier keys (Shift, Ctrl, Alt, Caps Lock, Win).
+pub fn is_modifier_vk(vk: u16) -> bool {
+    matches!(vk, 0x10..=0x12 | 0x14 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
 /// `dwControlKeyState` bits (mirrors of the Windows constants).
 pub const RIGHT_ALT: u32 = 1;
 pub const LEFT_ALT: u32 = 2;
@@ -198,6 +273,69 @@ mod tests {
         // A zero repeat count is sent as 1.
         r.repeat = 0;
         assert_eq!(win32_key_seq(&r), "\x1b[65;30;97;0;0;1_");
+    }
+
+    fn encode_all(records: &[KeyRecord]) -> Vec<u8> {
+        let mut enc = KeyEncoder::default();
+        records.iter().flat_map(|r| enc.encode(r)).collect()
+    }
+
+    fn tap(vk: u16, uchar: u16, ctrl: u32) -> [KeyRecord; 2] {
+        [key(vk, uchar, true, ctrl), key(vk, uchar, false, ctrl)]
+    }
+
+    #[test]
+    fn text_keys_go_as_utf8_without_their_key_ups() {
+        let mut records = Vec::new();
+        records.extend(tap(0x41, 'a' as u16, 0));
+        records.push(key(0xA0, 0, true, SHIFT));
+        records.extend(tap(0x4C, 'L' as u16, SHIFT));
+        records.push(key(0xA0, 0, false, 0));
+        records.extend(tap(0, 'ó' as u16, 0));
+        records.extend(tap(0x0D, '\r' as u16, 0));
+        records.extend(tap(0x09, '\t' as u16, 0));
+        assert_eq!(encode_all(&records), "aLó\r\t".as_bytes());
+    }
+
+    #[test]
+    fn altgr_symbols_are_text_and_ctrl_alt_letters_stay_chords() {
+        let at = key(0x32, '@' as u16, true, RIGHT_ALT | LEFT_CTRL);
+        assert_eq!(encode_all(&[at]), b"@");
+        let chord = key(0x51, 'q' as u16, true, RIGHT_ALT | LEFT_CTRL);
+        assert_eq!(encode_all(&[chord]), win32_key_seq(&chord).into_bytes());
+    }
+
+    #[test]
+    fn keys_that_are_not_text_keep_their_sequence() {
+        for r in [
+            key(0x41, 0x01, true, LEFT_CTRL),         // Ctrl+A
+            key(0x41, 'a' as u16, true, LEFT_ALT),    // Alt+A
+            key(0x0D, '\r' as u16, true, SHIFT),      // Shift+Enter
+            key(0x09, '\t' as u16, true, SHIFT),      // Shift+Tab
+            key(0x08, 0x08, true, 0),                 // Backspace
+            key(0x1B, 0x1B, true, 0),                 // Esc
+            key(0x25, 0, true, 0),                    // Left
+            key(0x25, 0, false, 0),                   // Left up
+        ] {
+            assert_eq!(encode_all(&[r]), win32_key_seq(&r).into_bytes(), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn surrogate_pairs_join_into_one_character() {
+        let mut records = Vec::new();
+        records.extend(tap(0, 0xD83D, 0));
+        records.extend(tap(0, 0xDE00, 0));
+        assert_eq!(encode_all(&records), "😀".as_bytes());
+        // A lone low half is dropped.
+        assert_eq!(encode_all(&tap(0, 0xDE00, 0)), b"");
+    }
+
+    #[test]
+    fn a_repeat_count_repeats_the_text() {
+        let mut r = key(0x41, 'a' as u16, true, 0);
+        r.repeat = 3;
+        assert_eq!(encode_all(&[r]), b"aaa");
     }
 
     #[test]

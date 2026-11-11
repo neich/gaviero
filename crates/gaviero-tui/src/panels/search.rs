@@ -201,8 +201,33 @@ fn collect_files(
 }
 
 impl SearchPanelState {
-    /// Rows above the results list: input, scope, summary.
-    pub const HEADER_ROWS: usize = 3;
+    /// Rows above the results list: input, mode legend, scope, summary.
+    pub const HEADER_ROWS: usize = 4;
+
+    /// Row (relative to the panel) of the mode legend.
+    pub const MODE_ROW: usize = 1;
+
+    /// The mode legend: each mode's label, drawn left to right from column 0,
+    /// followed by [`Self::MODE_HINT`]. The prompt glyph at the start of each
+    /// label is the one the input row shows in that mode.
+    const MODE_LABELS: [(SearchMode, &'static str); 2] = [
+        (SearchMode::Content, " > contents "),
+        (SearchMode::FileName, " @ file names "),
+    ];
+    const MODE_HINT: &'static str = "  Tab: switch";
+
+    /// The mode whose legend label covers `col` (relative to the panel), if any.
+    pub fn mode_at_column(col: usize) -> Option<SearchMode> {
+        let mut start = 0;
+        for (mode, label) in Self::MODE_LABELS {
+            let end = start + label.chars().count();
+            if (start..end).contains(&col) {
+                return Some(mode);
+            }
+            start = end;
+        }
+        None
+    }
 
     pub fn new() -> Self {
         Self {
@@ -455,8 +480,34 @@ impl SearchPanelState {
             }
         }
 
-        // ── Scope line (row 1) ──────────────────────────────────
-        let scope_y = area.y + 1;
+        // ── Mode legend (row 1) ─────────────────────────────────
+        // Says what the prompt glyph means and that Tab switches; the
+        // active mode is highlighted.
+        let mode_y = area.y + Self::MODE_ROW as u16;
+        if mode_y < area.bottom() {
+            let dim = Style::default().fg(theme::TEXT_DIM).bg(bg);
+            let active = Style::default()
+                .fg(theme::ACCENT)
+                .bg(bg)
+                .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::REVERSED);
+            let mut sx = area.x;
+            let segments = Self::MODE_LABELS
+                .iter()
+                .map(|(mode, label)| (*label, if *mode == self.mode { active } else { dim }))
+                .chain(std::iter::once((Self::MODE_HINT, dim)));
+            'mode: for (text, style) in segments {
+                for ch in text.chars() {
+                    if sx >= area.right() {
+                        break 'mode;
+                    }
+                    buf[(sx, mode_y)].set_char(ch).set_style(style);
+                    sx += 1;
+                }
+            }
+        }
+
+        // ── Scope line (row 2) ──────────────────────────────────
+        let scope_y = area.y + 2;
         if scope_y < area.bottom() {
             let dim = Style::default().fg(theme::TEXT_DIM).bg(bg);
             let prefix = " in ";
@@ -494,8 +545,8 @@ impl SearchPanelState {
             }
         }
 
-        // ── Summary line (row 2) ────────────────────────────────
-        let summary_y = area.y + 2;
+        // ── Summary line (row 3) ────────────────────────────────
+        let summary_y = area.y + 3;
         if summary_y < area.bottom() {
             let summary = match (self.mode, self.query.is_empty(), self.results.len()) {
                 (SearchMode::Content, true, _) => " Searching file contents".to_string(),
@@ -520,7 +571,7 @@ impl SearchPanelState {
             }
         }
 
-        // ── Results list (row 3+) ───────────────────────────────
+        // ── Results list (row 4+) ───────────────────────────────
         let results_start = area.y + Self::HEADER_ROWS as u16;
         let viewport = (area.height as usize).saturating_sub(Self::HEADER_ROWS);
         self.scroll.set_viewport(viewport);
@@ -649,6 +700,56 @@ mod tests {
         assert_eq!(file_name_rank("src/main.rs", "ain"), Some(2));
         assert_eq!(file_name_rank("src/main.rs", "src"), None);
         assert_eq!(file_name_rank("src/main.rs", "src/ma"), Some(3));
+    }
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn mode_legend_explains_prompt_glyphs_and_tab() {
+        let mut panel = SearchPanelState::new();
+        let area = Rect::new(0, 0, 50, 8);
+        let mut buf = Buffer::empty(area);
+        panel.render(area, &mut buf, true);
+
+        let legend = row_text(&buf, SearchPanelState::MODE_ROW as u16);
+        assert!(legend.contains("> contents"), "legend: {legend:?}");
+        assert!(legend.contains("@ file names"), "legend: {legend:?}");
+        assert!(legend.contains("Tab: switch"), "legend: {legend:?}");
+        assert!(row_text(&buf, 0).starts_with(" > "));
+
+        // The active mode's label is the highlighted one.
+        let reversed = |x: u16| {
+            buf[(x, SearchPanelState::MODE_ROW as u16)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        assert!(reversed(1));
+        assert!(!reversed(13));
+
+        panel.toggle_mode();
+        let mut buf = Buffer::empty(area);
+        panel.render(area, &mut buf, true);
+        assert!(row_text(&buf, 0).starts_with(" @ "));
+        let reversed = |x: u16| {
+            buf[(x, SearchPanelState::MODE_ROW as u16)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        assert!(!reversed(1));
+        assert!(reversed(13));
+    }
+
+    #[test]
+    fn mode_at_column_follows_the_legend() {
+        assert_eq!(SearchPanelState::mode_at_column(0), Some(SearchMode::Content));
+        assert_eq!(SearchPanelState::mode_at_column(11), Some(SearchMode::Content));
+        assert_eq!(SearchPanelState::mode_at_column(12), Some(SearchMode::FileName));
+        assert_eq!(SearchPanelState::mode_at_column(25), Some(SearchMode::FileName));
+        assert_eq!(SearchPanelState::mode_at_column(26), None);
     }
 
     #[test]
