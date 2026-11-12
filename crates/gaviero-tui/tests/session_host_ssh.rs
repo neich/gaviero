@@ -167,6 +167,26 @@ fn an_ssh_tab_runs_the_remote_command() {
 }
 
 #[test]
+fn shift_enter_reaches_an_ssh_tab_as_alt_enter() {
+    let fx = Fixture::new();
+    let mut pty = fx.host();
+
+    open_ssh(&mut pty, "testhost:/srv/proj");
+    pty.wait_for("the SSH tab", |_, _| pty.row(0).contains("testhost:proj"));
+    fx.ssh_args();
+
+    // `ssh.exe` reads VT, where conhost writes Shift+Enter as a bare CR; the
+    // host sends Alt+Enter instead, which crosses as `ESC CR`.
+    pty.send(&tap(0x0D, 0x1C, 13, SHIFT));
+    pty.wait_text("KEY Enter KeyModifiers(ALT) Press");
+    let screen = pty.contents();
+    assert!(!screen.contains("SHIFT"), "screen:\n{screen}");
+
+    pty.send(&ctrl_q());
+    assert_eq!(pty.wait_exit(Duration::from_secs(15)), Some(0));
+}
+
+#[test]
 fn a_picked_remote_folder_is_adopted_and_saved() {
     let fx = Fixture::new();
     let mut pty = fx.host();
