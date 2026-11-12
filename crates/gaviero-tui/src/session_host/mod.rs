@@ -4,6 +4,7 @@
 pub(crate) mod clipboard;
 pub(crate) mod encode;
 pub(crate) mod input_term;
+pub(crate) mod keys;
 pub(crate) mod picker;
 #[cfg(windows)]
 pub(crate) mod input_windows;
@@ -17,7 +18,7 @@ pub(crate) mod target;
 
 use anyhow::Context;
 use crossterm::event::{
-    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    EnableMouseCapture, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
     MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
@@ -124,7 +125,7 @@ pub(crate) fn claim_instance() -> Result<Option<state::InstanceLock>, ()> {
     }
 }
 
-/// A key the host keeps for itself instead of forwarding.
+/// A key the host keeps for itself instead of forwarding ([`keys::chord`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Chord {
     /// Alt+Left: previous session.
@@ -144,58 +145,6 @@ pub(crate) enum Chord {
     QuitAll,
 }
 
-const VK_Q: u16 = 0x51;
-
-/// The host chord a Windows key record is, if any. Key-down only. Ctrl+Q
-/// is Ctrl without Alt and the rest Alt without Ctrl, so AltGr
-/// (`RIGHT_ALT | LEFT_CTRL`) chords stay text. Alt+X is never a chord:
-/// Windows keeps it for itself.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn host_chord(r: &encode::KeyRecord) -> Option<Chord> {
-    if !r.key_down {
-        return None;
-    }
-    if encode::ctrl_only(r.ctrl_state) {
-        return (r.vk == VK_Q).then_some(Chord::QuitAll);
-    }
-    if !encode::alt_only(r.ctrl_state) {
-        return None;
-    }
-    let shift = r.ctrl_state & encode::SHIFT != 0;
-    match r.vk {
-        0x25 if shift => Some(Chord::MoveLeft),
-        0x27 if shift => Some(Chord::MoveRight),
-        0x25 => Some(Chord::Prev),
-        0x27 => Some(Chord::Next),
-        0x4E if !shift => Some(Chord::New),
-        VK_Q => Some(Chord::Close),
-        _ => None,
-    }
-}
-
-/// The host chord a crossterm key event is, if any (Unix input path).
-fn term_chord(k: &KeyEvent) -> Option<Chord> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = k.modifiers.contains(KeyModifiers::ALT);
-    let q = matches!(k.code, KeyCode::Char('q') | KeyCode::Char('Q'));
-    if ctrl && !alt {
-        return q.then_some(Chord::QuitAll);
-    }
-    if !alt || ctrl {
-        return None;
-    }
-    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
-    match k.code {
-        KeyCode::Left if shift => Some(Chord::MoveLeft),
-        KeyCode::Right if shift => Some(Chord::MoveRight),
-        KeyCode::Left => Some(Chord::Prev),
-        KeyCode::Right => Some(Chord::Next),
-        KeyCode::Char('n') if !shift => Some(Chord::New),
-        _ if q => Some(Chord::Close),
-        _ => None,
-    }
-}
-
 /// A question the host asks before it ends work in progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Confirm {
@@ -204,10 +153,6 @@ pub(crate) enum Confirm {
     /// Quit the host (Ctrl+Q).
     Quit,
 }
-
-const VK_Y: u16 = 0x59;
-#[cfg_attr(not(windows), allow(dead_code))]
-const VK_V: u16 = 0x56;
 
 /// Renders are coalesced to at most one per this interval.
 const RENDER_EVERY: Duration = Duration::from_millis(16);
@@ -228,7 +173,7 @@ pub(crate) struct Host {
     next_id: u64,
     #[cfg_attr(not(windows), allow(dead_code))]
     mouse: MouseTranslator,
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Keys whose key-down the host took: their key-up is not forwarded.
     swallow_keyups: Vec<u16>,
     /// Key records → child input (text as UTF-8, the rest win32-input-mode).
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -1005,61 +950,49 @@ impl Host {
         }
     }
 
-    #[cfg(windows)]
-    fn swallow_keyup(&mut self, vk: u16) {
-        if !self.swallow_keyups.contains(&vk) {
-            self.swallow_keyups.push(vk);
+    /// What the host state looks like to [`keys::route`].
+    fn key_view(&self, key: &keys::HostKey) -> keys::HostView {
+        keys::HostView {
+            confirm_open: self.confirm.is_some(),
+            picker_open: self.picker.is_some(),
+            active_disconnected: self.active_disconnected(),
+            active_ssh: self.active_session().is_some_and(|s| s.target.is_ssh()),
+            keyup_swallowed: !key.down && key.vk != 0 && self.swallow_keyups.contains(&key.vk),
         }
     }
 
+    /// The one key decision, for both input paths: run what [`keys::route`]
+    /// decides. True when the key goes on to the active session, which the
+    /// caller then encodes for its child.
+    fn take_key(&mut self, key: &keys::HostKey) -> bool {
+        use keys::HostRoute;
+        let route = keys::route(&self.key_view(key), key);
+        if route.takes_key() && key.down && key.vk != 0 && !self.swallow_keyups.contains(&key.vk) {
+            self.swallow_keyups.push(key.vk);
+        }
+        match route {
+            HostRoute::Forward => return true,
+            HostRoute::Drop => {}
+            HostRoute::SwallowKeyUp => self.swallow_keyups.retain(|vk| *vk != key.vk),
+            HostRoute::Confirm(yes) => self.answer_confirm(yes),
+            HostRoute::Picker(k) => self.picker_key(k),
+            HostRoute::Chord(chord) => self.run_chord(chord),
+            HostRoute::Reconnect => self.reconnect(self.active),
+            HostRoute::PasteLocalClipboard => self.paste_local_clipboard(),
+        }
+        false
+    }
+
+    /// Windows input path: a console key record. Decided by [`take_key`];
+    /// forwarded as the record itself (win32-input-mode), except that an SSH
+    /// tab's child reads VT (`encode::ssh_key_record`).
     #[cfg(windows)]
     fn on_key(&mut self, r: encode::KeyRecord) {
-        if !r.key_down {
-            if let Some(pos) = self.swallow_keyups.iter().position(|vk| *vk == r.vk) {
-                self.swallow_keyups.remove(pos);
-                return;
-            }
-            // Key-ups never leak out of a question or the picker.
-            if self.modal_open() {
-                return;
-            }
-        } else if self.confirm.is_some() {
-            if !encode::is_modifier_vk(r.vk) {
-                self.swallow_keyup(r.vk);
-                let plain = r.ctrl_state & 0x0F == 0;
-                self.answer_confirm(r.vk == VK_Y && plain);
-            }
-            return;
-        } else if self.picker.is_some() {
-            if let Some(key) = picker::key_from_record(&r) {
-                self.swallow_keyup(r.vk);
-                self.picker_key(key);
-            }
-            return;
-        } else if let Some(chord) = host_chord(&r) {
-            self.swallow_keyup(r.vk);
-            self.run_chord(chord);
+        if !self.take_key(&keys::HostKey::from_record(&r)) {
             return;
         }
-        if self.active_disconnected() {
-            // Nothing to type into: Enter reconnects, the rest is dropped.
-            if r.key_down && r.vk == 0x0D && r.ctrl_state & 0x1F == 0 {
-                self.swallow_keyup(0x0D);
-                self.reconnect(self.active);
-            }
-            return;
-        }
-        if r.key_down
-            && r.vk == VK_V
-            && encode::ctrl_only(r.ctrl_state)
-            && r.ctrl_state & encode::SHIFT == 0
-            && self.active_session().is_some_and(|s| s.target.is_ssh())
-        {
-            self.swallow_keyup(VK_V);
-            self.paste_local_clipboard();
-            return;
-        }
-        let bytes = self.keys.encode(&r);
+        let ssh = self.active_session().is_some_and(|s| s.target.is_ssh());
+        let bytes = self.keys.encode(&if ssh { encode::ssh_key_record(&r) } else { r });
         if !bytes.is_empty() {
             self.send_active(bytes);
         }
@@ -1120,10 +1053,20 @@ impl Host {
     /// Unix input path: crossterm events, re-encoded as VT bytes.
     fn on_term(&mut self, event: Event) {
         match event {
+            // Unix reports no key-ups (no keyboard enhancement is asked for);
+            // drop any anyway, the child reads VT.
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_term_key(k),
             Event::Mouse(m) => self.on_term_mouse(m),
             Event::Paste(text) => {
-                if let Some(s) = self.active_session().filter(|s| !s.disconnected) {
+                let view = keys::HostView {
+                    confirm_open: self.confirm.is_some(),
+                    picker_open: self.picker.is_some(),
+                    active_disconnected: self.active_disconnected(),
+                    ..keys::HostView::default()
+                };
+                if keys::paste_goes_to_session(&view)
+                    && let Some(s) = self.active_session()
+                {
                     let bracketed = s.parser.screen().bracketed_paste();
                     s.send(crate::panels::terminal::paste_bytes(bracketed, &text));
                 }
@@ -1132,41 +1075,24 @@ impl Host {
         }
     }
 
+    /// Unix input path: a crossterm key event. Decided by [`take_key`];
+    /// forwarded as VT bytes, with Shift+Enter / Alt+Enter kept apart from
+    /// Enter ([`keys::vt_override`]).
     fn on_term_key(&mut self, k: KeyEvent) {
-        if self.confirm.is_some() {
-            let yes = k.code == KeyCode::Char('y')
-                && !k
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            self.answer_confirm(yes);
-            return;
-        }
-        if self.picker.is_some() {
-            if let Some(key) = picker::key_from_event(&k) {
-                self.picker_key(key);
-            }
-            return;
-        }
-        if let Some(chord) = term_chord(&k) {
-            self.run_chord(chord);
-            return;
-        }
-        if self.active_disconnected() {
-            if k.code == KeyCode::Enter && k.modifiers.is_empty() {
-                self.reconnect(self.active);
-            }
-            return;
-        }
-        if matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'))
-            && k.modifiers == KeyModifiers::CONTROL
-            && self.active_session().is_some_and(|s| s.target.is_ssh())
-        {
-            self.paste_local_clipboard();
+        if !self.take_key(&keys::HostKey::from_event(&k)) {
             return;
         }
         if let Some(s) = self.active_session() {
-            let app_cursor = s.parser.screen().application_cursor();
-            s.send(crate::panels::terminal::key_event_to_bytes(&k, app_cursor));
+            let bytes = match keys::vt_override(&k) {
+                Some(bytes) => bytes.to_vec(),
+                None => {
+                    let app_cursor = s.parser.screen().application_cursor();
+                    crate::panels::terminal::key_event_to_bytes(&k, app_cursor)
+                }
+            };
+            if !bytes.is_empty() {
+                s.send(bytes);
+            }
         }
     }
 
@@ -1600,61 +1526,6 @@ mod tests {
         ));
     }
 
-    fn down(vk: u16, uchar: u16, ctrl_state: u32) -> encode::KeyRecord {
-        encode::KeyRecord {
-            vk,
-            scan: 0,
-            uchar,
-            key_down: true,
-            ctrl_state,
-            repeat: 1,
-        }
-    }
-
-    #[test]
-    fn host_chords_are_alt_keys_and_ctrl_q() {
-        use encode::{LEFT_ALT, LEFT_CTRL, RIGHT_ALT, RIGHT_CTRL, SHIFT};
-        assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT)), Some(Chord::Prev));
-        assert_eq!(host_chord(&down(0x27, 0, RIGHT_ALT)), Some(Chord::Next));
-        assert_eq!(host_chord(&down(0x4E, 'n' as u16, LEFT_ALT)), Some(Chord::New));
-        assert_eq!(host_chord(&down(0x51, 'q' as u16, LEFT_ALT)), Some(Chord::Close));
-        assert_eq!(
-            host_chord(&down(0x51, 'Q' as u16, LEFT_ALT | SHIFT)),
-            Some(Chord::Close)
-        );
-        assert_eq!(host_chord(&down(0x51, 17, LEFT_CTRL)), Some(Chord::QuitAll));
-        assert_eq!(host_chord(&down(0x51, 17, RIGHT_CTRL)), Some(Chord::QuitAll));
-        // Alt+X belongs to Windows; other Ctrl keys belong to the session.
-        assert_eq!(host_chord(&down(0x58, 'x' as u16, LEFT_ALT)), None);
-        assert_eq!(host_chord(&down(0x53, 19, LEFT_CTRL)), None);
-        // Key-up records never trigger a chord.
-        let mut up = down(0x25, 0, LEFT_ALT);
-        up.key_down = false;
-        assert_eq!(host_chord(&up), None);
-        let mut up = down(0x51, 17, LEFT_CTRL);
-        up.key_down = false;
-        assert_eq!(host_chord(&up), None);
-    }
-
-    #[test]
-    fn alt_shift_arrows_move_the_tab() {
-        use encode::{LEFT_ALT, LEFT_CTRL, RIGHT_ALT, SHIFT};
-        assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT | SHIFT)), Some(Chord::MoveLeft));
-        assert_eq!(host_chord(&down(0x27, 0, RIGHT_ALT | SHIFT)), Some(Chord::MoveRight));
-        // Shift alone or with Ctrl+Alt is the session's.
-        assert_eq!(host_chord(&down(0x25, 0, SHIFT)), None);
-        assert_eq!(host_chord(&down(0x25, 0, LEFT_ALT | LEFT_CTRL | SHIFT)), None);
-        let shift_alt = KeyModifiers::ALT | KeyModifiers::SHIFT;
-        assert_eq!(
-            term_chord(&KeyEvent::new(KeyCode::Left, shift_alt)),
-            Some(Chord::MoveLeft)
-        );
-        assert_eq!(
-            term_chord(&KeyEvent::new(KeyCode::Right, shift_alt)),
-            Some(Chord::MoveRight)
-        );
-    }
-
     #[test]
     fn a_moved_tab_stops_at_either_end() {
         assert_eq!(moved_index(1, -1, 3), Some(0));
@@ -1665,40 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn altgr_and_plain_keys_are_not_chords() {
-        use encode::{LEFT_CTRL, RIGHT_ALT};
-        assert_eq!(host_chord(&down(0x4E, 'n' as u16, RIGHT_ALT | LEFT_CTRL)), None);
-        // AltGr+Q is '@' on German layouts: text, not quit.
-        assert_eq!(host_chord(&down(0x51, '@' as u16, RIGHT_ALT | LEFT_CTRL)), None);
-        assert_eq!(host_chord(&down(0x4E, 'n' as u16, 0)), None);
-        assert_eq!(host_chord(&down(0x51, 'q' as u16, 0)), None);
-        assert_eq!(host_chord(&down(0x25, 0, 0)), None);
-    }
-
-    #[test]
-    fn crossterm_chords_and_mouse_reports() {
-        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
-        assert_eq!(term_chord(&alt(KeyCode::Left)), Some(Chord::Prev));
-        assert_eq!(term_chord(&alt(KeyCode::Right)), Some(Chord::Next));
-        assert_eq!(term_chord(&alt(KeyCode::Char('n'))), Some(Chord::New));
-        assert_eq!(term_chord(&alt(KeyCode::Char('Q'))), Some(Chord::Close));
-        assert_eq!(term_chord(&alt(KeyCode::Char('q'))), Some(Chord::Close));
-        assert_eq!(term_chord(&alt(KeyCode::Char('x'))), None);
-        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
-        assert_eq!(term_chord(&ctrl(KeyCode::Char('q'))), Some(Chord::QuitAll));
-        assert_eq!(term_chord(&ctrl(KeyCode::Char('s'))), None);
-        assert_eq!(
-            term_chord(&KeyEvent::new(
-                KeyCode::Char('q'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            )),
-            None
-        );
-        assert_eq!(
-            term_chord(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-            None
-        );
-
+    fn crossterm_mouse_reports() {
         let mouse = |kind, row| MouseEvent {
             kind,
             column: 9,

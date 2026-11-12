@@ -516,6 +516,7 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         cached_diff_index: usize::MAX,
         cached_highlights: None,
         filter_source: None,
+        confirm_discard: false,
     });
     app.left_panel = LeftPanelMode::Review;
     app.panel_visible.file_tree = true;
@@ -743,11 +744,30 @@ fn sort_review_proposals(
 }
 
 pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool {
-    if app.batch_review.is_none() {
+    let Some(br) = app.batch_review.as_mut() else {
         return false;
+    };
+    // The discard question owns the next key: `y` discards, anything else
+    // keeps reviewing.
+    if br.confirm_discard {
+        br.confirm_discard = false;
+        if matches!(action, Action::InsertChar('y' | 'Y')) {
+            app.cancel_batch_review();
+        }
+        return true;
     }
 
     match action {
+        // Esc asks before throwing away every proposal; Ctrl+Q is quit, and
+        // the quit question offers apply / discard for the review.
+        Action::Escape => {
+            br.confirm_discard = true;
+            true
+        }
+        Action::Quit => {
+            app.try_quit();
+            true
+        }
         Action::CycleTabForward | Action::CycleTabBack => {
             let forward = matches!(action, Action::CycleTabForward);
             let br = app.batch_review.as_mut().unwrap();
@@ -757,10 +777,6 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
         }
         Action::InsertChar('f') => {
             app.finalize_batch_review();
-            true
-        }
-        Action::Quit => {
-            app.cancel_batch_review();
             true
         }
         Action::CursorDown | Action::InsertChar('j') => {
@@ -1697,7 +1713,7 @@ pub(super) fn handle_changes_action(app: &mut App, action: &Action) -> bool {
             }
             true
         }
-        Action::Quit => {
+        Action::Quit | Action::Escape => {
             app.left_panel = LeftPanelMode::FileTree;
             app.changes_state = None;
             true

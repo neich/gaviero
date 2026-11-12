@@ -389,7 +389,7 @@ fn path_is_excluded(path: &Path, roots: &[PathBuf], exclude_patterns: &[String])
 fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     use crossterm::event::{self, Event, KeyEventKind};
 
-    let Ok(first) = event::read() else {
+    let Ok(first) = read_event() else {
         return Vec::new();
     };
     if !cfg!(windows) {
@@ -439,7 +439,7 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     let mut keys = vec![first];
     let mut trailing: Option<Event> = None;
     while event::poll(burst_gap(&text)).unwrap_or(false) {
-        let Ok(next) = event::read() else {
+        let Ok(next) = read_event() else {
             break;
         };
         if let Some(ch) = paste_char(&next) {
@@ -851,7 +851,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
     // tens of ms mid-paste under load; giving up early splits one gesture
     // into multiple Event::Paste chunks (see paste_text cursor note).
     let mut saw_start = false;
-    while let Ok(next) = event::read() {
+    while let Ok(next) = read_event() {
         if let Some(ch) = paste_or_escape_char(&next) {
             text.push(ch);
             keys.push(next);
@@ -860,7 +860,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
             }
             if saw_start && text.contains(BP_END) {
                 while event::poll(Duration::ZERO).unwrap_or(false) {
-                    let Ok(extra) = event::read() else {
+                    let Ok(extra) = read_event() else {
                         break;
                     };
                     if matches!(&extra, Event::Key(k) if k.kind == KeyEventKind::Release) {
@@ -943,6 +943,13 @@ fn strip_bracketed_paste(raw: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// The only way the TUI reads input: one crossterm event, normalized for the
+/// terminal gaviero runs in (`platform::normalize_event`) before the paste
+/// coalescer or any decision sees it.
+fn read_event() -> std::io::Result<crossterm::event::Event> {
+    crossterm::event::read().map(crate::platform::normalize_event)
+}
+
 fn is_escape_press(event: &crossterm::event::Event) -> bool {
     use crossterm::event::{Event, KeyCode, KeyEventKind};
     matches!(
@@ -968,11 +975,12 @@ fn paste_or_escape_char(event: &crossterm::event::Event) -> Option<char> {
 /// releases, real Ctrl/Alt/Super chords, and navigation keys map to `None`.
 /// Shift is allowed so pasted capitals survive.
 ///
-/// **AltGr (Windows):** reported as `CONTROL|ALT`. ConPTY paste injection of
-/// characters that are AltGr-produced on the active layout (notably `~` on
-/// many European layouts) arrives with those modifiers. Rejecting them ended
-/// the raw-paste coalescer at the first `~` (e.g. `topology: ~600` →
-/// `topology: `), after which `WINDOWS_PASTE_SETTLE_MS` dropped the rest.
+/// **AltGr (Windows):** ConPTY injects characters the active layout types
+/// with AltGr (notably `~` on many European layouts) as `CONTROL|ALT`
+/// records. Rejecting them ended the raw-paste coalescer at the first `~`
+/// (e.g. `topology: ~600` → `topology: `), after which
+/// `WINDOWS_PASTE_SETTLE_MS` dropped the rest. Events reach here normalized
+/// ([`read_event`] → `platform::normalize_key`), so those are plain text.
 fn paste_char(event: &crossterm::event::Event) -> Option<char> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -991,19 +999,8 @@ fn paste_char(event: &crossterm::event::Event) -> Option<char> {
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    // AltGr == Ctrl+Alt on Windows. Printable non-lowercase chars with that
-    // chord are paste text (same rule psmux uses); lowercase C-M-x is a real
-    // chord and must not be swallowed into a paste burst.
-    let altgr = ctrl && alt;
 
     match key.code {
-        KeyCode::Char(c) if altgr => {
-            if c.is_ascii_lowercase() {
-                None
-            } else {
-                Some(c)
-            }
-        }
         KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab if ctrl || alt => None,
         KeyCode::Char(c) => Some(c),
         KeyCode::Enter => Some('\n'),
@@ -1361,13 +1358,18 @@ mod tests {
         assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::ALT)), None);
         assert_eq!(paste_char(&press(KeyCode::Left, KeyModifiers::NONE)), None);
         // AltGr (Ctrl+Alt) printable chars — including `~` on many layouts —
-        // MUST be paste text; rejecting them truncated pastes at the first tilde.
+        // MUST be paste text; rejecting them truncated pastes at the first
+        // tilde. The reader normalizes them before the coalescer sees them.
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        assert_eq!(paste_char(&press(KeyCode::Char('~'), altgr)), Some('~'));
-        assert_eq!(paste_char(&press(KeyCode::Char('@'), altgr)), Some('@'));
-        assert_eq!(paste_char(&press(KeyCode::Char('\\'), altgr)), Some('\\'));
+        let normalized = |code| match press(code, altgr) {
+            Event::Key(k) => Event::Key(crate::platform::altgr_as_text(k)),
+            other => other,
+        };
+        assert_eq!(paste_char(&normalized(KeyCode::Char('~'))), Some('~'));
+        assert_eq!(paste_char(&normalized(KeyCode::Char('@'))), Some('@'));
+        assert_eq!(paste_char(&normalized(KeyCode::Char('\\'))), Some('\\'));
         // Real Ctrl+Alt+letter chords stay rejected.
-        assert_eq!(paste_char(&press(KeyCode::Char('c'), altgr)), None);
+        assert_eq!(paste_char(&normalized(KeyCode::Char('c'))), None);
         // Release halves of pasted keys must not contribute a character.
         assert_eq!(
             paste_char(&key(

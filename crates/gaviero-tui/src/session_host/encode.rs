@@ -103,6 +103,29 @@ fn text_unit(r: &KeyRecord) -> Option<u16> {
     (bare && (u == b'\r' as u16 || u == b'\t' as u16)).then_some(u)
 }
 
+/// The record an SSH tab gets for Shift+Enter: Alt+Enter. Every other
+/// record is returned unchanged.
+///
+/// `ssh.exe` reads its console as VT, and conhost writes Shift+Enter there
+/// as a bare `\r` — the Shift is gone before `ssh` sees it, so the remote
+/// gaviero got plain Enter and the agent chat sent the prompt instead of
+/// breaking the line. Alt+Enter survives as `ESC \r` (also through
+/// `ssh.exe`'s non-VT fallback, which prefixes Alt keys with ESC), and
+/// gaviero binds it to the same newline as Shift+Enter (`Action::AltEnter`);
+/// it is also what terminals are set up to send for Shift+Enter for other
+/// TUIs. An unknown CSI such as kitty's `ESC[13;2u` would pass through a VT
+/// reader as text, but conhost drops it for a non-VT one.
+pub fn ssh_key_record(r: &KeyRecord) -> KeyRecord {
+    let shift_only = r.ctrl_state & (ANY_ALT | ANY_CTRL | SHIFT) == SHIFT;
+    if r.vk != 0x0D || !shift_only {
+        return *r;
+    }
+    KeyRecord {
+        ctrl_state: (r.ctrl_state & !SHIFT) | LEFT_ALT,
+        ..*r
+    }
+}
+
 /// Virtual-key codes of modifier keys (Shift, Ctrl, Alt, Caps Lock, Win).
 pub fn is_modifier_vk(vk: u16) -> bool {
     matches!(vk, 0x10..=0x12 | 0x14 | 0x5B | 0x5C | 0xA0..=0xA5)
@@ -115,19 +138,11 @@ pub const RIGHT_CTRL: u32 = 4;
 pub const LEFT_CTRL: u32 = 8;
 pub const SHIFT: u32 = 16;
 
-const ANY_ALT: u32 = RIGHT_ALT | LEFT_ALT;
-const ANY_CTRL: u32 = RIGHT_CTRL | LEFT_CTRL;
-
-/// Some Alt key is held and no Ctrl key. AltGr reports as
-/// `RIGHT_ALT | LEFT_CTRL`, so it never counts as Alt here.
-pub fn alt_only(ctrl_state: u32) -> bool {
-    ctrl_state & ANY_ALT != 0 && ctrl_state & ANY_CTRL == 0
-}
-
-/// Some Ctrl key is held and no Alt key, so AltGr never counts here either.
-pub fn ctrl_only(ctrl_state: u32) -> bool {
-    ctrl_state & ANY_CTRL != 0 && ctrl_state & ANY_ALT == 0
-}
+/// Either Alt key / either Ctrl key. AltGr reports as `RIGHT_ALT |
+/// LEFT_CTRL`; which keys count as chords is decided once, in
+/// `session_host::keys`.
+pub const ANY_ALT: u32 = RIGHT_ALT | LEFT_ALT;
+pub const ANY_CTRL: u32 = RIGHT_CTRL | LEFT_CTRL;
 
 /// One Windows `MOUSE_EVENT_RECORD` (0-based col/row, raw fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +348,26 @@ mod tests {
     }
 
     #[test]
+    fn ssh_shift_enter_becomes_alt_enter_and_nothing_else_changes() {
+        for down in [true, false] {
+            let shift = key(0x0D, '\r' as u16, down, SHIFT);
+            assert_eq!(ssh_key_record(&shift), key(0x0D, '\r' as u16, down, LEFT_ALT));
+        }
+        // Lock-key bits (NumLock = 0x20) are kept.
+        let numlock = key(0x0D, '\r' as u16, true, SHIFT | 0x20);
+        assert_eq!(ssh_key_record(&numlock).ctrl_state, LEFT_ALT | 0x20);
+        for r in [
+            key(0x0D, '\r' as u16, true, 0),                  // Enter
+            key(0x0D, '\r' as u16, true, LEFT_ALT),           // Alt+Enter
+            key(0x0D, '\r' as u16, true, SHIFT | LEFT_CTRL),  // Ctrl+Shift+Enter
+            key(0x0D, '\r' as u16, true, SHIFT | RIGHT_ALT),  // Alt+Shift+Enter
+            key(0x09, '\t' as u16, true, SHIFT),              // Shift+Tab
+        ] {
+            assert_eq!(ssh_key_record(&r), r);
+        }
+    }
+
+    #[test]
     fn surrogate_pairs_join_into_one_character() {
         let mut records = Vec::new();
         records.extend(tap(0, 0xD83D, 0));
@@ -353,16 +388,6 @@ mod tests {
     fn ctrl_alt_left_encodes_both_modifier_bits() {
         let r = key(0x25, 0, true, LEFT_CTRL | LEFT_ALT);
         assert_eq!(win32_key_seq(&r), "\x1b[37;0;0;1;10;1_");
-    }
-
-    #[test]
-    fn alt_only_excludes_altgr() {
-        assert!(alt_only(LEFT_ALT));
-        assert!(alt_only(RIGHT_ALT | SHIFT));
-        assert!(!alt_only(RIGHT_ALT | LEFT_CTRL));
-        assert!(!alt_only(LEFT_ALT | RIGHT_CTRL));
-        assert!(!alt_only(0));
-        assert!(!alt_only(SHIFT));
     }
 
     #[test]

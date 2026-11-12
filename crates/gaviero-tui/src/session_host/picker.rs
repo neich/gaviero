@@ -19,7 +19,6 @@ use crate::widgets::prompt_input::{
     AutocompleteMode, FileAutocomplete, POPUP_ROWS, render_autocomplete,
 };
 use crate::widgets::text_input::TextInput;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -60,63 +59,6 @@ pub(crate) enum PickerOutcome {
     Stay,
     Close,
     Open(Target),
-}
-
-/// The picker key a Windows key-down record is, if any.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn key_from_record(r: &super::encode::KeyRecord) -> Option<PickerKey> {
-    if !r.key_down {
-        return None;
-    }
-    if r.vk == 0x54
-        && super::encode::ctrl_only(r.ctrl_state)
-        && r.ctrl_state & super::encode::SHIFT == 0
-    {
-        return Some(PickerKey::ToggleMode);
-    }
-    Some(match r.vk {
-        0x0D => PickerKey::Enter,
-        0x1B => PickerKey::Esc,
-        0x08 => PickerKey::Backspace,
-        0x09 => PickerKey::Tab,
-        0x25 => PickerKey::Left,
-        0x26 => PickerKey::Up,
-        0x27 => PickerKey::Right,
-        0x28 => PickerKey::Down,
-        0x21 => PickerKey::PageUp,
-        0x22 => PickerKey::PageDown,
-        _ => {
-            let c = char::from_u32(u32::from(r.uchar))?;
-            if c.is_control() {
-                return None;
-            }
-            PickerKey::Char(c)
-        }
-    })
-}
-
-/// The picker key a crossterm key event is, if any (Unix input path).
-pub(crate) fn key_from_event(k: &KeyEvent) -> Option<PickerKey> {
-    Some(match k.code {
-        KeyCode::Enter => PickerKey::Enter,
-        KeyCode::Esc => PickerKey::Esc,
-        KeyCode::Backspace => PickerKey::Backspace,
-        KeyCode::Tab => PickerKey::Tab,
-        KeyCode::Up => PickerKey::Up,
-        KeyCode::Down => PickerKey::Down,
-        KeyCode::Left => PickerKey::Left,
-        KeyCode::Right => PickerKey::Right,
-        KeyCode::PageUp => PickerKey::PageUp,
-        KeyCode::PageDown => PickerKey::PageDown,
-        KeyCode::Char('t' | 'T')
-            if k.modifiers.contains(KeyModifiers::CONTROL)
-                && !k.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            PickerKey::ToggleMode
-        }
-        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => PickerKey::Char(c),
-        _ => return None,
-    })
 }
 
 pub(crate) struct Picker {
@@ -511,7 +453,7 @@ pub(crate) fn ssh_config_hosts(path: &Path) -> Vec<String> {
 /// The terminal is restored either way.
 pub(crate) fn run_standalone(start: &Path) -> anyhow::Result<Option<PathBuf>> {
     use anyhow::Context;
-    use crossterm::event::{Event, KeyEventKind};
+    use crossterm::event::Event;
 
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let _guard = crate::TerminalGuard;
@@ -528,10 +470,9 @@ pub(crate) fn run_standalone(start: &Path) -> anyhow::Result<Option<PathBuf>> {
         let Event::Key(k) = event else {
             continue;
         };
-        if k.kind == KeyEventKind::Release {
-            continue;
-        }
-        let Some(key) = key_from_event(&k) else {
+        // The same key map as the host's picker (`keys::picker_key`, which
+        // also skips key-ups).
+        let Some(key) = super::keys::picker_key(&super::keys::HostKey::from_event(&k)) else {
             continue;
         };
         match picker.on_key(key, start) {
@@ -660,10 +601,12 @@ mod tests {
     #[test]
     fn ctrl_t_records_map_to_the_mode_switch() {
         use super::super::encode::{KeyRecord, LEFT_CTRL};
+        use super::super::keys::{HostKey, picker_key};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let rec = KeyRecord { vk: 0x54, scan: 0x14, uchar: 0x14, key_down: true, ctrl_state: LEFT_CTRL, repeat: 1 };
-        assert_eq!(key_from_record(&rec), Some(PickerKey::ToggleMode));
+        assert_eq!(picker_key(&HostKey::from_record(&rec)), Some(PickerKey::ToggleMode));
         let ev = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(key_from_event(&ev), Some(PickerKey::ToggleMode));
+        assert_eq!(picker_key(&HostKey::from_event(&ev)), Some(PickerKey::ToggleMode));
     }
 
     #[test]
@@ -845,11 +788,15 @@ mod tests {
             ctrl_state: 0,
             repeat: 1,
         };
-        assert_eq!(key_from_record(&rec(0x0D, 13, true)), Some(PickerKey::Enter));
-        assert_eq!(key_from_record(&rec(0x25, 0, true)), Some(PickerKey::Left));
-        assert_eq!(key_from_record(&rec(0x27, 0, true)), Some(PickerKey::Right));
-        assert_eq!(key_from_record(&rec(0x41, 'a' as u16, true)), Some(PickerKey::Char('a')));
-        assert_eq!(key_from_record(&rec(0x41, 'a' as u16, false)), None);
-        assert_eq!(key_from_record(&rec(0x51, 17, true)), None, "Ctrl+Q is not text");
+        use super::super::keys::{HostKey, picker_key};
+        let key = |r| picker_key(&HostKey::from_record(&r));
+        assert_eq!(key(rec(0x0D, 13, true)), Some(PickerKey::Enter));
+        assert_eq!(key(rec(0x25, 0, true)), Some(PickerKey::Left));
+        assert_eq!(key(rec(0x27, 0, true)), Some(PickerKey::Right));
+        assert_eq!(key(rec(0x41, 'a' as u16, true)), Some(PickerKey::Char('a')));
+        assert_eq!(key(rec(0x41, 'a' as u16, false)), None);
+        let mut ctrl_q = rec(0x51, 17, true);
+        ctrl_q.ctrl_state = super::super::encode::LEFT_CTRL;
+        assert_eq!(key(ctrl_q), None, "Ctrl+Q is not text");
     }
 }

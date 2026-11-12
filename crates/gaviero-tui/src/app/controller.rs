@@ -51,186 +51,68 @@ fn reranker_fallback_notice(model: &str, error: Option<&str>) -> Option<String> 
 
 pub(super) fn handle_event(app: &mut App, event: Event) {
     match event {
+        // The one key decision is `key_route::route_key`; this only carries
+        // out the route it picks.
         Event::Key(key) => {
-            // Ahead of terminal routing: a restored session may start with
-            // the terminal focused, and the modal must still get the key.
-            if app.settings_error_dialog.is_some() {
-                super::session::handle_settings_error_key(app, &key);
-                return;
-            }
-            // The save already wrote the file; this modal only reports what
-            // the grammar rejected, so any key dismisses it.
-            if app.syntax_error_dialog.is_some() {
-                super::session::handle_syntax_error_key(app, &key);
-                return;
-            }
-            // "New version installed, restart manually" — informational.
-            if app.restart.popup_open {
-                super::restart::handle_popup_key(app);
-                return;
-            }
-            if app.focus == Focus::Terminal
-                && !app.has_active_review()
-                && let Some(inst) = app.terminal_manager.active_instance()
-                && inst.spawned
-            {
-                use crate::panels::terminal::{is_terminal_escape_key, key_event_to_bytes};
-
-                // Intercept Ctrl+C when a terminal selection is active: copy instead of sending ^C.
-                let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
-                    && key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL);
-                if is_ctrl_c && app.terminal_selection.has_selection() {
-                    let text = if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                        app.terminal_selection.extract_text(inst.screen_mut())
-                    } else {
-                        None
-                    };
+            use super::key_route::{KeyContext, KeyRoute, Modal, PanelEscape, route_key};
+            match route_key(&KeyContext::of(app), &key) {
+                KeyRoute::Modal(Modal::SettingsError) => super::session::handle_settings_error_key(app, &key),
+                // The save already wrote the file; this modal only reports
+                // what the grammar rejected, so any key dismisses it.
+                KeyRoute::Modal(Modal::SyntaxError) => super::session::handle_syntax_error_key(app, &key),
+                // "New version installed, restart manually" — informational.
+                KeyRoute::Modal(Modal::RestartPopup) => super::restart::handle_popup_key(app),
+                KeyRoute::Modal(Modal::CodexTrust) => super::session::handle_codex_trust_key(app, &key),
+                KeyRoute::Modal(Modal::QuitConfirm) => handle_quit_confirm_key(app, &key),
+                KeyRoute::Modal(Modal::BulkConfirm) => handle_bulk_confirm_key(app, &key),
+                KeyRoute::Modal(Modal::TreeDialog) => app.handle_dialog_key(&key),
+                KeyRoute::Modal(Modal::DefinitionPicker) => {
+                    super::nav::handle_picker_key(app, &key);
+                }
+                KeyRoute::TerminalCopy => {
+                    let text = app
+                        .terminal_manager
+                        .active_instance_mut()
+                        .and_then(|inst| app.terminal_selection.extract_text(inst.screen_mut()));
                     if let Some(text) = text {
                         app.set_clipboard(&text);
                     }
                     app.terminal_selection.clear();
-                    return;
                 }
-
-                if is_terminal_escape_key(&key) {
-                    let action = Keymap::resolve(&key);
-                    app.handle_action(action);
-                } else {
-                    let bytes = key_event_to_bytes(&key, inst.screen().application_cursor());
-                    if !bytes.is_empty() {
-                        app.terminal_selection.clear();
-                        let inst = app.terminal_manager.active_instance_mut().unwrap();
-                        inst.screen_mut().set_scrollback(0);
-                        inst.write_input(&bytes);
-                    }
-                }
-                return;
-            }
-
-            if app.codex_trust_dialog.is_some() {
-                super::session::handle_codex_trust_key(app, &key);
-                return;
-            }
-
-            if app.quit_confirm {
-                use crossterm::event::KeyCode;
-                let has_review = app.diff_review.is_some();
-                match key.code {
-                    KeyCode::Char('a') | KeyCode::Char('A') if has_review => {
-                        super::review::finalize_current_review(app);
-                        app.quit_confirm = false;
-                        app.try_quit();
-                    }
-                    KeyCode::Char('r') | KeyCode::Char('R') if has_review => {
-                        app.diff_review = None;
-                        app.quit_confirm = false;
-                        app.try_quit();
-                    }
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        app.diff_review = None;
-                        app.should_quit = true;
-                    }
-                    _ => {
-                        app.quit_confirm = false;
-                    }
-                }
-                return;
-            }
-
-            // Bulk op confirm modals — fully block all other input.
-            if let Some(bulk) = app.bulk_op_state.clone() {
-                use crossterm::event::KeyCode;
-                match &bulk {
-                    BulkOpState::ConfirmDelete { paths } => {
-                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                            let p = paths.clone();
-                            app.execute_bulk_delete(&p);
-                        } else {
-                            app.bulk_op_state = None;
+                KeyRoute::TerminalBytes => {
+                    if let Some(inst) = app.terminal_manager.active_instance_mut() {
+                        let bytes = crate::panels::terminal::key_event_to_bytes(
+                            &key,
+                            inst.screen().application_cursor(),
+                        );
+                        if !bytes.is_empty() {
+                            inst.screen_mut().set_scrollback(0);
+                            inst.write_input(&bytes);
+                            app.terminal_selection.clear();
                         }
-                        return;
                     }
-                    BulkOpState::ConfirmMove { paths, dest_dir } => {
-                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                            let p = paths.clone();
-                            let d = dest_dir.clone();
-                            app.execute_bulk_move(&p, &d);
-                        } else {
-                            app.bulk_op_state = None;
-                        }
-                        return;
-                    }
-                    BulkOpState::SelectingDest { .. } => {} // handled below
                 }
+                KeyRoute::MoveMode => app.handle_move_key(&key),
+                KeyRoute::BulkMoveDest => app.handle_bulk_move_key(&key),
+                KeyRoute::CloseFindBar => super::editing::close_find_bar(app),
+                // Each steps back one level, or does nothing at the top.
+                KeyRoute::PanelEscape(PanelEscape::History) => {
+                    super::side_panel::handle_history_panel_escape(app);
+                }
+                KeyRoute::PanelEscape(PanelEscape::Swarm) => {
+                    super::swarm_run::handle_escape(app);
+                }
+                // Windows: after a clipboard-backed paste, ConPTY may still
+                // inject leftover key events from the same gesture (often a
+                // lone `\` that never reaches the Paste coalescer's length bar).
+                KeyRoute::DropPasteStraggler => {}
+                KeyRoute::Action(action) => app.handle_action(action),
             }
-
-            if app.tree_dialog.is_some() {
-                app.handle_dialog_key(&key);
-                return;
-            }
-
-            // The definition picker is modal: it consumes every key while open.
-            if app.definition_picker.is_some() {
-                super::nav::handle_picker_key(app, &key);
-                return;
-            }
-
-            if app.move_state.is_some()
-                && app.focus == Focus::FileTree
-                && app.left_panel == LeftPanelMode::FileTree
-            {
-                app.handle_move_key(&key);
-                return;
-            }
-
-            // Bulk move destination selection — user navigates the file tree.
-            if matches!(app.bulk_op_state, Some(BulkOpState::SelectingDest { .. }))
-                && app.focus == Focus::FileTree
-                && app.left_panel == LeftPanelMode::FileTree
-            {
-                app.handle_bulk_move_key(&key);
-                return;
-            }
-
-            if app.find_bar_active && key.code == crossterm::event::KeyCode::Esc {
-                super::editing::close_find_bar(app);
-                return;
-            }
-
-            // The keymap maps no action to Esc, so the HISTORY panel's
-            // close-overlay / clear-filter key is taken here.
-            if key.code == crossterm::event::KeyCode::Esc
-                && app.focus == Focus::SidePanel
-                && app.side_panel == SidePanelMode::HistoryPanel
-                && super::side_panel::handle_history_panel_escape(app)
-            {
-                return;
-            }
-            if key.code == crossterm::event::KeyCode::Esc
-                && app.focus == Focus::SidePanel
-                && app.side_panel == SidePanelMode::SwarmDashboard
-                && super::swarm_run::handle_escape(app)
-            {
-                return;
-            }
-
-            let action = Keymap::resolve(&key);
-            // Windows: after a clipboard-backed paste, ConPTY may still inject
-            // leftover key events from the same gesture (often a lone `\` that
-            // never reaches the Paste coalescer's length bar). Drop them.
-            if super::editing::should_drop_paste_straggler(app, &action) {
-                return;
-            }
-            app.handle_action(action);
         }
         Event::Paste(text) => {
-            if app.has_active_review()
-                || app.settings_error_dialog.is_some()
-                || app.syntax_error_dialog.is_some()
-                || app.restart.popup_open
-            {
+            // The same dialog gate as keys; a pending review locks pastes too.
+            let ctx = super::key_route::KeyContext::of(app);
+            if ctx.review || ctx.modal().is_some() {
                 return;
             }
             // Terminal delivered a paste — cancel the Windows Ctrl+V image fallback.
@@ -253,10 +135,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.begin_zoom_passthrough();
                 return;
             }
-            if app.settings_error_dialog.is_none()
-                && app.syntax_error_dialog.is_none()
-                && !app.restart.popup_open
-            {
+            // The same dialog gate as keys: no click lands behind a dialog.
+            // (A pending review is handled inside, per region.)
+            if super::key_route::KeyContext::of(app).modal().is_none() {
                 app.handle_mouse(mouse);
             }
         }
@@ -1814,6 +1695,56 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 
 /// Actions an editor-only session refuses: everything that opens the side
 /// panel, the CHANGES left mode, or reaches the (absent) code graph or agent.
+/// The quit question (`Modal::QuitConfirm`): with a review pending, `a`
+/// accepts it (diff) / applies it all (batch) and `r` rejects / discards it,
+/// then quit is tried again; `y` quits without writing; anything else
+/// cancels.
+fn handle_quit_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+    let has_review = app.has_active_review();
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') if has_review => {
+            if app.diff_review.is_some() {
+                super::review::finalize_current_review(app);
+            } else {
+                app.finalize_batch_review();
+            }
+            app.quit_confirm = false;
+            app.try_quit();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') if has_review => {
+            if app.diff_review.is_some() {
+                app.diff_review = None;
+            } else {
+                app.cancel_batch_review();
+            }
+            app.quit_confirm = false;
+            app.try_quit();
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.diff_review = None;
+            app.should_quit = true;
+        }
+        _ => {
+            app.quit_confirm = false;
+        }
+    }
+}
+
+/// The bulk delete / move question (`Modal::BulkConfirm`): `y` runs it,
+/// anything else cancels.
+fn handle_bulk_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+    let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+    match app.bulk_op_state.clone() {
+        Some(BulkOpState::ConfirmDelete { paths }) if yes => app.execute_bulk_delete(&paths),
+        Some(BulkOpState::ConfirmMove { paths, dest_dir }) if yes => {
+            app.execute_bulk_move(&paths, &dest_dir)
+        }
+        _ => app.bulk_op_state = None,
+    }
+}
+
 fn editor_only_blocks(action: &Action) -> bool {
     matches!(
         action,
@@ -2373,6 +2304,89 @@ mod reranker_notice_tests {
             reranker_fallback_notice("minilm", Some("download failed"))
                 .is_some_and(|m| m.contains("download failed"))
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_review_key_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app_with_batch(root: &std::path::Path) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Workspace::single_folder(root.to_path_buf()), tx);
+        app.enter_editor_only();
+        put_batch(&mut app);
+        app
+    }
+
+    fn put_batch(app: &mut App) {
+        app.batch_review = Some(BatchReviewState {
+            proposals: vec![ReviewProposal {
+                id: 7,
+                source: "agent".into(),
+                conv_id: None,
+                conflicts_with: Vec::new(),
+                superseded: false,
+                path: "a.rs".into(),
+                old_content: None,
+                new_content: "x\n".into(),
+                additions: 1,
+                deletions: 0,
+                is_deletion: false,
+            }],
+            selected_index: 0,
+            scroll_offset: 0,
+            diff_scroll: 0,
+            cached_diff: Vec::new(),
+            cached_diff_index: usize::MAX,
+            cached_highlights: None,
+            filter_source: None,
+            confirm_discard: false,
+        });
+        app.left_panel = LeftPanelMode::Review;
+        app.focus = Focus::FileTree;
+    }
+
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.handle_event(Event::Key(KeyEvent::new(code, mods)));
+    }
+
+    #[tokio::test]
+    async fn esc_asks_before_discarding_and_only_y_discards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_batch(dir.path());
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.batch_review.as_ref().unwrap().confirm_discard);
+        // Any other key keeps the review (and is not acted on).
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        let br = app.batch_review.as_ref().expect("review kept");
+        assert!(!br.confirm_discard);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.batch_review.is_none(), "y discards");
+        assert!(!app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_q_during_a_batch_review_asks_to_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_batch(dir.path());
+
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm, "Ctrl+Q opens the quit question");
+        assert!(app.batch_review.is_some(), "the review is not discarded by Ctrl+Q");
+        // Cancel keeps both.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.quit_confirm && app.batch_review.is_some() && !app.should_quit);
+
+        // `r`: discard and quit.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(app.batch_review.is_none());
+        assert!(app.should_quit);
     }
 }
 

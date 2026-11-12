@@ -51,7 +51,7 @@ pub(super) fn handle_search_action(app: &mut App, action: Action) {
                     app.open_selected_search_result();
                 }
             }
-            Action::Quit => {
+            Action::Quit | Action::Escape => {
                 if !app.search_panel.input.is_empty() {
                     app.search_panel.input.clear();
                     app.search_panel.results.clear();
@@ -89,7 +89,7 @@ pub(super) fn handle_search_action(app: &mut App, action: Action) {
                 app.search_panel.input.backspace();
                 app.run_search_from_input();
             }
-            Action::Quit => {
+            Action::Quit | Action::Escape => {
                 app.search_panel.editing = true;
             }
             _ => {}
@@ -159,7 +159,7 @@ pub(super) fn handle_file_tree_action(app: &mut App, action: Action) {
         Action::InsertChar('s') => {
             app.file_tree.toggle_selection();
         }
-        Action::Quit => {
+        Action::Quit | Action::Escape => {
             if app.file_tree.has_selection() {
                 app.file_tree.clear_selection();
             }
@@ -462,9 +462,8 @@ pub(super) fn handle_dialog_key(app: &mut App, key: &crossterm::event::KeyEvent)
                 d.cursor = 0;
             }
         }
-        // `!ctrl` alone would drop AltGr chars on Windows, which arrive with
-        // CONTROL|ALT set (see `platform::altgr_char`).
-        KeyCode::Char(c) if !ctrl || crate::platform::altgr_char(key).is_some() => {
+        // AltGr chars arrive as plain text (`platform::normalize_key`).
+        KeyCode::Char(c) if !ctrl => {
             if let Some(ref mut d) = app.tree_dialog {
                 d.insert_char(c);
             }

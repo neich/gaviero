@@ -147,14 +147,11 @@ fn transient_blocker(app: &App, now: Instant) -> Option<&'static str> {
     if app.diff_review.is_some() || app.batch_review.is_some() {
         return Some("a review is open");
     }
-    let dialog_open = app.quit_confirm
-        || app.codex_trust_dialog.is_some()
-        || app.settings_error_dialog.is_some()
-        || app.syntax_error_dialog.is_some()
-        || app.tree_dialog.is_some()
+    // The dialogs that own the keyboard (one list, `key_route`), plus the
+    // explorer's move / bulk-move picking, which is half-way through an edit.
+    let dialog_open = super::key_route::KeyContext::of(app).modal().is_some()
         || app.move_state.is_some()
-        || app.bulk_op_state.is_some()
-        || app.definition_picker.is_some();
+        || app.bulk_op_state.is_some();
     if dialog_open {
         return Some("a dialog is open");
     }

@@ -83,6 +83,9 @@ pub struct BatchReviewState {
     /// Active provider filter (matches `ReviewProposal.source`). `None` means
     /// "show everything". Cycled with `Alt+o` / `Alt+i`.
     pub filter_source: Option<String>,
+    /// Esc asked "discard the whole review?": the next key answers (`y`
+    /// discards, anything else keeps reviewing).
+    pub confirm_discard: bool,
 }
 
 #[derive(Clone, Debug)]

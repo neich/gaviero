@@ -3,6 +3,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    /// Esc: cancel / close / step back in the focused panel. Ctrl+Q stays
+    /// the global quit; a panel never has to treat it as "back".
+    Escape,
     ToggleFileTree,
     ToggleSidePanel,
     ToggleTerminal,
@@ -282,11 +285,13 @@ impl Keymap {
             KeyCode::Enter if alt => Action::AltEnter,
             KeyCode::Enter if shift => Action::AltEnter,
             KeyCode::Enter => Action::Enter,
+            // AltGr text arrives here as a plain character: the reader
+            // normalizes it (`platform::normalize_key`).
             KeyCode::Char(c) if !ctrl && !alt => Action::InsertChar(c),
-            // AltGr chords insert text (see `platform::altgr_char`). Reached
-            // only after every specific Ctrl/Alt shortcut above has had its
-            // chance.
-            KeyCode::Char(c) if crate::platform::altgr_char(key).is_some() => Action::InsertChar(c),
+
+            // Cancel / close / back in whatever has focus. Never escapes the
+            // terminal: Esc belongs to the shell there.
+            KeyCode::Esc => Action::Escape,
 
             _ => Action::None,
         }
@@ -317,18 +322,20 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn test_altgr_char_inserts() {
         // AltGr = CONTROL|ALT on Windows; the layout already resolved
-        // the char (Spanish AltGr+2 = '@').
-        assert_eq!(
-            Keymap::resolve(&key(
-                KeyCode::Char('@'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            )),
-            Action::InsertChar('@')
-        );
+        // the char (Spanish AltGr+2 = '@'), and normalization makes it text.
+        let altgr = crate::platform::altgr_as_text(key(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(Keymap::resolve(&altgr), Action::InsertChar('@'));
+    }
+
+    #[test]
+    fn test_escape_is_its_own_action() {
+        assert_eq!(Keymap::resolve(&key(KeyCode::Esc, KeyModifiers::NONE)), Action::Escape);
     }
 
     #[test]
