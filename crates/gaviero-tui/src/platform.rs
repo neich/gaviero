@@ -463,25 +463,110 @@ pub fn ctrl_key_held() -> bool {
 /// paste/key burst before falling back to a direct clipboard-image attach.
 pub const CTRL_V_IMAGE_FALLBACK_MS: u64 = 50;
 
-/// The character an AltGr chord resolves to, if this key event is one.
+/// Set while [`enable_key_disambiguation`] has the kitty flags pushed, so the
+/// restore path pops exactly what was pushed.
+static KEYS_DISAMBIGUATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Launch-terminal normalization, Unix side: ask the terminal to report the
+/// keys its legacy encoding cannot tell apart — Shift+Enter and Ctrl+Enter
+/// (a bare `\r`, i.e. Enter), Esc vs an Alt prefix — with the kitty keyboard
+/// protocol's *disambiguate* flag, when the terminal answers the protocol
+/// query (kitty, foot, WezTerm, Ghostty, Alacritty ≥ 0.13, Windows Terminal
+/// ≥ 1.25 through SSH). Text, Enter, Tab and Backspace keep their legacy
+/// bytes, and no key-up / repeat events are asked for. Terminals that do not
+/// answer (VTE, xterm, tmux) keep legacy keys; Alt+Enter and Ctrl+J insert
+/// the chat newline there. Under the session host the host is the terminal:
+/// its emulator has no kitty protocol and it sends Shift+Enter as Alt+Enter
+/// itself (`session_host::keys::vt_override`), so nothing is asked.
 ///
-/// AltGr on Windows reports as CONTROL|ALT with the layout-resolved character
-/// (Spanish AltGr+2 = '@'): crossterm's console parser sets both modifiers
-/// from RIGHT_ALT+LEFT_CTRL and emits `KeyCode::Char` with them untouched.
-/// Consumers must treat such events as text input, not Ctrl/Alt shortcuts —
-/// and must check *after* their specific Ctrl/Alt bindings, because AltGr
-/// chords with no layout mapping resolve to the base character (AltGr+q →
-/// Char('q')+CONTROL|ALT) and are indistinguishable from shortcut chords.
-///
-/// Always `None` off Windows, where AltGr arrives as plain resolved text.
-pub fn altgr_char(key: &KeyEvent) -> Option<char> {
-    if !cfg!(windows) {
-        return None;
+/// Windows: nothing to do — keys arrive as console records with every
+/// modifier, and crossterm cannot push the flags there. Call after
+/// `EnterAlternateScreen` (kitty keeps one flag stack per screen) and before
+/// the input reader starts (the query reads the reply from stdin).
+pub fn enable_key_disambiguation(w: &mut impl Write) -> std::io::Result<()> {
+    if !cfg!(unix) || std::env::var_os(crate::session_host::HOST_ENV).is_some() {
+        return Ok(());
     }
+    let supported = crossterm::terminal::supports_keyboard_enhancement();
+    tracing::info!("keyboard: kitty protocol query → {supported:?}");
+    if !wants_disambiguation(supported) {
+        return Ok(());
+    }
+    crossterm::execute!(
+        w,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
+    KEYS_DISAMBIGUATED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// Counterpart of [`enable_key_disambiguation`]; called from every
+/// terminal-restore path, before leaving the alternate screen.
+pub fn disable_key_disambiguation(w: &mut impl Write) -> std::io::Result<()> {
+    if KEYS_DISAMBIGUATED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        crossterm::execute!(w, crossterm::event::PopKeyboardEnhancementFlags)?;
+    }
+    Ok(())
+}
+
+/// Only a terminal that answered the protocol query gets the flags; an
+/// error (no answer within crossterm's timeout) counts as no.
+fn wants_disambiguation(supported: std::io::Result<bool>) -> bool {
+    matches!(supported, Ok(true))
+}
+
+/// Why raw mode could not start, for the error message: on Windows, Git
+/// Bash's mintty without a pseudo console hands gaviero pipes instead of a
+/// console (crossterm-rs/crossterm#580), so no key could ever be read.
+pub fn raw_mode_failure_hint() -> &'static str {
+    let mintty = std::env::var_os("MSYSTEM").is_some()
+        || std::env::var("TERM_PROGRAM").is_ok_and(|p| p.eq_ignore_ascii_case("mintty"));
+    if cfg!(windows) && mintty {
+        "enabling raw mode (Git Bash/mintty without a pseudo console gives gaviero no console: \
+         run it from Windows Terminal, or with `winpty gaviero`, or set MSYS=enable_pcon)"
+    } else {
+        "enabling raw mode"
+    }
+}
+
+/// Input normalization: every key event the TUI reads passes through here
+/// once, in `event.rs`, before any decision (`app::key_route`). It irons out
+/// what the terminal gaviero runs in does to keys, so nothing downstream
+/// checks for it again.
+///
+/// **Windows — AltGr.** crossterm reports AltGr as CONTROL|ALT with the
+/// character the layout already resolved (Spanish AltGr+2 = '@';
+/// crossterm-rs/crossterm#820), which reads as a Ctrl+Alt shortcut. A
+/// printable character that is not an ASCII letter or digit cannot be a
+/// shortcut, so it becomes plain text; Ctrl+Alt+letter / digit stays a chord
+/// (AltGr+q on a layout with nothing there is indistinguishable from it).
+/// The session host decides AltGr by the same rule (`session_host::keys`,
+/// `encode::KeyEncoder`). Off Windows the terminal already sends AltGr as
+/// text, and Ctrl+Alt+symbol is a real chord: no change.
+pub fn normalize_key(key: KeyEvent) -> KeyEvent {
+    if cfg!(windows) { altgr_as_text(key) } else { key }
+}
+
+/// The AltGr rule of [`normalize_key`], on every platform (for tests).
+pub(crate) fn altgr_as_text(mut key: KeyEvent) -> KeyEvent {
     let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
-    match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(ctrl_alt) => Some(c),
-        _ => None,
+    if let KeyCode::Char(c) = key.code
+        && key.modifiers.contains(ctrl_alt)
+        && !c.is_ascii_alphanumeric()
+        && !c.is_control()
+    {
+        key.modifiers -= ctrl_alt;
+    }
+    key
+}
+
+/// [`normalize_key`] for a whole crossterm event.
+pub fn normalize_event(event: crossterm::event::Event) -> crossterm::event::Event {
+    match event {
+        crossterm::event::Event::Key(k) => crossterm::event::Event::Key(normalize_key(k)),
+        other => other,
     }
 }
 
@@ -853,29 +938,47 @@ mod tests {
         assert!(rx.try_recv().is_err(), "close must not synthesize a key");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn altgr_char_resolves_ctrl_alt_chords() {
-        let key = KeyEvent::new(
-            KeyCode::Char('@'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        );
-        assert_eq!(altgr_char(&key), Some('@'));
-        // Plain Ctrl or plain Alt chords are shortcuts, not AltGr.
-        let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(altgr_char(&ctrl), None);
-        let alt = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(altgr_char(&alt), None);
+    fn altgr_symbols_become_text_and_ctrl_alt_letters_stay_chords() {
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        for c in ['@', '~', '\\', '€', '{', 'ł'] {
+            let key = altgr_as_text(KeyEvent::new(KeyCode::Char(c), ctrl_alt));
+            assert_eq!(key, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), "{c}");
+        }
+        // Shift survives (AltGr+Shift symbols).
+        let shifted = altgr_as_text(KeyEvent::new(KeyCode::Char('|'), ctrl_alt | KeyModifiers::SHIFT));
+        assert_eq!(shifted.modifiers, KeyModifiers::SHIFT);
+        // Ctrl+Alt+letter / digit, plain Ctrl, plain Alt and non-chars are chords.
+        for key in [
+            KeyEvent::new(KeyCode::Char('q'), ctrl_alt),
+            KeyEvent::new(KeyCode::Char('2'), ctrl_alt),
+            KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Left, ctrl_alt),
+        ] {
+            assert_eq!(altgr_as_text(key), key, "{key:?}");
+        }
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn altgr_char_is_none_off_windows() {
-        let key = KeyEvent::new(
-            KeyCode::Char('@'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        );
-        assert_eq!(altgr_char(&key), None);
+    fn only_a_terminal_that_answers_gets_the_kitty_flags() {
+        assert!(wants_disambiguation(Ok(true)));
+        assert!(!wants_disambiguation(Ok(false)));
+        assert!(!wants_disambiguation(Err(std::io::Error::other("timeout"))));
+    }
+
+    #[test]
+    fn nothing_was_pushed_so_nothing_is_popped() {
+        let mut out = Vec::new();
+        disable_key_disambiguation(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn normalization_is_the_altgr_rule_on_windows_only() {
+        let key = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let expected = if cfg!(windows) { altgr_as_text(key) } else { key };
+        assert_eq!(normalize_key(key), expected);
     }
 
     #[test]

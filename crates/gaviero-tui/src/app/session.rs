@@ -309,7 +309,7 @@ pub(super) fn try_quit(app: &mut App) {
         .filter(|c| c.is_streaming || c.has_running_background_agents())
         .count();
 
-    let has_pending_review = app.diff_review.is_some();
+    let has_pending_review = app.has_active_review();
 
     if unsaved.is_empty()
         && streaming_agents == 0

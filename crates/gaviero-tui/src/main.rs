@@ -139,6 +139,8 @@ fn prompt_c1_consent(proposals: &[gaviero_core::memory::C1MigrationProposal]) ->
 fn restore_terminal() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     let raw = disable_raw_mode();
+    // Before leaving the alternate screen: kitty keeps a flag stack per screen.
+    let keys = platform::disable_key_disambiguation(&mut stdout);
     let vt_mouse = platform::disable_vt_mouse_passthrough(&mut stdout);
     let _ = platform::restore_alt_scroll(&mut stdout);
     let modes = execute!(
@@ -149,7 +151,7 @@ fn restore_terminal() -> std::io::Result<()> {
         crossterm::cursor::Show
     );
     let paste = platform::set_bracketed_paste(&mut stdout, false);
-    raw.and(vt_mouse).and(modes).and(paste)
+    raw.and(keys).and(vt_mouse).and(modes).and(paste)
 }
 
 /// Coalesces expensive Agent Chat streaming redraws while leaving state
@@ -483,7 +485,7 @@ async fn run(cli: Cli) -> Result<bool> {
     }));
 
     // Terminal setup
-    enable_raw_mode().context("enabling raw mode")?;
+    enable_raw_mode().context(platform::raw_mode_failure_hint())?;
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
@@ -496,6 +498,10 @@ async fn run(cli: Cli) -> Result<bool> {
     // see `platform` for why each is gated the way it is.
     platform::set_bracketed_paste(&mut stdout, true).context("enabling bracketed paste")?;
     platform::enable_vt_mouse_passthrough(&mut stdout).context("enabling VT mouse passthrough")?;
+    // Unix terminals that speak the kitty keyboard protocol report
+    // Shift+Enter apart from Enter. Before the input reader starts: the
+    // query reads its answer from stdin.
+    platform::enable_key_disambiguation(&mut stdout).context("asking for unambiguous keys")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
     // is still restored when `_guard` is dropped.

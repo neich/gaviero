@@ -7,7 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer as RataBuf;
 use ratatui::layout::Rect;
 
-use crate::keymap::{Action, Keymap};
+use crate::keymap::Action;
+#[cfg(test)]
+use crate::keymap::Keymap;
 use crate::theme;
 
 /// State for mouse-based text selection in the terminal panel.
@@ -335,14 +337,8 @@ pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     // CSI vs SS3 introducer for unmodified cursor keys (DECCKM).
     let cursor_intro = if application_cursor { b'O' } else { b'[' };
 
-    // AltGr chords carry text, not a control chord (see
-    // `platform::altgr_char`) — send the char verbatim, before the Ctrl arm
-    // can mangle it into a control byte.
-    if let Some(c) = crate::platform::altgr_char(key) {
-        let mut char_buf = [0u8; 4];
-        return c.encode_utf8(&mut char_buf).as_bytes().to_vec();
-    }
-
+    // AltGr text reaches here as a plain character (`platform::normalize_key`),
+    // so the Ctrl arm below never mangles it into a control byte.
     match key.code {
         KeyCode::Char(c) if ctrl => {
             let byte = (c.to_ascii_lowercase() as u8)
@@ -481,7 +477,14 @@ fn action_escapes_terminal(action: &Action) -> bool {
 /// Returns true if this key should escape the terminal and go to the app
 /// keymap. Derived from `Keymap::resolve` so new global bindings escape
 /// automatically instead of desyncing from a second hand-written chord table.
+#[cfg(test)]
 pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
+    escapes_terminal(key, &Keymap::resolve(key))
+}
+
+/// Whether a key the keymap resolved to `action` leaves the focused terminal
+/// for the app (`app::key_route` resolves each key once and asks this).
+pub fn escapes_terminal(key: &KeyEvent, action: &Action) -> bool {
     // Shift+PageUp/PageDown page-scroll the terminal viewport. Explicit check:
     // Keymap::resolve maps PageUp/PageDown to the same action with or without
     // SHIFT, but the plain keys must reach the PTY.
@@ -489,7 +492,7 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
     if shift && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
         return true;
     }
-    action_escapes_terminal(&Keymap::resolve(key))
+    action_escapes_terminal(action)
 }
 
 /// Convert vt100 cell attributes to ratatui style.
@@ -531,15 +534,14 @@ pub(crate) fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Styl
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn altgr_char_passes_through_verbatim() {
         // AltGr = CONTROL|ALT on Windows; Spanish AltGr+2 = '@' must
         // reach the PTY as the character, not a control byte.
-        let key = KeyEvent::new(
+        let key = crate::platform::altgr_as_text(KeyEvent::new(
             KeyCode::Char('@'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
-        );
+        ));
         assert_eq!(key_event_to_bytes(&key, false), b"@".to_vec());
     }
 

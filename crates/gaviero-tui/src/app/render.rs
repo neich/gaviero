@@ -905,10 +905,14 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(ref br) = app.batch_review {
         let n = br.proposals.len();
         let current = br.selected_index + 1;
-        let status_text = format!(
-            " REVIEW ({} files)  [{}/{}]  |  a: accept  r: reject  f: apply all  Esc: discard  Ctrl+←→: panel",
-            n, current, n,
-        );
+        let status_text = if br.confirm_discard {
+            format!(" Discard the whole review ({n} files, nothing written)?  y: discard  any other key: keep reviewing")
+        } else {
+            format!(
+                " REVIEW ({} files)  [{}/{}]  |  a: accept  r: reject  f: apply all  Esc: discard  Ctrl+←→: panel",
+                n, current, n,
+            )
+        };
         let style = Style::default().fg(Color::Black).bg(theme::WARNING);
         for (i, ch) in status_text.chars().enumerate() {
             let x = area.x + i as u16;
@@ -1031,19 +1035,23 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                     }
                 },
                 LeftPanelMode::Review => {
-                    let (n, filter) = app
+                    let (n, filter, confirming) = app
                         .batch_review
                         .as_ref()
-                        .map(|br| (br.proposals.len(), br.filter_source.clone()))
-                        .unwrap_or((0, None));
+                        .map(|br| (br.proposals.len(), br.filter_source.clone(), br.confirm_discard))
+                        .unwrap_or((0, None, false));
                     let filter_hint = match filter {
                         Some(s) => format!("  filter: {}", s),
                         None => String::new(),
                     };
-                    format!(
-                        "REVIEW ({} files){}  f: apply all  Esc: discard  ↑↓: navigate  Alt+o/i: filter",
-                        n, filter_hint
-                    )
+                    if confirming {
+                        format!("Discard all {n} files? (y/N)  any other key: keep reviewing")
+                    } else {
+                        format!(
+                            "REVIEW ({} files){}  f: apply all  Esc: discard  ↑↓: navigate  Alt+o/i: filter",
+                            n, filter_hint
+                        )
+                    }
                 }
                 LeftPanelMode::Search => {
                     let tab_hint = match app.search_panel.mode {
@@ -1602,6 +1610,11 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         lines.push(format!("    • {}", path));
         lines.push(String::new());
     }
+    let pending_batch = app.batch_review.as_ref().map(|br| br.proposals.len());
+    if let Some(n) = pending_batch {
+        lines.push(format!("  Pending review: {n} file(s) not written yet"));
+        lines.push(String::new());
+    }
     if !unsaved.is_empty() {
         lines.push("  Unsaved files:".to_string());
         for name in &unsaved {
@@ -1626,6 +1639,11 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
     if pending_review.is_some() {
         lines.push(
             "  [a] Accept & quit   [r] Reject & quit   [y] Quit anyway   [n / Esc] Cancel"
+                .to_string(),
+        );
+    } else if pending_batch.is_some() {
+        lines.push(
+            "  [a] Apply all & quit   [r] Discard & quit   [y] Quit anyway   [n / Esc] Cancel"
                 .to_string(),
         );
     } else {

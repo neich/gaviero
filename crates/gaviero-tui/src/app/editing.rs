@@ -47,7 +47,7 @@ pub(super) fn handle_find_bar_action(app: &mut App, action: Action) {
             }
             app.ensure_editor_cursor_visible();
         }
-        Action::Quit | Action::FindInBuffer => close_find_bar(app),
+        Action::Quit | Action::Escape | Action::FindInBuffer => close_find_bar(app),
         _ => {}
     }
 }
@@ -2142,18 +2142,14 @@ pub(super) fn should_skip_duplicate_text_paste(app: &App) -> bool {
         .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(TEXT_PASTE_DEBOUNCE_MS))
 }
 
-/// Drop key actions that are almost certainly ConPTY paste residue.
-pub(super) fn should_drop_paste_straggler(app: &App, action: &Action) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
-    let Some(until) = app.windows_paste_settle_until else {
-        return false;
-    };
-    if std::time::Instant::now() >= until {
-        return false;
-    }
-    matches!(action, Action::InsertChar(_) | Action::Enter | Action::Tab)
+/// Whether a Windows text paste landed less than `WINDOWS_PASTE_SETTLE_MS`
+/// ago: text keys arriving now are almost certainly ConPTY paste residue,
+/// and `key_route::route_key` drops them.
+pub(super) fn paste_settling(app: &App) -> bool {
+    cfg!(windows)
+        && app
+            .windows_paste_settle_until
+            .is_some_and(|until| std::time::Instant::now() < until)
 }
 
 /// Whether a Windows `Event::Paste` payload may be replaced by the system

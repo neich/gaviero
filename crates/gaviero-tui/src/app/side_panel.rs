@@ -146,7 +146,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     if app.chat_state.renaming {
         match action {
             Action::Enter => app.chat_state.confirm_rename(),
-            Action::Quit => app.chat_state.cancel_rename(),
+            Action::Quit | Action::Escape => app.chat_state.cancel_rename(),
             Action::InsertChar(ch) => app.chat_state.insert_char(ch),
             Action::Backspace => app.chat_state.backspace(),
             Action::Delete => app.chat_state.text_input.delete(),
@@ -266,7 +266,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 }
                 app.chat_state.exit_browse_mode();
             }
-            Action::Quit | Action::Enter => {
+            Action::Quit | Action::Escape | Action::Enter => {
                 app.chat_state.exit_browse_mode();
             }
             _ => {
@@ -305,7 +305,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             let page = crate::widgets::prompt_input::POPUP_ROWS as isize;
             app.chat_state.autocomplete.move_selection(page);
         }
-        Action::Quit if ac_active => {
+        Action::Quit | Action::Escape if ac_active => {
             app.chat_state.autocomplete.reset();
         }
         Action::Enter => {
@@ -549,7 +549,7 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
                 }
                 app.git_panel.close_branch_picker();
             }
-            Action::Quit => app.git_panel.close_branch_picker(),
+            Action::Quit | Action::Escape => app.git_panel.close_branch_picker(),
             Action::Backspace => app.git_panel.branch_picker_backspace(),
             Action::InsertChar(ch) => app.git_panel.branch_picker_insert(ch),
             _ => {}
@@ -677,6 +677,9 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         Action::InsertChar('b') if app.git_panel.region != GitRegion::CommitInput => {
             app.git_panel.toggle_branch_picker();
         }
+        // Esc closes the branch picker only: the rest clears a typed commit
+        // message, which a stray Esc must not lose.
+        Action::Escape if app.git_panel.branch_picker_open => app.git_panel.close_branch_picker(),
         Action::Quit => {
             if app.git_panel.branch_picker_open {
                 app.git_panel.close_branch_picker();
@@ -863,7 +866,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
     // Inline `e` / `s` prompts hijack input until Enter / Esc.
     if !matches!(app.memory_panel.prompt_mode, PanelPromptMode::None) {
         match action {
-            Action::Quit => {
+            Action::Quit | Action::Escape => {
                 app.memory_panel.prompt_mode = PanelPromptMode::None;
             }
             Action::Enter => {
@@ -901,14 +904,14 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
 
     // Inspect / history overlays consume Esc / arrow keys.
     if app.memory_panel.inspecting {
-        if action == Action::Quit {
+        if matches!(action, Action::Quit | Action::Escape) {
             app.memory_panel.inspecting = false
         }
         return;
     }
     if app.memory_panel.history_mode {
         match action {
-            Action::Quit => app.memory_panel.history_mode = false,
+            Action::Quit | Action::Escape => app.memory_panel.history_mode = false,
             Action::CursorUp => {
                 app.memory_panel.history_cursor = app.memory_panel.history_cursor.saturating_sub(1);
             }
@@ -954,7 +957,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                     });
                 }
             }
-            Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
+            Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit | Action::Escape => {
                 app.memory_panel.confirm_delete = None;
             }
             _ => {}
@@ -973,7 +976,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                 app.memory_panel.search_query.pop();
                 schedule_memory_panel_search(app);
             }
-            Action::Quit => {
+            Action::Quit | Action::Escape => {
                 app.memory_panel.search_active = false;
                 app.memory_panel.search_query.clear();
                 app.memory_panel.search_results.clear();
