@@ -4,7 +4,7 @@
 use super::Host;
 use super::session::Activity;
 use crate::panels::terminal::vt100_style_to_ratatui;
-use crate::widgets::tabs::{HOST_PALETTE, TabBadges, TabBar, TabKind};
+use crate::widgets::tabs::{HOST_PALETTE, TabBadge, TabBadges, TabBar, TabKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -31,19 +31,22 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
     }
 }
 
-/// Circle palette, shared by both circles: green = working, yellow = waiting
+/// Badge palette, shared by both badges: green = working, yellow = waiting
 /// for the user, blue = finished while out of view. Pure hues at 80%
 /// brightness (204/255), so the three tell apart at a glance.
 const GREEN: Color = Color::Rgb(0, 204, 0);
 const YELLOW: Color = Color::Rgb(204, 204, 0);
 const BLUE: Color = Color::Rgb(0, 0, 204);
-/// Agent circle: an agent or swarm is running / waits for the user (a
+/// Agent badge (`A`): an agent or swarm is running / waits for the user (a
 /// permission, a question, a turn review) / finished while out of view.
+const AGENT_LETTER: char = 'A';
 const AGENT_RUNNING: Color = GREEN;
 const AGENT_WAITING: Color = YELLOW;
 const AGENT_DONE: Color = BLUE;
-/// Shell circle: a command is running / seems to wait for the user (a bell,
-/// a notification, or a quiet prompt line) / finished while out of view.
+/// Shell badge (`S`): a command is running / seems to wait for the user (a
+/// bell, a notification, or a quiet prompt line) / finished while out of
+/// view.
+const SHELL_LETTER: char = 'S';
 const SHELL_RUNNING: Color = GREEN;
 const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
@@ -55,13 +58,14 @@ pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
         .collect()
 }
 
-/// A tab's two circles: the agent one, then the shell one. The current tab
-/// shows them too; its "finished" marks stay until the user leaves it.
+/// The colours of a tab's two badges: the agent one, then the shell one.
+/// The current tab shows them too; its "finished" marks stay until the user
+/// leaves it.
 pub(crate) fn badges(
     activity: Activity,
     agent_done_unseen: bool,
     shell_done_unseen: bool,
-) -> TabBadges {
+) -> [Option<Color>; 2] {
     let agent = if activity.waiting {
         Some(AGENT_WAITING)
     } else if activity.agent {
@@ -86,12 +90,18 @@ pub(crate) fn badges(
 pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
     host.sessions
         .iter()
-        .map(|s| badges(s.activity, s.agent_done_unseen, s.shell_done_unseen))
+        .map(|s| {
+            let [agent, shell] = badges(s.activity, s.agent_done_unseen, s.shell_done_unseen);
+            [
+                agent.map(|colour| TabBadge { letter: AGENT_LETTER, colour }),
+                shell.map(|colour| TabBadge { letter: SHELL_LETTER, colour }),
+            ]
+        })
         .collect()
 }
 
 /// The host's tab bar: every tab has a close button and two activity
-/// circles, drawn in the host's own palette so it never looks like the
+/// badges (`A` agent, `S` shell), drawn in the host's own palette so it never looks like the
 /// editor's tab row inside the session below it.
 pub(crate) fn tab_bar<'a>(
     host: &Host,
