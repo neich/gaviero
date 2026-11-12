@@ -800,7 +800,11 @@ impl App {
         if self.chat_state.active_conv_busy() {
             return;
         }
-        let _ = side_panel::try_attach_clipboard_image(self);
+        // A Tick does not redraw by itself (`RenderScheduler`): without
+        // this the attachment stayed invisible until the next input.
+        if side_panel::try_attach_clipboard_image(self) {
+            self.needs_immediate_render = true;
+        }
     }
 
     /// Rescan skill roots after a `.gaviero/skills/` or extra-root file change.

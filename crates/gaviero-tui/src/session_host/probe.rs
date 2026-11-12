@@ -13,7 +13,9 @@
 //! line; Ctrl+K exits with 255 (a lost connection), Ctrl+O reports the
 //! folder `/srv/my proj` (OSC 7) and Ctrl+Y copies `probe-copy` (OSC 52).
 
-use crossterm::event::{Event, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use std::io::Write;
@@ -29,7 +31,7 @@ pub(crate) fn run_probe() -> anyhow::Result<()> {
     }
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
     crate::platform::enable_vt_mouse_passthrough(&mut stdout)?;
     stdout.write_all(b"\x1b]2;probe-ready\x07")?;
     stdout.flush()?;
@@ -90,7 +92,8 @@ fn probe_loop(stdout: &mut std::io::Stdout) -> anyhow::Result<()> {
             }
             Event::Resize(cols, rows) => format!("RESIZE {cols} {rows}"),
             Event::Paste(text) => format!("PASTE {text:?}"),
-            Event::FocusGained | Event::FocusLost => continue,
+            Event::FocusGained => "FOCUS gained".to_string(),
+            Event::FocusLost => "FOCUS lost".to_string(),
         };
         stdout.write_all(line.as_bytes())?;
         stdout.write_all(b"\r\n")?;
