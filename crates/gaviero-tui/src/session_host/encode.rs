@@ -154,6 +154,17 @@ pub fn sgr_mouse(code: u8, col0: u16, row0: u16, press: bool) -> String {
 const MOUSE_MOVED: u32 = 1;
 const MOUSE_WHEELED: u32 = 4;
 
+/// Whether a raw console record is the outer terminal's font-zoom gesture
+/// (Ctrl+wheel, vertical wheel only). The record form of
+/// `platform::is_terminal_zoom_gesture`; see `Host::begin_zoom`.
+/// `ctrl_held` asks the keyboard for its own Ctrl state
+/// (`platform::ctrl_key_held`), only for wheel records: Windows Terminal's
+/// wheel record can arrive without Ctrl in `ctrl_state`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_zoom_gesture(rec: &MouseRecord, ctrl_held: impl FnOnce() -> bool) -> bool {
+    rec.flags & MOUSE_WHEELED != 0 && (rec.ctrl_state & ANY_CTRL != 0 || ctrl_held())
+}
+
 /// Button bits of `dwButtonState` and their SGR button codes, in the order
 /// the reports are emitted: left (0), middle (1), right (2).
 const BUTTONS: [(u32, u8); 3] = [(1, 0), (4, 1), (2, 2)];
@@ -395,6 +406,22 @@ mod tests {
             t.translate(&mouse(3, 3, down, 0, MOUSE_WHEELED), 0),
             vec!["\x1b[<65;4;4M"]
         );
+    }
+
+    #[test]
+    fn zoom_gesture_is_ctrl_wheel_only() {
+        let up = 120u32 << 16;
+        let down = ((-120i16) as u16 as u32) << 16;
+        assert!(is_zoom_gesture(&mouse(3, 3, up, LEFT_CTRL, MOUSE_WHEELED), || false));
+        assert!(is_zoom_gesture(&mouse(3, 0, down, RIGHT_CTRL, MOUSE_WHEELED), || false));
+        // Ctrl missing from the record but held on the keyboard: still zoom.
+        assert!(is_zoom_gesture(&mouse(3, 3, up, 0, MOUSE_WHEELED), || true));
+        // Plain wheel, Ctrl+click, Ctrl+drag: not the gesture.
+        assert!(!is_zoom_gesture(&mouse(3, 3, up, 0, MOUSE_WHEELED), || false));
+        assert!(!is_zoom_gesture(&mouse(3, 3, 1, LEFT_CTRL, 0), || true));
+        assert!(!is_zoom_gesture(&mouse(3, 3, 1, LEFT_CTRL, MOUSE_MOVED), || true));
+        // Horizontal wheel (MOUSE_HWHEELED = 8) is not zoom.
+        assert!(!is_zoom_gesture(&mouse(3, 3, up, LEFT_CTRL, 8), || true));
     }
 
     #[test]

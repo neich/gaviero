@@ -172,6 +172,14 @@ fn keys_and_mouse_reach_a_crossterm_child() {
     pty.send(&sgr_mouse(65, 3, 3, true));
     pty.wait_text("MOUSE ScrollDown 3 3");
 
+    // 6b. Ctrl+wheel up (SGR 64 + Ctrl 16): ConPTY keeps the modifier, so
+    // when a live Windows Terminal wheel arrives without Ctrl the loss is
+    // upstream (`platform::ctrl_key_held` covers it).
+    pty.send(&sgr_mouse(64 + 16, 4, 3, true));
+    pty.wait_for("Ctrl+wheel", |s, _| {
+        line_with(s, &["MOUSE ScrollUp 4 3", "CONTROL"])
+    });
+
     // 7. Ctrl+Q ends the probe.
     pty.send(&tap(0x51, 0x10, 17, LEFT_CTRL));
     let code = pty.wait_exit(Duration::from_secs(10));

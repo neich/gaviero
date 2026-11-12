@@ -257,6 +257,48 @@ pub(crate) struct Host {
     cwd: PathBuf,
     /// Restart-on-new-build for the host and all its tabs.
     restart: restart::HostRestart,
+    /// Mouse reporting is off while the outer terminal zooms its font.
+    zoom: ZoomWindow,
+}
+
+/// The time mouse reporting stays off so the outer terminal can take
+/// Ctrl+wheel as its font zoom (`Host::begin_zoom`). The host owns the one
+/// window every tab is drawn in, so one zoom applies to all of them; a tab's
+/// own gaviero never sees the gesture.
+#[derive(Default)]
+struct ZoomWindow {
+    until: Option<Instant>,
+}
+
+impl ZoomWindow {
+    fn length() -> Duration {
+        Duration::from_millis(crate::theme::ZOOM_PASSTHROUGH_MS)
+    }
+
+    /// Open (or push out) the window; true when reporting must be turned off
+    /// now, i.e. the window was not already open.
+    fn begin(&mut self, now: Instant) -> bool {
+        let opened = self.until.is_none();
+        self.until = Some(now + Self::length());
+        opened
+    }
+
+    /// A zoom step resizes the grid: while open, keep the window open.
+    fn extend(&mut self, now: Instant) {
+        if self.until.is_some() {
+            self.until = Some(now + Self::length());
+        }
+    }
+
+    /// Close the window once it has passed; true when reporting must be
+    /// turned back on now.
+    fn end_due(&mut self, now: Instant) -> bool {
+        if self.until.is_some_and(|until| now >= until) {
+            self.until = None;
+            return true;
+        }
+        false
+    }
 }
 
 impl Host {
@@ -289,6 +331,27 @@ impl Host {
             picker: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             restart: restart::HostRestart::new(),
+            zoom: ZoomWindow::default(),
+        }
+    }
+
+    /// A Ctrl+wheel reached the host: mouse reporting is on, so the outer
+    /// terminal forwarded its zoom gesture instead of zooming. Turn reporting
+    /// off for `theme::ZOOM_PASSTHROUGH_MS` so the next notches zoom the font
+    /// of the whole window — every tab at once. Taken before anything else
+    /// (dialogs, the tab bar, a disconnected tab) and never forwarded.
+    fn begin_zoom(&mut self) {
+        if self.zoom.begin(Instant::now()) {
+            tracing::info!("zoom: Ctrl+wheel, mouse reporting paused");
+            let _ = crate::platform::suspend_mouse_reporting(&mut std::io::stdout());
+        }
+    }
+
+    /// Loop: once the zoom window has passed, turn mouse reporting back on.
+    fn maybe_end_zoom(&mut self) {
+        if self.zoom.end_due(Instant::now()) {
+            tracing::info!("zoom: mouse reporting resumed");
+            let _ = crate::platform::resume_mouse_reporting(&mut std::io::stdout());
         }
     }
 
@@ -990,6 +1053,10 @@ impl Host {
 
     #[cfg(windows)]
     fn on_mouse(&mut self, m: encode::MouseRecord) {
+        if encode::is_zoom_gesture(&m, crate::platform::ctrl_key_held) {
+            self.begin_zoom();
+            return;
+        }
         if self.modal_open() {
             return;
         }
@@ -1023,6 +1090,8 @@ impl Host {
     }
 
     fn on_resize(&mut self) {
+        // A zoom step changes the grid: the user is still zooming.
+        self.zoom.extend(Instant::now());
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             self.rows = rows;
             self.cols = cols;
@@ -1088,6 +1157,10 @@ impl Host {
     }
 
     fn on_term_mouse(&mut self, m: MouseEvent) {
+        if crate::platform::is_terminal_zoom_gesture(&m) {
+            self.begin_zoom();
+            return;
+        }
         if self.modal_open() {
             return;
         }
@@ -1427,6 +1500,7 @@ async fn host_loop(
             }
             _ = tick.tick() => {}
         }
+        host.maybe_end_zoom();
         if last_poll.elapsed() >= EXIT_POLL_EVERY {
             host.poll_exits();
             host.expire_message();
@@ -1453,6 +1527,26 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn zoom_window_suspends_once_extends_on_resize_and_resumes_after() {
+        let len = ZoomWindow::length();
+        let t0 = Instant::now();
+        let mut z = ZoomWindow::default();
+        // A resize with no window open does not open one.
+        z.extend(t0);
+        assert!(!z.end_due(t0 + len * 2));
+        // The first gesture turns reporting off; later ones only push out.
+        assert!(z.begin(t0));
+        assert!(!z.begin(t0 + len / 2));
+        assert!(!z.end_due(t0 + len));
+        // A zoom step (resize) keeps it open past the gesture's deadline.
+        z.extend(t0 + len);
+        assert!(!z.end_due(t0 + len + len / 2));
+        assert!(z.end_due(t0 + len * 2));
+        // Closed: nothing more to resume.
+        assert!(!z.end_due(t0 + len * 3));
     }
 
     #[test]
