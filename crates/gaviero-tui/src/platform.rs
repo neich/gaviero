@@ -107,6 +107,53 @@ pub fn disable_vt_mouse_passthrough(_w: &mut impl Write) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Whether a mouse event is the host terminal's font-zoom gesture
+/// (Ctrl+wheel up/down).
+///
+/// While an app has mouse reporting on, Windows Terminal (and xterm-style
+/// terminals in general) send the wheel to the app *instead of* zooming — WT
+/// only zooms when it is not forwarding VT mouse input, and Shift (its usual
+/// bypass) turns Ctrl+wheel into the opacity gesture. No VT sequence can
+/// change the host's font size, so the only way to give the gesture back is to
+/// stop reporting the mouse for a moment: see [`suspend_mouse_reporting`] and
+/// `App::begin_zoom_passthrough`.
+pub fn is_terminal_zoom_gesture(mouse: &crossterm::event::MouseEvent) -> bool {
+    use crossterm::event::MouseEventKind;
+    matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && mouse.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Stop the host terminal from reporting the mouse, so it handles the wheel
+/// (Ctrl+wheel zoom) itself. Undone by [`resume_mouse_reporting`].
+///
+/// Windows: the VT disable set, the same bytes as the exit path — the WinAPI
+/// console mouse mode never reaches the host terminal, so it is left alone.
+/// Unix: crossterm's `DisableMouseCapture`, which writes the VT sequences.
+pub fn suspend_mouse_reporting(w: &mut impl Write) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        disable_vt_mouse_passthrough(w)
+    }
+    #[cfg(not(windows))]
+    {
+        crossterm::execute!(w, crossterm::event::DisableMouseCapture)
+    }
+}
+
+/// Counterpart of [`suspend_mouse_reporting`].
+pub fn resume_mouse_reporting(w: &mut impl Write) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        enable_vt_mouse_passthrough(w)
+    }
+    #[cfg(not(windows))]
+    {
+        crossterm::execute!(w, crossterm::event::EnableMouseCapture)
+    }
+}
+
 /// Install a Windows console-control handler that turns Ctrl+C / Ctrl+Break
 /// *signals* back into key events instead of letting them terminate the TUI.
 ///
@@ -663,6 +710,52 @@ mod tests {
             out,
             b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l".to_vec()
         );
+    }
+
+    /// Ctrl+wheel (either direction) is the zoom gesture; a plain or
+    /// Shift wheel, and Ctrl+click, are not.
+    #[test]
+    fn zoom_gesture_is_ctrl_wheel_only() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, modifiers| MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers,
+        };
+        assert!(is_terminal_zoom_gesture(&ev(
+            MouseEventKind::ScrollUp,
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_terminal_zoom_gesture(&ev(
+            MouseEventKind::ScrollDown,
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_terminal_zoom_gesture(&ev(
+            MouseEventKind::ScrollDown,
+            KeyModifiers::empty()
+        )));
+        assert!(!is_terminal_zoom_gesture(&ev(
+            MouseEventKind::ScrollUp,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_terminal_zoom_gesture(&ev(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    /// Suspending and resuming write exactly the exit and keep-alive sets, so
+    /// a resume can never turn on any-motion tracking.
+    #[cfg(windows)]
+    #[test]
+    fn zoom_suspend_and_resume_reuse_the_vt_mouse_sets() {
+        let mut off: Vec<u8> = Vec::new();
+        suspend_mouse_reporting(&mut off).unwrap();
+        assert_eq!(off, DISABLE_VT_MOUSE.as_bytes());
+        let mut on: Vec<u8> = Vec::new();
+        resume_mouse_reporting(&mut on).unwrap();
+        assert_eq!(on, ENABLE_VT_MOUSE.as_bytes());
     }
 
     /// Windows image paste depends on us advertising `?2004h` so Windows

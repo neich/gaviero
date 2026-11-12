@@ -341,6 +341,10 @@ pub struct App {
     /// Last time the VT mouse-passthrough request was re-asserted to the
     /// host terminal (see `platform::enable_vt_mouse_passthrough`).
     pub last_vt_mouse_reassert: std::time::Instant,
+    /// Set while mouse reporting is suspended so the host terminal can zoom
+    /// on Ctrl+wheel; the instant reporting comes back on
+    /// (`begin_zoom_passthrough` / `maybe_end_zoom_passthrough`).
+    pub zoom_passthrough_until: Option<std::time::Instant>,
 
     /// Windows: instant of a physical Ctrl+V edge (`platform::take_ctrl_v_press_edge`)
     /// while waiting to see if the terminal delivers a paste. Cleared on any
@@ -605,6 +609,7 @@ impl App {
             ),
             terminal_selection: crate::panels::terminal::TerminalSelectionState::default(),
             last_vt_mouse_reassert: std::time::Instant::now(),
+            zoom_passthrough_until: None,
             windows_ctrl_v_pending: None,
             last_clipboard_image_attach: None,
             last_text_paste: None,
@@ -706,10 +711,49 @@ impl App {
         // so Ctrl+C keeps arriving as a key event (the console ctrl handler
         // covers the gap in between). See platform.rs for both halves.
         let _ = crate::platform::reassert_console_input_modes(&mut stdout);
-        let _ = crate::platform::enable_vt_mouse_passthrough(&mut stdout);
+        // Mouse reporting is off on purpose while the host terminal zooms;
+        // `maybe_end_zoom_passthrough` turns it back on.
+        if self.zoom_passthrough_until.is_none() {
+            let _ = crate::platform::enable_vt_mouse_passthrough(&mut stdout);
+        }
         // Same insurance as mouse: mux/ConPTY can drop `?2004h`, and without
         // it Windows Terminal will not emit empty bracketed paste for images.
         let _ = crate::platform::set_bracketed_paste(&mut stdout, true);
+    }
+
+    /// A Ctrl+wheel reached gaviero: mouse reporting is on, so the host
+    /// terminal forwarded its zoom gesture instead of zooming
+    /// (`platform::is_terminal_zoom_gesture`). Turn reporting off for
+    /// `theme::ZOOM_PASSTHROUGH_MS` so the following notches zoom the font.
+    /// The notch that got here is spent arming the window: no VT sequence can
+    /// zoom on the terminal's behalf.
+    pub(crate) fn begin_zoom_passthrough(&mut self) {
+        let window = std::time::Duration::from_millis(crate::theme::ZOOM_PASSTHROUGH_MS);
+        if self.zoom_passthrough_until.is_none() {
+            let _ = crate::platform::suspend_mouse_reporting(&mut std::io::stdout());
+        }
+        self.zoom_passthrough_until = Some(std::time::Instant::now() + window);
+    }
+
+    /// A zoom step changes the cell grid, so a resize inside the window means
+    /// the user is still zooming: keep reporting off a while longer.
+    pub(crate) fn extend_zoom_passthrough(&mut self) {
+        if self.zoom_passthrough_until.is_some() {
+            let window = std::time::Duration::from_millis(crate::theme::ZOOM_PASSTHROUGH_MS);
+            self.zoom_passthrough_until = Some(std::time::Instant::now() + window);
+        }
+    }
+
+    /// Tick: once the window has passed, turn mouse reporting back on.
+    pub(crate) fn maybe_end_zoom_passthrough(&mut self) {
+        if self
+            .zoom_passthrough_until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            self.zoom_passthrough_until = None;
+            let _ = crate::platform::resume_mouse_reporting(&mut std::io::stdout());
+            self.last_vt_mouse_reassert = std::time::Instant::now();
+        }
     }
 
     /// Consume the post-handle redraw flag set by paint-only mutations
