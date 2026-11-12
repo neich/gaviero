@@ -269,16 +269,20 @@ fn two_sessions_switch_close_and_quit() {
     assert_eq!(open_names(&state), vec![lb.clone()]);
 }
 
-/// The host's circle colours (`session_host/render.rs`).
+/// The host's badge colours (`session_host/render.rs`).
 const RUNNING: vt100::Color = vt100::Color::Rgb(0, 204, 0);
 const DONE: vt100::Color = vt100::Color::Rgb(0, 0, 204);
+/// A badge's left cap (`widgets/tabs.rs`).
+const PILL_LEFT: char = '\u{E0B6}';
 
-/// The two circle cells after `label` on the tab bar: (symbol, colour) each.
+/// The two badges after `label` on the tab bar, each a 3-cell pill (cap,
+/// letter, cap): (letter, the cap's colour) each; a blank letter when unset.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
     let col = (bar[..at].chars().count() + label.chars().count() + 1) as u16;
-    [pty.cell(0, col), pty.cell(0, col + 1)]
+    let badge = |cap: u16| (pty.cell(0, cap + 1).0, pty.cell(0, cap).1);
+    [badge(col), badge(col + 3)]
 }
 
 #[test]
@@ -307,14 +311,14 @@ fn background_tabs_show_agent_and_shell_activity() {
     pty.wait_text("STATUS busy");
     pty.wait_for("B's running circles while current", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("●".to_string(), RUNNING) && shell == ("●".to_string(), RUNNING)
+        agent == ("A".to_string(), RUNNING) && shell == ("S".to_string(), RUNNING)
     });
 
     // Seen from A, B still shows both running.
     pty.send(&alt_left());
     pty.wait_for("B's running circles", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("●".to_string(), RUNNING) && shell == ("●".to_string(), RUNNING)
+        agent == ("A".to_string(), RUNNING) && shell == ("S".to_string(), RUNNING)
     });
     let [a_agent, a_shell] = circles(&pty, &la);
     assert_eq!((a_agent.0.trim(), a_shell.0.trim()), ("", ""), "A has none");
@@ -322,7 +326,7 @@ fn background_tabs_show_agent_and_shell_activity() {
     // The work ends while B is out of view: both turn to finished.
     pty.wait_for("B's finished circles", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("●".to_string(), DONE) && shell == ("●".to_string(), DONE)
+        agent == ("A".to_string(), DONE) && shell == ("S".to_string(), DONE)
     });
 
     // Making B current keeps them.
@@ -330,20 +334,20 @@ fn background_tabs_show_agent_and_shell_activity() {
     pty.wait_for("B current, finished circles kept", |s, _| {
         let [agent, shell] = circles(&pty, &lb);
         s.contains("STATUS idle (later)")
-            && agent == ("●".to_string(), DONE)
-            && shell == ("●".to_string(), DONE)
+            && agent == ("A".to_string(), DONE)
+            && shell == ("S".to_string(), DONE)
     });
 
     // New work on the current tab replaces them; when it ends in view it
     // leaves no finished mark.
     pty.send(&ctrl_e());
     pty.wait_for("B's second run ended", |s, _| {
-        s.matches("STATUS idle (later)").count() == 2 && !pty.row(0).contains('●')
+        s.matches("STATUS idle (later)").count() == 2 && !pty.row(0).contains(PILL_LEFT)
     });
     pty.send(&alt_left());
     pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));
     pty.wait_text("KEY Char('z')");
-    assert!(!pty.row(0).contains('●'), "row 0: {}", pty.row(0));
+    assert!(!pty.row(0).contains(PILL_LEFT), "row 0: {}", pty.row(0));
 
     // Nothing in progress: Ctrl+Q quits at once.
     pty.send(&ctrl_q());
