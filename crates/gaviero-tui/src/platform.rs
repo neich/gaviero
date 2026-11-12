@@ -60,6 +60,17 @@ const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 #[cfg(windows)]
 const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
+/// Alternate scroll mode (DECSET 1007) off / on. Windows Terminal turns it
+/// on by default, and in the alternate screen it wins over zoom: with mouse
+/// reporting off, its `ControlInteractivity::MouseWheel` sends the wheel to
+/// the app as Up/Down keys whenever alternate scroll applies, and only
+/// zooms on Ctrl+wheel when it does not. So the zoom window turns it off too
+/// and restores WT's default after.
+#[cfg(windows)]
+const DISABLE_ALT_SCROLL: &str = "\x1b[?1007l";
+#[cfg(windows)]
+const ENABLE_ALT_SCROLL: &str = "\x1b[?1007h";
+
 /// Ask the hosting terminal to forward mouse events (Windows-only VT write;
 /// no-op elsewhere, where crossterm's `EnableMouseCapture` already emits the
 /// sequences). Must run after `EnterAlternateScreen`/`EnableMouseCapture`.
@@ -117,23 +128,29 @@ pub fn disable_vt_mouse_passthrough(_w: &mut impl Write) -> std::io::Result<()> 
 /// change the host's font size, so the only way to give the gesture back is to
 /// stop reporting the mouse for a moment: see [`suspend_mouse_reporting`] and
 /// `App::begin_zoom_passthrough`.
+///
+/// The wheel event may come without its Ctrl modifier (see
+/// [`ctrl_key_held`]), so on Windows a Ctrl key held right now counts too.
 pub fn is_terminal_zoom_gesture(mouse: &crossterm::event::MouseEvent) -> bool {
     use crossterm::event::MouseEventKind;
     matches!(
         mouse.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-    ) && mouse.modifiers.contains(KeyModifiers::CONTROL)
+    ) && (mouse.modifiers.contains(KeyModifiers::CONTROL) || ctrl_key_held())
 }
 
 /// Stop the host terminal from reporting the mouse, so it handles the wheel
 /// (Ctrl+wheel zoom) itself. Undone by [`resume_mouse_reporting`].
 ///
 /// Windows: the VT disable set, the same bytes as the exit path — the WinAPI
-/// console mouse mode never reaches the host terminal, so it is left alone.
+/// console mouse mode never reaches the host terminal, so it is left alone —
+/// plus alternate scroll off, without which Windows Terminal turns the wheel
+/// into arrow keys instead of zooming ([`DISABLE_ALT_SCROLL`]).
 /// Unix: crossterm's `DisableMouseCapture`, which writes the VT sequences.
 pub fn suspend_mouse_reporting(w: &mut impl Write) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        w.write_all(DISABLE_ALT_SCROLL.as_bytes())?;
         disable_vt_mouse_passthrough(w)
     }
     #[cfg(not(windows))]
@@ -142,10 +159,27 @@ pub fn suspend_mouse_reporting(w: &mut impl Write) -> std::io::Result<()> {
     }
 }
 
+/// Exit path: put alternate scroll back to Windows Terminal's default (on),
+/// in case gaviero ends inside a zoom window ([`suspend_mouse_reporting`]
+/// turned it off). No-op off Windows, where gaviero never touches it.
+pub fn restore_alt_scroll(w: &mut impl Write) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        w.write_all(ENABLE_ALT_SCROLL.as_bytes())?;
+        w.flush()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = w;
+        Ok(())
+    }
+}
+
 /// Counterpart of [`suspend_mouse_reporting`].
 pub fn resume_mouse_reporting(w: &mut impl Write) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        w.write_all(ENABLE_ALT_SCROLL.as_bytes())?;
         enable_vt_mouse_passthrough(w)
     }
     #[cfg(not(windows))]
@@ -401,6 +435,27 @@ pub fn take_ctrl_v_press_edge() -> bool {
 
 #[cfg(not(windows))]
 pub fn take_ctrl_v_press_edge() -> bool {
+    false
+}
+
+/// Whether a Ctrl key is physically down right now (Win32
+/// `GetAsyncKeyState`). Always `false` off Windows.
+///
+/// Windows Terminal forwards Ctrl+wheel to an app with mouse reporting on,
+/// but the wheel record that reaches the app can arrive without Ctrl in its
+/// `dwControlKeyState` (seen live under `gaviero --sessions`; a plain ConPTY
+/// keeps the SGR Ctrl bit — `tests/session_host_transport.rs` — so the loss
+/// is upstream of it). The zoom gesture checks the keyboard itself.
+#[cfg(windows)]
+pub fn ctrl_key_held() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_CONTROL: i32 = 0x11;
+    // High bit set ⇒ key currently down.
+    (unsafe { GetAsyncKeyState(VK_CONTROL) } as u16) & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+pub fn ctrl_key_held() -> bool {
     false
 }
 
@@ -752,10 +807,10 @@ mod tests {
     fn zoom_suspend_and_resume_reuse_the_vt_mouse_sets() {
         let mut off: Vec<u8> = Vec::new();
         suspend_mouse_reporting(&mut off).unwrap();
-        assert_eq!(off, DISABLE_VT_MOUSE.as_bytes());
+        assert_eq!(off, format!("\x1b[?1007l{DISABLE_VT_MOUSE}").as_bytes());
         let mut on: Vec<u8> = Vec::new();
         resume_mouse_reporting(&mut on).unwrap();
-        assert_eq!(on, ENABLE_VT_MOUSE.as_bytes());
+        assert_eq!(on, format!("\x1b[?1007h{ENABLE_VT_MOUSE}").as_bytes());
     }
 
     /// Windows image paste depends on us advertising `?2004h` so Windows

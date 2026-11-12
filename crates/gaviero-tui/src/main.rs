@@ -140,6 +140,7 @@ fn restore_terminal() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     let raw = disable_raw_mode();
     let vt_mouse = platform::disable_vt_mouse_passthrough(&mut stdout);
+    let _ = platform::restore_alt_scroll(&mut stdout);
     let modes = execute!(
         stdout,
         LeaveAlternateScreen,
