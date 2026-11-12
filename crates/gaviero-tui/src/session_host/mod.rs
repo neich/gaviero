@@ -558,6 +558,17 @@ impl Host {
                 }
             }
         }
+        self.sync_focus();
+    }
+
+    /// After every event, whatever changed the current tab (a switch, a
+    /// close, a new tab, a reorder, a relaunch): the shown tab has focus,
+    /// every other one has not (`Session::sync_focus`).
+    fn sync_focus(&mut self) {
+        let active = self.active;
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            s.sync_focus(i == active);
+        }
     }
 
     fn on_output(&mut self, id: u64, bytes: &[u8]) {
@@ -568,6 +579,7 @@ impl Host {
         let before = self.sessions[i].activity;
         self.sessions[i].feed(bytes);
         if let Some(path) = self.sessions[i].take_reported_path() {
+            self.sessions[i].focus_ready = true;
             self.adopt_reported_path(i, path);
         }
         let s = &mut self.sessions[i];
@@ -731,9 +743,11 @@ impl Host {
 
     /// Ctrl+V in an SSH tab: the remote gaviero would read the remote
     /// machine's clipboard, so paste this machine's text instead (as a
-    /// bracketed paste when the remote asked for one). Images do not cross.
-    fn paste_local_clipboard(&self) {
+    /// bracketed paste when the remote asked for one). Images do not cross,
+    /// so with no text the tab bar says so instead of nothing happening.
+    fn paste_local_clipboard(&mut self) {
         let Some(text) = clipboard::get_text().filter(|t| !t.is_empty()) else {
+            self.notify("Nothing to paste: only text reaches an SSH tab".to_string());
             return;
         };
         if let Some(s) = self.active_session() {

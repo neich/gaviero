@@ -174,6 +174,12 @@ pub(crate) struct Session {
     /// An SSH tab whose connection was lost (`ssh` exited with 255): kept
     /// with its last screen until the user reconnects (Enter) or closes it.
     pub disconnected: bool,
+    /// The child has reported its folder (OSC 7), which gaviero does right
+    /// before its event loop: from then on it reads focus reports as such.
+    pub focus_ready: bool,
+    /// The focus report last sent (`true` = gained), so each change is
+    /// sent once.
+    focus_sent: Option<bool>,
 }
 
 /// The largest copy taken from a session (OSC 52), decoded.
@@ -355,6 +361,8 @@ pub(crate) fn spawn(
         shell_done_unseen: false,
         restart_pending: false,
         disconnected: false,
+        focus_ready: false,
+        focus_sent: None,
     })
 }
 
@@ -362,6 +370,22 @@ impl Session {
     /// Queue bytes for the child's input.
     pub fn send(&self, bytes: Vec<u8>) {
         let _ = self.input.send(bytes);
+    }
+
+    /// Tell a local child whether its tab is the one shown (`ESC[I` /
+    /// `ESC[O`, which ConPTY turns into focus events). Every hidden tab's
+    /// gaviero would otherwise believe it has focus and act on input it
+    /// detects outside its own console: a Ctrl+V anywhere attached the
+    /// clipboard image in every idle local chat. Sent only once the child
+    /// is ready (before that it may be on a setup screen reading keys), and
+    /// never to an SSH tab, whose remote end may be a shell.
+    pub fn sync_focus(&mut self, focused: bool) {
+        if self.target.is_ssh() || !self.focus_ready || self.focus_sent == Some(focused) {
+            return;
+        }
+        self.focus_sent = Some(focused);
+        let report: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+        self.send(report.to_vec());
     }
 
     /// Feed child output into the screen, answer its terminal queries, and

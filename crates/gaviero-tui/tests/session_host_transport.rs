@@ -185,3 +185,30 @@ fn keys_and_mouse_reach_a_crossterm_child() {
     let code = pty.wait_exit(Duration::from_secs(10));
     assert!(code.is_some(), "probe did not exit; screen:\n{}", pty.contents());
 }
+
+/// Focus reports (`ESC[O` / `ESC[I`, what the host sends a tab it hides or
+/// shows) reach a crossterm child as focus events, not as typed keys.
+#[test]
+fn focus_reports_reach_a_crossterm_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pty = Pty::spawn(
+        &[],
+        &[("GAVIERO_INPUT_PROBE", OsStr::new("1"))],
+        dir.path(),
+    );
+    pty.wait_for("title probe-ready", |_, t| t == Some("probe-ready"));
+    pty.send("\x1b[O");
+    pty.wait_text("FOCUS lost");
+    pty.send("\x1b[I");
+    pty.wait_text("FOCUS gained");
+    // A key after them still arrives as itself.
+    pty.send(&tap(0x58, 0x2D, 'x' as u16, 0));
+    pty.wait_text("KEY Char('x')");
+    let screen = pty.contents();
+    assert!(
+        !screen.lines().any(|l| l.starts_with("KEY") && !l.contains("Char('x')")),
+        "focus reports leaked as keys:\n{screen}"
+    );
+    pty.send(&tap(0x51, 0x10, 17, LEFT_CTRL));
+    let _ = pty.wait_exit(Duration::from_secs(10));
+}

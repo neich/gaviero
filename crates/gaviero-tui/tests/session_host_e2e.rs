@@ -525,6 +525,82 @@ fn a_deploy_restarts_the_host_with_its_tabs() {
     assert_eq!(open_names(&state), vec![la, lb]);
 }
 
+/// The probe reports a folder (OSC 7), as gaviero does before its event loop.
+fn ctrl_o() -> String {
+    tap(0x4F, 0x18, 15, LEFT_CTRL)
+}
+
+/// The focus events the shown probe printed, oldest first.
+fn focus_lines(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .filter(|l| l.starts_with("FOCUS "))
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// A hidden local tab must know it is hidden: its gaviero reacts to a
+/// Ctrl+V pressed anywhere on the desktop (a clipboard image was attached
+/// in every idle local chat). Once a child has reported its folder, the
+/// tab shown gets focus-gained and every other one focus-lost.
+#[test]
+fn tabs_get_focus_reports_once_ready() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    let b = root.path().join("beta-b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let (la, lb) = (name_of(&a), name_of(&b));
+    let state = root.path().join("state.json");
+    let mut pty = host(
+        &[OsStr::new("--sessions"), a.as_os_str()],
+        &state,
+        root.path(),
+    );
+    pty.wait_for("A's tab", |_, _| pty.row(0).contains(&la));
+    // A has not reported its folder: switching away sends it nothing.
+    open_in_picker(&mut pty, &b);
+    pty.wait_for("both tabs", |_, _| {
+        let bar = pty.row(0);
+        bar.contains(&la) && bar.contains(&lb)
+    });
+
+    // B (shown) reports its folder and is told it has focus.
+    pty.send(&ctrl_o());
+    pty.wait_text("FOCUS gained");
+
+    // A, shown now, had nothing sent while it was not ready.
+    pty.send(&alt_left());
+    pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));
+    pty.wait_text("KEY Char('z')");
+    assert!(focus_lines(&pty.contents()).is_empty(), "screen:\n{}", pty.contents());
+    pty.send(&ctrl_o());
+    pty.wait_text("FOCUS gained");
+
+    // Back to B: it lost focus when A was shown, and gains it again now.
+    pty.send(&alt_right());
+    pty.wait_for("B lost then regained focus", |s, _| {
+        focus_lines(s).ends_with(&["FOCUS lost".to_string(), "FOCUS gained".to_string()])
+            && focus_lines(s).len() == 3
+    });
+
+    // And A likewise.
+    pty.send(&alt_left());
+    pty.wait_for("A lost then regained focus", |s, _| {
+        focus_lines(s).ends_with(&["FOCUS lost".to_string(), "FOCUS gained".to_string()])
+            && focus_lines(s).len() == 3
+    });
+    let screen = pty.contents();
+    assert!(
+        !screen.lines().any(|l| l.starts_with("KEY") && !l.contains("Char('z')")),
+        "a focus report leaked as keys:\n{screen}"
+    );
+
+    pty.send(&ctrl_q());
+    let code = pty.wait_exit(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
+}
+
 /// Alt+N, the full path of `dir`, Enter.
 fn open_in_picker(pty: &mut Pty, dir: &Path) {
     pty.send(&tap(0x4E, 0x31, 'n' as u16, LEFT_ALT));
