@@ -129,6 +129,12 @@ pub const RAW_PASTE_MIN_CHARS: usize = 16;
 /// it). Re-writing the enable sequences is idempotent, so a short interval
 /// is safe; 24 bytes every 2 s is negligible next to frame output.
 pub const VT_MOUSE_REASSERT_MS: u64 = 2000;
+
+/// How long mouse reporting stays off after a Ctrl+wheel reaches gaviero,
+/// so the host terminal can zoom its font (`App::begin_zoom_passthrough`).
+/// Each resize inside the window — a zoom step changes the cell grid —
+/// pushes the end out by the same amount, so continuous zooming is not cut.
+pub const ZOOM_PASSTHROUGH_MS: u64 = 1500;
 /// Default number of messages to keep on /compact.
 pub const DEFAULT_COMPACT_KEEP: usize = 6;
 /// Terminal resize step (percentage per key press).

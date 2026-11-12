@@ -247,6 +247,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_paste(&text);
         }
         Event::Mouse(mouse) => {
+            // Ctrl+wheel belongs to the host terminal (font zoom), whatever
+            // is open in gaviero.
+            if crate::platform::is_terminal_zoom_gesture(&mouse) {
+                app.begin_zoom_passthrough();
+                return;
+            }
             if app.settings_error_dialog.is_none()
                 && app.syntax_error_dialog.is_none()
                 && !app.restart.popup_open
@@ -256,6 +262,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::Resize(_w, _h) => {
             app.needs_full_redraw = true;
+            app.extend_zoom_passthrough();
             // Mux / WT resize is a known trigger for dropping pane mouse
             // modes (and, one layer up, the psmux client's registration).
             // Re-assert immediately so drag selection recovers with the
@@ -1786,6 +1793,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::Tick => {
             app.terminal_manager.tick();
+            app.maybe_end_zoom_passthrough();
             app.maybe_reassert_vt_mouse(false);
             // Windows: WT often swallows Ctrl+V for image-only clipboards and
             // emits nothing. Detect the physical chord and, after a short
