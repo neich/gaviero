@@ -33,7 +33,8 @@ similar = "2"
 git2 = "0.19"
 tree-sitter = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
-ort = "2.0.0-rc.12"
+# rc.12's ONNX Runtime 1.24.2 requires glibc 2.38; Linux releases target Ubuntu 22.04.
+ort = "=2.0.0-rc.11"
 # Default features minus `esaxx_fast`: esaxx-rs's build script hardcodes
 # the static CRT (/MT), which cannot link alongside ort's /MD prebuilt
 # onnxruntime on windows-msvc (LNK2038 mismatch). esaxx only accelerates
