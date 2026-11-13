@@ -760,7 +760,7 @@ impl Host {
         }
     }
 
-    fn quitting(&self) -> bool {
+    pub(crate) fn quitting(&self) -> bool {
         self.quit_deadline.is_some()
     }
 
@@ -831,6 +831,7 @@ impl Host {
     fn quit_host(&mut self) {
         tracing::info!(sessions = self.sessions.len(), "quitting the host");
         self.quit_deadline = Some(Instant::now() + EXIT_GRACE);
+        self.dirty = true;
         self.save_state();
         for s in &mut self.sessions {
             if s.target.is_ssh() {

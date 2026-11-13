@@ -59,6 +59,13 @@
 ; ── Loop block keywords ───────────────────────────────────────
 "loop" @keyword
 "until" @keyword
+
+; ── For block keywords ────────────────────────────────────────
+"for" @keyword
+"in" @keyword
+"parallel" @keyword
+"sequential" @keyword
+"peer_template" @keyword
 "agents" @keyword
 "reviewers" @keyword
 "template_init" @keyword

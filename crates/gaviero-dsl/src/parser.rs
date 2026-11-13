@@ -96,6 +96,13 @@ enum LoopField {
     TemplateInit(String, Span),
     TemplateRefine(String, Span),
     ConsensusMode(ConsensusModeLit),
+    For(ForBlock),
+}
+
+#[derive(Debug, Clone)]
+enum ForItem {
+    Agent(String, Span),
+    PeerTemplate(String, Span),
 }
 
 #[derive(Debug)]
@@ -103,6 +110,8 @@ enum ReviewerField {
     Id(String, Span),
     Model(String, Span),
     Effort(String, Span),
+    /// Free `<ident> "<string>"` field of a list-param entry.
+    Free(String, String, Span),
 }
 
 #[derive(Debug)]
@@ -117,6 +126,94 @@ enum MemoryField {
 }
 
 // ── Parser builder ─────────────────────────────────────────────────────────
+
+/// `[ { id "…" [model "…"] [effort …] [<ident> "<string>"]* } … ]` — the
+/// list-param / roster literal. Shared by the script parser and
+/// [`parse_list_literal`] (the `--param NAME=[…]` CLI form).
+fn list_entries_parser<'src, I>()
+-> impl Parser<'src, I, Vec<ReviewerEntry>, extra::Err<Rich<'src, Token, Span>>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    let string = select! {
+        Token::Str(s)    => s,
+        Token::RawStr(s) => s,
+    };
+    let kw_id = select! { Token::Ident(s) if s == "id" => () };
+    // `effort` accepts the same shape as `client { effort <value> }` — either
+    // an identifier (e.g. `high`) or a quoted string (e.g. `"max"`).
+    let effort_value = choice((
+        select! { Token::Ident(s) => s },
+        select! { Token::Str(s) => s },
+    ));
+    let reviewer_field = choice((
+        kw_id
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Id(v, s)),
+        just(Token::KwModel)
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Model(v, s)),
+        just(Token::KwEffort)
+            .ignore_then(effort_value.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Effort(v, s)),
+        // Free fields come last so `id` keeps its own meaning. Duplicates are
+        // kept (in order) for the `for` expansion to report.
+        select! { Token::Ident(s) => s }
+            .then(string)
+            .map_with(|(k, v), e| ReviewerField::Free(k, v, e.span())),
+    ));
+    let reviewer_entry = reviewer_field
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
+        .map_with(|fields, e| {
+            let mut id: Option<(String, Span)> = None;
+            let mut model: Option<(String, Span)> = None;
+            let mut effort: Option<(String, Span)> = None;
+            let mut free: Vec<(String, String, Span)> = Vec::new();
+            for f in fields {
+                match f {
+                    // A repeated `id` / `model` / `effort` keeps the first
+                    // value and lands in `fields` under its own name, so the
+                    // `for` expansion can report it as a duplicate field.
+                    ReviewerField::Id(v, s) => match id {
+                        None => id = Some((v, s)),
+                        Some(_) => free.push(("id".to_string(), v, s)),
+                    },
+                    ReviewerField::Model(v, s) => match model {
+                        None => model = Some((v, s)),
+                        Some(_) => free.push(("model".to_string(), v, s)),
+                    },
+                    ReviewerField::Effort(v, s) => match effort {
+                        None => effort = Some((v, s)),
+                        Some(_) => free.push(("effort".to_string(), v, s)),
+                    },
+                    ReviewerField::Free(k, v, s) => free.push((k, v, s)),
+                }
+            }
+            let (id_value, id_span) = id.unwrap_or_else(|| (String::new(), e.span()));
+            let (model_value, model_span) = match model {
+                Some((v, s)) => (Some(v), s),
+                None => (None, e.span()),
+            };
+            ReviewerEntry {
+                id: id_value,
+                id_span,
+                model: model_value,
+                model_span,
+                effort,
+                fields: free,
+                span: e.span(),
+            }
+        });
+    reviewer_entry
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+}
+
 
 fn script_parser<'src, I>()
 -> impl Parser<'src, I, Script, extra::Err<Rich<'src, Token, Span>>> + Clone
@@ -736,6 +833,7 @@ where
                 memory,
                 context,
                 vars,
+                item_vars: Vec::new(),
                 tools,
                 template,
                 span: e.span(),
@@ -830,57 +928,7 @@ where
             })
     };
 
-    let kw_id = select! { Token::Ident(s) if s == "id" => () };
-    // `effort` accepts the same shape as `client { effort <value> }` — either
-    // an identifier (e.g. `high`) or a quoted string (e.g. `"max"`).
-    let effort_value = choice((
-        select! { Token::Ident(s) => s },
-        select! { Token::Str(s) => s },
-    ));
-    let reviewer_field = choice((
-        kw_id
-            .ignore_then(string.map_with(|v, e| (v, e.span())))
-            .map(|(v, s)| ReviewerField::Id(v, s)),
-        just(Token::KwModel)
-            .ignore_then(string.map_with(|v, e| (v, e.span())))
-            .map(|(v, s)| ReviewerField::Model(v, s)),
-        just(Token::KwEffort)
-            .ignore_then(effort_value.map_with(|v, e| (v, e.span())))
-            .map(|(v, s)| ReviewerField::Effort(v, s)),
-    ));
-    let reviewer_entry = reviewer_field
-        .repeated()
-        .at_least(2)
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        .map_with(|fields, e| {
-            let mut id: Option<(String, Span)> = None;
-            let mut model: Option<(String, Span)> = None;
-            let mut effort: Option<(String, Span)> = None;
-            for f in fields {
-                match f {
-                    ReviewerField::Id(v, s) => id.get_or_insert((v, s)),
-                    ReviewerField::Model(v, s) => model.get_or_insert((v, s)),
-                    ReviewerField::Effort(v, s) => effort.get_or_insert((v, s)),
-                };
-            }
-            let (id_value, id_span) = id.unwrap_or_else(|| (String::new(), e.span()));
-            let (model_value, model_span) = model.unwrap_or_else(|| (String::new(), e.span()));
-            ReviewerEntry {
-                id: id_value,
-                id_span,
-                model: model_value,
-                model_span,
-                effort,
-                span: e.span(),
-            }
-        });
-    let reviewer_literal_list = reviewer_entry
-        .clone()
-        .repeated()
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket));
+    let reviewer_literal_list = list_entries_parser();
     // `reviewers` accepts either a literal list or a bare identifier that
     // references a workflow `param` declaration.
     let reviewers_source = choice((
@@ -888,7 +936,72 @@ where
         ident.map_with(|name, e| ReviewerSource::ParamRef(name, e.span())),
     ));
 
+    // ── for block: `for <var> in <list> parallel|sequential { … }` ──
+    //
+    // Every word is a contextual keyword (matched as an identifier), so no
+    // existing script that names an agent `for`, `parallel`, … breaks.
+    let kw_for = select! { Token::Ident(s) if s == "for" => () };
+    let kw_in = select! { Token::Ident(s) if s == "in" => () };
+    let kw_peer_template = select! { Token::Ident(s) if s == "peer_template" => () };
+    let for_mode = select! {
+        Token::Ident(s) if s == "parallel"   => ForMode::Parallel,
+        Token::Ident(s) if s == "sequential" => ForMode::Sequential,
+    };
+    let for_item = choice((
+        kw_peer_template
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ForItem::PeerTemplate(v, s)),
+        ident.map_with(|n, e| ForItem::Agent(n, e.span())),
+    ));
+    let for_block = kw_for
+        .ignore_then(ident.map_with(|s, e| (s, e.span())))
+        .then_ignore(kw_in)
+        .then(ident.map_with(|s, e| (s, e.span())))
+        .then(for_mode.map_with(|m, e| (m, e.span())))
+        .then(
+            for_item
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .try_map(|((((var, var_span), (list, list_span)), (mode, mode_span)), items), span| {
+            let mut agents = Vec::new();
+            let mut peer_template: Option<(String, Span)> = None;
+            for item in items {
+                match item {
+                    ForItem::Agent(n, s) => agents.push((n, s)),
+                    ForItem::PeerTemplate(t, s) => {
+                        if peer_template.is_some() {
+                            return Err(Rich::custom(
+                                s,
+                                "a `for` block takes at most one `peer_template`",
+                            ));
+                        }
+                        peer_template = Some((t, s));
+                    }
+                }
+            }
+            if agents.is_empty() {
+                return Err(Rich::custom(
+                    span,
+                    "a `for` block needs at least one agent in its body",
+                ));
+            }
+            Ok(ForBlock {
+                var,
+                var_span,
+                list,
+                list_span,
+                mode,
+                mode_span,
+                agents,
+                peer_template,
+                span,
+            })
+        });
+
     let loop_field = choice((
+        for_block.clone().map(LoopField::For),
         just(Token::KwReviewers)
             .ignore_then(reviewers_source)
             .map(LoopField::Reviewers),
@@ -959,8 +1072,10 @@ where
             let mut template_init = None;
             let mut template_refine = None;
             let mut consensus_mode = ConsensusModeLit::Strict;
+            let mut fors: Vec<ForBlock> = Vec::new();
             for f in fields {
                 match f {
+                    LoopField::For(fb) => fors.push(fb),
                     LoopField::Reviewers(v) => reviewers = v,
                     LoopField::Agents(v) => agents = v,
                     LoopField::Until(c) => {
@@ -1015,6 +1130,8 @@ where
                 reviewers,
                 template_init,
                 template_refine,
+                fors,
+                baseline_units: Vec::new(),
                 consensus_mode,
                 span: e.span(),
             }
@@ -1024,6 +1141,7 @@ where
 
     let step_item = choice((
         loop_block.map(StepItem::Loop),
+        for_block.map(StepItem::For),
         ident.map_with(|s, e| StepItem::Agent(s, e.span())),
     ));
 
@@ -1348,6 +1466,29 @@ pub fn parse(
         .collect();
 
     (ast, dsl_errors)
+}
+
+/// Parse a list-param literal (`[ { id "a" focus "x" } … ]`) supplied as a
+/// `--param NAME=[…]` value. The error string carries the first lexer or
+/// parse problem.
+pub(crate) fn parse_list_literal(text: &str) -> Result<Vec<ReviewerEntry>, String> {
+    let (tokens, lex_errors) = crate::lexer::lex(text);
+    if let Some(span) = lex_errors.first() {
+        return Err(format!(
+            "list literal: unexpected character at offset {}",
+            span.start
+        ));
+    }
+    let eoi = SimpleSpan::from(text.len()..text.len());
+    let stream = tokens.as_slice().split_token_span(eoi);
+    let (entries, errors) = list_entries_parser()
+        .then_ignore(end())
+        .parse(stream)
+        .into_output_errors();
+    if let Some(e) = errors.first() {
+        return Err(format!("list literal: {e}"));
+    }
+    entries.ok_or_else(|| "list literal: could not parse".to_string())
 }
 
 #[cfg(test)]
@@ -2205,5 +2346,196 @@ mod tests {
         } else {
             panic!("expected Agent item");
         }
+    }
+
+    // ── list entries with free fields / `for` blocks ──────────────
+
+    fn workflow_steps(src: &str) -> Vec<StepItem> {
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        ast.unwrap()
+            .items
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Workflow(w) => w.steps.map(|(s, _)| s),
+                _ => None,
+            })
+            .expect("workflow steps")
+    }
+
+    #[test]
+    fn list_param_entry_with_free_field() {
+        let src = r#"
+            agent a { description "a" }
+            workflow w {
+                param p [ { id "a" focus "x" } ]
+                steps [a]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let Item::Workflow(w) = &ast.unwrap().items[1] else {
+            panic!("expected workflow");
+        };
+        let Some(ParamShape::Roster(entries)) = &w.params[0].shape else {
+            panic!("expected list param");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "a");
+        assert!(entries[0].model.is_none());
+        assert_eq!(entries[0].fields.len(), 1);
+        assert_eq!(entries[0].fields[0].0, "focus");
+        assert_eq!(entries[0].fields[0].1, "x");
+    }
+
+    #[test]
+    fn list_param_repeated_builtin_field_is_kept_for_diagnostics() {
+        let src = r#"
+            agent a { description "a" }
+            workflow w {
+                param p [ { id "a" id "b" model "claude:opus" } ]
+                steps [a]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let Item::Workflow(w) = &ast.unwrap().items[1] else {
+            panic!("expected workflow");
+        };
+        let Some(ParamShape::Roster(entries)) = &w.params[0].shape else {
+            panic!("expected list param");
+        };
+        assert_eq!(entries[0].id, "a");
+        assert_eq!(entries[0].model.as_deref(), Some("claude:opus"));
+        assert!(entries[0].fields.iter().any(|(k, v, _)| k == "id" && v == "b"));
+    }
+
+    #[test]
+    fn for_block_parallel_with_peer_template_as_step() {
+        let steps = workflow_steps(
+            r##"
+            agent a { description "a" }
+            agent b { description "b" }
+            agent c { description "c" }
+            workflow w {
+                steps [
+                    for t in topics parallel { a b peer_template #"- {{peer}}"# }
+                    c
+                ]
+            }
+        "##,
+        );
+        assert_eq!(steps.len(), 2);
+        let StepItem::For(fb) = &steps[0] else {
+            panic!("expected For step");
+        };
+        assert_eq!(fb.var, "t");
+        assert_eq!(fb.list, "topics");
+        assert_eq!(fb.mode, ForMode::Parallel);
+        let names: Vec<&str> = fb.agents.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(fb.peer_template.as_ref().map(|(t, _)| t.as_str()), Some("- {{peer}}"));
+        assert!(matches!(&steps[1], StepItem::Agent(n, _) if n == "c"));
+    }
+
+    #[test]
+    fn for_block_sequential_parses() {
+        let steps = workflow_steps(
+            r#"
+            agent e { description "e" }
+            workflow w { steps [ for c in chapters sequential { e } ] }
+        "#,
+        );
+        let StepItem::For(fb) = &steps[0] else {
+            panic!("expected For step");
+        };
+        assert_eq!(fb.mode, ForMode::Sequential);
+        assert!(fb.peer_template.is_none());
+    }
+
+    #[test]
+    fn for_block_inside_loop_parses() {
+        let steps = workflow_steps(
+            r#"
+            agent r { description "r" }
+            agent j { description "j" }
+            workflow w {
+                steps [
+                    loop {
+                        for t in topics parallel { r }
+                        until agent j
+                    }
+                ]
+            }
+        "#,
+        );
+        let StepItem::Loop(lb) = &steps[0] else {
+            panic!("expected Loop step");
+        };
+        assert_eq!(lb.fors.len(), 1);
+        assert!(lb.agents.is_empty());
+        assert!(lb.baseline_units.is_empty());
+    }
+
+    #[test]
+    fn for_block_unknown_mode_is_a_parse_error() {
+        let (_, errs) = parse_str(
+            r#"
+            agent a { description "a" }
+            workflow w { steps [ for t in topics sideways { a } ] }
+        "#,
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn for_block_with_empty_body_is_a_parse_error() {
+        let (_, errs) = parse_str(
+            r#"
+            agent a { description "a" }
+            workflow w { steps [ for t in topics parallel { } ] }
+        "#,
+        );
+        // chumsky reports the alternative it backtracked to, not the custom
+        // message, so only the presence of an error is asserted.
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn for_block_with_two_peer_templates_is_a_parse_error() {
+        let (_, errs) = parse_str(
+            r#"
+            agent a { description "a" }
+            workflow w { steps [ for t in topics parallel { a peer_template "x" peer_template "y" } ] }
+        "#,
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn agent_named_parallel_still_works_as_a_step() {
+        let steps = workflow_steps(
+            r#"
+            agent parallel { description "p" }
+            agent for { description "f" }
+            workflow w { steps [ parallel for ] }
+        "#,
+        );
+        assert!(matches!(&steps[0], StepItem::Agent(n, _) if n == "parallel"));
+        assert!(matches!(&steps[1], StepItem::Agent(n, _) if n == "for"));
+    }
+
+    #[test]
+    fn list_literal_parses_free_fields_and_models() {
+        let entries =
+            parse_list_literal(r#"[{id "a" focus "x"} {id "b" model "claude:opus"}]"#).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].fields[0].0, "focus");
+        assert_eq!(entries[1].model.as_deref(), Some("claude:opus"));
+    }
+
+    #[test]
+    fn list_literal_rejects_trailing_garbage() {
+        assert!(parse_list_literal(r#"[{id "a"}] extra"#).is_err());
     }
 }

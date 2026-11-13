@@ -495,12 +495,15 @@ pub async fn execute(
     observer.on_phase_changed("validating");
 
     // 1. Validate scopes
-    let loop_groups = validation::expand_loop_groups_with_roster_init(
-        plan.loop_configs
-            .iter()
-            .map(|lc| lc.agent_ids.clone())
-            .collect(),
-        &work_units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+    let loop_groups = validation::add_baseline_units_to_loop_groups(
+        validation::expand_loop_groups_with_roster_init(
+            plan.loop_configs
+                .iter()
+                .map(|lc| lc.agent_ids.clone())
+                .collect(),
+            &work_units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        ),
+        &plan.loop_configs,
     );
     let scope_errors = validation::validate_scopes(&work_units, &loop_groups);
     if !scope_errors.is_empty() {

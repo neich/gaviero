@@ -1,0 +1,116 @@
+// description: Explicit `for` loops — parallel fan-out, a sequential chain, fan-in, and a panel loop
+//
+// `for <var> in <list-param> parallel|sequential { <agent>+ [peer_template "…"] }`
+// clones each body agent once per list item, named `<item-id>-<agent>`
+// (here `a-analyst`, `b-analyst`, `c-analyst`, …). Inside a clone:
+//
+//   {{t.id}}          the item id            {{t.<field>}}  any free field
+//   {{t.index}}       1-based position       {{t.count}}    list length
+//   {{t.peers}}       other ids, comma-joined {{t.peer_count}}
+//   {{t.prev}}        previous item's id (sequential only; empty for the first)
+//   {{t.peer_block}}  the `peer_template` rendered once per peer ({{peer}} = peer id)
+//
+// Rules:
+//   - every clone's `owned` / `produces` paths must contain {{t.id}} — clones
+//     never share files;
+//   - `for … sequential` chains item k after item k−1 and needs
+//     `execution_mode document` (item k reads item k−1's files);
+//   - `depends_on [analyst]` on any other agent means "after every analyst
+//     clone" (fan-in);
+//   - inside a `loop` only `for … parallel` is allowed. Clones of an earlier
+//     top-level `for` over the same list become the loop's baseline, so a
+//     resumed run skips them.
+//
+// Override the list from the CLI with a DSL literal or the short form:
+//
+//   gaviero-cli --script for_loops.gaviero --prompt "the release" \
+//     --param 'topics=[{id "db" focus "storage"} {id "net" focus "network"}]'
+//   gaviero-cli --script for_loops.gaviero --prompt "the release" --param topics=db,net
+
+client sonnet { model "claude:sonnet" effort medium default }
+
+vars {
+    OUT_DIR "for-loops"
+}
+
+agent analyst {
+    description "Analyse {{t.focus}} for {{PROMPT}}"
+    scope { owned ["{{OUT_DIR}}/{{t.id}}-notes.md"] }
+    produces ["{{OUT_DIR}}/{{t.id}}-notes.md"]
+    prompt #"
+        You are analyst {{t.index}} of {{t.count}}. Analyse {{t.focus}} for
+        {{PROMPT}} and write {{OUT_DIR}}/{{t.id}}-notes.md.
+
+        Your peers ({{t.peers}}) write these files; do not edit them:
+{{t.peer_block}}
+    "#
+}
+
+agent editor {
+    description "Draft section {{t.id}}"
+    scope {
+        owned ["{{OUT_DIR}}/{{t.id}}-draft.md"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/{{t.id}}-draft.md"]
+    prompt #"
+        Continue the draft. Read {{OUT_DIR}}/{{t.prev}}-draft.md when
+        `{{t.prev}}` is not empty, then write {{OUT_DIR}}/{{t.id}}-draft.md.
+    "#
+}
+
+agent summarizer {
+    description "Summarise every analysis"
+    depends_on [analyst]
+    scope {
+        owned ["{{OUT_DIR}}/summary.md"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt #"
+        Read every {{OUT_DIR}}/*-notes.md and write {{OUT_DIR}}/summary.md.
+    "#
+}
+
+agent reviewer {
+    description "Review the drafts ({{t.id}})"
+    scope {
+        owned ["{{OUT_DIR}}/{{t.id}}-review-v*.md"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/{{t.id}}-review-v{{ITER}}.md"]
+    prompt #"
+        Review the drafts under {{OUT_DIR}}/ and write
+        {{OUT_DIR}}/{{t.id}}-review-v{{ITER}}.md.
+    "#
+}
+
+agent judge {
+    description "Decide whether the reviews agree"
+    scope { read_only ["{{OUT_DIR}}/"] }
+    prompt #"
+        Read {{OUT_DIR}}/*-review-v{{ITER}}.md and reply with
+        `VERDICT: PASS` when they agree, otherwise `VERDICT: FAIL`.
+    "#
+}
+
+workflow for-loops {
+    execution_mode document
+    param topics [
+        { id "a" focus "storage" }
+        { id "b" focus "network" }
+        { id "c" focus "ui" }
+    ]
+    steps [
+        for t in topics parallel {
+            analyst
+            peer_template #"          - {{OUT_DIR}}/{{peer}}-notes.md"#
+        }
+        for t in topics sequential { editor }
+        summarizer
+        loop {
+            for t in topics parallel { reviewer }
+            max_iterations 3
+            until agent judge
+        }
+    ]
+}

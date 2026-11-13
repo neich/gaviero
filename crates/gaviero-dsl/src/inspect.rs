@@ -425,6 +425,30 @@ mod tests {
     }
 
     #[test]
+    fn a_list_default_with_free_fields_is_a_literal_that_parses_back() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/for_loops.gaviero");
+        let info = inspect_file(&path).unwrap();
+        let topics = &info.workflows[0].params[0];
+        assert_eq!(topics.kind, ParamKindInfo::Roster);
+        let default = topics.default.as_deref().unwrap();
+        assert_eq!(
+            default,
+            r#"[{id "a" focus "storage"} {id "b" focus "network"} {id "c" focus "ui"}]"#
+        );
+        let entries = crate::workflow_params::parse_reviewers_override(default).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].fields[0].1, "ui");
+
+        let mut odd = entries[0].clone();
+        odd.fields[0].1 = "say \"hi\"".into();
+        odd.model = Some("claude:opus".into());
+        let literal = crate::workflow_params::list_literal_entry(&odd);
+        let back = crate::workflow_params::parse_reviewers_override(&format!("[{literal}]")).unwrap();
+        assert_eq!(back[0].fields[0].1, "say \"hi\"");
+        assert_eq!(back[0].model.as_deref(), Some("claude:opus"));
+    }
+
+    #[test]
     fn each_workflow_reports_its_execution_mode() {
         let info = inspect(concat!(
             "agent a { prompt #\"x\"# }\n",

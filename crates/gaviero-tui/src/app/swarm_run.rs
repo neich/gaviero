@@ -15,8 +15,8 @@ use super::state::{Focus, SidePanelMode};
 use crate::event::Event;
 use crate::keymap::Action;
 use crate::panels::swarm_dashboard::{
-    DashboardFocus, FieldRole, FormValues, PlannedAgent, ScriptRow, SwarmForm, SwarmUpdate,
-    SwarmView,
+    DashboardFocus, FieldRole, FormValues, ListTarget, PlannedAgent, ScriptRow, SwarmForm,
+    SwarmUpdate, SwarmView,
 };
 use crate::widgets::prompt_input::{self, AutocompleteMode};
 use crate::widgets::render_utils::strip_ansi;
@@ -761,6 +761,9 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
                 if let Some(prompt) = form.focused_prompt() {
                     prompt.insert_str(text);
                     refresh_prompt_autocomplete(app);
+                } else if form.on_list() {
+                    form.paste_into_list(text);
+                    refresh_field_completion(app);
                 } else if let Some(input) = form.focused_input() {
                     input.insert_str(&text.replace(['\r', '\n'], " "));
                     refresh_field_completion(app);
@@ -1057,6 +1060,21 @@ fn handle_form(app: &mut App, action: Action) {
             _ => {}
         }
     }
+    if form.on_list() {
+        match action {
+            Action::AltEnter => {
+                form.add_item_after_focused();
+                return;
+            }
+            Action::Backspace | Action::Delete
+                if form.remove_empty_focused_item(action == Action::Backspace) =>
+            {
+                return;
+            }
+            Action::InsertChar(_) => form.ensure_list_item(),
+            _ => {}
+        }
+    }
     match action {
         Action::Tab | Action::CursorDown => form.focus_next(),
         Action::CursorUp => form.focus_previous(),
@@ -1305,7 +1323,14 @@ pub(super) fn click(app: &mut App, col: u16, row: u16) {
         }
         SwarmView::Form => {
             if let Some(form) = dash.form.as_mut() {
-                form.press_prompt(col, row);
+                match form.list_target_at(col, row) {
+                    Some((field, ListTarget::Add)) => form.add_list_item(field, None),
+                    Some((field, ListTarget::Remove(index))) => {
+                        form.remove_list_item(field, index)
+                    }
+                    Some((field, ListTarget::Item(index))) => form.focus_list_item(field, index),
+                    None => form.press_prompt(col, row),
+                }
             }
         }
         SwarmView::Run => {
@@ -1759,10 +1784,7 @@ workflow run {
     fn field_text(app: &App, name: &str) -> String {
         let form = app.swarm_dashboard.form.as_ref().unwrap();
         let field = form.fields.iter().find(|f| f.name == name).unwrap();
-        match &field.value {
-            crate::panels::swarm_dashboard::FieldValue::Text(input) => input.text.clone(),
-            _ => panic!("{name} is not a text field"),
-        }
+        field.text().unwrap_or_else(|| panic!("{name} is not a text field"))
     }
 
     fn completion_matches(app: &App) -> Vec<String> {
@@ -2030,6 +2052,51 @@ workflow run {
             handle_action(&mut app, Action::Backspace);
         }
         assert_eq!(completion_matches(&app), vec!["tier:glacial".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_items_are_added_and_removed_with_keys_and_clicks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_source(&root, "http://127.0.0.1:9", ROSTER_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Enter);
+        app.swarm_dashboard.form.as_mut().unwrap().focus_field("panel");
+        assert_eq!(field_text(&app, "panel"), "a=tier:low");
+
+        // Alt+Enter: a new item below; typing fills it.
+        handle_action(&mut app, Action::AltEnter);
+        type_text(&mut app, "b=ollama:x");
+        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:x");
+
+        // Backspace on an emptied item removes it and returns to the one above.
+        handle_action(&mut app, Action::AltEnter);
+        handle_action(&mut app, Action::Backspace);
+        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:x");
+        type_text(&mut app, "y");
+        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:xy");
+
+        // Mouse: `x` removes the first item, `+` appends an empty one.
+        let area = ratatui::layout::Rect::new(0, 0, 60, 20);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.swarm_dashboard.render(area, &mut buf, true);
+        let screen: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let at = |needle: &str| {
+            screen
+                .iter()
+                .enumerate()
+                .find_map(|(y, line)| line.find(needle).map(|x| (x as u16, y as u16)))
+                .unwrap_or_else(|| panic!("{needle} not drawn:\n{}", screen.join("\n")))
+        };
+        let (plus_x, plus_y) = at("(list) +");
+        let (x_x, x_y) = at("x a=tier:low");
+        click(&mut app, x_x, x_y);
+        assert_eq!(field_text(&app, "panel"), "b=ollama:xy");
+        click(&mut app, plus_x + "(list) ".len() as u16, plus_y);
+        type_text(&mut app, "c");
+        assert_eq!(field_text(&app, "panel"), "b=ollama:xy,c");
     }
 
     /// Open the form with a repo skill named `lint` available.

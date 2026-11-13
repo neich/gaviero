@@ -248,13 +248,26 @@ pub fn detect(
     // Roster loops name their baseline units `<id>-init` and their loop body
     // `<id>-refine` (see `swarm::validation::expand_loop_groups_with_roster_init`).
     // Resuming past the baseline means those units must not run again.
-    let satisfied_init_units: Vec<String> = loop_config
+    let mut satisfied_init_units: Vec<String> = loop_config
         .agent_ids
         .iter()
         .filter_map(|id| id.strip_suffix("-refine"))
         .map(|prefix| format!("{prefix}-init"))
         .filter(|init_id| unit_map.contains_key(init_id.as_str()))
         .collect();
+    // DSL `for … parallel` baselines are named explicitly on the loop config
+    // (`LoopConfig::baseline_units`) instead of by suffix.
+    if !loop_config.baseline_units.is_empty() {
+        satisfied_init_units.extend(
+            loop_config
+                .baseline_units
+                .iter()
+                .filter(|id| unit_map.contains_key(id.as_str()))
+                .cloned(),
+        );
+        satisfied_init_units.sort();
+        satisfied_init_units.dedup();
+    }
 
     Some(LoopResume {
         out_dir: out_dir.to_string(),
@@ -341,6 +354,7 @@ mod tests {
             consensus_mode: Default::default(),
             verdict_output_dir: Some(out_dir.to_string()),
             irreconcilable_after: 2,
+            baseline_units: Vec::new(),
         }
     }
 
@@ -491,6 +505,49 @@ mod tests {
             resume.satisfied_init_units.len(),
             2,
             "both baseline units are already represented on disk"
+        );
+    }
+
+    /// A DSL `for … parallel` baseline names its units on the loop config;
+    /// they need no `-init` / `-refine` naming to be skipped on resume.
+    #[test]
+    fn explicit_baseline_units_are_satisfied_on_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        for r in ["claude", "codex"] {
+            for v in [1, 2, 3] {
+                write(tmp.path(), &format!("research/{r}-conclusion-v{v}.md"), "c");
+                write(tmp.path(), &format!("research/{r}-summary-v{v}.md"), "s");
+            }
+        }
+        let units: Vec<WorkUnit> = ["claude", "codex"]
+            .iter()
+            .flat_map(|r| {
+                [
+                    unit(
+                        &format!("{r}-rev"),
+                        &[
+                            &format!("research/{r}-conclusion-v*.md"),
+                            &format!("research/{r}-summary-v*.md"),
+                        ],
+                    ),
+                    unit(
+                        &format!("{r}-base"),
+                        &[
+                            &format!("research/{r}-conclusion-v*.md"),
+                            &format!("research/{r}-summary-v*.md"),
+                        ],
+                    ),
+                ]
+            })
+            .collect();
+        let mut lc = loop_config(&["claude-rev", "codex-rev"], "research", 2);
+        lc.baseline_units = vec!["claude-base".to_string(), "codex-base".to_string()];
+
+        let resume = detect(tmp.path(), &lc, &map(&units)).expect("resume point");
+        assert_eq!(resume.last_complete_iter, 3);
+        assert_eq!(
+            resume.satisfied_init_units,
+            vec!["claude-base".to_string(), "codex-base".to_string()]
         );
     }
 

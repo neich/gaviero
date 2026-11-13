@@ -364,6 +364,48 @@ mod tests {
         );
     }
 
+    fn parse_ok(src: &str) -> String {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let sexp = tree.root_node().to_sexp();
+        assert!(!tree.root_node().has_error(), "parse tree: {sexp}");
+        sexp
+    }
+
+    #[test]
+    fn parse_for_parallel_with_peer_template() {
+        let sexp = parse_ok(
+            "workflow w { steps [ for t in topics parallel { a b peer_template #\"- {{peer}}\"# } c ] }",
+        );
+        assert_eq!(sexp.matches("(for_block").count(), 1, "{sexp}");
+        assert_eq!(sexp.matches("(peer_template").count(), 1, "{sexp}");
+    }
+
+    #[test]
+    fn parse_for_sequential() {
+        let sexp = parse_ok("workflow w { steps [ for c in chapters sequential { editor } ] }");
+        assert!(sexp.contains("(for_mode"), "{sexp}");
+    }
+
+    #[test]
+    fn parse_for_inside_loop() {
+        let sexp = parse_ok(
+            "workflow w { steps [ loop { for t in topics parallel { r } until agent j } ] }",
+        );
+        assert!(sexp.contains("(loop_block"), "{sexp}");
+        assert_eq!(sexp.matches("(for_block").count(), 1, "{sexp}");
+    }
+
+    #[test]
+    fn parse_list_entry_with_free_field() {
+        let sexp = parse_ok(
+            "workflow w { param topics [ { id \"a\" focus \"storage\" } { id \"b\" model \"tier:high\" } ] steps [ x ] }",
+        );
+        assert_eq!(sexp.matches("(reviewer_entry").count(), 2, "{sexp}");
+    }
+
     #[test]
     fn invalid_gaviero_syntax_produces_error_nodes() {
         let mut parser = tree_sitter::Parser::new();

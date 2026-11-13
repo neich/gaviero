@@ -940,6 +940,10 @@
           ]
         },
         {
+          "type": "SYMBOL",
+          "name": "for_block"
+        },
+        {
           "type": "SEQ",
           "members": [
             {
@@ -1105,7 +1109,7 @@
           "value": "["
         },
         {
-          "type": "REPEAT",
+          "type": "REPEAT1",
           "content": {
             "type": "SYMBOL",
             "name": "reviewer_entry"
@@ -1125,7 +1129,7 @@
           "value": "{"
         },
         {
-          "type": "REPEAT",
+          "type": "REPEAT1",
           "content": {
             "type": "SYMBOL",
             "name": "reviewer_field"
@@ -1178,6 +1182,94 @@
               "name": "_effort_value"
             }
           ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_string_value"
+            }
+          ]
+        }
+      ]
+    },
+    "for_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "for"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "STRING",
+          "value": "in"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "for_mode"
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "identifier"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "peer_template"
+              }
+            ]
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "for_mode": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "parallel"
+        },
+        {
+          "type": "STRING",
+          "value": "sequential"
+        }
+      ]
+    },
+    "peer_template": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "peer_template"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
         }
       ]
     },
@@ -1597,6 +1689,10 @@
               {
                 "type": "SYMBOL",
                 "name": "loop_block"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "for_block"
               },
               {
                 "type": "SYMBOL",

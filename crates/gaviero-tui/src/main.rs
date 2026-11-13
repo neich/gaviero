@@ -317,11 +317,21 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse_from(std::iter::once(std::ffi::OsString::from("gaviero")).chain(args));
-    let restart = tokio::runtime::Builder::new_multi_thread()
+    let restart = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?
-        .block_on(run(cli))?;
+        .block_on(run(cli))
+    {
+        Ok(restart) => restart,
+        // A session-host tab closed while still at a launch prompt: nothing
+        // was opened, so there is nothing to save or report.
+        Err(e) if e.is::<setup::HostClosed>() => {
+            tracing::info!("the session host closed this tab at a launch prompt");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     if restart {
         std::process::exit(supervisor::RESTART_EXIT_CODE);
     }

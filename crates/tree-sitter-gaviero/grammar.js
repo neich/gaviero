@@ -164,6 +164,9 @@ module.exports = grammar({
     loop_field: ($) =>
       choice(
         seq("agents", $.identifier_list),
+        // `for t in list parallel { … }` inside a loop (parallel only; the
+        // compiler rejects `sequential` here).
+        $.for_block,
         // `reviewers` accepts either a literal list (anonymous roster) or
         // a bare identifier that names a workflow `param` declaration.
         seq("reviewers", choice($.reviewer_list, $.identifier)),
@@ -180,17 +183,37 @@ module.exports = grammar({
         seq("branch_chain", $.branch_chain_value),
       ),
 
-    reviewer_list: ($) => seq("[", repeat($.reviewer_entry), "]"),
+    reviewer_list: ($) => seq("[", repeat1($.reviewer_entry), "]"),
 
     reviewer_entry: ($) =>
-      seq("{", repeat($.reviewer_field), "}"),
+      seq("{", repeat1($.reviewer_field), "}"),
 
     reviewer_field: ($) =>
       choice(
         seq("id", $._string_value),
         seq("model", $._string_value),
         seq("effort", $._effort_value),
+        // Free `<ident> "<string>"` field of a list param (`{{t.<ident>}}`).
+        seq($.identifier, $._string_value),
       ),
+
+    // ── For block ────────────────────────────────────────────────
+    // `for <var> in <list-param> parallel|sequential { <agent>+ [peer_template "…"] }`
+    for_block: ($) =>
+      seq(
+        "for",
+        $.identifier,
+        "in",
+        $.identifier,
+        $.for_mode,
+        "{",
+        repeat1(choice($.identifier, $.peer_template)),
+        "}",
+      ),
+
+    for_mode: (_) => choice("parallel", "sequential"),
+
+    peer_template: ($) => seq("peer_template", $._string_value),
 
     consensus_mode_value: (_) =>
       choice("strict", "partial_ok", "explore"),
@@ -256,8 +279,9 @@ module.exports = grammar({
     param_client_block: ($) =>
       seq("{", repeat($.client_field), "}"),
 
-    // ── Step list (identifiers + loop blocks) ────────────────────
-    step_list: ($) => seq("[", repeat(choice($.loop_block, $.identifier)), "]"),
+    // ── Step list (identifiers + loop blocks + for blocks) ───────
+    step_list: ($) =>
+      seq("[", repeat(choice($.loop_block, $.for_block, $.identifier)), "]"),
 
     // ── Lists ────────────────────────────────────────────────────
     string_list: ($) => seq("[", repeat($._string_value), "]"),

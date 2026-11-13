@@ -18,7 +18,7 @@ Conventions: [CLAUDE.md](CLAUDE.md). Language reference: [README.md](README.md).
    lexer (logos) → parser (chumsky) → AST
         │
         ▼
-   workflow_params::expand_…  (client + roster params)
+   workflow_params::expand_…  (client + roster params, then for_loops::expand_for_blocks)
         │
         ▼
    compiler::compile_ast_with_* → CompiledPlan → gaviero-core::swarm
@@ -41,6 +41,7 @@ Single synchronous library. Depends on [`gaviero-core`](../gaviero-core), logos,
 | [`resolver.rs`](src/resolver.rs) | Transitive `include` resolution |
 | [`workflow_params.rs`](src/workflow_params.rs) | `param` client + roster expansion (`--param`) |
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports of roster helpers |
+| [`for_loops.rs`](src/for_loops.rs) | Private: `for … parallel/sequential` expansion into per-item clones |
 | [`tiers.rs`](src/tiers.rs) | `load_tier_overrides` for `--tiers-file` |
 | [`profile.rs`](src/profile.rs) | Merges a model profile into the resolved script for `--profile` / the SWARM form |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette spans) |
@@ -63,6 +64,8 @@ Re-exported from core. [`workflow_execution_mode`](src/lib.rs) / [`peek_workflow
 
 [`workflow_params`](src/workflow_params.rs) expands client params (`provider:model[@effort]`) into synthetic `__param_*` clients and roster params into per-reviewer agent clones before semantic compile.
 
+Its last pass, [`for_loops::expand_for_blocks`](src/for_loops.rs), expands `for <var> in <list> parallel|sequential { … }`: one clone `<item-id>-<agent>` per item and body agent, item values in `AgentDecl::item_vars` (`<var>.id`, `<var>.<field>`, `<var>.index`, …), the sequential chain as `depends_on`, and fan-in `depends_on [body]` rewritten to every clone. A `for … parallel` inside a `loop` appends its clones to the loop's agents; when the step right before the loop is a top-level `for` over the same list, its clones become `LoopBlock::baseline_units`, emitted as `LoopConfig::baseline_units` (scope-group and resume pairing in core, alongside the roster's `-init`/`-refine` suffix rule).
+
 ### Tier overrides
 
 [`load_tier_overrides`](src/tiers.rs) parses a profile that contains **only** `tier <alias> <client>` lines. CLI profile beats script/includes.
@@ -75,7 +78,7 @@ Re-exported from core. [`workflow_execution_mode`](src/lib.rs) / [`peek_workflow
 source / entry_path
   │ compile_file → resolver::resolve (cycle reject, canonical dedup)
   ▼ lexer::lex → parser::parse → Script
-  ▼ workflow_params::expand_workflow_params_in_script
+  ▼ workflow_params::expand_workflow_params_in_script (client params → roster → for_loops::expand_for_blocks)
   ▼ compiler::compile_ast_with_vars / compile_ast_with_sources
       index items → duplicate checks → select workflow
       merge vars (agent > CLI --var > script; AGENT/PROMPT reserved)
@@ -86,7 +89,7 @@ source / entry_path
   ▼ CompiledPlan
 ```
 
-Var precedence for `{{KEY}}`: reserved runtime (`PROMPT`, `AGENT`, planner injects) → agent `vars` → `--var` → script `vars`. Single-pass substitution.
+Var precedence for `{{KEY}}`: reserved runtime (`PROMPT`, `AGENT`, planner injects) → agent `vars` → `--var` → script `vars`. Item vars (`AgentDecl::item_vars`, from `for` / roster expansion) are substituted first of all, so placeholders inside their values (`{{OUT_DIR}}` in a peer block) still resolve. Single pass per layer.
 
 ---
 

@@ -23,6 +23,8 @@ use crate::widgets::text_input::TextInput;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::swarm::plan::ExecutionMode;
 use gaviero_core::types::ModelTier;
+use gaviero_dsl::ast::ReviewerEntry;
+use gaviero_dsl::workflow_params::{list_literal_entry, parse_reviewers_override};
 use gaviero_dsl::{ParamKindInfo, ScriptInspection, VarKind};
 
 /// Activity kept per agent; the oldest output goes first.
@@ -186,6 +188,82 @@ pub enum FieldValue {
     Text(TextInput),
     /// The script's prompt, in the same box the chat uses.
     Prompt(Box<PromptInput>),
+    /// A list param, one input per item; `item` has the keyboard.
+    List { items: Vec<TextInput>, item: usize },
+}
+
+/// What a click on a list field's marks does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListTarget {
+    /// The `+` after the field type.
+    Add,
+    /// The `x` before an item.
+    Remove(usize),
+    /// The item's text.
+    Item(usize),
+}
+
+/// A list param's value split into items, each in `--param` syntax:
+/// `id=provider:model[@effort]`, `id`, or `{id "a" focus "x"}` when the entry
+/// has free fields.
+pub fn split_list_value(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.starts_with('[') {
+        return match parse_reviewers_override(value) {
+            Ok(entries) => entries.iter().map(list_item_text).collect(),
+            Err(_) => vec![value.to_string()],
+        };
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn list_item_text(entry: &ReviewerEntry) -> String {
+    if !entry.fields.is_empty() {
+        return list_literal_entry(entry);
+    }
+    match &entry.model {
+        Some(model) => match &entry.effort {
+            Some((effort, _)) => format!("{}={model}@{effort}", entry.id),
+            None => format!("{}={model}", entry.id),
+        },
+        None => entry.id.clone(),
+    }
+}
+
+/// Items back into one `--param` value: the short form, or a list literal as
+/// soon as one item is written as `{…}`. Empty items are dropped.
+pub fn join_list_items<S: AsRef<str>>(items: &[S]) -> String {
+    let items: Vec<&str> = items
+        .iter()
+        .map(|s| s.as_ref().trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.iter().any(|item| item.starts_with('{')) {
+        return items.join(",");
+    }
+    let literal: Vec<String> = items
+        .iter()
+        .map(|item| {
+            if item.starts_with('{') {
+                return item.to_string();
+            }
+            match parse_reviewers_override(item) {
+                Ok(entries) => entries
+                    .iter()
+                    .map(list_literal_entry)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                // Left as typed so compiling names the problem.
+                Err(_) => item.to_string(),
+            }
+        })
+        .collect();
+    format!("[{}]", literal.join(" "))
 }
 
 #[derive(Debug, Clone)]
@@ -199,24 +277,42 @@ pub struct FormField {
 }
 
 impl FormField {
-    fn text(&self) -> Option<&str> {
+    /// The value as `--param` / `--var` text; `None` for a selector.
+    pub fn text(&self) -> Option<String> {
         match &self.value {
-            FieldValue::Text(input) => Some(&input.text),
-            FieldValue::Prompt(prompt) => Some(&prompt.input.text),
+            FieldValue::Text(input) => Some(input.text.clone()),
+            FieldValue::Prompt(prompt) => Some(prompt.input.text.clone()),
+            FieldValue::List { items, .. } => {
+                let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+                Some(join_list_items(&texts))
+            }
             FieldValue::Choice { .. } => None,
         }
     }
 
     /// True once the user has changed a text field from its default.
     fn is_edited(&self) -> bool {
-        self.text()
-            .is_some_and(|t| t != self.default.as_deref().unwrap_or(""))
+        let default = self.default.as_deref().unwrap_or("");
+        match &self.value {
+            FieldValue::List { items, .. } => {
+                let now: Vec<&str> = items
+                    .iter()
+                    .map(|i| i.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                now != split_list_value(default)
+            }
+            _ => self.text().is_some_and(|t| t != default),
+        }
     }
 
     fn label(&self) -> String {
         let required = if self.required { " *" } else { "" };
+        if matches!(self.value, FieldValue::List { .. }) {
+            return format!("{}{required} (list)", self.name);
+        }
         let kind = match self.role {
-            FieldRole::Param(ParamKindInfo::Roster) => " (roster)",
+            FieldRole::Param(ParamKindInfo::Roster) => " (list)",
             FieldRole::Param(ParamKindInfo::Client) => " (model)",
             FieldRole::File => " (file)",
             FieldRole::Dir => " (folder)",
@@ -231,7 +327,9 @@ impl FormField {
             FieldRole::Workflow => "Which workflow to run. ←/→ to change",
             FieldRole::Profile => "Which models the script's tiers use. ←/→ to change",
             FieldRole::Prompt => "Alt+Enter new line  Alt+↑↓ resize  $skill  @file",
-            FieldRole::Param(ParamKindInfo::Roster) => "id=provider:model[@effort],… or id=tier:<name>,…",
+            FieldRole::Param(ParamKindInfo::Roster) => {
+                "id=provider:model[@effort] · id · {id \"…\" key \"…\"}  Alt+Enter/+ add  x or ⌫ on empty removes"
+            }
             FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort] or tier:<name>",
             FieldRole::Var => "Script variable. Empty leaves it unset",
             FieldRole::File => "An existing file. Type to search, as with @ in chat",
@@ -245,6 +343,28 @@ impl FormField {
             role: FieldRole::Prompt,
             value: FieldValue::Prompt(Box::default()),
             default: None,
+            required,
+        }
+    }
+
+    /// A list param; with no default it starts with one empty item to type in.
+    fn list_field(name: &str, role: FieldRole, default: Option<String>, required: bool) -> Self {
+        let mut items: Vec<TextInput> = split_list_value(default.as_deref().unwrap_or(""))
+            .iter()
+            .map(|text| {
+                let mut input = TextInput::new();
+                input.insert_str(text);
+                input
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(TextInput::new());
+        }
+        Self {
+            name: name.to_string(),
+            role,
+            value: FieldValue::List { items, item: 0 },
+            default,
             required,
         }
     }
@@ -297,6 +417,8 @@ pub struct SwarmForm {
     pub warnings: Vec<String>,
     /// Popup of the focused file or param field.
     pub completion: FileAutocomplete,
+    /// Where the last frame drew each list field's `+`, `x` and items.
+    list_hits: Vec<(Rect, usize, ListTarget)>,
 }
 
 impl SwarmForm {
@@ -317,6 +439,7 @@ impl SwarmForm {
             error: None,
             warnings: Vec::new(),
             completion: FileAutocomplete::new(),
+            list_hits: Vec::new(),
         };
         form.fields = form.build_fields(selected_folder, 0, 0);
         form
@@ -379,7 +502,11 @@ impl SwarmForm {
         }
         if let Some(wf) = self.inspection.workflows.get(workflow) {
             for param in &wf.params {
-                fields.push(FormField::text_field(
+                let build = match param.kind {
+                    ParamKindInfo::Roster => FormField::list_field,
+                    ParamKindInfo::Client => FormField::text_field,
+                };
+                fields.push(build(
                     &param.name,
                     FieldRole::Param(param.kind),
                     param.default.clone(),
@@ -472,8 +599,144 @@ impl SwarmForm {
         match &mut self.fields.get_mut(self.focus)?.value {
             FieldValue::Text(input) => Some(input),
             FieldValue::Prompt(prompt) => Some(&mut prompt.input),
+            FieldValue::List { items, item } => items.get_mut(*item),
             FieldValue::Choice { .. } => None,
         }
+    }
+
+    /// True when the focused field is a list.
+    pub fn on_list(&self) -> bool {
+        matches!(
+            self.fields.get(self.focus).map(|f| &f.value),
+            Some(FieldValue::List { .. })
+        )
+    }
+
+    /// Add an empty item to list field `field`, after `after` (at the end when
+    /// `None`), and give it the keyboard.
+    pub fn add_list_item(&mut self, field: usize, after: Option<usize>) {
+        let Some(FieldValue::List { items, item }) = self.fields.get_mut(field).map(|f| &mut f.value)
+        else {
+            return;
+        };
+        let at = after.map_or(items.len(), |i| (i + 1).min(items.len()));
+        items.insert(at, TextInput::new());
+        *item = at;
+        self.focus = field;
+        self.completion.reset();
+        self.error = None;
+    }
+
+    /// Add an item below the focused one.
+    pub fn add_item_after_focused(&mut self) {
+        let after = match self.fields.get(self.focus).map(|f| &f.value) {
+            Some(FieldValue::List { items, item }) if !items.is_empty() => Some(*item),
+            Some(FieldValue::List { .. }) => None,
+            _ => return,
+        };
+        self.add_list_item(self.focus, after);
+    }
+
+    /// Remove item `index` of list field `field`. The keyboard stays on the
+    /// field: on the item that slid into place, else on the one before.
+    pub fn remove_list_item(&mut self, field: usize, index: usize) {
+        let Some(FieldValue::List { items, item }) = self.fields.get_mut(field).map(|f| &mut f.value)
+        else {
+            return;
+        };
+        if index >= items.len() {
+            return;
+        }
+        items.remove(index);
+        if *item > index || *item >= items.len() {
+            *item = item.saturating_sub(1);
+        }
+        self.focus = field;
+        self.completion.reset();
+        self.error = None;
+    }
+
+    /// `Backspace` / `Delete` on an empty item removes it; `backwards` moves to
+    /// the item above. Returns false when the item is not empty.
+    pub fn remove_empty_focused_item(&mut self, backwards: bool) -> bool {
+        let Some(FieldValue::List { items, item }) =
+            self.fields.get(self.focus).map(|f| &f.value)
+        else {
+            return false;
+        };
+        let index = *item;
+        if !items.get(index).is_some_and(|i| i.text.is_empty()) {
+            return false;
+        }
+        self.remove_list_item(self.focus, index);
+        if backwards
+            && index > 0
+            && let Some(FieldValue::List { items, item }) =
+                self.fields.get_mut(self.focus).map(|f| &mut f.value)
+        {
+            *item = index - 1;
+            if let Some(input) = items.get_mut(*item) {
+                input.move_end();
+            }
+        }
+        true
+    }
+
+    /// Make sure a focused list has an item to type into.
+    pub fn ensure_list_item(&mut self) {
+        if let Some(FieldValue::List { items, item }) =
+            self.fields.get_mut(self.focus).map(|f| &mut f.value)
+            && items.is_empty()
+        {
+            items.push(TextInput::new());
+            *item = 0;
+        }
+    }
+
+    /// Paste into the focused list: a whole `--param` value, or several
+    /// lines, becomes one item each; the first goes where the cursor is.
+    pub fn paste_into_list(&mut self, text: &str) {
+        let parts: Vec<String> = if text.trim_start().starts_with('[') {
+            split_list_value(text)
+        } else if text.contains('{') {
+            text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+        } else {
+            text.split([',', '\n', '\r'])
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        self.ensure_list_item();
+        for (n, part) in parts.iter().enumerate() {
+            if n > 0 {
+                self.add_item_after_focused();
+            }
+            if let Some(input) = self.focused_input() {
+                input.insert_str(part);
+            }
+        }
+    }
+
+    /// Give the keyboard to item `index` of list field `field`.
+    pub fn focus_list_item(&mut self, field: usize, index: usize) {
+        if let Some(FieldValue::List { items, item }) =
+            self.fields.get_mut(field).map(|f| &mut f.value)
+            && index < items.len()
+        {
+            *item = index;
+            items[index].move_end();
+            self.focus = field;
+            self.completion.reset();
+        }
+    }
+
+    /// The list mark drawn at a screen position, with its field.
+    pub fn list_target_at(&self, col: u16, row: u16) -> Option<(usize, ListTarget)> {
+        self.list_hits
+            .iter()
+            .find(|(rect, _, _)| rect.contains((col, row).into()))
+            .map(|(_, field, target)| (*field, *target))
     }
 
     /// The prompt box, when it has the keyboard.
@@ -524,11 +787,16 @@ impl SwarmForm {
         let Some(field) = self.fields.get(self.focus) else {
             return;
         };
-        match (field.role, &field.value) {
-            (FieldRole::File | FieldRole::Dir, FieldValue::Text(input)) => {
+        let input = match &field.value {
+            FieldValue::Text(input) => Some(input),
+            FieldValue::List { items, item } => items.get(*item),
+            _ => None,
+        };
+        match (field.role, input) {
+            (FieldRole::File | FieldRole::Dir, Some(input)) => {
                 prompt_input::update_path_autocomplete(input, &mut self.completion);
             }
-            (FieldRole::Param(kind), FieldValue::Text(input)) => {
+            (FieldRole::Param(kind), Some(input)) => {
                 prompt_input::update_tier_autocomplete(
                     input,
                     &mut self.completion,
@@ -540,11 +808,12 @@ impl SwarmForm {
     }
 
     pub fn accept_completion(&mut self) {
-        if let Some(FormField {
-            value: FieldValue::Text(input),
-            ..
-        }) = self.fields.get_mut(self.focus)
-        {
+        let input = match self.fields.get_mut(self.focus).map(|f| &mut f.value) {
+            Some(FieldValue::Text(input)) => Some(input),
+            Some(FieldValue::List { items, item }) => items.get_mut(*item),
+            _ => None,
+        };
+        if let Some(input) = input {
             prompt_input::accept_autocomplete(input, &mut self.completion);
         }
     }
@@ -553,14 +822,44 @@ impl SwarmForm {
         self.focus >= self.fields.len()
     }
 
+    /// Next stop: the next item of a list, else the next field.
     pub fn focus_next(&mut self) {
         self.completion.reset();
+        if let Some(FieldValue::List { items, item }) =
+            self.fields.get_mut(self.focus).map(|f| &mut f.value)
+            && *item + 1 < items.len()
+        {
+            *item += 1;
+            return;
+        }
         self.focus = (self.focus + 1).min(self.fields.len());
+        if let Some(FieldValue::List { item, .. }) =
+            self.fields.get_mut(self.focus).map(|f| &mut f.value)
+        {
+            *item = 0;
+        }
     }
 
+    /// Previous stop: the item above in a list, else the previous field (on
+    /// its last item).
     pub fn focus_previous(&mut self) {
         self.completion.reset();
-        self.focus = self.focus.saturating_sub(1);
+        if let Some(FieldValue::List { item, .. }) =
+            self.fields.get_mut(self.focus).map(|f| &mut f.value)
+            && *item > 0
+        {
+            *item -= 1;
+            return;
+        }
+        if self.focus == 0 {
+            return;
+        }
+        self.focus -= 1;
+        if let Some(FieldValue::List { items, item }) =
+            self.fields.get_mut(self.focus).map(|f| &mut f.value)
+        {
+            *item = items.len().saturating_sub(1);
+        }
     }
 
     /// Validate and gather the inputs. The message names the first missing
@@ -1301,8 +1600,18 @@ impl SwarmDashboardState {
             } else {
                 fg(theme::TEXT_FG)
             };
-            rows.push(FormRow::field(field.label(), label_style, index, None));
+            let label = field.label();
+            let mut label_row = FormRow::field(label.clone(), label_style, index, None);
+            if matches!(field.value, FieldValue::List { .. }) {
+                let col = label.chars().count() + 1;
+                label_row.marks.push((col, "+".to_string(), bold(theme::SUCCESS)));
+                label_row.hits.push((col, 1, ListTarget::Add));
+            }
+            rows.push(label_row);
             match &field.value {
+                FieldValue::List { items, item } => {
+                    rows.extend(list_rows(items, *item, is_focused, index, width));
+                }
                 FieldValue::Choice { options, selected } => {
                     let value = format!("‹ {} ›", options[*selected]);
                     rows.push(FormRow::field(value, fg(theme::TEXT_BRIGHT), index, None));
@@ -1312,12 +1621,10 @@ impl SwarmDashboardState {
                     for (text, col) in field_rows(&input.text, cursor, width, 2) {
                         let style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
                         rows.push(FormRow {
-                            text,
-                            style,
                             cursor: col,
-                            field: Some(index),
                             fill: Some(theme::INPUT_BG),
-                            prompt_box: false,
+                            anchor: is_focused,
+                            ..FormRow::field(text, style, index, None)
                         });
                     }
                 }
@@ -1351,17 +1658,30 @@ impl SwarmDashboardState {
 
         let body_y = area.y + 1;
         let body_height = area.height.saturating_sub(2 + error_height) as usize;
-        let first_focused = rows.iter().position(|r| r.field == Some(form.focus)).unwrap_or(0);
-        let last_focused = rows
+        let mut first_focused = rows.iter().position(|r| r.field == Some(form.focus)).unwrap_or(0);
+        let mut last_focused = rows
             .iter()
             .rposition(|r| r.field == Some(form.focus))
             .unwrap_or(0);
+        // In a long list, the item being edited matters more than the label.
+        if form.on_list()
+            && let (Some(first), Some(last)) = (
+                rows.iter().position(|r| r.anchor),
+                rows.iter().rposition(|r| r.anchor),
+            )
+        {
+            last_focused = last;
+            if last + 1 - first_focused > body_height {
+                first_focused = first;
+            }
+        }
         let offset = form_offset(first_focused, last_focused, body_height, rows.len());
         let mut box_rows: Option<(u16, u16)> = None;
         let mut value_rows: Option<(u16, u16)> = None;
+        let mut list_hits = Vec::new();
         for (i, row) in rows.iter().skip(offset).take(body_height).enumerate() {
             let y = body_y + i as u16;
-            if row.field == Some(form.focus) && row.fill.is_some() && !row.prompt_box {
+            if row.anchor && row.fill.is_some() {
                 let (top, height) = value_rows.unwrap_or((y, 0));
                 value_rows = Some((top, height + 1));
             }
@@ -1375,6 +1695,21 @@ impl SwarmDashboardState {
                 }
             }
             put(buf, area.x + 2, y, right, &row.text, row.style);
+            for (col, text, style) in &row.marks {
+                let x = area.x + 2 + *col as u16;
+                if x < right {
+                    put(buf, x, y, right, text, *style);
+                }
+            }
+            if let Some(field) = row.field {
+                for (col, width, target) in &row.hits {
+                    let x = area.x + 2 + *col as u16;
+                    if x < right {
+                        let width = (*width as u16).min(right - x);
+                        list_hits.push((Rect { x, y, width, height: 1 }, field, *target));
+                    }
+                }
+            }
             if focused && let Some(col) = row.cursor {
                 let x = area.x + 2 + col as u16;
                 if x < right {
@@ -1386,6 +1721,9 @@ impl SwarmDashboardState {
         for (i, line) in error_rows.iter().take(error_height as usize).enumerate() {
             let y = footer_y - error_height + i as u16;
             put(buf, area.x + 1, y, right, line, fg(theme::ERROR));
+        }
+        if let Some(form) = self.form.as_mut() {
+            form.list_hits = list_hits;
         }
 
         let box_area = box_rows.map(|(y, height)| Rect {
@@ -1771,6 +2109,12 @@ struct FormRow {
     fill: Option<Color>,
     /// Blank row the prompt box is drawn over.
     prompt_box: bool,
+    /// Part of the input that has the keyboard: popups open below it.
+    anchor: bool,
+    /// Text drawn over the row at a column, in its own style.
+    marks: Vec<(usize, String, Style)>,
+    /// Clickable spans: column, width, what a click does.
+    hits: Vec<(usize, usize, ListTarget)>,
 }
 
 impl FormRow {
@@ -1782,30 +2126,89 @@ impl FormRow {
             field: None,
             fill: None,
             prompt_box: false,
+            anchor: false,
+            marks: Vec::new(),
+            hits: Vec::new(),
         }
     }
 
     fn prompt_box(field: usize) -> Self {
         Self {
-            text: String::new(),
-            style: Style::default(),
-            cursor: None,
             field: Some(field),
             fill: Some(theme::INPUT_BG),
             prompt_box: true,
+            ..Self::plain(String::new(), Style::default())
         }
     }
 
     fn field(text: String, style: Style, field: usize, cursor: Option<usize>) -> Self {
         Self {
-            text,
-            style,
             cursor,
             field: Some(field),
-            fill: None,
-            prompt_box: false,
+            ..Self::plain(text, style)
         }
     }
+}
+
+/// Columns before a list item's text: `x` and a space.
+const LIST_ITEM_INDENT: usize = 2;
+
+/// The rows of one list field: its items, each with a `x` to remove it, or a
+/// note when there are none. The label row (with its `+`) is drawn apart.
+fn list_rows(
+    items: &[TextInput],
+    item: usize,
+    focused: bool,
+    index: usize,
+    width: usize,
+) -> Vec<FormRow> {
+    if items.is_empty() {
+        let mut row = FormRow::field(
+            "no items: + or Alt+Enter adds one".to_string(),
+            fg(theme::TEXT_DIM),
+            index,
+            None,
+        );
+        row.anchor = focused;
+        return vec![row];
+    }
+    let mut rows = Vec::new();
+    let text_width = width.saturating_sub(LIST_ITEM_INDENT).max(1);
+    for (i, input) in items.iter().enumerate() {
+        let has_keyboard = focused && i == item;
+        let cursor = has_keyboard.then_some(input.cursor);
+        for (n, (text, col)) in field_rows(&input.text, cursor, text_width, 2)
+            .into_iter()
+            .enumerate()
+        {
+            let mut row = FormRow {
+                cursor: col.map(|c| c + LIST_ITEM_INDENT),
+                fill: Some(theme::INPUT_BG),
+                anchor: has_keyboard,
+                ..FormRow::field(
+                    format!("{}{text}", " ".repeat(LIST_ITEM_INDENT)),
+                    Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG),
+                    index,
+                    None,
+                )
+            };
+            row.hits.push((
+                LIST_ITEM_INDENT,
+                text_width,
+                ListTarget::Item(i),
+            ));
+            if n == 0 {
+                row.marks.push((
+                    0,
+                    "x".to_string(),
+                    Style::default().fg(theme::ERROR).bg(theme::INPUT_BG),
+                ));
+                row.hits.push((0, 1, ListTarget::Remove(i)));
+            }
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 fn fg(color: Color) -> Style {
@@ -2472,6 +2875,170 @@ mod tests {
         assert!(screen.contains("OUT_DIR"), "{screen}");
         assert!(screen.contains("Run"), "{screen}");
         assert!(screen.contains("gate is required"), "{screen}");
+    }
+
+    // ── List fields ─────────────────────────────────────────────
+
+    const TOPICS: &str = r#"[{id "a" focus "storage"} {id "b" focus "network"}]"#;
+
+    fn list_param(name: &str, default: Option<&str>) -> ParamInspection {
+        ParamInspection {
+            kind: ParamKindInfo::Roster,
+            ..param(name, default)
+        }
+    }
+
+    fn list_form(default: Option<&str>) -> SwarmForm {
+        let mut form = SwarmForm::new(
+            row(),
+            inspection(vec![workflow("w", vec![list_param("topics", default)])]),
+            folders(),
+            0,
+        );
+        type_into(&mut form, "Prompt", "p");
+        focus_field(&mut form, "topics");
+        form
+    }
+
+    fn items(form: &SwarmForm) -> Vec<String> {
+        let field = form.fields.iter().find(|f| f.name == "topics").unwrap();
+        match &field.value {
+            FieldValue::List { items, .. } => items.iter().map(|i| i.text.clone()).collect(),
+            _ => panic!("topics is not a list"),
+        }
+    }
+
+    fn list_item(form: &SwarmForm) -> usize {
+        match &form.fields[form.focus].value {
+            FieldValue::List { item, .. } => *item,
+            _ => panic!("not on a list"),
+        }
+    }
+
+    #[test]
+    fn list_values_split_into_items_and_join_back() {
+        assert_eq!(split_list_value("a=claude:opus@high, b ,c"), ["a=claude:opus@high", "b", "c"]);
+        assert_eq!(
+            split_list_value(TOPICS),
+            [r#"{id "a" focus "storage"}"#, r#"{id "b" focus "network"}"#]
+        );
+        assert_eq!(
+            split_list_value(r#"[{id "a" model "codex:x" effort low}]"#),
+            ["a=codex:x@low"],
+            "an entry without free fields reads in the short form"
+        );
+        assert!(split_list_value("").is_empty());
+
+        assert_eq!(join_list_items(&["a=codex:x", "", " b "]), "a=codex:x,b");
+        let mixed = join_list_items(&[r#"{id "a" focus "x"}"#, "b=codex:y@low"]);
+        assert_eq!(mixed, r#"[{id "a" focus "x"} {id "b" model "codex:y" effort "low"}]"#);
+        let back = parse_reviewers_override(&mixed).unwrap();
+        assert_eq!(back[1].effort.as_ref().unwrap().0, "low");
+    }
+
+    #[test]
+    fn each_list_item_is_a_row_with_a_remove_mark_and_the_type_has_a_plus() {
+        let mut dash = SwarmDashboardState::new();
+        dash.form = Some(list_form(Some(TOPICS)));
+        dash.view = SwarmView::Form;
+
+        let screen = render_rows(&mut dash, 60, 24);
+        let label = screen.iter().position(|l| l.contains("topics (list) +"));
+        let label = label.unwrap_or_else(|| panic!("{}", screen.join("\n")));
+        assert!(screen[label + 1].trim_start().starts_with(r#"x {id "a" focus "storage"}"#), "{}", screen.join("\n"));
+        assert!(screen[label + 2].trim_start().starts_with(r#"x {id "b" focus "network"}"#), "{}", screen.join("\n"));
+        assert!(!screen.join("\n").contains(TOPICS), "never one joined line");
+
+        // The marks are clickable where they are drawn.
+        let form = dash.form.as_ref().unwrap();
+        let plus_col = screen[label].find('+').unwrap() as u16;
+        assert_eq!(form.list_target_at(plus_col, label as u16).map(|t| t.1), Some(ListTarget::Add));
+        let x_col = screen[label + 2].find('x').unwrap() as u16;
+        assert_eq!(
+            form.list_target_at(x_col, label as u16 + 2).map(|t| t.1),
+            Some(ListTarget::Remove(1))
+        );
+    }
+
+    #[test]
+    fn untouched_list_is_not_passed_and_an_edited_item_keeps_its_free_fields() {
+        let mut form = list_form(Some(TOPICS));
+        assert!(form.collect().unwrap().params.is_empty());
+
+        // Item 1: change its focus field; item 0 keeps `focus "storage"`.
+        form.focus_next();
+        let input = form.focused_input().unwrap();
+        input.clear();
+        input.insert_str(r#"{id "b" focus "ui"}"#);
+        let params = form.collect().unwrap().params;
+        assert_eq!(
+            params,
+            vec![(
+                "topics".to_string(),
+                r#"[{id "a" focus "storage"} {id "b" focus "ui"}]"#.to_string()
+            )]
+        );
+        assert_eq!(parse_reviewers_override(&params[0].1).unwrap()[0].fields[0].1, "storage");
+    }
+
+    #[test]
+    fn arrows_walk_items_before_leaving_the_list() {
+        let mut form = list_form(Some("a,b,c"));
+        let topics = form.focus;
+        form.focus_next();
+        form.focus_next();
+        assert_eq!((form.focus, list_item(&form)), (topics, 2));
+        form.focus_next();
+        assert_ne!(form.focus, topics, "past the last item is the next field");
+        form.focus_previous();
+        assert_eq!((form.focus, list_item(&form)), (topics, 2), "coming back lands on the last item");
+    }
+
+    #[test]
+    fn items_are_added_after_the_cursor_and_removed() {
+        let mut form = list_form(Some("a,b"));
+        let topics = form.focus;
+        form.add_item_after_focused();
+        assert_eq!(items(&form), ["a", "", "b"]);
+        assert_eq!(list_item(&form), 1);
+        form.focused_input().unwrap().insert_str("new");
+
+        form.add_list_item(topics, None);
+        assert_eq!(items(&form), ["a", "new", "b", ""]);
+        assert_eq!(list_item(&form), 3);
+        assert!(form.remove_empty_focused_item(true), "backspace on an empty item");
+        assert_eq!(items(&form), ["a", "new", "b"]);
+        assert_eq!(list_item(&form), 2);
+        assert!(!form.remove_empty_focused_item(true), "a non-empty item stays");
+
+        form.remove_list_item(topics, 0);
+        assert_eq!(items(&form), ["new", "b"]);
+        assert_eq!(form.collect().unwrap().params[0].1, "new,b");
+    }
+
+    #[test]
+    fn a_required_list_emptied_of_items_is_reported() {
+        let mut form = list_form(None);
+        let topics = form.focus;
+        assert_eq!(items(&form), [""], "a required list starts with one empty item");
+        form.remove_list_item(topics, 0);
+        assert!(items(&form).is_empty());
+        assert_eq!(form.collect().unwrap_err(), "topics is required");
+
+        form.ensure_list_item();
+        form.focused_input().unwrap().insert_str("x");
+        assert_eq!(form.collect().unwrap().params[0].1, "x");
+    }
+
+    #[test]
+    fn a_pasted_list_becomes_one_item_each() {
+        let mut form = list_form(None);
+        form.paste_into_list("a=codex:x, b\nc");
+        assert_eq!(items(&form), ["a=codex:x", "b", "c"]);
+
+        let mut form = list_form(None);
+        form.paste_into_list(TOPICS);
+        assert_eq!(items(&form).len(), 2);
     }
 
     fn prompt_form() -> SwarmDashboardState {

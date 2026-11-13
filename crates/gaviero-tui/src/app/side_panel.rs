@@ -1846,8 +1846,117 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
-    let files = workspace_completion_files(app);
+    let files = chat_completion_files(app, app.chat_state.active_conv);
     app.chat_state.update_autocomplete_matches(&files);
+}
+
+/// `@` completions in one conversation: every workspace file, then the files
+/// of the folders granted to it with `/add-dir`.
+fn chat_completion_files(app: &App, conv_idx: usize) -> Vec<String> {
+    let mut files = workspace_completion_files(app);
+    let grants = chat_grant_roots(app, conv_idx);
+    if !grants.is_empty() {
+        let excludes = parse_exclude_patterns(&app.workspace, None);
+        files.extend(grant_completion_files(&grants, &excludes));
+    }
+    files
+}
+
+/// [`grant_named_roots`] for one conversation's `/add-dir` grants.
+fn chat_grant_roots(app: &App, conv_idx: usize) -> Vec<(String, std::path::PathBuf)> {
+    match app.chat_state.conversations.get(conv_idx) {
+        Some(conv) if !conv.session_read_folders.is_empty() => grant_named_roots(
+            &completion_named_roots(&app.workspace),
+            &conv.session_read_folders,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+/// `/add-dir` grants as `(label, folder)` for `@` completion and `@path`
+/// resolution. The label is always shown, even in a single-folder workspace,
+/// and its first component never equals a workspace root label, a top-level
+/// entry of a workspace root, or another grant's, so a grant path can never
+/// resolve into the workspace or the reverse. It grows by one ancestor until
+/// it is free; the full path is the last resort.
+pub(crate) fn grant_named_roots(
+    workspace_roots: &[(String, std::path::PathBuf)],
+    grants: &[std::path::PathBuf],
+) -> Vec<(String, std::path::PathBuf)> {
+    let first_lower = |label: &str| {
+        label
+            .split('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+    };
+    let mut taken: std::collections::HashSet<String> = unique_root_labels(workspace_roots)
+        .iter()
+        .filter_map(|l| first_lower(l))
+        .collect();
+    let mut out = Vec::new();
+    for grant in grants {
+        if !grant.is_dir() {
+            continue;
+        }
+        // Folder name first, then its ancestors.
+        let names: Vec<String> = grant
+            .components()
+            .rev()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => n.to_str().map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        let mut label = None;
+        for depth in 1..=names.len() {
+            let first = &names[depth - 1];
+            let lower = first.to_lowercase();
+            if taken.contains(&lower)
+                || workspace_roots.iter().any(|(_, root)| root.join(first).exists())
+            {
+                continue;
+            }
+            taken.insert(lower);
+            let parts: Vec<&str> = names[..depth].iter().rev().map(String::as_str).collect();
+            label = Some(parts.join("/"));
+            break;
+        }
+        let label = label.unwrap_or_else(|| grant.to_string_lossy().replace('\\', "/"));
+        out.push((label, grant.clone()));
+    }
+    out
+}
+
+/// Files under the granted folders, each as `<label>/<path>`. Capped at
+/// 5 000 paths split across grants: a grant may be a large folder.
+fn grant_completion_files(
+    grant_roots: &[(String, std::path::PathBuf)],
+    excludes: &[String],
+) -> Vec<String> {
+    const GRANT_LIMIT: usize = 5_000;
+    let per_grant = GRANT_LIMIT / grant_roots.len().max(1);
+    grant_roots
+        .iter()
+        .flat_map(|(label, root)| {
+            list_workspace_files(root, per_grant, excludes)
+                .into_iter()
+                .map(move |f| format!("{label}/{f}"))
+        })
+        .collect()
+}
+
+/// A `<label>/<path>` completion from [`grant_completion_files`] back to the
+/// file it names.
+fn resolve_grant_path(
+    rel_path: &str,
+    grant_roots: &[(String, std::path::PathBuf)],
+) -> Option<std::path::PathBuf> {
+    grant_roots.iter().find_map(|(label, root)| {
+        let tail = rel_path.strip_prefix(label.as_str())?.strip_prefix('/')?;
+        let abs_path = root.join(tail);
+        abs_path.is_file().then_some(abs_path)
+    })
 }
 
 /// Roots `@` completion and `@path` resolution share with the explorer:
@@ -2282,10 +2391,21 @@ pub(crate) fn dispatch_prompt_core(
         .clone()
         .or_else(|| app.workspace.folders().first().map(|f| f.path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // `/add-dir` folders: their files are named by absolute path in the
+    // prompt, since the agent works in the workspace, and are checked against
+    // the workspace policy (`fallback_root`), never the grant's own settings.
+    let grant_roots = chat_grant_roots(app, conv_idx);
     let mut file_refs: Vec<(String, String)> = Vec::new();
     for rel_path in &refs {
-        let Some(abs_path) = resolve_at_path(rel_path, &named_roots) else {
-            continue;
+        let (abs_path, label) = match resolve_at_path(rel_path, &named_roots) {
+            Some(abs_path) => (abs_path, rel_path.clone()),
+            None => match resolve_grant_path(rel_path, &grant_roots) {
+                Some(abs_path) => {
+                    let label = abs_path.to_string_lossy().replace('\\', "/");
+                    (abs_path, label)
+                }
+                None => continue,
+            },
         };
         if let Some(reason) = protected_ref_refusal(&abs_path, &named_roots, &fallback_root) {
             app.chat_state
@@ -2293,7 +2413,7 @@ pub(crate) fn dispatch_prompt_core(
             continue;
         }
         if let Ok(content) = std::fs::read_to_string(&abs_path) {
-            file_refs.push((rel_path.clone(), content));
+            file_refs.push((label, content));
         }
     }
 
@@ -4294,6 +4414,59 @@ mod tests {
         assert!(!app.chat_state.autocomplete.is_open());
 
         cleanup_session(ws.path());
+    }
+
+    #[test]
+    fn at_completion_includes_add_dir_grants_of_the_active_conversation() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("local.md"), "x").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let grant = outside.path().join("extra");
+        std::fs::create_dir_all(grant.join("sub")).unwrap();
+        std::fs::write(grant.join("sub/notes.md"), "granted").unwrap();
+        let mut app = chat_app(ws.path());
+
+        type_into_chat(&mut app, "@notes");
+        assert!(app.chat_state.autocomplete.matches.is_empty());
+
+        app.chat_state.text_input.clear();
+        let idx = app.chat_state.active_conv;
+        app.chat_state.conversations[idx]
+            .session_read_folders
+            .push(grant.clone());
+        type_into_chat(&mut app, "@notes");
+        assert_eq!(
+            app.chat_state.autocomplete.matches,
+            vec!["extra/sub/notes.md".to_string()]
+        );
+        // Workspace files keep their bare form in a single-folder workspace.
+        app.chat_state.text_input.clear();
+        type_into_chat(&mut app, "@local");
+        assert_eq!(app.chat_state.autocomplete.matches, vec!["local.md".to_string()]);
+
+        let grants = super::chat_grant_roots(&app, idx);
+        let resolved = super::resolve_grant_path("extra/sub/notes.md", &grants).unwrap();
+        assert_eq!(std::fs::read_to_string(resolved).unwrap(), "granted");
+        assert!(super::resolve_grant_path("sub/notes.md", &grants).is_none());
+
+        cleanup_session(ws.path());
+    }
+
+    #[test]
+    fn grant_labels_never_shadow_workspace_entries() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("docs")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let first = outside.path().join("a").join("docs");
+        let second = outside.path().join("b").join("docs");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let roots = vec![(String::new(), ws.path().to_path_buf())];
+        let labels: Vec<String> = super::grant_named_roots(&roots, &[first, second])
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, vec!["a/docs".to_string(), "b/docs".to_string()]);
     }
 
     #[test]

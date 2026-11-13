@@ -84,6 +84,7 @@ Eleven workflow scripts, three tier overrides and three model profiles live in `
 | `update_docs.gaviero` | Parallel doc rewrite with `--tiers-file` |
 | `security_audit_memory.gaviero` | `memory {}` overrides, `read_ns`, staleness |
 | `tiered_review.gaviero` | Provider-agnostic script; models come from a profile |
+| `for_loops.gaviero` | Explicit `for … parallel` / `for … sequential` over a list param |
 
 **Model profiles** (`examples/profiles/`, see [below](#model-profiles)): `claude.gaviero`, `codex.gaviero`, `mixed.gaviero`.
 
@@ -222,11 +223,82 @@ All compile functions return `Result<CompiledPlan, miette::Report>` with source 
 
 - **Client** — model + tier + effort + optional `extra {}` provider pairs
 - **Agent** — scope, prompt, dependencies, `produces []`, `context {}`, `memory {}`, `tools []`
-- **Workflow** — steps, `verify {}`, iteration strategy, explicit `loop {}` blocks
+- **Workflow** — steps, `verify {}`, iteration strategy, explicit `loop {}` blocks, `for … parallel|sequential` over list params
 - **Include** — splice shared declarations; cycles rejected; requires `compile_file`
 - **Scope** — `owned`, `read_only`, `impact_scope` with glob patterns
 - **Produces** — exact artefact paths the agent must have written when its turn
   ends; enforced by the runtime, not by the prompt
+
+### Explicit loops (`for`)
+
+`for <var> in <list-param> parallel|sequential { <agent>+ [peer_template "…"] }`
+iterates a list param and clones each body agent once per item. Example:
+[`examples/for_loops.gaviero`](examples/for_loops.gaviero).
+
+```
+workflow w {
+    execution_mode document          // required by `for … sequential`
+    param topics [
+        { id "a" focus "storage" }
+        { id "b" focus "network" model "tier:high" }
+    ]
+    steps [
+        for t in topics parallel {
+            analyst
+            peer_template #"- {{OUT_DIR}}/{{peer}}-notes.md"#
+        }
+        for t in topics sequential { editor }
+        summarizer                   // depends_on [analyst] → every analyst clone
+        loop {
+            for t in topics parallel { reviewer }   // only `parallel` inside a loop
+            until agent judge
+        }
+    ]
+}
+```
+
+- **List params** are the roster param kind with free fields: entries are
+  `{ id "…" [model "…"] [effort …] [<ident> "<string>"]* }`. `id` is required,
+  unique, and matches `[A-Za-z0-9][A-Za-z0-9_.-]*`. Free-field names must not be
+  DSL keywords; `index`, `count`, `peers`, `peer_count`, `prev` and `peer_block`
+  are reserved.
+- **Clones** are named `<item-id>-<agent>` (`a-analyst`, `b-analyst`, …). With
+  `model` (a `provider:model` or `tier:<name>` spec) the clone binds to it as a
+  roster entry does; without it the clone keeps the body agent's own client.
+  Body agents run only through their clones: listing one as a plain step, or in
+  two `for` blocks, is an error. They need no `template true`.
+- **Item vars** inside a clone: `{{t.id}}`, `{{t.<field>}}`, `{{t.model}}` /
+  `{{t.effort}}` when set, `{{t.index}}` (1-based), `{{t.count}}`, `{{t.peers}}`
+  (other ids, comma-joined), `{{t.peer_count}}`, `{{t.prev}}` (sequential only;
+  empty for the first item), and `{{t.peer_block}}` — the `peer_template`
+  rendered once per peer with `{{peer}}` = the peer id, joined by newlines
+  (`(none)` without peers). Item vars are substituted before agent, CLI and
+  script vars, so `{{OUT_DIR}}` inside a `peer_template` resolves. An unknown
+  `{{t.x}}` is a compile error.
+- **Files:** every clone's `scope.owned` and `produces` paths must contain
+  `{{t.id}}` — clones never share files, in either mode.
+- **`parallel`**: clones are independent. **`sequential`**: every clone of item
+  k depends on every clone of item k−1, and the workflow must declare
+  `execution_mode document` (item k reads item k−1's files; repo-mode worktrees
+  would hide them until the run ends).
+- **Fan-in:** `depends_on [analyst]` on any agent outside the body means "after
+  every analyst clone". Inside the body, `depends_on` a sibling body agent means
+  that item's own clone.
+- **Inside a `loop`** only `for … parallel` is allowed; its clones become the
+  loop's agents. When the step directly before the loop is a top-level `for`
+  over the same list, its clones are the loop's **baseline**
+  (`LoopConfig::baseline_units`): they may own the same paths as the loop
+  agents, and a resumed run skips them.
+- **CLI:** `--param 'topics=[{id "a" focus "x"} {id "b"}]'` (a DSL list
+  literal) or the short form `--param topics=a,b` / `id=provider:model[@effort],…`.
+- **Not supported:** `for … sequential` inside a `loop`, `loop` inside `for`,
+  `for` inside `for`, lists produced at runtime (use `pattern map_reduce`).
+
+The `loop { reviewers … template_init … template_refine … }` roster sugar
+remains and keeps its `<id>-init` / `<id>-refine` names and `REVIEWER_ID` /
+`PEER_*` vars. Prefer `for` when the list carries more than a model per item,
+when items must run in order, or when the peer-file layout is not the
+conclusion/summary pair the roster's `PEER_READ_BLOCK` assumes.
 
 ### Output contracts (`produces`)
 
@@ -302,7 +374,7 @@ explicit `"verdict": "irreconcilable"` from the judge stops the loop and writes
 `blockers` array. Repeat detection fingerprints the blockers' agent/criterion
 pairing rather than the prose, so a judge rephrasing itself does not reset the
 count. `0` disables it.
-- **Params** — typed `param` on workflows; roster `id=provider:model[@effort],…`
+- **Params** — typed `param` on workflows; roster / list `id=provider:model[@effort],…`, bare ids `a,b`, or a DSL list literal `[{id "a" …}]`
 
 Full language reference: see the prior detailed blocks in [ARCHITECTURE.md](ARCHITECTURE.md) or browse `examples/`.
 
