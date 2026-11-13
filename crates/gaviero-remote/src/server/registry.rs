@@ -162,6 +162,7 @@ mod tests {
             tui_version: "0.1.0".into(),
             started_at: "2026-09-09T12:00:00Z".into(),
             client_connected: connected,
+            last_activity_at: None,
         }
     }
 

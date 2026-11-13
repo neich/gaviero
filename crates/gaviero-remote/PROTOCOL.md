@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.8 (1.0 frozen; 1.1 through 1.8 additive)
+# Gaviero Remote Protocol — v1.9 (1.0 frozen; 1.1 through 1.9 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 7 }
+PROTOCOL_VERSION  = { major: 1, minor: 9 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
@@ -230,8 +230,13 @@ ProtocolVersion      { major: u16, minor: u16 }
 
 MachineInfo          { host, directory_url? }                                   (1.1)
 InstanceInfo         { instance_id, workspace: { id, display_name }, url, port,
-                       tui_version, started_at, client_connected }             (1.1)
+                       tui_version, started_at, client_connected,
+                       last_activity_at? }                       (1.1; last_activity_at 1.9)
   url is wss://<host>:<port>/v1/ws; started_at is RFC 3339; never a path or a token.
+  last_activity_at (RFC 3339) is the instance's latest prompt sent, permission request or
+  question, turn review pending, or turn end — whether or not a phone was attached; absent
+  until the first one since the instance started. The heartbeat is rewritten at once when it
+  moves. Clients order their instance list by it.
 InstanceDirectory    { protocol_version, host, generated_at, instances: [InstanceInfo] }  (1.1)
   Body of GET /v1/instances. Fixture: fixtures/http/instances.json.
 

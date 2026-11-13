@@ -812,6 +812,7 @@ fn registry_entry(id: &str, name: &str, port: u16) -> InstanceInfo {
         tui_version: "0.1.0-test".into(),
         started_at: "2026-09-09T12:00:00Z".into(),
         client_connected: false,
+        last_activity_at: None,
     }
 }
 
@@ -1013,6 +1014,92 @@ async fn client_connected_flips_within_one_heartbeat() {
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
+}
+
+/// The registry entry read from disk once it satisfies `pred`.
+async fn wait_for_entry(
+    dir: &std::path::Path,
+    what: &str,
+    pred: impl Fn(&InstanceInfo) -> bool,
+) -> InstanceInfo {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let listed = registry::read_directory(dir, TEST_HOST, Duration::from_secs(90));
+        if let Some(entry) = listed
+            .instances
+            .into_iter()
+            .find(|i| i.instance_id == INSTANCE && pred(i))
+        {
+            return entry;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("{what}");
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_frames_stamp_last_activity_without_a_client() {
+    use gaviero_remote::dto::{Message as WireMessage, Role};
+    use gaviero_remote::envelope::MessageComplete;
+
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = with_registry(test_config(&tls), dir.path(), INSTANCE);
+    // Only the activity path may write promptly; the timer stays out of it.
+    config.heartbeat_interval = Duration::from_secs(3600);
+    let server = spawn(config).await.unwrap();
+    // The first heartbeat tick fires at once.
+    let entry = wait_for_entry(dir.path(), "first heartbeat never appeared", |_| true).await;
+    assert_eq!(entry.last_activity_at, None);
+
+    let message = |role| {
+        ServerFrame::MessageComplete(MessageComplete {
+            conv_id: "conv-a".into(),
+            message: WireMessage {
+                seq: 1,
+                role,
+                content: "hi".into(),
+                truncated: false,
+                full_bytes: None,
+                tool_calls: Vec::new(),
+                code_blocks: Vec::new(),
+            },
+        })
+    };
+    // Streaming output and the agent's reply are not activity.
+    for frame in [
+        ServerFrame::StreamChunk(StreamChunk {
+            conv_id: "conv-a".into(),
+            turn_id: "turn-a".into(),
+            text: "partial".into(),
+        }),
+        message(Role::Assistant),
+    ] {
+        server
+            .handle
+            .try_send(HubInput::Event { revision: 1, frame })
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let entry = wait_for_entry(dir.path(), "entry vanished", |_| true).await;
+    assert_eq!(entry.last_activity_at, None, "non-activity frames must not stamp");
+
+    // A prompt sent is, and the entry is rewritten without waiting for the timer.
+    server
+        .handle
+        .try_send(HubInput::Event {
+            revision: 2,
+            frame: message(Role::User),
+        })
+        .unwrap();
+    let entry = wait_for_entry(dir.path(), "prompt never stamped last_activity_at", |i| {
+        i.last_activity_at.is_some()
+    })
+    .await;
+    let stamp = entry.last_activity_at.unwrap();
+    assert!(stamp.ends_with('Z') && stamp.contains('T'), "{stamp}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

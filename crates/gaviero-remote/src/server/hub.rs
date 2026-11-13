@@ -4,6 +4,7 @@
 //! receives `&App` or anything that can mutate UI state.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,6 +74,13 @@ pub(crate) struct RemoteHub {
     token_poll_interval: Duration,
     registry: Option<RegistryConfig>,
     heartbeat_interval: Duration,
+    /// Directory `last_activity_at`: stamped by [`is_activity`] frames.
+    last_activity_at: Option<String>,
+    /// One heartbeat write at a time, so two writes never share the `.tmp`
+    /// file and an older entry never lands after a newer one.
+    heartbeat_in_flight: Arc<AtomicBool>,
+    /// A write was asked for while one was in flight; retried on the flush tick.
+    heartbeat_pending: bool,
 
     registration_rx: mpsc::Receiver<Registration>,
     inbound_rx: mpsc::Receiver<ConnIn>,
@@ -124,6 +132,9 @@ impl RemoteHub {
             token_poll_interval: config.token_poll_interval,
             registry: config.registry,
             heartbeat_interval: config.heartbeat_interval,
+            last_activity_at: None,
+            heartbeat_in_flight: Arc::new(AtomicBool::new(false)),
+            heartbeat_pending: false,
             registration_rx,
             inbound_rx,
             input_rx,
@@ -168,7 +179,12 @@ impl RemoteHub {
                         break;
                     }
                 }
-                _ = flush.tick() => self.flush_all(),
+                _ = flush.tick() => {
+                    self.flush_all();
+                    if self.heartbeat_pending {
+                        self.write_heartbeat();
+                    }
+                }
                 _ = token_poll.tick(), if self.token_path.is_some() => {
                     self.poll_token_file().await;
                 }
@@ -179,17 +195,33 @@ impl RemoteHub {
         }
     }
 
-    /// Fire-and-forget: the hub never awaits disk (Plan C §2.3).
-    fn write_heartbeat(&self) {
+    /// Fire-and-forget: the hub never awaits disk (Plan C §2.3). While a
+    /// write is in flight the request is deferred to the next flush tick.
+    fn write_heartbeat(&mut self) {
         let Some(reg) = &self.registry else { return };
+        if self.heartbeat_in_flight.swap(true, Ordering::AcqRel) {
+            self.heartbeat_pending = true;
+            return;
+        }
+        self.heartbeat_pending = false;
         let mut entry = reg.entry.clone();
         entry.client_connected = self.active.is_some();
+        entry.last_activity_at = self.last_activity_at.clone();
         let dir = reg.dir.clone();
+        let in_flight = self.heartbeat_in_flight.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = super::registry::write_entry(&dir, &entry) {
                 tracing::warn!(error = %e, "registry heartbeat write failed");
             }
+            in_flight.store(false, Ordering::Release);
         });
+    }
+
+    /// An attention-worthy event happened: the directory lists it at once so
+    /// a phone can order instances by their latest activity.
+    fn note_activity(&mut self) {
+        self.last_activity_at = Some(super::registry::utc_now_rfc3339());
+        self.write_heartbeat();
     }
 
     /// Plan C invariant 15: a rotation performed by another instance (or by
@@ -332,6 +364,9 @@ impl RemoteHub {
         match input {
             HubInput::Event { revision, frame } => {
                 self.revision = revision.max(self.revision);
+                if is_activity(&frame) {
+                    self.note_activity();
+                }
                 match frame {
                     ServerFrame::StreamChunk(chunk) => {
                         let key = (chunk.conv_id, chunk.turn_id);
@@ -501,6 +536,20 @@ impl RemoteHub {
                 }
             }
         }
+    }
+}
+
+/// Frames that move an instance's directory `last_activity_at`: a prompt
+/// sent (desktop or phone — both project the user message), a permission
+/// request or question, a turn review, and a turn ending (with or without
+/// changes). Events reach the hub whether or not a phone is attached.
+fn is_activity(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::PermissionRequest(_)
+        | ServerFrame::TurnReviewPending(_)
+        | ServerFrame::StreamingEnded(_) => true,
+        ServerFrame::MessageComplete(m) => m.message.role == crate::dto::Role::User,
+        _ => false,
     }
 }
 
