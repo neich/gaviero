@@ -81,7 +81,7 @@ impl OnnxEmbedder {
         dimensions: usize,
         model_id: &str,
     ) -> Result<Self> {
-        let session = Session::builder()
+        let session = Session::builder(super::onnx_environment()?)
             .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?
             .with_intra_threads(1)
             .map_err(|e| anyhow::anyhow!("setting thread count: {e}"))?

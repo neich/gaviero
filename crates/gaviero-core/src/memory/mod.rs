@@ -81,7 +81,19 @@ pub use writer::{
 };
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+pub(crate) fn onnx_environment() -> anyhow::Result<&'static ort::environment::Environment> {
+    static ENVIRONMENT: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| {
+            ort::environment::init()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("creating ONNX environment: {error}"))
+}
 
 /// Initialize a MemoryStore with the default ONNX embedder.
 ///
