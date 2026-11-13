@@ -43,11 +43,11 @@ pub const DEEPSEEK_LEGACY_MODELS: &[&str] = &["deepseek-v4-flash"];
 /// `claude-fable-5-1`, `sonnet` → `claude-sonnet-5`, `haiku` →
 /// `claude-haiku-4-5-20251001`, and `opus` → `claude-opus-5` in the last
 /// published `provider_alias_targets` (a document still dated 2026-09-12).
-/// Listing the promoted full names lets the picker show Fable 5.1 and Opus 5.5
+/// Listing the promoted full names lets the picker show Fable 5.2 and Opus 5.5
 /// explicitly, and [`resolve_claude_cli_model`] independently pins the bare
-/// `opus` alias to Opus 5.5, so neither surface depends on the installed CLI's
-/// alias table (which points `opus` at older ids on some providers). Sonnet 5
-/// and Haiku 4.5 stay alias-only: their aliases are unambiguous.
+/// `fable` alias to Fable 5.2 and `opus` to Opus 5.5, so neither surface
+/// depends on the installed CLI's alias table (which lags the catalog). Sonnet
+/// 5 and Haiku 4.5 stay alias-only: their aliases are unambiguous.
 /// `claude-opus-5-5` carries
 /// `min_claude_code_version` 2.1.280, and its arrival moved `claude-opus-5` to
 /// the catalog's `overflow` section, so the picker lists 5.5 instead — both ids
@@ -61,7 +61,7 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
     "opusplan",
     "sonnet[1m]",
     "opus[1m]",
-    "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-opus-5-5",
 ];
 
@@ -127,11 +127,24 @@ pub const SONNET_ALIAS_CLI_MODEL: &str = "claude-sonnet-5";
 /// change needed.
 pub const OPUS_ALIAS_CLI_MODEL: &str = "claude-opus-5-5";
 
+/// Concrete Claude CLI `--model` id that the bare `fable` alias resolves to.
+///
+/// Same rationale as [`OPUS_ALIAS_CLI_MODEL`]: the installed CLI's alias table
+/// still maps `fable` → `claude-fable-5-1`, so the alias is pinned to Fable 5.2
+/// host-side. Applied unconditionally — an older CLI that does not serve the id
+/// fails at dispatch instead of silently substituting a model. Explicit pins
+/// (`claude-fable-5-1`, `claude-fable-5`) still pass through unchanged.
+///
+/// If Anthropic ships a different Fable 5.x id, this one line is the only
+/// change needed.
+pub const FABLE_ALIAS_CLI_MODEL: &str = "claude-fable-5-2";
+
 /// Resolve a prefix-stripped Claude model alias/name into the concrete CLI
-/// `--model` argument. The bare `sonnet` and `opus` aliases are remapped (to
-/// [`SONNET_ALIAS_CLI_MODEL`] / [`OPUS_ALIAS_CLI_MODEL`]); the optional `[1m]`
-/// long-context suffix is preserved. Every other alias (`haiku`, `fable`,
-/// `opusplan`, …) and every explicit full model id (e.g. `claude-sonnet-4-6`,
+/// `--model` argument. The bare `sonnet`, `opus` and `fable` aliases are
+/// remapped (to [`SONNET_ALIAS_CLI_MODEL`] / [`OPUS_ALIAS_CLI_MODEL`] /
+/// [`FABLE_ALIAS_CLI_MODEL`]); the optional `[1m]` long-context suffix is
+/// preserved. Every other alias (`haiku`, `opusplan`, …) and every explicit
+/// full model id (e.g. `claude-sonnet-4-6`,
 /// `claude-opus-4-7`) passes through unchanged so a deliberate pin is always
 /// honoured. `opusplan` is a distinct alias (plan mode), not an `opus` variant,
 /// so it is never rewritten.
@@ -148,6 +161,7 @@ pub fn resolve_claude_cli_model(model: &str) -> String {
     match base {
         "sonnet" => format!("{SONNET_ALIAS_CLI_MODEL}{suffix}"),
         "opus" => format!("{OPUS_ALIAS_CLI_MODEL}{suffix}"),
+        "fable" => format!("{FABLE_ALIAS_CLI_MODEL}{suffix}"),
         _ => trimmed.to_string(),
     }
 }
@@ -503,7 +517,7 @@ fn is_preferred_cursor_model(model: &str) -> bool {
 
 /// Claude's stable aliases (`fable`, `sonnet`, `opus`, `haiku`, `opusplan`,
 /// and the `[1m]` long-context variants) are digit-free, while concrete model
-/// ids (`claude-fable-5-1`, `claude-opus-5-5`, …) always carry a version digit.
+/// ids (`claude-fable-5-2`, `claude-opus-5-5`, …) always carry a version digit.
 /// Ranking aliases first keeps [`CLAUDE_MODEL_ALIASES`]'s concrete entries from
 /// crowding the aliases out of the 10-candidate completion window.
 fn is_preferred_claude_model(model: &str) -> bool {
@@ -1037,10 +1051,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_claude_cli_model_pins_fable_alias_to_fable_5_2() {
+        assert_eq!(resolve_claude_cli_model("fable"), FABLE_ALIAS_CLI_MODEL);
+        assert_eq!(FABLE_ALIAS_CLI_MODEL, "claude-fable-5-2");
+        assert_eq!(
+            resolve_claude_cli_model("fable[1m]"),
+            format!("{FABLE_ALIAS_CLI_MODEL}[1m]")
+        );
+        assert_eq!(resolve_claude_cli_model("  fable  "), FABLE_ALIAS_CLI_MODEL);
+        // An explicit older Fable pin is a deliberate choice — never dragged
+        // forward to 5.2.
+        for pinned in ["claude-fable-5", "claude-fable-5-1"] {
+            assert_eq!(resolve_claude_cli_model(pinned), pinned);
+        }
+    }
+
+    #[test]
     fn resolve_claude_cli_model_passes_through_other_specs() {
-        // Only the `sonnet` and `opus` aliases are remapped. `opusplan` is a
-        // distinct alias (plan mode), not an `opus` variant.
-        for alias in ["haiku", "fable", "opusplan"] {
+        // Only the `sonnet`, `opus` and `fable` aliases are remapped.
+        // `opusplan` is a distinct alias (plan mode), not an `opus` variant.
+        for alias in ["haiku", "opusplan"] {
             assert_eq!(resolve_claude_cli_model(alias), alias);
         }
         // An explicit full model id is a deliberate pin — never rewritten,
@@ -1051,7 +1081,7 @@ mod tests {
         );
         // Idempotent: each resolved id resolves to itself, with and without
         // the long-context suffix.
-        for resolved in [SONNET_ALIAS_CLI_MODEL, OPUS_ALIAS_CLI_MODEL] {
+        for resolved in [SONNET_ALIAS_CLI_MODEL, OPUS_ALIAS_CLI_MODEL, FABLE_ALIAS_CLI_MODEL] {
             assert_eq!(resolve_claude_cli_model(resolved), resolved);
             let long = format!("{resolved}[1m]");
             assert_eq!(resolve_claude_cli_model(&long), long);
@@ -1331,7 +1361,7 @@ mod tests {
     #[test]
     fn test_model_spec_completions_merges_discovered_with_statics() {
         // `claude --help` currently names only `claude-fable-5`; the static
-        // list contributes the newer Fable 5.1 / Opus 5.5 catalog ids. Both are
+        // list contributes the newer Fable 5.2 / Opus 5.5 catalog ids. Both are
         // offered alongside the discovered full name.
         let discovered = vec!["claude:claude-fable-5".to_string()];
         let hits = model_spec_completions("claude:claude", &discovered);
@@ -1339,7 +1369,7 @@ mod tests {
             hits,
             vec![
                 "claude:claude-fable-5".to_string(),
-                "claude:claude-fable-5-1".to_string(),
+                "claude:claude-fable-5-2".to_string(),
                 "claude:claude-opus-5-5".to_string(),
             ]
         );
@@ -1365,7 +1395,7 @@ mod tests {
             );
         }
         assert!(
-            hits.contains(&"claude:claude-fable-5-1".to_string()),
+            hits.contains(&"claude:claude-fable-5-2".to_string()),
             "got {hits:?}"
         );
         assert!(
@@ -1427,7 +1457,7 @@ mod tests {
                 "claude:".to_string(),
                 "codex:".to_string(),
                 "cursor:".to_string(),
-                "claude:claude-fable-5-1".to_string(),
+                "claude:claude-fable-5-2".to_string(),
                 "claude:claude-opus-5-5".to_string(),
                 "cursor:claude-4.6-sonnet".to_string(),
             ]

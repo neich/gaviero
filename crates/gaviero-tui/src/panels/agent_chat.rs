@@ -1998,7 +1998,7 @@ impl AgentChatState {
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
-                         claude:claude-fable-5-1, claude:claude-opus-5-5, \
+                         claude:claude-fable-5-2, claude:claude-opus-5-5, \
                          codex:gpt-6.1-sol, codex:gpt-6-astra, codex:gpt-6.1-terra, \
                          codex:gpt-6-sol, codex:gpt-6-luna, codex:gpt-5.6-sol, \
                          codex:gpt-5.6-terra, codex:gpt-5.6-luna, \
