@@ -1,6 +1,6 @@
 [package]
 name = "gaviero-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Runtime for gaviero: agent sessions, turn capture, write gate, swarm pipeline, memory, code graph and MCP server."
 license.workspace = true

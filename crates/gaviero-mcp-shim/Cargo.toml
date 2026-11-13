@@ -1,6 +1,6 @@
 [package]
 name = "gaviero-mcp-shim"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "stdio bridge that lets subprocess coding agents reach gaviero's workspace MCP server."
 license.workspace = true

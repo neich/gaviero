@@ -1,6 +1,6 @@
 [package]
 name = "gaviero-remote"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 # Remote-owned wire DTOs and (feature `server`) the WSS sidecar server.

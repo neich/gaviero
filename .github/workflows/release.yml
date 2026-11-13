@@ -1,23 +1,82 @@
 name: Release
 
-# Push a tag like `v0.1.0` to build prebuilt binaries for Linux, macOS and
-# Windows and attach them to a DRAFT GitHub release. Review the draft and
-# publish it by hand. `workflow_dispatch` builds the archives as workflow
-# artifacts only (no release), for a dry run.
+# Publishes a GitHub release with prebuilt binaries for Linux, macOS and
+# Windows. Three ways to start it, all ending in the same published release:
+#
+#   1. `./scripts/release.ps1` — reads [workspace.package] version from Cargo.toml,
+#      tags v<version> and pushes the tag (the usual way).
+#   2. Actions → Release → Run workflow, enter a tag such as `v0.2.0`.
+#      The tag is created on the commit the run was started from.
+#   3. `git tag v0.2.0 && git push origin v0.2.0`.
+#
+# The tag must match [workspace.package] version (checked on the three
+# shipped crates: gaviero-tui, gaviero-cli, gaviero-mcp-shim) so `--version`
+# agrees with the release name. A tag with a `-` suffix (`v0.2.0-rc.1`) is
+# published as a pre-release.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, e.g. v0.2.0"
+        required: true
+        type: string
+      draft:
+        description: "Create the release as a draft instead of publishing it"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   # ort's build script downloads prebuilt ONNX Runtime binaries; keep them
   # inside the workspace so Swatinem/rust-cache picks them up.
   ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Fails fast, before three platform builds, on a malformed tag, a tag that
+  # disagrees with the crate versions, or (manual runs) a tag that already
+  # exists — that release would point at a different commit than the one
+  # built here.
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not of the form vMAJOR.MINOR.PATCH[-PRE]"
+            exit 1
+          fi
+          version="${TAG#v}"
+          # cargo metadata resolves `version.workspace = true`.
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for crate in gaviero-tui gaviero-cli gaviero-mcp-shim; do
+            have=$(jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version' <<< "$metadata")
+            if [[ "$have" != "$version" ]]; then
+              echo "::error file=Cargo.toml::$crate is version $have but the tag is $TAG. Bump [workspace.package] version (and Cargo.lock) first."
+              exit 1
+            fi
+          done
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] \
+             && git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::Tag $TAG already exists. Pick a new version, or delete the tag and its release first."
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -54,8 +113,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="gaviero-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          name="${name//\//-}"
+          name="gaviero-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           ext=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
@@ -84,9 +142,8 @@ jobs:
           path: dist/*
 
   release:
-    name: Draft release
+    name: Publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -95,8 +152,17 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # On a manual run the tag does not exist yet: the release API creates
+      # it on `target_commitish`, the commit this run built. A tag created
+      # with GITHUB_TOKEN does not trigger the `push: tags` event, so the
+      # workflow does not run a second time.
       - uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ env.TAG }}
+          name: gaviero ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ contains(env.TAG, '-') }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: dist/*

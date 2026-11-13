@@ -3,6 +3,11 @@ members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "c
 resolver = "2"
 
 [workspace.package]
+# The gaviero release version, inherited by every crate a gaviero install is
+# built from. To release: bump it, then run `./scripts/release.ps1`, which tags
+# v<version> and pushes the tag (.github/workflows/release.yml takes it from
+# there). gaviero-relay and tree-sitter-gaviero keep their own versions.
+version = "0.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/neich/gaviero"
 homepage = "https://github.com/neich/gaviero"

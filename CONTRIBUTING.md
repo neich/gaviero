@@ -59,6 +59,10 @@ These are the rules that most often trip people up. The full list is in [CLAUDE.
 
 Using an AI agent to write the change is fine, gaviero included. You are responsible for reviewing what it produced.
 
+## Releasing (maintainers)
+
+The release version is `[workspace.package] version` in the root `Cargo.toml`. Bump it on `main`, then run `./scripts/release.ps1` (PowerShell 7). The script refreshes `Cargo.lock`, commits the bump as `Release vX.Y.Z`, pushes, and tags `vX.Y.Z`. The tag starts the Release workflow, which builds Linux, macOS and Windows archives and publishes the GitHub release. `-DryRun` runs every check without changing anything.
+
 ## License
 
 By contributing you agree that your contributions are licensed under the [Apache License 2.0](LICENSE).

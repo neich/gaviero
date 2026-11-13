@@ -1,6 +1,6 @@
 [package]
 name = "gaviero-tui"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Terminal code editor for working with AI coding agents (Claude Code, Codex, Cursor, DeepSeek, Ollama): every change a turn makes is reviewed before the conversation continues."
 license.workspace = true
