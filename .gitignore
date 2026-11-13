@@ -31,6 +31,10 @@ plans/
 /bp.log
 /files.zip
 /gaviero.code-workspace
+/tmp_*.rs
+/zz-*/
+/.tmp-test/
+/*.original.md
 .mcp.json
 .codex-tmp
 .codex
