@@ -1169,6 +1169,47 @@ fn compile_file_scientific_research_param_roster_override_to_two() {
     assert_eq!(plan.loop_configs[0].agent_ids.len(), 2);
 }
 
+/// The roster's peer block carries `{{OUT_DIR}}` placeholders. They must be
+/// substituted like any other var: a reviewer told to read a file under a
+/// literal `{{OUT_DIR}}/` directory never finds its peers.
+#[test]
+fn scientific_research_peer_block_substitutes_out_dir() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let vars = vec![("OUT_DIR".to_string(), "research/run-a".to_string())];
+    let overrides = vec![(
+        "roster".to_string(),
+        "claude=claude:opus@max,codex=codex:gpt-5.5@high".to_string(),
+    )];
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("test topic"),
+        &vars,
+        &[],
+        &overrides,
+    )
+    .expect("scientific_research should compile");
+    let units = plan.work_units_unordered();
+    let refine = units
+        .iter()
+        .find(|u| u.id == "claude-refine")
+        .expect("claude-refine unit");
+    let prompt = &refine.coordinator_instructions;
+    assert!(
+        !prompt.contains("{{OUT_DIR}}"),
+        "literal {{{{OUT_DIR}}}} reached the refine prompt"
+    );
+    assert!(
+        prompt.contains("research/run-a/codex-conclusion-v"),
+        "peer conclusion path missing from the refine prompt"
+    );
+    assert!(
+        !prompt.contains("-init- on first refine pass"),
+        "stale -init- note still in the peer block"
+    );
+}
+
 #[test]
 fn workflow_execution_document_parsed() {
     let src = r#"
@@ -1395,4 +1436,288 @@ fn compile_rejects_inline_include_with_helpful_diagnostic() {
         "expected diagnostic to point at compile_file/--script, got: {}",
         msg
     );
+}
+
+// ── `for` loops (examples/for_loops.gaviero) ─────────────────────────────
+
+fn for_loops_plan(params: &[(String, String)]) -> gaviero_core::swarm::plan::CompiledPlan {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/for_loops.gaviero");
+    gaviero_dsl::compile_file(
+        &path,
+        Some("for-loops"),
+        Some("the release"),
+        &[("OUT_DIR".to_string(), "out/x".to_string())],
+        &[],
+        params,
+    )
+    .expect("for_loops.gaviero should compile")
+}
+
+fn unit<'a>(
+    plan: &'a gaviero_core::swarm::plan::CompiledPlan,
+    id: &str,
+) -> &'a gaviero_core::swarm::models::WorkUnit {
+    plan.work_units_unordered()
+        .into_iter()
+        .find(|u| u.id == id)
+        .unwrap_or_else(|| panic!("missing unit {id}"))
+}
+
+#[test]
+fn for_loops_clones_are_named_item_dash_agent() {
+    let plan = for_loops_plan(&[]);
+    let ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.clone())
+        .collect();
+    for item in ["a", "b", "c"] {
+        for agent in ["analyst", "editor", "reviewer"] {
+            let id = format!("{item}-{agent}");
+            assert!(ids.contains(&id), "missing {id} in {ids:?}");
+        }
+    }
+    for body in ["analyst", "editor", "reviewer"] {
+        assert!(!ids.iter().any(|i| i == body), "body agent {body} must not run itself");
+    }
+}
+
+#[test]
+fn for_loops_item_vars_reach_prompt_and_scope() {
+    let plan = for_loops_plan(&[]);
+    let b = unit(&plan, "b-analyst");
+    let prompt = &b.coordinator_instructions;
+    assert!(prompt.contains("network"), "focus field missing: {prompt}");
+    assert!(prompt.contains("a,c"), "peers missing: {prompt}");
+    assert!(prompt.contains("analyst 2 of 3"), "index/count missing: {prompt}");
+    assert!(prompt.contains("out/x/a-notes.md"), "peer_block not rendered: {prompt}");
+    assert!(prompt.contains("out/x/c-notes.md"), "peer_block not rendered: {prompt}");
+    assert!(!prompt.contains("- out/x/b-notes.md"), "self listed as a peer: {prompt}");
+    assert!(!prompt.contains("{{t."), "unsubstituted item var: {prompt}");
+    assert!(!prompt.contains("{{OUT_DIR}}"), "unsubstituted OUT_DIR: {prompt}");
+    assert_eq!(b.scope.owned_paths, vec!["out/x/b-notes.md".to_string()]);
+    assert_eq!(b.produces, vec!["out/x/b-notes.md".to_string()]);
+}
+
+#[test]
+fn for_loops_sequential_chain_and_empty_prev() {
+    let plan = for_loops_plan(&[]);
+    let a = unit(&plan, "a-editor");
+    let b = unit(&plan, "b-editor");
+    let c = unit(&plan, "c-editor");
+    assert!(b.depends_on.contains(&"a-editor".to_string()), "{:?}", b.depends_on);
+    assert!(c.depends_on.contains(&"b-editor".to_string()), "{:?}", c.depends_on);
+    assert!(
+        !a.depends_on.iter().any(|d| d.ends_with("-editor")),
+        "first item must not depend on another editor: {:?}",
+        a.depends_on
+    );
+    assert!(a.coordinator_instructions.contains("out/x/-draft.md"));
+    assert!(b.coordinator_instructions.contains("out/x/a-draft.md"));
+}
+
+#[test]
+fn for_loops_fan_in_depends_on_every_clone() {
+    let plan = for_loops_plan(&[]);
+    let s = unit(&plan, "summarizer");
+    for id in ["a-analyst", "b-analyst", "c-analyst"] {
+        assert!(s.depends_on.contains(&id.to_string()), "{:?}", s.depends_on);
+    }
+    assert!(!s.depends_on.contains(&"analyst".to_string()));
+}
+
+#[test]
+fn for_loops_parallel_inside_loop_becomes_loop_agents() {
+    let plan = for_loops_plan(&[]);
+    let lc = plan.loop_configs.first().expect("loop config");
+    assert_eq!(lc.agent_ids, vec!["a-reviewer", "b-reviewer", "c-reviewer"]);
+    assert!(lc.baseline_units.is_empty(), "{:?}", lc.baseline_units);
+}
+
+const FOR_BASE_SRC: &str = r#"
+client c { model "claude:sonnet" effort low default }
+agent base {
+    scope { owned ["out/{{t.id}}-v*.md"] }
+    prompt "baseline {{t.id}}"
+}
+agent rev {
+    scope { owned ["out/{{t.id}}-v*.md"] }
+    prompt "review {{t.id}} v{{ITER}}"
+}
+agent judge { prompt "VERDICT" }
+workflow w {
+    execution_mode document
+    param topics [ { id "a" } { id "b" } { id "c" } ]
+    steps [
+        for t in topics parallel { base }
+        loop {
+            for t in topics parallel { rev }
+            max_iterations 2
+            until agent judge
+        }
+    ]
+}
+"#;
+
+#[test]
+fn for_loops_baseline_units_pair_a_for_step_with_its_loop() {
+    let plan =
+        gaviero_dsl::compile_with_vars(FOR_BASE_SRC, "t.gaviero", Some("w"), None, &[], &[], &[])
+            .expect("compiles");
+    let lc = plan.loop_configs.first().expect("loop config");
+    assert_eq!(lc.agent_ids, vec!["a-rev", "b-rev", "c-rev"]);
+    assert_eq!(lc.baseline_units, vec!["a-base", "b-base", "c-base"]);
+}
+
+#[test]
+fn for_loops_param_list_literal_override() {
+    let plan = for_loops_plan(&[(
+        "topics".to_string(),
+        r#"[{id "x" focus "one"} {id "y" focus "two"}]"#.to_string(),
+    )]);
+    let mut ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .filter(|u| u.id.ends_with("-analyst"))
+        .map(|u| u.id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["x-analyst", "y-analyst"]);
+}
+
+/// A minimal script around one `for` block, for the error cases.
+fn for_error(steps: &str, agents: &str, params: &str, document: bool) -> String {
+    let src = format!(
+        r#"
+client c {{ model "claude:sonnet" effort low default }}
+agent judge {{ prompt "VERDICT" }}
+{agents}
+workflow w {{
+    {mode}
+    param topics [ {{ id "a" }} {{ id "b" }} ]
+    param judgeparam {{ model "claude:sonnet" }}
+    {params}
+    steps [ {steps} ]
+}}
+"#,
+        mode = if document { "execution_mode document" } else { "" },
+    );
+    match gaviero_dsl::compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[]) {
+        Ok(_) => panic!("expected a compile error for:\n{src}"),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+const OK_AGENT: &str = r#"agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.id}}" }
+agent uses_judgeparam { client judgeparam prompt "j" }"#;
+
+#[test]
+fn for_error_parallel_body_must_write_per_item_files() {
+    let msg = for_error(
+        "for t in topics parallel { a } uses_judgeparam",
+        r#"agent a { scope { owned ["out/shared.md"] } prompt "x" }
+agent uses_judgeparam { client judgeparam prompt "j" }"#,
+        "",
+        true,
+    );
+    assert!(msg.contains("{{t.id}}"), "{msg}");
+}
+
+#[test]
+fn for_error_sequential_needs_document_mode() {
+    let msg = for_error("for t in topics sequential { a } uses_judgeparam", OK_AGENT, "", false);
+    // miette wraps the message, so match the words separately.
+    assert!(msg.contains("execution_mode"), "{msg}");
+    assert!(msg.contains("document"), "{msg}");
+}
+
+#[test]
+fn for_error_unknown_item_field() {
+    let msg = for_error(
+        "for t in topics parallel { a } uses_judgeparam",
+        r#"agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.nope}}" }
+agent uses_judgeparam { client judgeparam prompt "j" }"#,
+        "",
+        true,
+    );
+    assert!(msg.contains("t.nope"), "{msg}");
+}
+
+#[test]
+fn for_error_empty_list_from_cli() {
+    let src = r#"
+client c { model "claude:sonnet" effort low default }
+agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x" }
+workflow w { param topics [ { id "a" } ] steps [ for t in topics parallel { a } ] }
+"#;
+    let err = gaviero_dsl::compile_with_vars(
+        src,
+        "t.gaviero",
+        Some("w"),
+        None,
+        &[],
+        &[],
+        &[("topics".to_string(), " , ".to_string())],
+    )
+    .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("empty"), "{msg}");
+}
+
+#[test]
+fn for_error_duplicate_ids() {
+    let msg = for_error(
+        "for t in topics2 parallel { a } uses_judgeparam",
+        OK_AGENT,
+        r#"param topics2 [ { id "a" } { id "a" } ]"#,
+        true,
+    );
+    assert!(msg.contains("duplicate"), "{msg}");
+}
+
+#[test]
+fn for_error_invalid_id() {
+    let msg = for_error(
+        "for t in topics2 parallel { a } uses_judgeparam",
+        OK_AGENT,
+        r#"param topics2 [ { id "a b" } ]"#,
+        true,
+    );
+    assert!(msg.contains("id"), "{msg}");
+    assert!(msg.contains("invalid"), "{msg}");
+}
+
+#[test]
+fn for_error_reserved_field() {
+    let msg = for_error(
+        "for t in topics2 parallel { a } uses_judgeparam",
+        OK_AGENT,
+        r#"param topics2 [ { id "a" prev "x" } ]"#,
+        true,
+    );
+    assert!(msg.contains("reserved"), "{msg}");
+}
+
+#[test]
+fn for_error_body_agent_listed_as_plain_step() {
+    let msg = for_error("for t in topics parallel { a } a uses_judgeparam", OK_AGENT, "", true);
+    assert!(msg.contains("plain step"), "{msg}");
+}
+
+#[test]
+fn for_error_sequential_inside_loop() {
+    let msg = for_error(
+        "loop { for t in topics sequential { a } until agent judge } uses_judgeparam",
+        OK_AGENT,
+        "",
+        true,
+    );
+    assert!(msg.contains("sequential"), "{msg}");
+    assert!(msg.contains("loop"), "{msg}");
+}
+
+#[test]
+fn for_error_over_a_client_param() {
+    let msg = for_error("for t in judgeparam parallel { a } uses_judgeparam", OK_AGENT, "", true);
+    assert!(msg.contains("not a list param"), "{msg}");
 }

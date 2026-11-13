@@ -82,6 +82,7 @@ fn command_loop(agent_id: &str, probe: &str, max_iterations: u32) -> LoopConfig 
         consensus_mode: Default::default(),
         verdict_output_dir: None,
         irreconcilable_after: 2,
+        baseline_units: Vec::new(),
     }
 }
 

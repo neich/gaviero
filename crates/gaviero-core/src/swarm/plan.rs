@@ -231,6 +231,12 @@ pub struct LoopConfig {
     /// rounds of restating it.
     #[serde(default = "default_irreconcilable_after")]
     pub irreconcilable_after: u32,
+    /// Units that form this loop's independent baseline pass (e.g. the clones of
+    /// a `for … parallel` step over the same list that precedes the loop).
+    /// They may share owned paths with the loop agents and count as already
+    /// satisfied when the loop resumes past its first pass.
+    #[serde(default)]
+    pub baseline_units: Vec<String>,
 }
 
 fn default_irreconcilable_after() -> u32 {

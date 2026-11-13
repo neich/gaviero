@@ -237,6 +237,8 @@ struct Cli {
     /// `NAME=VALUE`. For roster params, the value is a comma-separated list
     /// of `id=provider:model[@effort]` entries
     /// (e.g. `--param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high`).
+    /// List / roster params (`for t in <list>`) also accept a DSL list literal
+    /// (`--param 'topics=[{id "a" focus "x"} {id "b"}]'`) or bare ids (`a,b`).
     /// `tier:<name>` may stand in for any model spec (e.g. `--param judge=tier:high`).
     /// Required params without a default fail compilation when absent.
     /// Can be specified multiple times. Only valid with `--script`.

@@ -42,8 +42,8 @@ fn client_spec_tier(spec: &ClientParamSpec) -> Result<Option<String>, String> {
 }
 
 /// The tier a roster entry resolves to; see [`client_spec_tier`].
-fn roster_entry_tier(entry: &ReviewerEntry) -> Result<Option<&str>, String> {
-    let Some(tier) = tier_of_model_spec(&entry.model) else {
+pub(crate) fn roster_entry_tier(entry: &ReviewerEntry) -> Result<Option<&str>, String> {
+    let Some(tier) = entry.model.as_deref().and_then(tier_of_model_spec) else {
         return Ok(None);
     };
     if tier.is_empty() {
@@ -87,19 +87,36 @@ pub fn parse_client_override(value: &str) -> Result<ClientParamSpec, String> {
     })
 }
 
-/// Parse a `--param NAME=...` value string into a roster.
+/// Parse a `--param NAME=...` value string into a roster / list param.
 ///
-/// Format: `id=provider:model[@effort](,id=provider:model[@effort])*`.
+/// Forms:
+/// - a DSL list literal: `[{id "a" focus "x"} {id "b" model "claude:opus"}]`
+///   (any value whose trimmed form starts with `[`);
+/// - the short form `id=provider:model[@effort](,id=provider:model[@effort])*`,
+///   where a part without `=` is an id-only entry (`a,b,c`).
 pub fn parse_reviewers_override(value: &str) -> Result<Vec<ReviewerEntry>, String> {
+    if value.trim_start().starts_with('[') {
+        return crate::parser::parse_list_literal(value);
+    }
     let mut out = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let (id, rest) = part
-            .split_once('=')
-            .ok_or_else(|| format!("invalid roster entry `{part}` (expected id=provider:model)"))?;
+        let Some((id, rest)) = part.split_once('=') else {
+            let span: chumsky::span::SimpleSpan = (0..0).into();
+            out.push(ReviewerEntry {
+                id: part.to_string(),
+                id_span: span,
+                model: None,
+                model_span: span,
+                effort: None,
+                fields: Vec::new(),
+                span,
+            });
+            continue;
+        };
         let id = id.trim();
         if id.is_empty() {
             return Err(format!("invalid roster entry `{part}` (empty id)"));
@@ -117,9 +134,10 @@ pub fn parse_reviewers_override(value: &str) -> Result<Vec<ReviewerEntry>, Strin
         out.push(ReviewerEntry {
             id: id.to_string(),
             id_span: span,
-            model: model_spec,
+            model: Some(model_spec),
             model_span: span,
             effort: effort.map(|e| (e, span)),
+            fields: Vec::new(),
             span,
         });
     }
@@ -163,11 +181,22 @@ pub(crate) fn describe_workflow_params(
                     name: decl.name.clone(),
                     kind: ParamKindInfo::Roster,
                     default: entries.filter(|e| !e.is_empty()).map(|entries| {
+                        // Free fields only survive in the literal form.
+                        if entries.iter().any(|r| !r.fields.is_empty()) {
+                            let items: Vec<String> =
+                                entries.iter().map(list_literal_entry).collect();
+                            return format!("[{}]", items.join(" "));
+                        }
                         entries
                             .iter()
                             .map(|r| {
                                 let effort = r.effort.as_ref().map(|(e, _)| e.as_str());
-                                format!("{}={}", r.id, with_effort(&r.model, effort))
+                                match &r.model {
+                                    Some(model) => {
+                                        format!("{}={}", r.id, with_effort(model, effort))
+                                    }
+                                    None => r.id.clone(),
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join(",")
@@ -183,6 +212,31 @@ pub(crate) fn describe_workflow_params(
             })
         })
         .collect()
+}
+
+/// One entry in list-literal syntax: `{id "a" model "m" effort high focus "x"}`.
+pub fn list_literal_entry(entry: &ReviewerEntry) -> String {
+    let mut out = format!("{{id {}", quote_literal(&entry.id));
+    if let Some(model) = &entry.model {
+        out.push_str(&format!(" model {}", quote_literal(model)));
+    }
+    if let Some((effort, _)) = &entry.effort {
+        out.push_str(&format!(" effort {}", quote_literal(effort)));
+    }
+    for (name, value, _) in &entry.fields {
+        out.push_str(&format!(" {name} {}", quote_literal(value)));
+    }
+    out.push('}');
+    out
+}
+
+/// A DSL string literal holding `value` verbatim.
+fn quote_literal(value: &str) -> String {
+    if value.contains(['"', '\\', '\n', '\r']) {
+        format!("#\"{value}\"#")
+    } else {
+        format!("\"{value}\"")
+    }
 }
 
 /// Materialize client params and expand reviewer rosters for the selected workflow.
@@ -371,7 +425,11 @@ pub fn expand_workflow_params_in_script(
                     let tier_problems: Vec<DslError> = roster
                         .iter()
                         .filter_map(|entry| {
-                            let reason = roster_entry_tier(entry).err()?;
+                            let reason = if entry.model.is_none() {
+                                format!("roster entry `{}` needs `model`", entry.id)
+                            } else {
+                                roster_entry_tier(entry).err()?
+                            };
                             Some(DslError::Compile {
                                 src: miette::NamedSource::new("script", String::new()),
                                 span: (
@@ -456,7 +514,11 @@ pub fn expand_workflow_params_in_script(
                             format!("__roster_{}", entry.id)
                         };
                         // A tier entry binds through the tier; it has no client of its own.
-                        let needs_client = tier_of_model_spec(&entry.model).is_none();
+                        let needs_client = entry
+                            .model
+                            .as_deref()
+                            .and_then(tier_of_model_spec)
+                            .is_none();
                         if needs_client {
                             new_clients.push(synth_client_from_entry(&refine_client_name, entry));
                         }
@@ -508,6 +570,17 @@ pub fn expand_workflow_params_in_script(
         script.items.push(Item::Agent(agent));
     }
 
+    // Pass 3 — `for` blocks (explicit parallel / sequential iteration).
+    if errors.is_empty() {
+        crate::for_loops::expand_for_blocks(
+            script,
+            workflow_name,
+            override_params,
+            &kinds_by_workflow,
+            &mut errors,
+        );
+    }
+
     if !errors.is_empty() {
         return Err(DslErrors::new(errors));
     }
@@ -544,12 +617,19 @@ fn param_usage_for_workflow(
                 if let ReviewerSource::ParamRef(name, _) = &lb.reviewers {
                     usage.entry(name.clone()).or_default().roster = true;
                 }
+                for fb in &lb.fors {
+                    usage.entry(fb.list.clone()).or_default().roster = true;
+                }
                 if let UntilCondition::Agent(judge, _) = &lb.until {
                     record_client_param_usage(&mut usage, judge, &param_names, agent_by_name);
                 }
             }
             StepItem::Agent(name, _) => {
                 record_client_param_usage(&mut usage, name, &param_names, agent_by_name);
+            }
+            // A `for` iterates a list param, which is the roster kind.
+            StepItem::For(fb) => {
+                usage.entry(fb.list.clone()).or_default().roster = true;
             }
         }
     }
@@ -667,7 +747,7 @@ fn resolve_client_spec(
     })
 }
 
-fn resolve_roster(
+pub(crate) fn resolve_roster(
     source: &ReviewerSource,
     params_by_name: &HashMap<String, ParamDecl>,
     resolved_kinds: &HashMap<String, ParamKind>,
@@ -749,12 +829,12 @@ fn synth_client_from_spec(name: &str, spec: &ClientParamSpec) -> ClientDecl {
     }
 }
 
-fn synth_client_from_entry(name: &str, entry: &ReviewerEntry) -> ClientDecl {
+pub(crate) fn synth_client_from_entry(name: &str, entry: &ReviewerEntry) -> ClientDecl {
     ClientDecl {
         name: name.to_string(),
         name_span: entry.span,
         tier: None,
-        model: Some((entry.model.clone(), entry.model_span)),
+        model: entry.model.clone().map(|m| (m, entry.model_span)),
         effort: entry.effort.clone(),
         extra: Vec::new(),
         privacy: Some((PrivacyLit::Public, entry.span)),
@@ -784,7 +864,7 @@ fn clone_reviewer_agent(
         template: false,
         ..clone_agent_shell(template)
     };
-    if let Some(tier) = tier_of_model_spec(&entry.model) {
+    if let Some(tier) = entry.model.as_deref().and_then(tier_of_model_spec) {
         agent.client = None;
         agent.tier_ref = Some((tier.to_string(), template.name_span));
     }
@@ -817,6 +897,7 @@ fn clone_agent_shell(template: &AgentDecl) -> AgentDecl {
         memory: template.memory.clone(),
         context: template.context.clone(),
         vars: Vec::new(),
+        item_vars: Vec::new(),
         tools: template.tools.clone(),
         template: false,
         span: template.span,
@@ -854,13 +935,18 @@ fn inject_peer_vars(mut agent: AgentDecl, self_id: &str, peer_ids: &[String]) ->
         .map(String::as_str)
         .filter(|id| *id != self_id)
         .collect();
-    agent.vars.push(("REVIEWER_ID".into(), self_id.to_string()));
-    agent.vars.push(("PEER_IDS".into(), others.join(",")));
+    // Item vars are substituted before every other layer, so the
+    // `{{OUT_DIR}}` / `{{PREV_ITER}}` placeholders inside the peer block are
+    // still filled in by the script / CLI vars and the runtime.
     agent
-        .vars
+        .item_vars
+        .push(("REVIEWER_ID".into(), self_id.to_string()));
+    agent.item_vars.push(("PEER_IDS".into(), others.join(",")));
+    agent
+        .item_vars
         .push(("PEER_COUNT".into(), others.len().to_string()));
     agent
-        .vars
+        .item_vars
         .push(("PEER_READ_BLOCK".into(), build_peer_read_block(&others)));
     agent
 }
@@ -875,7 +961,7 @@ fn build_peer_read_block(peers: &[&str]) -> String {
         // `{OUT_DIR}` that survives substitution and reaches the agent as a
         // literal path segment.
         s.push_str(&format!(
-            "      - {{{{OUT_DIR}}}}/{peer}-conclusion-v{{{{PREV_ITER}}}}.md (or -init- on first refine pass)\n"
+            "      - {{{{OUT_DIR}}}}/{peer}-conclusion-v{{{{PREV_ITER}}}}.md\n"
         ));
         s.push_str(&format!(
             "      - {{{{OUT_DIR}}}}/{peer}-summary-v{{{{PREV_ITER}}}}.md (skip if the file does not exist)\n"
@@ -909,7 +995,7 @@ mod tests {
         let entries = parse_reviewers_override("claude=claude:opus,codex=codex:gpt-5.5").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "claude");
-        assert_eq!(entries[0].model, "claude:opus");
+        assert_eq!(entries[0].model.as_deref(), Some("claude:opus"));
     }
 
     #[test]
@@ -918,6 +1004,26 @@ mod tests {
             parse_reviewers_override("claude=claude:opus@max,codex=codex:gpt-5.5@high").unwrap();
         assert_eq!(entries[0].effort.as_ref().unwrap().0, "max");
         assert_eq!(entries[1].effort.as_ref().unwrap().0, "high");
+    }
+
+    #[test]
+    fn parse_list_literal_override() {
+        let entries = parse_reviewers_override(
+            r#"[{id "a" focus "x"} {id "b" model "claude:opus"}]"#,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].fields[0].1, "x");
+        assert_eq!(entries[1].model.as_deref(), Some("claude:opus"));
+    }
+
+    #[test]
+    fn parse_id_only_short_form() {
+        let entries = parse_reviewers_override("a,b").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "a");
+        assert!(entries[0].model.is_none());
+        assert_eq!(entries[1].id, "b");
     }
 
     #[test]

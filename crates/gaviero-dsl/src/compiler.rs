@@ -461,6 +461,7 @@ pub fn compile_ast_with_sources(
         for step in steps {
             match step {
                 StepItem::Agent(name, _) => preceding.push(name.clone()),
+                StepItem::For(_) => unreachable!("for blocks are expanded before compilation"),
                 StepItem::Loop(lb) => {
                     let loop_ids: Vec<String> = lb.agents.iter().map(|(n, _)| n.clone()).collect();
                     if !preceding.is_empty() {
@@ -706,6 +707,7 @@ fn ordered_agents_from_workflow<'a>(
         let refs: Vec<(&str, &Span)> = match step {
             StepItem::Agent(name, span) => vec![(name.as_str(), span)],
             StepItem::Loop(lb) => lb.agents.iter().map(|(n, s)| (n.as_str(), s)).collect(),
+            StepItem::For(_) => unreachable!("for blocks are expanded before compilation"),
         };
         for (name, name_span) in refs {
             if seen.contains(name) {
@@ -842,6 +844,7 @@ fn apply_vars(
     script_vars: &[(String, String)],
     override_vars: &[(String, String)],
     agent_vars: &[(String, String)],
+    item_vars: &[(String, String)],
     agent_name: &str,
     runtime_prompt: Option<&str>,
 ) -> String {
@@ -880,7 +883,13 @@ fn apply_vars(
         merged.push((k.as_str(), v.as_str()));
     }
 
+    // Item vars (`for` / roster expansion) go first, so placeholders inside
+    // their values — `{{OUT_DIR}}` in a peer block, say — are still
+    // substituted by the layers below. One pass per layer; no fixpoint.
     let mut result = text.to_string();
+    for (k, v) in item_vars {
+        result = result.replace(&format!("{{{{{k}}}}}"), v);
+    }
     for (k, v) in merged {
         result = result.replace(&format!("{{{{{k}}}}}"), v);
     }
@@ -1026,6 +1035,7 @@ fn compile_agent(
             script_vars,
             override_vars,
             &decl.vars,
+            &decl.item_vars,
             &decl.name,
             runtime_prompt,
         )
@@ -1066,6 +1076,7 @@ fn compile_agent(
             script_vars,
             override_vars,
             &decl.vars,
+            &decl.item_vars,
             &decl.name,
             runtime_prompt,
         )
@@ -1099,6 +1110,7 @@ fn compile_agent(
             script_vars,
             override_vars,
             &decl.vars,
+            &decl.item_vars,
             &decl.name,
             runtime_prompt,
         ),
@@ -1166,6 +1178,7 @@ fn compile_agent(
                 script_vars,
                 override_vars,
                 &decl.vars,
+                &decl.item_vars,
                 &decl.name,
                 runtime_prompt,
             )
@@ -1187,6 +1200,7 @@ fn compile_agent(
                 script_vars,
                 override_vars,
                 &decl.vars,
+                &decl.item_vars,
                 &decl.name,
                 runtime_prompt,
             )
@@ -1386,6 +1400,7 @@ fn extract_loop_configs(
                         ConsensusModeLit::Explore => ConsensusMode::Explore,
                     },
                     verdict_output_dir: Some(out_dir.clone()),
+                    baseline_units: lb.baseline_units.clone(),
                 })
             } else {
                 None
@@ -1432,7 +1447,7 @@ fn map_until_condition(
             // Substitute script-level + CLI override vars so probes can
             // refer to {{OUT_DIR}} etc. {{ITER}} / {{PREV_ITER}} are
             // reserved and substituted later by the runtime per iteration.
-            let expanded = apply_vars(cmd, script_vars, override_vars, &[], "", None);
+            let expanded = apply_vars(cmd, script_vars, override_vars, &[], &[], "", None);
             LoopUntilCondition::Command(expanded)
         }
         UntilCondition::All(conditions, _) => LoopUntilCondition::All(

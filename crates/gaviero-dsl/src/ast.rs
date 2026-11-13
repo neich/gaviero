@@ -247,6 +247,10 @@ pub struct AgentDecl {
     /// Per-agent compile-time substitution variables.
     /// Override script-level vars; cannot shadow built-ins (PROMPT, AGENT).
     pub vars: Vec<(String, String)>,
+    /// Values injected per list item by `for` / roster expansion (keys like
+    /// `t.id` or `REVIEWER_ID`); substituted before every other var layer, so
+    /// placeholders inside these values still get agent / CLI / script vars.
+    pub item_vars: Vec<(String, String)>,
     /// Extra tools requested for this agent on top of the runner's default
     /// read-only set (`Read, Glob, Grep, Write, Edit, MultiEdit`). Names are
     /// passed verbatim to the backend via `--allowedTools`. The backend
@@ -275,12 +279,18 @@ pub struct ReviewerEntry {
     pub id_span: Span,
     /// Canonical `provider:model` spec (validated downstream by
     /// `gaviero_core::swarm::backend::shared::validate_model_spec`), or
-    /// `tier:<name>` to bind this reviewer to a tier instead.
-    pub model: String,
+    /// `tier:<name>` to bind this reviewer to a tier instead. `None` for a
+    /// plain list entry (`for` keeps the body agent's own client); the
+    /// `reviewers` roster requires it.
+    pub model: Option<String>,
+    /// Span of the `model` field when present, else the entry span.
     pub model_span: Span,
     /// Optional effort override (`off | auto | low | medium | high | xhigh | max`).
     /// When `None`, the backend's default kicks in.
     pub effort: Option<(String, Span)>,
+    /// Free `<ident> "<string>"` fields, in source order (list params used by
+    /// `for`; exposed as `{{<var>.<name>}}`).
+    pub fields: Vec<(String, String, Span)>,
     pub span: Span,
 }
 
@@ -464,6 +474,42 @@ pub enum StepItem {
     Agent(String, Span),
     /// An explicit loop over a sequence of agents.
     Loop(LoopBlock),
+    /// `for <var> in <list> parallel|sequential { … }` — expanded into
+    /// per-item agent clones before compilation.
+    For(ForBlock),
+}
+
+/// How the clones of a `for` block relate to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForMode {
+    /// Clones run concurrently (no inter-item dependencies).
+    Parallel,
+    /// Item k's clones depend on item k−1's; `{{<var>.prev}}` names it.
+    Sequential,
+}
+
+/// `for <var> in <list-param> parallel|sequential { <agent>+ [peer_template "…"] }`
+///
+/// ```text
+/// for t in topics parallel {
+///     analyst
+///     peer_template #"- {{OUT_DIR}}/{{peer}}-notes.md"#
+/// }
+/// ```
+///
+/// Expanded by `for_loops::expand_for_blocks` into one clone per item and
+/// body agent, named `<item-id>-<agent>`.
+#[derive(Debug, Clone)]
+pub struct ForBlock {
+    pub var: String,
+    pub var_span: Span,
+    pub list: String,
+    pub list_span: Span,
+    pub mode: ForMode,
+    pub mode_span: Span,
+    pub agents: Vec<(String, Span)>,
+    pub peer_template: Option<(String, Span)>,
+    pub span: Span,
 }
 
 /// Exit condition for a `loop` block.
@@ -565,6 +611,13 @@ pub struct LoopBlock {
     pub template_init: Option<(String, Span)>,
     /// Template agent name for each refinement iteration.
     pub template_refine: Option<(String, Span)>,
+    /// `for … parallel { … }` blocks inside the loop. Expansion appends their
+    /// clones to `agents` and clears this list.
+    pub fors: Vec<ForBlock>,
+    /// Units that form this loop's baseline pass: clones of top-level `for`
+    /// steps before the loop that iterate the same list. Filled by expansion;
+    /// emitted as `LoopConfig::baseline_units`.
+    pub baseline_units: Vec<String>,
     pub consensus_mode: ConsensusModeLit,
     pub span: Span,
 }

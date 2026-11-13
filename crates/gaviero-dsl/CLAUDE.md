@@ -9,7 +9,7 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-Examples: **10** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `doc-cursor`) + **3** model profiles (`claude`, `codex`, `mixed`) under [`examples/`](examples/).
+Examples: **11** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `doc-cursor`) + **3** model profiles (`claude`, `codex`, `mixed`) under [`examples/`](examples/).
 
 ## Architecture
 
@@ -22,6 +22,7 @@ Examples: **10** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `d
 | [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (cycles, tier resolution, var substitution). Scope overlap is validated at swarm runtime. |
 | [`workflow_params.rs`](src/workflow_params.rs) | `param` materialization: client params + roster expansion (`--param`). |
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports only; impl lives in `workflow_params`. |
+| [`for_loops.rs`](src/for_loops.rs) | Private: `for <var> in <list> parallel/sequential` expansion (last pass of `workflow_params`). |
 | [`resolver.rs`](src/resolver.rs) | `include` graph; drives `compile_file`. |
 | [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader (`tier` lines only). |
 | [`profile.rs`](src/profile.rs) | Merges a model profile (`client` + `tier`) into a resolved script. |
@@ -35,7 +36,7 @@ Examples: **10** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `d
 - `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
 - `inspect_file` ([`inspect.rs`](src/inspect.rs)) — a script's inputs (workflows, params, vars, prompt use) without compiling; backs the TUI SWARM form.
 
-**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Tier: `--tiers-file` > chosen profile > script/includes `tier` lines > implicit `default` profile.
+**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Item vars (`for` / roster) are substituted before agent, CLI and script vars. Tier: `--tiers-file` > chosen profile > script/includes `tier` lines > implicit `default` profile.
 
 Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](README.md).
 

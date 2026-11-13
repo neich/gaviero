@@ -140,6 +140,32 @@ pub fn expand_loop_groups_with_roster_init(
         .collect()
 }
 
+/// Add each loop's explicit `baseline_units` to its scope group.
+///
+/// `groups` must be in the same order as `loop_configs` (one group per loop,
+/// as built from `LoopConfig::agent_ids`). A baseline unit is the independent
+/// first pass a DSL `for … parallel` step runs before a loop over the same
+/// list, so it may own the same paths as the loop agents it precedes.
+pub fn add_baseline_units_to_loop_groups(
+    groups: Vec<Vec<String>>,
+    loop_configs: &[crate::swarm::plan::LoopConfig],
+) -> Vec<Vec<String>> {
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut group)| {
+            if let Some(lc) = loop_configs.get(i) {
+                for unit in &lc.baseline_units {
+                    if !group.contains(unit) {
+                        group.push(unit.clone());
+                    }
+                }
+            }
+            group
+        })
+        .collect()
+}
+
 /// Check if two sets of owned paths overlap.
 fn find_overlapping_paths(paths_a: &[String], paths_b: &[String]) -> Vec<String> {
     let mut overlaps = Vec::new();
@@ -326,6 +352,45 @@ mod tests {
         let expanded =
             expand_loop_groups_with_roster_init(narrow, &["claude-init", "claude-refine"]);
         assert!(validate_scopes(&units, &expanded).is_empty());
+    }
+
+    fn loop_with_baseline(agent_ids: &[&str], baseline: &[&str]) -> crate::swarm::plan::LoopConfig {
+        crate::swarm::plan::LoopConfig {
+            agent_ids: agent_ids.iter().map(|s| s.to_string()).collect(),
+            until: crate::swarm::plan::LoopUntilCondition::Agent("judge".into()),
+            max_iterations: 3,
+            iter_start: 1,
+            strict_judge: true,
+            stability: 1,
+            judge_timeout_secs: 120,
+            branch_chain: Default::default(),
+            consensus_mode: Default::default(),
+            verdict_output_dir: None,
+            irreconcilable_after: 2,
+            baseline_units: baseline.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_baseline_units_may_share_owned_paths_with_their_loop() {
+        let units = vec![
+            unit("a-x", &["out/a-*.md"], &[]),
+            unit("a-y", &["out/a-*.md"], &[]),
+        ];
+        let configs = vec![loop_with_baseline(&["a-y"], &["a-x"])];
+        let groups = add_baseline_units_to_loop_groups(vec![vec!["a-y".to_string()]], &configs);
+        assert!(validate_scopes(&units, &groups).is_empty());
+    }
+
+    #[test]
+    fn test_overlap_rejected_without_baseline_units() {
+        let units = vec![
+            unit("a-x", &["out/a-*.md"], &[]),
+            unit("a-y", &["out/a-*.md"], &[]),
+        ];
+        let configs = vec![loop_with_baseline(&["a-y"], &[])];
+        let groups = add_baseline_units_to_loop_groups(vec![vec!["a-y".to_string()]], &configs);
+        assert_eq!(validate_scopes(&units, &groups).len(), 1);
     }
 
     #[test]
