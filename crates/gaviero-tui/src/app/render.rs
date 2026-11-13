@@ -52,7 +52,11 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         }
         if matches!(
             app.bulk_op_state,
-            Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
+            Some(
+                BulkOpState::ConfirmDelete { .. }
+                    | BulkOpState::ConfirmMove { .. }
+                    | BulkOpState::ConfirmCopy { .. }
+            )
         ) {
             app.render_bulk_op_dialog(frame, size);
         }
@@ -211,7 +215,11 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     }
     if matches!(
         app.bulk_op_state,
-        Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
+        Some(
+            BulkOpState::ConfirmDelete { .. }
+                | BulkOpState::ConfirmMove { .. }
+                | BulkOpState::ConfirmCopy { .. }
+        )
     ) {
         app.render_bulk_op_dialog(frame, size);
     }
@@ -2308,6 +2316,20 @@ pub(super) fn render_bulk_op_dialog(app: &App, frame: &mut Frame, area: Rect) {
             lines.push(String::new());
             lines.push("  [y] Move   [n / Esc] Cancel".to_string());
         }
+        BulkOpState::ConfirmCopy { paths, dest_dir } => {
+            let dest = dest_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            lines.push(format!("  Copy {} item(s) → '{}'?", paths.len(), dest));
+            lines.push(String::new());
+            for path in paths.iter().take(10) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                lines.push(format!("    • {}", name));
+            }
+            if paths.len() > 10 {
+                lines.push(format!("    … and {} more", paths.len() - 10));
+            }
+            lines.push(String::new());
+            lines.push("  [y] Copy   [n / Esc] Cancel".to_string());
+        }
         BulkOpState::SelectingDest { .. } => return,
     }
 
@@ -2317,6 +2339,7 @@ pub(super) fn render_bulk_op_dialog(app: &App, frame: &mut Frame, area: Rect) {
     let title_tag = match state {
         BulkOpState::ConfirmDelete { .. } => "Delete",
         BulkOpState::ConfirmMove { .. } => "Move",
+        BulkOpState::ConfirmCopy { .. } => "Copy",
         _ => "",
     };
 

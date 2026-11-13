@@ -1736,10 +1736,23 @@ fn handle_quit_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) {
 fn handle_bulk_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) {
     use crossterm::event::KeyCode;
     let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+    if matches!(app.bulk_op_state, Some(BulkOpState::ConfirmCopy { .. })) {
+        // The paste gesture that opened the question must not answer it: a
+        // second Ctrl+V of the same gesture, or ConPTY's leftover key burst.
+        let action = crate::keymap::Keymap::resolve(key);
+        let residue = super::editing::paste_settling(app)
+            && matches!(action, Action::InsertChar(_) | Action::Enter | Action::Tab);
+        if action == Action::Paste || residue {
+            return;
+        }
+    }
     match app.bulk_op_state.clone() {
         Some(BulkOpState::ConfirmDelete { paths }) if yes => app.execute_bulk_delete(&paths),
         Some(BulkOpState::ConfirmMove { paths, dest_dir }) if yes => {
             app.execute_bulk_move(&paths, &dest_dir)
+        }
+        Some(BulkOpState::ConfirmCopy { paths, dest_dir }) if yes => {
+            super::file_paste::execute_copy(app, &paths, &dest_dir)
         }
         _ => app.bulk_op_state = None,
     }
