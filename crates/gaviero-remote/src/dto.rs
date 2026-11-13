@@ -74,6 +74,11 @@ pub struct InstanceInfo {
     pub started_at: String,
     /// A mobile client is currently attached; connecting will replace it.
     pub client_connected: bool,
+    /// 1.9: RFC 3339 time of the instance's last attention-worthy event — a
+    /// prompt sent, a permission request or question, a turn review, or a
+    /// turn ending. Absent until the first one since the instance started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
 }
 
 /// Body of `GET /v1/instances`. Only instances with a fresh heartbeat are

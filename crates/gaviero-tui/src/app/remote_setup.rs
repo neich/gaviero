@@ -620,6 +620,7 @@ pub async fn start(
                     tui_version: env!("CARGO_PKG_VERSION").to_string(),
                     started_at: gaviero_remote::server::registry::utc_now_rfc3339(),
                     client_connected: false,
+                    last_activity_at: None,
                 },
             }
         });

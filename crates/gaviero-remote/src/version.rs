@@ -19,14 +19,15 @@ use serde::{Deserialize, Serialize};
 /// `mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.
 /// Minor 7 is additive: the `shell_history` capability and optional
 /// `request_terminals.history`. Minor 8 is additive: the `skill_completions`
-/// capability and the `request_skill_completions` client frame.
+/// capability and the `request_skill_completions` client frame. Minor 9 is
+/// additive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
