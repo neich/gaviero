@@ -23,9 +23,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04 keeps the glibc requirement low enough for most distros.
+          # Not 22.04: ort's prebuilt static onnxruntime references the C23
+          # `__isoc23_strto*` symbols, which first shipped in glibc 2.38, so
+          # it cannot link against 22.04's glibc 2.35. 24.04 (glibc 2.39)
+          # sets the floor for the shipped binary: Ubuntu 24.04+, Debian 13+,
+          # Fedora 40+.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc
