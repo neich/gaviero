@@ -1,0 +1,97 @@
+name: Release
+
+# Push a tag like `v0.1.0` to build prebuilt binaries for Linux, macOS and
+# Windows and attach them to a DRAFT GitHub release. Review the draft and
+# publish it by hand. `workflow_dispatch` builds the archives as workflow
+# artifacts only (no release), for a dry run.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # ort's build script downloads prebuilt ONNX Runtime binaries; keep them
+  # inside the workspace so Swatinem/rust-cache picks them up.
+  ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 keeps the glibc requirement low enough for most distros.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # The three binaries must ship side by side: gaviero finds
+      # gaviero-cli (agent hooks) and gaviero-mcp-shim (MCP bridge) next to
+      # its own executable.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gaviero-tui -p gaviero-cli -p gaviero-mcp-shim
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="gaviero-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="${name//\//-}"
+          mkdir -p "dist/$name"
+          ext=""
+          if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
+          for bin in gaviero gaviero-cli gaviero-mcp-shim; do
+            cp "target/${{ matrix.target }}/release/${bin}${ext}" "dist/$name/"
+          done
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            archive="$name.zip"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          rm -rf "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gaviero-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*

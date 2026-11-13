@@ -2,6 +2,10 @@
 name = "gaviero-mcp-shim"
 version = "0.1.0"
 edition = "2024"
+description = "stdio bridge that lets subprocess coding agents reach gaviero's workspace MCP server."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "gaviero-mcp-shim"

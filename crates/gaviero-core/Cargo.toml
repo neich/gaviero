@@ -2,6 +2,10 @@
 name = "gaviero-core"
 version = "0.1.0"
 edition = "2024"
+description = "Runtime for gaviero: agent sessions, turn capture, write gate, swarm pipeline, memory, code graph and MCP server."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "fake_acp_agent"
