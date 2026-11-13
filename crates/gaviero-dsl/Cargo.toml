@@ -2,6 +2,10 @@
 name = "gaviero-dsl"
 version = "0.1.0"
 edition = "2024"
+description = "Compiler for .gaviero multi-agent workflow scripts."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 gaviero-core = { path = "../gaviero-core" }

@@ -2,6 +2,10 @@
 name = "gaviero-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Headless runner for gaviero: single agent tasks, coordinated swarms and .gaviero workflow scripts."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "gaviero-cli"

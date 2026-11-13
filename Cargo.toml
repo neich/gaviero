@@ -2,6 +2,11 @@
 members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/gaviero-mcp-shim", "crates/gaviero-remote", "crates/gaviero-relay", "crates/tree-sitter-gaviero"]
 resolver = "2"
 
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/neich/gaviero"
+homepage = "https://github.com/neich/gaviero"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }

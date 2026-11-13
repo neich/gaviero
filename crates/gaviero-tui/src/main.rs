@@ -35,6 +35,7 @@ const CHAT_SPINNER_RENDER_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(Parser)]
 #[command(
     name = "gaviero",
+    version,
     about = "Terminal code editor for AI agent orchestration"
 )]
 struct Cli {

@@ -30,7 +30,7 @@ enum OutputFormat {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "gaviero-cli", about = "Headless AI agent task runner")]
+#[command(name = "gaviero-cli", version, about = "Headless AI agent task runner")]
 struct Cli {
     /// Path to the git repository root (`execution repo` workflows).
     #[arg(long, default_value = ".", conflicts_with = "workspace")]

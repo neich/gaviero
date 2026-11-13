@@ -26,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[derive(Parser)]
 #[command(
     name = "gaviero-mcp-shim",
+    version,
     about = "stdio↔socket bridge for Gaviero's MCP server"
 )]
 struct Cli {

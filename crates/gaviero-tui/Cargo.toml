@@ -2,6 +2,13 @@
 name = "gaviero-tui"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal code editor for working with AI coding agents (Claude Code, Codex, Cursor, DeepSeek, Ollama): every change a turn makes is reviewed before the conversation continues."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agents", "editor", "tui", "mcp"]
+categories = ["command-line-utilities", "development-tools", "text-editors"]
 
 [[bin]]
 name = "gaviero"
