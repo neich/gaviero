@@ -17,6 +17,25 @@ use super::model_manager::{ModelInfo, ModelManager};
 /// 512), so 512 is safe for all currently-supported models.
 pub const MAX_SEQUENCE_LENGTH: usize = 512;
 
+/// The process-wide ONNX Runtime environment every `Session` is built from.
+///
+/// ort allows exactly one environment per process, for the life of the
+/// process (a second `build()` fails even after the first is dropped), so it
+/// is built once on first use and never released. A failed build is cached
+/// too: retrying cannot succeed.
+pub(crate) fn ort_environment() -> Result<&'static ort::environment::Environment> {
+    static ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
+        std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::environment::init()
+            .with_name("gaviero")
+            .build()
+            .map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map_err(|e| anyhow::anyhow!("creating ONNX Runtime environment: {e}"))
+}
+
 /// ONNX-based text embedder using E5, nomic-embed-text, or similar models.
 ///
 /// Uses interior mutability (Mutex) because `ort::Session::run()` requires `&mut self`
@@ -81,7 +100,7 @@ impl OnnxEmbedder {
         dimensions: usize,
         model_id: &str,
     ) -> Result<Self> {
-        let session = Session::builder()
+        let session = Session::builder(ort_environment()?)
             .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?
             .with_intra_threads(1)
             .map_err(|e| anyhow::anyhow!("setting thread count: {e}"))?

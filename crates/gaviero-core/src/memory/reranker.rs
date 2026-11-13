@@ -339,7 +339,7 @@ impl ModernBertReranker {
         threads: usize,
     ) -> Result<Self> {
         let intra_threads = resolve_intra_threads(threads);
-        let session = Session::builder()
+        let session = Session::builder(super::onnx_embedder::ort_environment()?)
             .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| anyhow::anyhow!("setting thread count: {e}"))?
