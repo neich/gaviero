@@ -31,7 +31,8 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
           - target: aarch64-apple-darwin
-            os: macos-14
+            # macos-14 was retired on 2026-11-02. macos-15 is arm64 too.
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
