@@ -136,6 +136,22 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
         draw_notice(&text, bar, frame.buffer_mut());
     }
 
+    // Quitting: tabs leave one by one and the current one moves along with
+    // them, so drawing it would flash whatever another tab shows on its way
+    // out (a tab still at its launch prompt, say). Show the quit instead.
+    if host.quitting() {
+        draw_confirm(
+            " Quitting gaviero ",
+            &[
+                format!("Saving {} tab(s)…", host.sessions.len()),
+                "Every tab reopens next start".to_string(),
+            ],
+            area,
+            frame.buffer_mut(),
+        );
+        return;
+    }
+
     if let Some(session) = host.sessions.get(host.active) {
         let screen = session.parser.screen();
         render_screen(screen, body, frame.buffer_mut());

@@ -215,11 +215,22 @@ fn run_screen<S: Screen>(screen: &mut S) -> Result<S::Out> {
         return Err(e).context("entering alternate screen for setup screen");
     }
 
+    let control = std::env::var_os(crate::session_host::CONTROL_ENV).map(PathBuf::from);
     let result = (|| -> Result<S::Out> {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).context("creating setup terminal")?;
         loop {
             terminal.draw(|frame| screen.draw(frame))?;
+            // Under a session host, a tab still at this screen when the
+            // host closes it (or quits) must go at once, not sit here until
+            // it is killed.
+            if let Some(control) = &control {
+                while !event::poll(CONTROL_POLL)? {
+                    if host_closed_session(control) {
+                        return Err(HostClosed.into());
+                    }
+                }
+            }
             let TermEvent::Key(key) = event::read()? else {
                 continue;
             };
@@ -237,6 +248,31 @@ fn run_screen<S: Screen>(screen: &mut S) -> Result<S::Out> {
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
     result
+}
+
+/// How often a pre-editor screen under a session host checks its control
+/// file while no key arrives.
+const CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The session host closed this tab or is quitting while a pre-editor
+/// screen was still asking: nothing was chosen or written, and the process
+/// should end quietly (`main` exits 0 on it).
+#[derive(Debug)]
+pub struct HostClosed;
+
+impl std::fmt::Display for HostClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the session host closed this tab")
+    }
+}
+
+impl std::error::Error for HostClosed {}
+
+/// The host wrote `exit` (tab closed / host quitting) or `quit` into the
+/// control file (`App::poll_session_control` reads the same file once the
+/// editor runs). Either ends a screen that has nothing to save.
+fn host_closed_session(control: &Path) -> bool {
+    std::fs::read_to_string(control).is_ok_and(|text| matches!(text.trim(), "exit" | "quit"))
 }
 
 // ── Folder that holds a workspace file ─────────────────────────
@@ -1112,6 +1148,24 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A tab still at a launch prompt leaves when the host writes `exit`
+    /// (tab closed, host quitting) or `quit`; no file or anything else
+    /// keeps it asking.
+    #[test]
+    fn launch_prompt_ends_when_the_host_closes_the_tab() {
+        let dir = tempdir();
+        let control = dir.path().join("1.control");
+        assert!(!host_closed_session(&control));
+        std::fs::write(&control, "").unwrap();
+        assert!(!host_closed_session(&control));
+        std::fs::write(&control, "exit\n").unwrap();
+        assert!(host_closed_session(&control));
+        std::fs::write(&control, "quit").unwrap();
+        assert!(host_closed_session(&control));
+        let err: anyhow::Error = HostClosed.into();
+        assert!(err.context("asking").is::<HostClosed>());
     }
 
     /// A global settings file with arbitrary formatting (to prove the copy
