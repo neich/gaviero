@@ -183,6 +183,11 @@ pub(super) fn handle_file_tree_action(app: &mut App, action: Action) {
                 app.start_move();
             }
         }
+        // Files copied in the OS file manager → the selected folder.
+        Action::Paste => {
+            app.clear_windows_ctrl_v_pending();
+            super::file_paste::start_paste(app, None);
+        }
         _ => {}
     }
 }

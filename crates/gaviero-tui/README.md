@@ -101,6 +101,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |
 | Double-click (explorer) | On a file the editor cannot open as text (images, PDFs, archives, …): show it selected in the OS file manager (Explorer / Finder / the freedesktop file manager) so you can open it with another app |
+| Ctrl+V (explorer) | Copy the files or folders copied in the OS file manager (Explorer / Finder / Files) into the selected folder — or the folder of the selected file — after a `y` confirmation. Dropping files on the terminal window works too where the terminal pastes their paths. Never overwrites: a taken name becomes `name (copy).ext`. Text that is not a list of existing paths copies nothing |
 | Alt+Left/Right (`--sessions` host) | Previous / next session |
 | Alt+Shift+Left/Right (`--sessions` host) | Move the current tab one place left / right (stops at the ends; the order is kept for the next start) |
 | Alt+N (`--sessions` host) | New session picker; Ctrl+T in the picker switches Local / SSH (`host` or `host:/path`) |

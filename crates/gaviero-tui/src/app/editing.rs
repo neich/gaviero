@@ -2244,6 +2244,17 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             }
             note_text_paste(app);
         }
+        // Files copied in the OS file manager, or dropped on the terminal
+        // window (which pastes their paths): copy into the selected folder.
+        Focus::FileTree if super::file_paste::explorer_focused(app) => {
+            if should_skip_duplicate_text_paste(app) {
+                return;
+            }
+            super::file_paste::start_paste(app, Some(&paste_body));
+            // Windows: arms the settle window so ConPTY's leftover keys
+            // cannot answer the copy question.
+            note_text_paste(app);
+        }
         _ => {}
     }
 }

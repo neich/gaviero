@@ -264,6 +264,12 @@ pub enum BulkOpState {
         paths: Vec<PathBuf>,
         dest_dir: PathBuf,
     },
+    /// Waiting for [y/n] to confirm copying pasted files (from the OS file
+    /// manager or a terminal drop) into `dest_dir` (`app::file_paste`).
+    ConfirmCopy {
+        paths: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
 }
 
 impl TreeDialog {

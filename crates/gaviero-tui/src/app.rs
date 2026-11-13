@@ -34,6 +34,7 @@ mod commands;
 mod controller;
 mod editing;
 pub(crate) mod egress;
+mod file_paste;
 pub(crate) mod key_route;
 mod layout;
 mod left_panel;
@@ -793,6 +794,18 @@ impl App {
         self.windows_ctrl_v_pending = None;
 
         if !self.terminal_has_focus {
+            return;
+        }
+        // Explorer: files copied in Explorer leave no text for Windows
+        // Terminal to paste, so it may send nothing at all.
+        if file_paste::explorer_focused(self) {
+            let ctx = key_route::KeyContext::of(self);
+            if !ctx.review
+                && ctx.modal().is_none()
+                && file_paste::start_paste_clipboard_files(self)
+            {
+                self.needs_immediate_render = true;
+            }
             return;
         }
         if self.focus != Focus::SidePanel || self.side_panel != SidePanelMode::AgentChat {

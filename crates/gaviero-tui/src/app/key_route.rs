@@ -82,7 +82,11 @@ impl KeyContext {
             quit_confirm: app.quit_confirm,
             bulk_confirm: matches!(
                 app.bulk_op_state,
-                Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
+                Some(
+                    BulkOpState::ConfirmDelete { .. }
+                        | BulkOpState::ConfirmMove { .. }
+                        | BulkOpState::ConfirmCopy { .. }
+                )
             ),
             tree_dialog: app.tree_dialog.is_some(),
             definition_picker: app.definition_picker.is_some(),
