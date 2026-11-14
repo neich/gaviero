@@ -182,7 +182,10 @@ impl Keymap {
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
             KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('h') if alt => Action::SetSideModeHistory,
-            KeyCode::Char('g') if alt => Action::SetSideModeGit,
+            // Alt+Shift+G fallback: another program can hold plain Alt+G as
+            // a global hotkey (RegisterHotKey), and the terminal then never
+            // receives it. Same pattern as Alt+Shift+Z.
+            KeyCode::Char('g') | KeyCode::Char('G') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
             // Alt+R: open / refresh the code graph panel (Alt+R was unbound).
             KeyCode::Char('r') | KeyCode::Char('R') if alt => Action::SetSideModeGraph,
@@ -376,6 +379,13 @@ mod tests {
             Keymap::resolve(&key(KeyCode::Right, KeyModifiers::SHIFT)),
             Action::SelectRight
         );
+    }
+
+    #[test]
+    fn alt_g_and_its_shifted_fallback_open_the_git_panel() {
+        let shift_alt = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(Keymap::resolve(&key(KeyCode::Char('g'), KeyModifiers::ALT)), Action::SetSideModeGit);
+        assert_eq!(Keymap::resolve(&key(KeyCode::Char('G'), shift_alt)), Action::SetSideModeGit);
     }
 
     #[test]
