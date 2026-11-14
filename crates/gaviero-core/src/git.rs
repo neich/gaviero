@@ -63,8 +63,9 @@ pub struct BranchEntry {
 /// not a repository but holds several clones yields one entry per clone.
 ///
 /// Children whose name is hidden (`.`-prefixed) or for which `skip_child`
-/// returns true are not inspected. Repositories already listed (same
-/// working directory) are not repeated.
+/// returns true are not inspected, except `.gaviero`: a folder's gaviero
+/// configuration is often versioned as its own repository. Repositories
+/// already listed (same working directory) are not repeated.
 pub fn discover_folder_repos(folder: &Path, skip_child: impl Fn(&str) -> bool) -> Vec<GitRepo> {
     let mut out: Vec<GitRepo> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
@@ -91,7 +92,8 @@ pub fn discover_folder_repos(folder: &Path, skip_child: impl Fn(&str) -> bool) -
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
-            (!name.starts_with('.') && !skip_child(&name)).then(|| (name, e.path()))
+            let hidden = name.starts_with('.') && name != ".gaviero";
+            (!hidden && !skip_child(&name)).then(|| (name, e.path()))
         })
         .filter(|(_, path)| path.join(".git").exists())
         .collect();
@@ -1272,6 +1274,25 @@ mod tests {
             })
             .collect();
         assert_eq!(workdir_names(&children), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn discover_folder_repos_lists_a_versioned_dot_gaviero() {
+        let parent = TempDir::new().unwrap();
+        git2::Repository::init(parent.path().join(".gaviero")).unwrap();
+        git2::Repository::init(parent.path().join(".other")).unwrap();
+
+        let repos = discover_folder_repos(parent.path(), |_| false);
+        let parent_canon = std::fs::canonicalize(parent.path()).unwrap();
+        let children: Vec<GitRepo> = repos
+            .into_iter()
+            .filter(|r| {
+                std::fs::canonicalize(r.workdir().unwrap())
+                    .unwrap()
+                    .starts_with(&parent_canon)
+            })
+            .collect();
+        assert_eq!(workdir_names(&children), [".gaviero"]);
     }
 
     #[test]
