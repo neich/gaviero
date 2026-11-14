@@ -557,6 +557,11 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         return;
     }
 
+    // An error describes the last action; the next one replaces it. (With
+    // no repository the message explains the empty panel: it stays.)
+    if !app.git_panel.sections.is_empty() {
+        app.git_panel.error_message = None;
+    }
     match action {
         Action::CursorUp | Action::InsertChar('k') => app.git_panel.move_up(),
         Action::CursorDown | Action::InsertChar('j') => app.git_panel.move_down(),
@@ -775,7 +780,7 @@ pub(super) fn git_repo_for_path<'a>(
 }
 
 /// Re-run repo discovery (a clone added or removed since startup) and keep
-/// the active tab on the same repository when it still exists.
+/// the selection on the same repository when it still exists.
 pub(super) fn rescan_git_repos(app: &mut App) {
     let active = app
         .git_repos
@@ -785,17 +790,20 @@ pub(super) fn rescan_git_repos(app: &mut App) {
     if let Some(active) = active
         && let Some(idx) = app.git_repos.iter().position(|e| e.workdir == active)
     {
-        app.git_panel.active_repo = idx;
+        app.git_panel.retarget_repo(idx);
     }
 }
 
+/// Reload every repository's block of the GIT panel.
 pub(super) fn refresh_git_panel(app: &mut App) {
     let names: Vec<String> = app.git_repos.iter().map(|e| e.name.clone()).collect();
-    app.git_panel.set_repo_tabs(names);
-    if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
-        app.git_panel.refresh(&entry.repo);
-    } else {
+    app.git_panel.set_repos(names);
+    if app.git_repos.is_empty() {
         app.git_panel.show_no_repository();
+        return;
+    }
+    for (idx, entry) in app.git_repos.iter().enumerate() {
+        app.git_panel.refresh_repo(idx, &entry.repo);
     }
 }
 
@@ -4597,7 +4605,11 @@ mod tests {
         app.side_panel = SidePanelMode::GitPanel;
         app.focus = Focus::Editor;
         let unstaged = |app: &crate::app::App| -> Vec<String> {
-            app.git_panel.unstaged.iter().map(|e| e.path.clone()).collect()
+            app.git_panel
+                .sections
+                .iter()
+                .flat_map(|s| s.unstaged.iter().map(|e| e.path.clone()))
+                .collect()
         };
 
         assert!(!super::sync_git_panel_entry(&mut app), "hidden");
@@ -4627,7 +4639,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_folder_of_clones_gets_one_git_tab_per_clone() {
+    fn plain_folder_of_clones_lists_every_clone_in_the_git_panel() {
         use crate::app::state::{Focus, SidePanelMode};
         let dir = tempfile::tempdir().unwrap();
         for name in ["app", "lib"] {
@@ -4648,16 +4660,22 @@ mod tests {
         assert_eq!((entry.name.as_str(), rel.as_str()), ("lib", "new.rs"));
         assert!(super::git_repo_for_path(&app.git_repos, &dir.path().join("docs/x.md")).is_none());
 
-        // The panel shows a tab per clone and cycles into the second one.
+        // The panel lists both clones at once, each under its own title, and
+        // selecting the clone's file makes that clone the one acted on.
         app.panel_visible.side_panel = true;
         app.side_panel = SidePanelMode::GitPanel;
         app.focus = Focus::Editor;
         super::refresh_git_panel(&mut app);
-        assert_eq!(app.git_panel.repo_tabs, ["app", "lib"]);
-        app.git_panel.cycle_repo(1);
-        super::refresh_git_panel(&mut app);
-        let unstaged: Vec<&str> = app.git_panel.unstaged.iter().map(|e| e.path.as_str()).collect();
+        let titles: Vec<&str> = app.git_panel.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(titles, ["app", "lib"]);
+        assert!(app.git_panel.sections[0].unstaged.is_empty());
+        let unstaged: Vec<&str> =
+            app.git_panel.sections[1].unstaged.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(unstaged, ["new.rs"]);
+        app.git_panel.move_down(); // app's title → lib's title
+        app.git_panel.move_down(); // → lib/new.rs
+        assert_eq!(app.git_panel.selected_path(), Some("new.rs"));
+        assert_eq!(app.git_repos[app.git_panel.active_repo].name, "lib");
 
         // CHANGES spans every clone and labels entries with the repo name.
         app.refresh_git_changes();
@@ -4670,6 +4688,11 @@ mod tests {
             .map(|e| e.label.clone())
             .collect();
         assert_eq!(labels, ["lib/new.rs"]);
+
+        // `s` stages the selected file in its own clone.
+        app.handle_git_panel_action(crate::keymap::Action::InsertChar('s'));
+        assert_eq!(app.git_panel.sections[1].staged.len(), 1, "staged in lib");
+        assert_eq!(app.git_panel.selected_path(), Some("new.rs"), "now in Staged");
         cleanup_session(dir.path());
     }
 
@@ -4679,8 +4702,10 @@ mod tests {
         let mut app = chat_app(dir.path());
         app.git_repos.clear(); // TMP may sit inside a checkout
         super::refresh_git_panel(&mut app);
-        assert!(app.git_panel.repo_tabs.is_empty());
+        assert!(app.git_panel.sections.is_empty());
         assert!(app.git_panel.error_message.is_some());
+        app.handle_git_panel_action(crate::keymap::Action::CursorDown);
+        assert!(app.git_panel.error_message.is_some(), "the explanation stays");
         cleanup_session(dir.path());
     }
 

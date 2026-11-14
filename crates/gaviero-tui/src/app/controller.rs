@@ -2111,10 +2111,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     SidePanelMode::HistoryPanel => {
                         app.handle_history_panel_action(Action::CycleTabForward);
                     }
-                    SidePanelMode::GitPanel => {
-                        app.git_panel.cycle_repo(1);
-                        app.refresh_git_panel();
-                    }
+                    SidePanelMode::GitPanel => app.git_panel.cycle_repo(1),
                     _ => {
                         app.chat_state.next_conversation();
                     }
@@ -2134,10 +2131,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     SidePanelMode::HistoryPanel => {
                         app.handle_history_panel_action(Action::CycleTabBack);
                     }
-                    SidePanelMode::GitPanel => {
-                        app.git_panel.cycle_repo(-1);
-                        app.refresh_git_panel();
-                    }
+                    SidePanelMode::GitPanel => app.git_panel.cycle_repo(-1),
                     _ => {
                         app.chat_state.prev_conversation();
                     }
