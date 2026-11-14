@@ -1046,8 +1046,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         return;
                     }
                     let rel_y = row.saturating_sub(area.y);
-                    if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height) {
-                        app.git_panel.select_file(region, idx);
+                    // A repository title selects it (the target of commit and
+                    // the branch picker); a file also opens its diff.
+                    if let Some(row) = app.git_panel.hit_test_file(rel_y, area.height) {
+                        app.git_panel.select(row);
                         super::side_panel::open_selected_git_file(app);
                         return;
                     }
