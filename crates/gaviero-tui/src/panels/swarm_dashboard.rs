@@ -25,7 +25,8 @@ use gaviero_core::swarm::plan::ExecutionMode;
 use gaviero_core::types::ModelTier;
 use gaviero_dsl::ast::ReviewerEntry;
 use gaviero_dsl::workflow_params::{list_literal_entry, parse_reviewers_override};
-use gaviero_dsl::{ParamKindInfo, ScriptInspection, VarKind};
+use crate::widgets::prompt_input::AutocompleteMode;
+use gaviero_dsl::{ParamKindInfo, ProfileInspection, ScriptInspection, TierOverride, VarKind};
 
 /// Activity kept per agent; the oldest output goes first.
 const MAX_ACTIVITY_LINES: usize = 500;
@@ -180,6 +181,24 @@ pub enum FieldRole {
     File,
     /// A var declared `dir`.
     Dir,
+    /// The tier one agent runs on; the field's name is the agent.
+    AgentTier,
+    /// The profile client one tier means for this run; the field's name is
+    /// the tier.
+    TierModel,
+    /// The effort one tier runs at for this run; the field's name is the tier.
+    TierEffort,
+}
+
+impl FieldRole {
+    /// Selectors whose options open as a list on Enter.
+    pub fn picks_from_list(self) -> bool {
+        matches!(self, Self::AgentTier | Self::TierModel | Self::TierEffort)
+    }
+
+    fn is_model_row(self) -> bool {
+        self.picks_from_list()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +318,19 @@ impl FormField {
                     .collect();
                 now != split_list_value(default)
             }
+            FieldValue::Choice { options, selected } => self
+                .default
+                .as_deref()
+                .is_some_and(|d| options.get(*selected).is_some_and(|o| o != d)),
             _ => self.text().is_some_and(|t| t != default),
+        }
+    }
+
+    /// The selected option of a choice field.
+    pub fn choice(&self) -> Option<&str> {
+        match &self.value {
+            FieldValue::Choice { options, selected } => options.get(*selected).map(String::as_str),
+            _ => None,
         }
     }
 
@@ -329,6 +360,36 @@ impl FormField {
             FieldRole::Var => "Script variable. Empty leaves it unset",
             FieldRole::File => "An existing file. Type to search, as with @ in chat",
             FieldRole::Dir => "A folder. Type to search the workspace",
+            FieldRole::AgentTier => "The tier this agent runs on. Enter: list  ←/→ change",
+            FieldRole::TierModel => {
+                "This tier's model, from the profile's clients. Enter: list  ←/→ change"
+            }
+            FieldRole::TierEffort => {
+                "This tier's effort; the model's levels. Enter: list  ←/→ change"
+            }
+        }
+    }
+
+    /// A choice from `options` starting on `previous` when it is one of them,
+    /// else on `default`.
+    fn choice_field(
+        name: &str,
+        role: FieldRole,
+        options: Vec<String>,
+        default: &str,
+        previous: Option<&str>,
+    ) -> Self {
+        let position = |wanted: &str| options.iter().position(|o| o == wanted);
+        let selected = previous
+            .and_then(position)
+            .or_else(|| position(default))
+            .unwrap_or(0);
+        Self {
+            name: name.to_string(),
+            role,
+            value: FieldValue::Choice { options, selected },
+            default: Some(default.to_string()),
+            required: false,
         }
     }
 
@@ -391,10 +452,24 @@ pub struct FormValues {
     pub prompt: Option<String>,
     pub vars: Vec<(String, String)>,
     pub params: Vec<(String, String)>,
+    /// `--tier AGENT=TIER`: agents moved off the tier they run on by default.
+    pub agent_tiers: Vec<(String, String)>,
+    /// `--tier-client` / `--tier-effort`: tiers pointed at another profile
+    /// client and/or run at another effort.
+    pub tier_overrides: Vec<TierOverride>,
 }
 
 /// First entry of the Profile selector: no explicit choice.
 const PROFILE_AUTO: &str = "auto";
+
+/// The Model choice of a tier the profile does not bind.
+const TIER_UNBOUND: &str = "(not in profile)";
+
+/// The Effort choice of a client that sets none (the provider decides).
+const EFFORT_UNSET: &str = "(provider default)";
+
+const AGENTS_HEADING: &str = "Agents — the tier each one runs on";
+const TIERS_HEADING: &str = "Tiers — the model each one means, this run only";
 
 /// Shown in place of the prompt box, so its absence does not look like a fault.
 const NO_PROMPT_NOTE: &str = "This script takes no prompt: its agents have fixed instructions.";
@@ -406,12 +481,18 @@ pub struct SwarmForm {
     /// Profile names on offer; the selector is hidden when empty.
     pub profiles: Vec<String>,
     pub fields: Vec<FormField>,
+    /// The profile the run would use, read for the agent and tier rows;
+    /// `None` shows none (no profile, or one that does not parse).
+    pub profile_info: Option<ProfileInspection>,
     /// `fields.len()` is the Run button.
     pub focus: usize,
     pub error: Option<String>,
     pub warnings: Vec<String>,
-    /// Popup of the focused file or param field.
+    /// Popup of the focused file or param field, or a selector's option list.
     pub completion: FileAutocomplete,
+    /// The efforts a model offers (`gaviero_core`'s list); replaceable in
+    /// tests, since the Codex lookup asks the installed CLI.
+    pub effort_options: fn(&str) -> Vec<String>,
     /// Where the last frame drew each list field's `+`, `x` and items.
     list_hits: Vec<(Rect, usize, ListTarget)>,
 }
@@ -430,13 +511,15 @@ impl SwarmForm {
             folders,
             profiles: Vec::new(),
             fields: Vec::new(),
+            profile_info: None,
             focus: 0,
             error: None,
             warnings: Vec::new(),
             completion: FileAutocomplete::new(),
+            effort_options: model_effort_options,
             list_hits: Vec::new(),
         };
-        form.fields = form.build_fields(selected_folder, 0, 0);
+        form.fields = form.build_fields(selected_folder, 0, 0, &[]);
         form.focus = form.first_input_field();
         form
     }
@@ -444,9 +527,185 @@ impl SwarmForm {
     /// Offer these profiles in a selector.
     pub fn with_profiles(mut self, profiles: Vec<String>) -> Self {
         self.profiles = profiles;
-        self.fields = self.build_fields(self.selected_folder(), self.selected_workflow(), 0);
+        self.fields = self.build_fields(self.selected_folder(), self.selected_workflow(), 0, &[]);
         self.focus = self.first_input_field();
         self
+    }
+
+    /// Show the agent and tier rows for this profile (the one the Profile
+    /// selector, or `default`, resolves to). Choices made for agents and
+    /// tiers the new profile still has are kept.
+    pub fn set_profile_info(&mut self, info: Option<ProfileInspection>) {
+        self.profile_info = info;
+        self.rebuild();
+    }
+
+    /// The model a tier runs on as the form now stands: its Tiers row, else
+    /// the profile's binding.
+    fn client_for_tier(&self, tier: &str) -> Option<String> {
+        let info = self.profile_info.as_ref()?;
+        let chosen = self
+            .fields
+            .iter()
+            .find(|f| f.role == FieldRole::TierModel && f.name == tier)
+            .and_then(FormField::choice);
+        match chosen {
+            Some(TIER_UNBOUND) => None,
+            Some(client) => Some(client.to_string()),
+            None => info.client_of(tier).map(str::to_string),
+        }
+    }
+
+    /// The effort a tier runs at as the form now stands: its Effort row, else
+    /// its client's. `None` when it sets none.
+    fn effort_for_tier(&self, tier: &str) -> Option<String> {
+        let chosen = self
+            .fields
+            .iter()
+            .find(|f| f.role == FieldRole::TierEffort && f.name == tier)
+            .and_then(FormField::choice);
+        let effort = match chosen {
+            Some(choice) => Some(choice.to_string()),
+            None => {
+                let info = self.profile_info.as_ref()?;
+                info.client(&self.client_for_tier(tier)?)?.effort.clone()
+            }
+        };
+        effort.filter(|e| e != EFFORT_UNSET)
+    }
+
+    /// `model · effort (client)` for a tier as the form now stands.
+    fn tier_summary(&self, tier: &str, with_client: bool) -> String {
+        let info = self.profile_info.as_ref();
+        let Some(client) = self
+            .client_for_tier(tier)
+            .and_then(|c| info.and_then(|i| i.client(&c)))
+        else {
+            return "no model: the run will not compile".to_string();
+        };
+        let model = client.model.clone().unwrap_or_else(|| client.name.clone());
+        let mut text = match self.effort_for_tier(tier) {
+            Some(effort) => format!("{model} · {effort}"),
+            None => model,
+        };
+        if with_client {
+            text.push_str(&format!(" ({})", client.name));
+        }
+        text
+    }
+
+    /// What a choice row resolves to, drawn after its value: the model and
+    /// effort of an agent's tier, or the model of a tier's client.
+    pub fn choice_detail(&self, index: usize) -> Option<String> {
+        let field = self.fields.get(index)?;
+        let info = self.profile_info.as_ref()?;
+        match field.role {
+            FieldRole::AgentTier => Some(self.tier_summary(field.choice()?, true)),
+            FieldRole::TierModel => Some(match info.client(field.choice()?) {
+                Some(client) => client.model.clone().unwrap_or_else(|| client.name.clone()),
+                None => "no model: the run will not compile".to_string(),
+            }),
+            FieldRole::TierEffort => {
+                let FieldValue::Choice { options, .. } = &field.value else {
+                    return None;
+                };
+                (options.len() < 2).then(|| "this model takes no effort setting".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// The option labels of a list selector: each option and what it means.
+    fn choice_labels(&self, index: usize) -> Vec<String> {
+        let Some(field) = self.fields.get(index) else {
+            return Vec::new();
+        };
+        let FieldValue::Choice { options, .. } = &field.value else {
+            return Vec::new();
+        };
+        let info = self.profile_info.as_ref();
+        let width = options.iter().map(|o| o.chars().count()).max().unwrap_or(0);
+        options
+            .iter()
+            .map(|option| {
+                let detail = match field.role {
+                    FieldRole::AgentTier => self.tier_summary(option, true),
+                    FieldRole::TierModel => info
+                        .and_then(|i| i.client(option))
+                        .map(|c| c.summary())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if detail.is_empty() {
+                    option.clone()
+                } else {
+                    format!("{option:<width$}  {detail}")
+                }
+            })
+            .collect()
+    }
+
+    /// Enter on a list selector: show its options with the current one
+    /// highlighted. Returns false for any other field.
+    pub fn open_choice_list(&mut self) -> bool {
+        let Some(field) = self.fields.get(self.focus) else {
+            return false;
+        };
+        let FieldValue::Choice { selected, .. } = field.value else {
+            return false;
+        };
+        if !field.role.picks_from_list() {
+            return false;
+        }
+        let labels = self.choice_labels(self.focus);
+        self.completion.open_choices(labels, selected);
+        true
+    }
+
+    /// Pick option `index` of the focused selector, as if cycled there.
+    fn set_focused_choice(&mut self, index: usize) {
+        let Some(field) = self.fields.get_mut(self.focus) else {
+            return;
+        };
+        let FieldValue::Choice { options, selected } = &mut field.value else {
+            return;
+        };
+        if index >= options.len() {
+            return;
+        }
+        *selected = index;
+        // Another workflow runs other agents; another tier may need a row;
+        // another model offers other efforts.
+        if matches!(
+            field.role,
+            FieldRole::Workflow | FieldRole::AgentTier | FieldRole::TierModel
+        ) {
+            self.rebuild();
+        }
+    }
+
+    /// Rebuild every field from the current choices, keeping what the user
+    /// typed or chose under the same name.
+    fn rebuild(&mut self) {
+        let focused = self.focus;
+        let folder = self.selected_folder();
+        let workflow = self.selected_workflow();
+        let profile = self.choice_of(FieldRole::Profile);
+        let old = std::mem::take(&mut self.fields);
+        let mut fresh = self.build_fields(folder, workflow, profile, &old);
+        for field in &mut fresh {
+            if matches!(field.value, FieldValue::Choice { .. }) {
+                continue;
+            }
+            if let Some(previous) = old
+                .iter()
+                .find(|o| o.name == field.name && o.role == field.role && o.is_edited())
+            {
+                field.value = previous.value.clone();
+            }
+        }
+        self.fields = fresh;
+        self.focus = focused.min(self.fields.len());
     }
 
     /// The first field to type into. The Folder / Workflow / Profile
@@ -460,7 +719,15 @@ impl SwarmForm {
             .unwrap_or(0)
     }
 
-    fn build_fields(&self, folder: usize, workflow: usize, profile: usize) -> Vec<FormField> {
+    /// `previous` carries the agent and tier choices the user made, where
+    /// they still apply.
+    fn build_fields(
+        &self,
+        folder: usize,
+        workflow: usize,
+        profile: usize,
+        previous: &[FormField],
+    ) -> Vec<FormField> {
         let mut fields = Vec::new();
         if self.folders.len() > 1 {
             fields.push(FormField {
@@ -531,7 +798,92 @@ impl SwarmForm {
                 required,
             ));
         }
+        if let Some(info) = &self.profile_info {
+            self.push_model_fields(&mut fields, info, workflow, previous);
+        }
         fields
+    }
+
+    /// One row per agent the workflow runs (its tier) and one per tier those
+    /// agents now use (its client). Only edited choices carry over.
+    fn push_model_fields(
+        &self,
+        fields: &mut Vec<FormField>,
+        info: &ProfileInspection,
+        workflow: usize,
+        previous: &[FormField],
+    ) {
+        let edited = |role: FieldRole, name: &str| {
+            previous
+                .iter()
+                .find(|f| f.role == role && f.name == name && f.is_edited())
+                .and_then(FormField::choice)
+                .map(str::to_string)
+        };
+        let profile_tiers = info.tier_names();
+
+        let mut used: Vec<String> = Vec::new();
+        for (agent, tier) in self.inspection.agent_tiers(workflow) {
+            let mut options = profile_tiers.clone();
+            if !options.contains(&tier) {
+                options.insert(0, tier.clone());
+            }
+            let field = FormField::choice_field(
+                &agent,
+                FieldRole::AgentTier,
+                options,
+                &tier,
+                edited(FieldRole::AgentTier, &agent).as_deref(),
+            );
+            if let Some(now) = field.choice()
+                && !used.iter().any(|t| t == now)
+            {
+                used.push(now.to_string());
+            }
+            fields.push(field);
+        }
+
+        let clients: Vec<String> = info.clients.iter().map(|c| c.name.clone()).collect();
+        for tier in used {
+            let mut options = clients.clone();
+            let default = match info.client_of(&tier) {
+                Some(client) => client.to_string(),
+                None => {
+                    options.insert(0, TIER_UNBOUND.to_string());
+                    TIER_UNBOUND.to_string()
+                }
+            };
+            let model_field = FormField::choice_field(
+                &tier,
+                FieldRole::TierModel,
+                options,
+                &default,
+                edited(FieldRole::TierModel, &tier).as_deref(),
+            );
+
+            // The efforts the chosen client's model offers; its own effort
+            // is the default, listed even when the model does not offer it
+            // (so the row shows what the profile says).
+            let client = model_field.choice().and_then(|c| info.client(c));
+            let own = client
+                .and_then(|c| c.effort.clone())
+                .unwrap_or_else(|| EFFORT_UNSET.to_string());
+            let mut efforts = client
+                .and_then(|c| c.model.as_deref())
+                .map(self.effort_options)
+                .unwrap_or_default();
+            if !efforts.contains(&own) {
+                efforts.insert(0, own.clone());
+            }
+            fields.push(model_field);
+            fields.push(FormField::choice_field(
+                &tier,
+                FieldRole::TierEffort,
+                efforts,
+                &own,
+                edited(FieldRole::TierEffort, &tier).as_deref(),
+            ));
+        }
     }
 
     fn choice_of(&self, role: FieldRole) -> usize {
@@ -576,27 +928,9 @@ impl SwarmForm {
             return;
         };
         let len = options.len() as isize;
-        *selected = (*selected as isize + delta).rem_euclid(len) as usize;
-        if field.role != FieldRole::Workflow {
-            return;
-        }
-
-        let focused = self.focus;
-        let folder = self.selected_folder();
-        let workflow = self.selected_workflow();
-        let profile = self.choice_of(FieldRole::Profile);
-        let old = std::mem::take(&mut self.fields);
-        let mut fresh = self.build_fields(folder, workflow, profile);
-        for field in &mut fresh {
-            if let Some(previous) = old
-                .iter()
-                .find(|o| o.name == field.name && o.role == field.role && o.is_edited())
-            {
-                field.value = previous.value.clone();
-            }
-        }
-        self.fields = fresh;
-        self.focus = focused.min(self.fields.len());
+        let next = (*selected as isize + delta).rem_euclid(len) as usize;
+        self.completion.reset();
+        self.set_focused_choice(next);
     }
 
     pub fn focused_input(&mut self) -> Option<&mut TextInput> {
@@ -808,6 +1142,13 @@ impl SwarmForm {
     }
 
     pub fn accept_completion(&mut self) {
+        if self.completion.mode == AutocompleteMode::Choice {
+            let picked = self.completion.selected;
+            self.completion.reset();
+            self.set_focused_choice(picked);
+            self.focus_next();
+            return;
+        }
         let input = match self.fields.get_mut(self.focus).map(|f| &mut f.value) {
             Some(FieldValue::Text(input)) => Some(input),
             Some(FieldValue::List { items, item }) => items.get_mut(*item),
@@ -886,8 +1227,23 @@ impl SwarmForm {
             prompt: None,
             vars: Vec::new(),
             params: Vec::new(),
+            agent_tiers: Vec::new(),
+            tier_overrides: Vec::new(),
         };
+        let mut tier_clients = Vec::new();
+        let mut tier_efforts = Vec::new();
         for field in &self.fields {
+            if field.is_edited()
+                && let Some(choice) = field.choice()
+            {
+                let pair = (field.name.clone(), choice.to_string());
+                match field.role {
+                    FieldRole::AgentTier => values.agent_tiers.push(pair),
+                    FieldRole::TierModel if choice != TIER_UNBOUND => tier_clients.push(pair),
+                    FieldRole::TierEffort if choice != EFFORT_UNSET => tier_efforts.push(pair),
+                    _ => {}
+                }
+            }
             let Some(text) = field.text() else { continue };
             match field.role {
                 FieldRole::Prompt if !text.trim().is_empty() => {
@@ -907,8 +1263,14 @@ impl SwarmForm {
                 _ => {}
             }
         }
+        values.tier_overrides = TierOverride::from_pairs(&tier_clients, &tier_efforts);
         Ok(values)
     }
+}
+
+/// What `gaviero_core` says a model accepts: its levels, then `auto` / `off`.
+fn model_effort_options(model: &str) -> Vec<String> {
+    gaviero_core::swarm::backend::effort::effort_completions(model, "")
 }
 
 // ── Agents ──────────────────────────────────────────────────────
@@ -1593,6 +1955,13 @@ impl SwarmDashboardState {
                 rows.push(FormRow::plain(line, fg(theme::TEXT_DIM)));
             }
         }
+        let model_label_width = form
+            .fields
+            .iter()
+            .filter(|f| f.role.is_model_row())
+            .map(|f| f.name.chars().count())
+            .max()
+            .unwrap_or(0);
         for (index, field) in form.fields.iter().enumerate() {
             let is_focused = index == form.focus;
             let label_style = if is_focused {
@@ -1600,6 +1969,29 @@ impl SwarmDashboardState {
             } else {
                 fg(theme::TEXT_FG)
             };
+            if field.role.is_model_row() {
+                let section = |role: FieldRole| role == FieldRole::AgentTier;
+                let first_of_section = index == 0
+                    || !form.fields[index - 1].role.is_model_row()
+                    || section(form.fields[index - 1].role) != section(field.role);
+                if first_of_section {
+                    let heading = if field.role == FieldRole::AgentTier {
+                        AGENTS_HEADING
+                    } else {
+                        TIERS_HEADING
+                    };
+                    rows.push(FormRow::plain(String::new(), Style::default()));
+                    rows.push(FormRow::plain(heading.to_string(), bold(theme::TEXT_DIM)));
+                }
+                let mut row = model_row(form, index, field, model_label_width, label_style);
+                // The open list hangs off the row being chosen.
+                if is_focused && form.completion.mode == AutocompleteMode::Choice {
+                    row.anchor = true;
+                    row.fill = form.completion.is_open().then_some(theme::INPUT_BG);
+                }
+                rows.push(row);
+                continue;
+            }
             let label = field.label();
             let mut label_row = FormRow::field(label.clone(), label_style, index, None);
             if matches!(field.value, FieldValue::List { .. }) {
@@ -2101,6 +2493,43 @@ impl SwarmDashboardState {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// One line for an agent's tier or a tier's model: the name, the choice
+/// (highlighted when changed from the script's or profile's), and what it
+/// resolves to.
+fn model_row(
+    form: &SwarmForm,
+    index: usize,
+    field: &FormField,
+    label_width: usize,
+    label_style: Style,
+) -> FormRow {
+    let choice = field.choice().unwrap_or_default();
+    let name = if field.role == FieldRole::TierEffort {
+        ""
+    } else {
+        field.name.as_str()
+    };
+    let kind = match field.role {
+        FieldRole::TierModel => "model   ",
+        FieldRole::TierEffort => "effort  ",
+        _ => "",
+    };
+    let label = format!("{name:<label_width$}  {kind}");
+    let value = format!("‹ {choice} ›");
+    let value_style = if field.is_edited() {
+        bold(theme::WARNING)
+    } else {
+        fg(theme::TEXT_BRIGHT)
+    };
+    let detail = form.choice_detail(index).unwrap_or_default();
+    let value_col = label.chars().count();
+    let detail_col = value_col + value.chars().count() + 2;
+    let mut row = FormRow::field(label, label_style, index, None);
+    row.marks.push((value_col, value, value_style));
+    row.marks.push((detail_col, detail, fg(theme::TEXT_DIM)));
+    row
+}
+
 struct FormRow {
     text: String,
     style: Style,
@@ -2363,6 +2792,8 @@ mod tests {
             name: name.into(),
             execution: ExecutionMode::Repo,
             params,
+            agents: Vec::new(),
+            tiers: Vec::new(),
         }
     }
 
@@ -2393,6 +2824,7 @@ mod tests {
             accepts_prompt: true,
             default_execution: ExecutionMode::Repo,
             tiers: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
@@ -2556,6 +2988,299 @@ mod tests {
         assert!(form.on_run_button());
         form.focus_next();
         assert!(form.on_run_button(), "focus stops on the button");
+    }
+
+    fn profile_info() -> ProfileInspection {
+        let client = |name: &str, model: &str, effort: Option<&str>| gaviero_dsl::ProfileClient {
+            name: name.into(),
+            model: Some(model.into()),
+            effort: effort.map(str::to_string),
+        };
+        ProfileInspection {
+            clients: vec![
+                client("sonnet", "claude:sonnet", None),
+                client("opus", "claude:opus", Some("high")),
+                client("sol", "codex:gpt-6.1-sol", None),
+                client("qwen", "ollama:qwen", None),
+            ],
+            tiers: vec![
+                ("medium".into(), "sonnet".into()),
+                ("high".into(), "opus".into()),
+                ("high-codex".into(), "sol".into()),
+            ],
+        }
+    }
+
+    /// A form for agents `scout` (high) and `judge` (medium), with a profile.
+    fn model_form() -> SwarmForm {
+        let mut info = inspection(vec![workflow("w", vec![])]);
+        info.agents = vec![
+            gaviero_dsl::AgentInspection {
+                name: "scout".into(),
+                tier: Some("high".into()),
+            },
+            gaviero_dsl::AgentInspection {
+                name: "judge".into(),
+                tier: Some("medium".into()),
+            },
+        ];
+        let mut form = SwarmForm::new(row(), info, folders(), 0);
+        form.effort_options = test_efforts;
+        form.set_profile_info(Some(profile_info()));
+        type_into(&mut form, "Prompt", "p");
+        form
+    }
+
+    /// Claude models offer three levels here, the rest none.
+    fn test_efforts(model: &str) -> Vec<String> {
+        if model.starts_with("claude:") {
+            vec!["low".into(), "high".into(), "max".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn overrides(list: &[(&str, Option<&str>, Option<&str>)]) -> Vec<TierOverride> {
+        list.iter()
+            .map(|(tier, client, effort)| TierOverride {
+                tier: tier.to_string(),
+                client: client.map(str::to_string),
+                effort: effort.map(str::to_string),
+            })
+            .collect()
+    }
+
+    fn rows_of(form: &SwarmForm, role: FieldRole) -> Vec<(String, String)> {
+        form.fields
+            .iter()
+            .filter(|f| f.role == role)
+            .map(|f| (f.name.clone(), f.choice().unwrap_or_default().to_string()))
+            .collect()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    fn choose(form: &mut SwarmForm, role: FieldRole, name: &str, option: &str) {
+        form.focus = form
+            .fields
+            .iter()
+            .position(|f| f.role == role && f.name == name)
+            .unwrap();
+        for _ in 0..10 {
+            if form.fields[form.focus].choice() == Some(option) {
+                return;
+            }
+            form.cycle_focused_choice(1);
+        }
+        panic!("{option} is not an option of {name}");
+    }
+
+    #[test]
+    fn every_agent_and_tier_it_uses_gets_a_row_and_untouched_rows_pass_nothing() {
+        let mut form = model_form();
+        assert_eq!(
+            rows_of(&form, FieldRole::AgentTier),
+            pairs(&[("scout", "high"), ("judge", "medium")])
+        );
+        assert_eq!(
+            rows_of(&form, FieldRole::TierModel),
+            pairs(&[("high", "opus"), ("medium", "sonnet")])
+        );
+        let values = form.collect().unwrap();
+        assert!(values.agent_tiers.is_empty() && values.tier_overrides.is_empty());
+        assert_eq!(
+            rows_of(&form, FieldRole::TierEffort),
+            pairs(&[("high", "high"), ("medium", EFFORT_UNSET)]),
+            "each tier shows its client's effort"
+        );
+    }
+
+    #[test]
+    fn moving_an_agent_and_rebinding_a_tier_are_passed_to_the_run() {
+        let mut form = model_form();
+        choose(&mut form, FieldRole::AgentTier, "judge", "high-codex");
+        // The judge left `medium`, so it has no row; `high-codex` gets one.
+        assert_eq!(
+            rows_of(&form, FieldRole::TierModel),
+            pairs(&[("high", "opus"), ("high-codex", "sol")])
+        );
+        choose(&mut form, FieldRole::TierModel, "high", "sonnet");
+
+        let values = form.collect().unwrap();
+        assert_eq!(values.agent_tiers, pairs(&[("judge", "high-codex")]));
+        assert_eq!(values.tier_overrides, overrides(&[("high", Some("sonnet"), None)]));
+
+        let scout = form.fields.iter().position(|f| f.name == "scout").unwrap();
+        assert_eq!(form.choice_detail(scout).as_deref(), Some("claude:sonnet (sonnet)"));
+    }
+
+    #[test]
+    fn choices_survive_a_new_profile_that_still_offers_them() {
+        let mut form = model_form();
+        choose(&mut form, FieldRole::AgentTier, "judge", "high-codex");
+        choose(&mut form, FieldRole::TierModel, "high", "sol");
+
+        let mut other = profile_info();
+        other.tiers.retain(|(tier, _)| tier != "high-codex");
+        form.set_profile_info(Some(other));
+        let values = form.collect().unwrap();
+        assert!(values.agent_tiers.is_empty(), "the new profile has no high-codex");
+        assert_eq!(values.tier_overrides, overrides(&[("high", Some("sol"), None)]));
+
+        form.set_profile_info(None);
+        assert!(rows_of(&form, FieldRole::AgentTier).is_empty());
+    }
+
+    #[test]
+    fn a_tier_the_profile_lacks_is_marked_and_not_bound_until_chosen() {
+        let mut form = model_form();
+        let mut info = profile_info();
+        info.tiers.retain(|(tier, _)| tier != "medium");
+        form.set_profile_info(Some(info));
+        assert!(rows_of(&form, FieldRole::TierModel).contains(&(
+            "medium".to_string(),
+            TIER_UNBOUND.to_string()
+        )));
+        let judge = form.fields.iter().position(|f| f.name == "judge").unwrap();
+        assert!(form.choice_detail(judge).unwrap().contains("will not compile"));
+        assert!(form.collect().unwrap().tier_overrides.is_empty());
+
+        choose(&mut form, FieldRole::TierModel, "medium", "opus");
+        assert_eq!(
+            form.collect().unwrap().tier_overrides,
+            overrides(&[("medium", Some("opus"), None)])
+        );
+    }
+
+    #[test]
+    fn agent_and_tier_rows_render_under_their_headings() {
+        let mut dash = SwarmDashboardState::new();
+        dash.form = Some(model_form());
+        dash.view = SwarmView::Form;
+        let text = render_rows(&mut dash, 70, 40).join("
+");
+        assert!(text.contains(AGENTS_HEADING), "{text}");
+        assert!(text.contains(TIERS_HEADING), "{text}");
+        assert!(text.contains("scout   ‹ high ›  claude:opus · high (opus)"), "{text}");
+        assert!(text.contains("high    model   ‹ opus ›  claude:opus"), "{text}");
+        assert!(text.contains("        effort  ‹ high ›"), "{text}");
+    }
+
+    /// Pick `option` from the row's list, as Enter, arrows and Enter would.
+    fn pick(form: &mut SwarmForm, role: FieldRole, name: &str, option: &str) {
+        form.focus = form
+            .fields
+            .iter()
+            .position(|f| f.role == role && f.name == name)
+            .unwrap();
+        let FieldValue::Choice { options, .. } = &form.fields[form.focus].value else {
+            panic!("{name} is not a choice");
+        };
+        let index = options.iter().position(|o| o == option).unwrap();
+        assert!(form.open_choice_list());
+        form.completion.selected = index;
+        form.accept_completion();
+    }
+
+    #[test]
+    fn a_tier_effort_is_passed_alone_or_with_its_client() {
+        let mut form = model_form();
+        choose(&mut form, FieldRole::TierEffort, "high", "max");
+        assert_eq!(
+            form.collect().unwrap().tier_overrides,
+            overrides(&[("high", None, Some("max"))])
+        );
+        let scout = form.fields.iter().position(|f| f.name == "scout").unwrap();
+        assert_eq!(
+            form.choice_detail(scout).as_deref(),
+            Some("claude:opus · max (opus)")
+        );
+
+        // Another Claude model still offers `max`, so the choice stays.
+        pick(&mut form, FieldRole::TierModel, "high", "sonnet");
+        assert_eq!(
+            form.collect().unwrap().tier_overrides,
+            overrides(&[("high", Some("sonnet"), Some("max"))])
+        );
+
+        // A model without levels has nothing to choose, and says so.
+        pick(&mut form, FieldRole::TierModel, "high", "qwen");
+        assert_eq!(
+            form.collect().unwrap().tier_overrides,
+            overrides(&[("high", Some("qwen"), None)])
+        );
+        let effort = form
+            .fields
+            .iter()
+            .position(|f| f.role == FieldRole::TierEffort && f.name == "high")
+            .unwrap();
+        assert_eq!(
+            form.choice_detail(effort).as_deref(),
+            Some("this model takes no effort setting")
+        );
+    }
+
+    #[test]
+    fn enter_lists_the_options_and_picking_one_moves_on() {
+        let mut form = model_form();
+        form.focus = form
+            .fields
+            .iter()
+            .position(|f| f.role == FieldRole::TierModel && f.name == "high")
+            .unwrap();
+        assert!(form.open_choice_list());
+        assert!(form.completion.is_open());
+        assert_eq!(form.completion.mode, AutocompleteMode::Choice);
+        assert_eq!(form.completion.selected, 1, "the current choice is highlighted");
+        assert_eq!(
+            form.completion.matches,
+            vec![
+                "sonnet  claude:sonnet".to_string(),
+                "opus    claude:opus · high".to_string(),
+                "sol     codex:gpt-6.1-sol".to_string(),
+                "qwen    ollama:qwen".to_string(),
+            ]
+        );
+
+        form.completion.select_previous();
+        form.accept_completion();
+        assert!(!form.completion.is_open());
+        assert_eq!(
+            rows_of(&form, FieldRole::TierModel)[0],
+            ("high".to_string(), "sonnet".to_string())
+        );
+        let focused = &form.fields[form.focus];
+        assert_eq!(
+            (focused.role, focused.name.as_str()),
+            (FieldRole::TierEffort, "high"),
+            "the effort of the same tier is next"
+        );
+
+        assert!(form.open_choice_list());
+        assert_eq!(
+            form.completion.matches,
+            vec![EFFORT_UNSET.to_string(), "low".into(), "high".into(), "max".into()]
+        );
+        form.focus = form.fields.iter().position(|f| f.name == "Prompt").unwrap();
+        form.completion.reset();
+        assert!(!form.open_choice_list(), "only model rows open a list");
+    }
+
+    #[test]
+    fn an_agent_list_shows_what_each_tier_means() {
+        let mut form = model_form();
+        form.focus = form.fields.iter().position(|f| f.name == "judge").unwrap();
+        assert!(form.open_choice_list());
+        assert_eq!(
+            form.completion.matches,
+            vec![
+                "medium      claude:sonnet (sonnet)".to_string(),
+                "high        claude:opus · high (opus)".to_string(),
+                "high-codex  codex:gpt-6.1-sol (sol)".to_string(),
+            ]
+        );
     }
 
     fn planned(id: &str) -> PlannedAgent {

@@ -38,6 +38,8 @@ pub enum AutocompleteMode {
     Effort,
     /// The tier after `id=` in a list param item — the active profile's tiers.
     Tier,
+    /// The options of a form selector; accepting picks one, inserting nothing.
+    Choice,
 }
 
 /// Rows the popup shows at most; longer lists scroll.
@@ -138,6 +140,14 @@ impl FileAutocomplete {
         self.query = query.to_string();
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    /// Show `options` as a pick list with `selected` highlighted and on screen.
+    pub fn open_choices(&mut self, options: Vec<String>, selected: usize) {
+        self.open(AutocompleteMode::Choice, 0, "");
+        self.selected = selected.min(options.len().saturating_sub(1));
+        self.scroll = (self.selected + 1).saturating_sub(POPUP_ROWS);
+        self.matches = options;
     }
 
     /// Back to the first match when the new list no longer reaches the
@@ -519,7 +529,10 @@ pub fn accept_autocomplete(input: &mut TextInput, autocomplete: &mut FileAutocom
             input.text.push_str(&path);
             input.text.push(' ');
         }
-        AutocompleteMode::ModelSpec | AutocompleteMode::Effort | AutocompleteMode::Tier => {
+        AutocompleteMode::ModelSpec
+        | AutocompleteMode::Effort
+        | AutocompleteMode::Tier
+        | AutocompleteMode::Choice => {
             input.text.push_str(&path);
         }
     }
@@ -757,7 +770,8 @@ pub fn render_autocomplete(autocomplete: &FileAutocomplete, area: Rect, buf: &mu
             | AutocompleteMode::DetachName
             | AutocompleteMode::ModelSpec
             | AutocompleteMode::Effort
-            | AutocompleteMode::Tier => {
+            | AutocompleteMode::Tier
+            | AutocompleteMode::Choice => {
                 format!(" {}", path)
             }
             AutocompleteMode::SkillRef => path.clone(),
