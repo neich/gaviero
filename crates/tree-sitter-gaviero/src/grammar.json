@@ -423,19 +423,6 @@
           "members": [
             {
               "type": "STRING",
-              "value": "client"
-            },
-            {
-              "type": "SYMBOL",
-              "name": "identifier"
-            }
-          ]
-        },
-        {
-          "type": "SEQ",
-          "members": [
-            {
-              "type": "STRING",
               "value": "tier"
             },
             {
@@ -467,6 +454,18 @@
             {
               "type": "STRING",
               "value": "produces"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "json"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
             },
             {
               "type": "SYMBOL",
@@ -1162,24 +1161,11 @@
           "members": [
             {
               "type": "STRING",
-              "value": "model"
+              "value": "tier"
             },
             {
               "type": "SYMBOL",
-              "name": "_string_value"
-            }
-          ]
-        },
-        {
-          "type": "SEQ",
-          "members": [
-            {
-              "type": "STRING",
-              "value": "effort"
-            },
-            {
-              "type": "SYMBOL",
-              "name": "_effort_value"
+              "name": "tier_alias_name"
             }
           ]
         },
@@ -1214,12 +1200,42 @@
           "value": "in"
         },
         {
-          "type": "SYMBOL",
-          "name": "identifier"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "for_json_source"
+            }
+          ]
         },
         {
           "type": "SYMBOL",
           "name": "for_mode"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "max"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "integer"
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -1257,6 +1273,19 @@
         {
           "type": "STRING",
           "value": "sequential"
+        }
+      ]
+    },
+    "for_json_source": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "json"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
         }
       ]
     },
@@ -1544,7 +1573,116 @@
         },
         {
           "type": "SYMBOL",
+          "name": "tiers_block"
+        },
+        {
+          "type": "SYMBOL",
           "name": "pattern_block"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "budget_block"
+        }
+      ]
+    },
+    "tiers_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "tiers"
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "agent_tier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "agent_tier": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tier_alias_name"
+        }
+      ]
+    },
+    "budget_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "budget"
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "budget_field"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "budget_field": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "wall"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_string_value"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "usd"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "float"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "integer"
+                }
+              ]
+            }
+          ]
         }
       ]
     },
@@ -1635,42 +1773,13 @@
           "type": "CHOICE",
           "members": [
             {
-              "type": "CHOICE",
-              "members": [
-                {
-                  "type": "SYMBOL",
-                  "name": "reviewer_list"
-                },
-                {
-                  "type": "SYMBOL",
-                  "name": "param_client_block"
-                }
-              ]
+              "type": "SYMBOL",
+              "name": "reviewer_list"
             },
             {
               "type": "BLANK"
             }
           ]
-        }
-      ]
-    },
-    "param_client_block": {
-      "type": "SEQ",
-      "members": [
-        {
-          "type": "STRING",
-          "value": "{"
-        },
-        {
-          "type": "REPEAT",
-          "content": {
-            "type": "SYMBOL",
-            "name": "client_field"
-          }
-        },
-        {
-          "type": "STRING",
-          "value": "}"
         }
       ]
     },

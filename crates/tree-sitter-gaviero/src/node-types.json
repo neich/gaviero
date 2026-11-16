@@ -78,6 +78,25 @@
     }
   },
   {
+    "type": "agent_tier",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "tier_alias_name",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "boolean",
     "named": true,
     "fields": {}
@@ -86,6 +105,48 @@
     "type": "branch_chain_value",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "budget_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "budget_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "budget_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "float",
+          "named": true
+        },
+        {
+          "type": "integer",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
   },
   {
     "type": "client_declaration",
@@ -232,6 +293,10 @@
       "required": true,
       "types": [
         {
+          "type": "for_json_source",
+          "named": true
+        },
+        {
           "type": "for_mode",
           "named": true
         },
@@ -240,7 +305,30 @@
           "named": true
         },
         {
+          "type": "integer",
+          "named": true
+        },
+        {
           "type": "peer_template",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "for_json_source",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         }
       ]
@@ -413,21 +501,6 @@
     }
   },
   {
-    "type": "param_client_block",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "client_field",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
     "type": "param_declaration",
     "named": true,
     "fields": {},
@@ -437,10 +510,6 @@
       "types": [
         {
           "type": "identifier",
-          "named": true
-        },
-        {
-          "type": "param_client_block",
           "named": true
         },
         {
@@ -552,7 +621,7 @@
           "named": true
         },
         {
-          "type": "tier_value",
+          "type": "tier_alias_name",
           "named": true
         }
       ]
@@ -744,6 +813,21 @@
     "fields": {}
   },
   {
+    "type": "tiers_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "agent_tier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "until_agent",
     "named": true,
     "fields": {},
@@ -924,6 +1008,10 @@
           "named": true
         },
         {
+          "type": "budget_block",
+          "named": true
+        },
+        {
           "type": "execution_mode_value",
           "named": true
         },
@@ -949,6 +1037,10 @@
         },
         {
           "type": "strategy_value",
+          "named": true
+        },
+        {
+          "type": "tiers_block",
           "named": true
         },
         {
@@ -984,6 +1076,10 @@
   },
   {
     "type": "branch_chain",
+    "named": false
+  },
+  {
+    "type": "budget",
     "named": false
   },
   {
@@ -1140,6 +1236,10 @@
     "named": false
   },
   {
+    "type": "json",
+    "named": false
+  },
+  {
     "type": "judge_timeout",
     "named": false
   },
@@ -1149,6 +1249,10 @@
   },
   {
     "type": "loop",
+    "named": false
+  },
+  {
+    "type": "max",
     "named": false
   },
   {
@@ -1336,6 +1440,10 @@
     "named": false
   },
   {
+    "type": "tiers",
+    "named": false
+  },
+  {
     "type": "timeout",
     "named": false
   },
@@ -1352,11 +1460,19 @@
     "named": false
   },
   {
+    "type": "usd",
+    "named": false
+  },
+  {
     "type": "vars",
     "named": false
   },
   {
     "type": "verify",
+    "named": false
+  },
+  {
+    "type": "wall",
     "named": false
   },
   {

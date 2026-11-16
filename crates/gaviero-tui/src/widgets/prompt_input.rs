@@ -36,7 +36,7 @@ pub enum AutocompleteMode {
     ModelSpec,
     /// `/effort <level>` argument — the levels the current model offers.
     Effort,
-    /// `tier:<name>` in a roster or client param — the active profile's tiers.
+    /// The tier after `id=` in a list param item — the active profile's tiers.
     Tier,
 }
 
@@ -414,46 +414,33 @@ pub fn update_path_autocomplete(input: &TextInput, autocomplete: &mut FileAutoco
     );
 }
 
-const TIER_PREFIX: &str = "tier:";
-
-/// Open the popup while the cursor is on a model spec that is, or could become,
-/// `tier:<name>`. In a roster that is the text after `id=` of the current entry.
-pub fn update_tier_autocomplete(
-    input: &TextInput,
-    autocomplete: &mut FileAutocomplete,
-    roster: bool,
-) {
+/// Open the popup while the cursor is on the tier of a list item: the text
+/// after `id=` of the current `id=tier` entry.
+pub fn update_tier_autocomplete(input: &TextInput, autocomplete: &mut FileAutocomplete) {
     let before_cursor = &input.text[..input.cursor_byte_offset()];
-    let mut start = 0;
-    if roster {
-        let entry = before_cursor.rfind(',').map_or(0, |comma| comma + 1);
-        let Some(equals) = before_cursor[entry..].find('=') else {
-            autocomplete.reset();
-            return;
-        };
-        start = entry + equals + 1;
-    }
-    let spec = before_cursor[start..].trim_start();
-    start = before_cursor.len() - spec.len();
-    let query = match spec.strip_prefix(TIER_PREFIX) {
-        Some(name) => name,
-        None if TIER_PREFIX.starts_with(spec) => "",
-        None => {
-            autocomplete.reset();
-            return;
-        }
+    let entry = before_cursor.rfind(',').map_or(0, |comma| comma + 1);
+    let Some(equals) = before_cursor[entry..].find('=') else {
+        autocomplete.reset();
+        return;
     };
+    let after = &before_cursor[entry + equals + 1..];
+    let query = after.trim_start();
+    if query.contains(char::is_whitespace) {
+        autocomplete.reset();
+        return;
+    }
+    let start = before_cursor.len() - query.len();
     autocomplete.open(AutocompleteMode::Tier, start, query);
 }
 
-/// Fill a tier popup; each match is the full `tier:<name>` to insert. Every
-/// tier is kept; the popup scrolls.
+/// Fill a tier popup; each match is a tier name to insert. Every tier is
+/// kept; the popup scrolls.
 pub fn set_tier_matches(autocomplete: &mut FileAutocomplete, tiers: &[String]) {
     let query = autocomplete.query.to_lowercase();
     autocomplete.matches = tiers
         .iter()
         .filter(|tier| tier.to_lowercase().starts_with(&query))
-        .map(|tier| format!("{TIER_PREFIX}{tier}"))
+        .cloned()
         .collect();
     autocomplete.clamp_selection();
 }
@@ -1072,59 +1059,54 @@ mod tests {
     }
 
     #[test]
-    fn a_roster_entry_completes_after_its_equals_sign() {
+    fn a_roster_entry_completes_its_tier_after_the_equals_sign() {
         let mut ac = FileAutocomplete::new();
-        update_tier_autocomplete(&field("a=tier:lo"), &mut ac, true);
+        update_tier_autocomplete(&field("a=lo"), &mut ac);
         assert_eq!(ac.mode, AutocompleteMode::Tier);
         assert_eq!(ac.query, "lo");
         assert_eq!(ac.at_pos, 2);
         set_tier_matches(&mut ac, &tiers());
-        assert_eq!(ac.matches, ["tier:low", "tier:lower"]);
+        assert_eq!(ac.matches, ["low", "lower"]);
 
-        update_tier_autocomplete(&field("a=tier:top,b="), &mut ac, true);
-        assert_eq!(ac.at_pos, "a=tier:top,b=".len(), "only the current entry");
+        update_tier_autocomplete(&field("a=top,b="), &mut ac);
+        assert_eq!(ac.at_pos, "a=top,b=".len(), "only the current entry");
         assert_eq!(ac.query, "");
     }
 
     #[test]
     fn tier_completion_stays_out_of_the_way_of_other_text() {
         let mut ac = FileAutocomplete::new();
-        update_tier_autocomplete(&field("first"), &mut ac, true);
+        update_tier_autocomplete(&field("first"), &mut ac);
         assert!(!ac.active, "still typing the id");
-        update_tier_autocomplete(&field("a=claude:op"), &mut ac, true);
-        assert!(!ac.active, "a provider spec");
-        update_tier_autocomplete(&field("claude:op"), &mut ac, false);
-        assert!(!ac.active);
-        update_tier_autocomplete(&field("ti"), &mut ac, false);
-        assert!(ac.active, "on the way to `tier:`");
-        assert_eq!(ac.query, "");
+        update_tier_autocomplete(&field("a=hi gh"), &mut ac);
+        assert!(!ac.active, "a tier name has no spaces");
     }
 
     #[test]
     fn accepting_a_tier_mid_roster_keeps_the_entries_after_it() {
-        let mut input = field("a=tier:lo,b=tier:top");
-        input.cursor = "a=tier:lo".len();
+        let mut input = field("a=lo,b=top");
+        input.cursor = "a=lo".len();
         let mut ac = FileAutocomplete::new();
-        update_tier_autocomplete(&input, &mut ac, true);
+        update_tier_autocomplete(&input, &mut ac);
         set_tier_matches(&mut ac, &tiers());
 
         accept_autocomplete(&mut input, &mut ac);
 
-        assert_eq!(input.text, "a=tier:low,b=tier:top");
-        assert_eq!(input.cursor, "a=tier:low".len());
+        assert_eq!(input.text, "a=low,b=top");
+        assert_eq!(input.cursor, "a=low".len());
     }
 
     #[test]
     fn accepting_a_tier_replaces_the_rest_of_the_name() {
-        let mut input = field("tier:lower");
-        input.cursor = "tier:lo".len();
+        let mut input = field("a=lower");
+        input.cursor = "a=lo".len();
         let mut ac = FileAutocomplete::new();
-        update_tier_autocomplete(&input, &mut ac, false);
+        update_tier_autocomplete(&input, &mut ac);
         set_tier_matches(&mut ac, &["low".to_string()]);
 
         accept_autocomplete(&mut input, &mut ac);
 
-        assert_eq!(input.text, "tier:low");
+        assert_eq!(input.text, "a=low");
     }
 
     fn long_popup(count: usize) -> FileAutocomplete {
