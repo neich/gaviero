@@ -21,13 +21,15 @@ use serde::{Deserialize, Serialize};
 /// `request_terminals.history`. Minor 8 is additive: the `skill_completions`
 /// capability and the `request_skill_completions` client frame. Minor 9 is
 /// additive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.
+/// Minor 10 is additive: the `swarm_activity` capability and the
+/// `request_swarm` client frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 10 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -53,6 +55,9 @@ pub mod capability {
     /// 1.8: `request_skill_completions` lists catalog skills for a `$skill`
     /// invocation.
     pub const SKILL_COMPLETIONS: &str = "skill_completions";
+    /// 1.10: `request_swarm` reads the SWARM panel's run — its agents, their
+    /// state, and one agent's output. Read-only.
+    pub const SWARM_ACTIVITY: &str = "swarm_activity";
 }
 
 /// Why a peer's version is unacceptable.
@@ -90,7 +95,7 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            ours.check_compatible(&ProtocolVersion { major: 1, minor: 9 })
+            ours.check_compatible(&ProtocolVersion { major: 1, minor: 10 })
                 .is_ok()
         );
     }

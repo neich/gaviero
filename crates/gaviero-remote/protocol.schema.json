@@ -124,7 +124,7 @@
         ]
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.\nMinor 10 is additive: the `swarm_activity` capability and the\n`request_swarm` client frame.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -258,6 +258,26 @@
         "required": [
           "query"
         ],
+        "type": "object"
+      },
+      "RequestSwarm": {
+        "description": "Read the SWARM panel's run (1.10, `swarm_activity`). Polled; never moves\nthe desktop's selection.",
+        "properties": {
+          "agent_id": {
+            "description": "Agent whose output to return. Absent, or no longer in the run ⇒ the\nagent selected on the desktop.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_token": {
+            "description": "`output.token` from the previous reply. When the chosen agent's output\nhas not changed since, the reply carries `output.unchanged: true` and\nno lines.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "RequestTerminals": {
@@ -771,6 +791,23 @@
           "payload"
         ],
         "type": "object"
+      },
+      {
+        "description": "1.10 (`swarm_activity`): the SWARM panel's run and one agent's output.",
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RequestSwarm"
+          },
+          "type": {
+            "const": "request_swarm",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
       }
     ],
     "properties": {
@@ -848,7 +885,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.\nMinor 10 is additive: the `swarm_activity` capability and the\n`request_swarm` client frame.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -919,7 +956,7 @@
   "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 9
+    "minor": 10
   },
   "server_envelope": {
     "$defs": {
@@ -1865,7 +1902,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.\nMinor 2 is additive: the turn-review frames, `snapshot.open_turn_reviews`,\nand two error codes. Minor 3 is additive: the `file_browser` capability\nwith the `list_directory` / `read_file` client frames. Minor 4 is\nadditive: the `permission_turn_grant` capability, optional\n`permission_request.mcp_server` and `permission_decision.grant`. Minor 5\nis additive: optional `TurnReviewFile.folder` and\n`turn_review_action.folder` (no capability — a client groups by `folder`\nwhen files carry it, and echoes it only then). Minor 6 is additive: the\n`permission_grants` capability, optional `permission_request.grants`, and\nthree more `PermissionGrant` values (`tool_session`,\n`mcp_server_session`, `turn_all`) — the desktop's `a` / `A` / `p` keys.\nMinor 7 is additive: the `shell_history` capability and optional\n`request_terminals.history`. Minor 8 is additive: the `skill_completions`\ncapability and the `request_skill_completions` client frame. Minor 9 is\nadditive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.\nMinor 10 is additive: the `swarm_activity` capability and the\n`request_swarm` client frame.",
         "properties": {
           "major": {
             "format": "uint16",

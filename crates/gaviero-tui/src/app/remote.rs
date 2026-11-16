@@ -214,6 +214,138 @@ fn terminal_snapshot(app: &App, requested: Option<u64>, history: Option<u32>) ->
     result
 }
 
+/// Most output bytes one `request_swarm` reply carries: the newest ones.
+const SWARM_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The SWARM panel's run as the phone shows it (1.10 `swarm_activity`): the
+/// header and agent table the desktop draws, plus one agent's output. The
+/// phone picks its agent with `agent_id`; the desktop selection never moves.
+/// `output_token` names output the phone already has, so a poll of an idle
+/// agent sends no lines.
+fn swarm_snapshot(
+    app: &App,
+    agent_id: Option<&str>,
+    output_token: Option<&str>,
+) -> serde_json::Value {
+    use gaviero_core::swarm::models::AgentStatus;
+    use gaviero_core::types::ModelTier;
+
+    let dash = &app.swarm_dashboard;
+    if !dash.has_run() {
+        return serde_json::json!({ "run": null, "selected_id": null, "output": null });
+    }
+    let agents: Vec<_> = dash
+        .agents
+        .iter()
+        .map(|agent| {
+            let (status, error) = match &agent.status {
+                AgentStatus::Pending => ("queued", None),
+                AgentStatus::Running => ("running", None),
+                AgentStatus::Completed => ("completed", None),
+                AgentStatus::Failed(e) => ("failed", Some(e.clone())),
+            };
+            serde_json::json!({
+                "id": agent.id,
+                "status": status,
+                "error": error,
+                "detail": agent.detail.replace(['\n', '\r'], " "),
+                "tier": agent.model_tier.map(|t| match t {
+                    ModelTier::Cheap => "cheap",
+                    ModelTier::Expensive => "expensive",
+                }),
+                "backend": agent.backend,
+                "elapsed_ms": agent.elapsed().map(|d| d.as_millis() as u64),
+                "branch": agent.branch,
+                "modified_files": agent.modified_files,
+            })
+        })
+        .collect();
+    let counts = dash.counts();
+    let run = serde_json::json!({
+        "run_id": dash.run_id,
+        "script": dash.script_label,
+        "phase": dash.phase,
+        "running": dash.running,
+        "tier_current": dash.tier_current,
+        "tier_total": dash.tier_total,
+        "cost_usd": dash.estimated_cost_usd,
+        "message": dash.status_message,
+        "counts": {
+            "running": counts.running,
+            "queued": counts.queued,
+            "done": counts.done,
+            "failed": counts.failed,
+        },
+        "agents": agents,
+    });
+
+    let selected = agent_id
+        .and_then(|id| dash.agents.iter().find(|a| a.id == id))
+        .or_else(|| dash.agents.get(dash.scroll.selected))
+        .or_else(|| dash.agents.first());
+    let output = selected.map(|agent| {
+        let token = format!("{}:{}", dash.run_id, agent.revision());
+        if output_token == Some(token.as_str()) {
+            return serde_json::json!({
+                "agent_id": agent.id,
+                "token": token,
+                "unchanged": true,
+            });
+        }
+        let (lines, truncated) = output_tail(&agent.activity, SWARM_OUTPUT_BYTES);
+        serde_json::json!({
+            "agent_id": agent.id,
+            "token": token,
+            "unchanged": false,
+            "lines": lines,
+            "truncated": truncated,
+        })
+    });
+    serde_json::json!({
+        "run": run,
+        "selected_id": selected.map(|a| a.id.clone()),
+        "output": output,
+    })
+}
+
+/// The newest activity lines that fit in `budget` bytes, oldest first. The
+/// oldest kept line loses its head when it does not fit whole.
+fn output_tail(
+    activity: &[crate::panels::swarm_dashboard::ActivityLine],
+    budget: usize,
+) -> (Vec<serde_json::Value>, bool) {
+    use crate::panels::swarm_dashboard::ActivityKind;
+    let mut lines = Vec::new();
+    let mut left = budget;
+    let mut truncated = false;
+    for line in activity.iter().rev() {
+        if left == 0 {
+            truncated = true;
+            break;
+        }
+        let text = if line.text.len() <= left {
+            line.text.as_str()
+        } else {
+            truncated = true;
+            let mut cut = line.text.len() - left;
+            while !line.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            &line.text[cut..]
+        };
+        left -= text.len();
+        let kind = match line.kind {
+            ActivityKind::Text => "text",
+            ActivityKind::ToolCall => "tool_call",
+            ActivityKind::Status => "status",
+            ActivityKind::FileChange => "file_change",
+        };
+        lines.push(serde_json::json!({ "kind": kind, "text": text }));
+    }
+    lines.reverse();
+    (lines, truncated)
+}
+
 /// `@` completion for the phone composer: the same file list and matcher
 /// as the desktop popup, so an accepted path resolves in `send_prompt`.
 fn file_completions(
@@ -393,6 +525,15 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 .map(|result| (CommandStatus::Completed, Some(result))),
             ClientFrame::RequestSkillCompletions(r) => skill_completions(app, &r.query, r.limit)
                 .map(|result| (CommandStatus::Completed, Some(result))),
+            // 1.10 (`swarm_activity`): read-only view of the SWARM panel.
+            ClientFrame::RequestSwarm(r) => Ok((
+                CommandStatus::Completed,
+                Some(swarm_snapshot(
+                    app,
+                    r.agent_id.as_deref(),
+                    r.output_token.as_deref(),
+                )),
+            )),
             // 1.3 (`file_browser`): read-only workspace browsing.
             ClientFrame::ListDirectory(r) => {
                 crate::app::remote_files::list_directory(app, r.path.as_deref())
@@ -1042,6 +1183,130 @@ mod tests {
         // History only when asked; no tab means an empty list, not an error.
         assert!(snapshot.get("history").is_none());
         assert_eq!(terminal_snapshot(&app, None, Some(50))["history"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn swarm_request_mirrors_the_run_without_moving_the_desktop_selection() {
+        use crate::panels::swarm_dashboard::{PlannedAgent, SwarmUpdate};
+        use gaviero_core::swarm::models::AgentStatus;
+        use gaviero_core::types::ModelTier;
+        use gaviero_remote::envelope::RequestSwarm;
+
+        let (dir, mut app) = two_tab_app();
+        let mut request = |app: &mut App, agent_id: Option<&str>, token: Option<&str>| {
+            handle_remote_command(
+                app,
+                ClientEnvelope {
+                    version: gaviero_remote::version::PROTOCOL_VERSION,
+                    instance_id: Some("test".into()),
+                    command_id: format!("swarm-{agent_id:?}-{token:?}"),
+                    frame: ClientFrame::RequestSwarm(RequestSwarm {
+                        agent_id: agent_id.map(str::to_string),
+                        output_token: token.map(str::to_string),
+                    }),
+                },
+                131072,
+            );
+            match app.remote.pending_frames.pop() {
+                Some(ServerFrame::CommandResult(done)) => done.result.unwrap(),
+                other => panic!("expected command_result, got {other:?}"),
+            }
+        };
+
+        // Nothing has run yet.
+        let idle = request(&mut app, None, None);
+        assert!(idle["run"].is_null());
+        assert!(idle["output"].is_null());
+
+        let run = app.swarm_dashboard.begin_run(
+            "deep_explore".into(),
+            dir.path().to_path_buf(),
+            vec![
+                PlannedAgent { id: "scout".into(), tier: ModelTier::Cheap, model: Some("claude:haiku".into()) },
+                PlannedAgent { id: "writer".into(), tier: ModelTier::Expensive, model: None },
+            ],
+            vec!["prepared".into()],
+        );
+        app.swarm_dashboard.apply(run, SwarmUpdate::Agent {
+            id: "scout".into(),
+            status: AgentStatus::Running,
+            detail: "reading".into(),
+        });
+        app.swarm_dashboard.apply(run, SwarmUpdate::Text { id: "scout".into(), text: "hello\x1b[1m world".into() });
+        app.swarm_dashboard.apply(run, SwarmUpdate::Tool { id: "scout".into(), summary: "Read src/main.rs".into() });
+
+        let first = request(&mut app, None, None);
+        let header = &first["run"];
+        assert_eq!(header["script"], "deep_explore");
+        assert_eq!(header["running"], true);
+        assert_eq!(header["message"], "prepared");
+        assert_eq!(header["counts"]["running"], 1);
+        assert_eq!(header["counts"]["queued"], 1);
+        let agents = header["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0]["status"], "running");
+        assert_eq!(agents[0]["tier"], "cheap");
+        assert_eq!(agents[0]["backend"], "claude:haiku");
+        assert_eq!(agents[0]["detail"], "[Read src/main.rs]");
+        assert_eq!(agents[1]["status"], "queued");
+        assert_eq!(agents[1]["tier"], "expensive");
+        // No agent asked for: the desktop's selection (it follows the
+        // running agent).
+        assert_eq!(first["selected_id"], "scout");
+        let output = &first["output"];
+        assert_eq!(output["unchanged"], false);
+        let kinds: Vec<_> = output["lines"].as_array().unwrap().iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["status", "text", "tool_call"]);
+        assert_eq!(output["lines"][1]["text"], "hello world");
+        let token = output["token"].as_str().unwrap().to_string();
+
+        // Same output again: no lines.
+        let same = request(&mut app, Some("scout"), Some(&token));
+        assert_eq!(same["output"]["unchanged"], true);
+        assert!(same["output"].get("lines").is_none());
+
+        // The phone looks at another agent; the desktop keeps its own.
+        let desktop_selected = app.swarm_dashboard.scroll.selected;
+        let writer = request(&mut app, Some("writer"), Some(&token));
+        assert_eq!(writer["selected_id"], "writer");
+        assert_eq!(writer["output"]["unchanged"], false);
+        assert_eq!(writer["output"]["lines"], serde_json::json!([]));
+        assert_eq!(app.swarm_dashboard.scroll.selected, desktop_selected);
+
+        // An agent that is gone falls back to the desktop's selection.
+        assert_eq!(request(&mut app, Some("gone"), None)["selected_id"], "scout");
+
+        // A failed run reports each unfinished agent's reason.
+        app.swarm_dashboard.apply(run, SwarmUpdate::Failed("boom".into()));
+        let failed = request(&mut app, None, None);
+        assert_eq!(failed["run"]["phase"], "failed");
+        assert_eq!(failed["run"]["running"], false);
+        assert_eq!(failed["run"]["message"], "boom");
+        assert_eq!(failed["run"]["agents"][1]["status"], "failed");
+        assert_eq!(failed["run"]["agents"][1]["error"], "failed");
+    }
+
+    #[test]
+    fn swarm_output_tail_keeps_the_newest_bytes() {
+        use crate::panels::swarm_dashboard::{ActivityKind, ActivityLine};
+        let activity = vec![
+            ActivityLine { kind: ActivityKind::Status, text: "Running: x".into() },
+            ActivityLine { kind: ActivityKind::Text, text: "ééé".into() },
+            ActivityLine { kind: ActivityKind::ToolCall, text: "[Read]".into() },
+        ];
+        let (all, truncated) = output_tail(&activity, 1024);
+        assert!(!truncated);
+        assert_eq!(all.len(), 3);
+        // 6 bytes for the tool line, 2 left: the head of "ééé" (6 bytes) is
+        // cut on a char boundary, and the oldest line is dropped.
+        let (tail, truncated) = output_tail(&activity, 8);
+        assert!(truncated);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["text"], "é");
+        assert_eq!(tail[1]["text"], "[Read]");
+        let (none, truncated) = output_tail(&activity, 6);
+        assert!(truncated);
+        assert_eq!(none.len(), 1);
     }
 
     #[test]
