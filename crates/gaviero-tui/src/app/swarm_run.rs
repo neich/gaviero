@@ -246,6 +246,7 @@ fn open_form(app: &mut App, script: ScriptRow) {
             app.swarm_dashboard.form =
                 Some(SwarmForm::new(script, inspection, folders, selected).with_profiles(profiles));
             app.swarm_dashboard.view = SwarmView::Form;
+            reload_profile_info(app);
             refresh_form_warnings(app);
         }
         Err(report) => {
@@ -391,13 +392,27 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         expanded
     });
 
-    let plan = gaviero_dsl::compile_file_with_profile(
+    for (agent, tier) in &values.agent_tiers {
+        notes.push(format!("Agent {agent} runs on tier {tier}"));
+    }
+    for o in &values.tier_overrides {
+        notes.push(match (&o.client, &o.effort) {
+            (Some(client), Some(effort)) => {
+                format!("Tier {} runs on client {client} at effort {effort}", o.tier)
+            }
+            (Some(client), None) => format!("Tier {} runs on client {client}", o.tier),
+            (None, Some(effort)) => format!("Tier {} runs at effort {effort}", o.tier),
+            (None, None) => continue,
+        });
+    }
+    let plan = gaviero_dsl::compile_file_with_models(
         &script.path,
         profile.as_ref(),
+        &values.tier_overrides,
         values.workflow.as_deref(),
         prompt.as_deref(),
         &vars,
-        &[],
+        &values.agent_tiers,
         &values.params,
     )
     .map_err(|report| report_text(&report))?;
@@ -853,23 +868,36 @@ fn refresh_prompt_autocomplete(app: &mut App) {
     }
 }
 
-/// The tiers a run would have right now: the profile the form has selected,
-/// then whatever the script binds itself ([`gaviero_dsl`] merges them so).
+/// The tiers a run would have right now: the ones the profile the form
+/// resolves to binds. Only the profile defines tiers; the script merely names
+/// them, so a name the profile lacks would not compile and is not offered.
 fn active_tiers(app: &App) -> Vec<String> {
+    app.swarm_dashboard
+        .form
+        .as_ref()
+        .and_then(|form| form.profile_info.as_ref())
+        .map(|info| info.tier_names())
+        .unwrap_or_default()
+}
+
+/// Read the profile the form's Folder and Profile choices resolve to, for its
+/// agent and tier rows. A profile that cannot be read shows no rows; the run
+/// reports the problem when it compiles.
+fn reload_profile_info(app: &mut App) {
     let Some(form) = app.swarm_dashboard.form.as_ref() else {
-        return Vec::new();
+        return;
     };
-    let root = &form.folders[form.selected_folder()].1;
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    let root = form.folders[form.selected_folder()].1.clone();
+    let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let repo = gaviero_core::memory::scope::hash_path(&canonical);
-    // Only the profile defines tiers; the script merely names them, so a
-    // name the profile lacks would not compile and is not offered.
-    ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
-        .select(form.selected_profile().as_deref(), Some(&repo), root)
+    let info = ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
+        .select(form.selected_profile().as_deref(), Some(&repo), &root)
         .ok()
         .flatten()
-        .and_then(|profile| gaviero_dsl::profile_tier_names(&profile.path).ok())
-        .unwrap_or_default()
+        .and_then(|profile| gaviero_dsl::inspect_profile(&profile.path).ok());
+    if let Some(form) = app.swarm_dashboard.form.as_mut() {
+        form.set_profile_info(info);
+    }
 }
 
 /// Bring the focused field's popup up to date after its text changed.
@@ -1075,12 +1103,17 @@ fn handle_form(app: &mut App, action: Action) {
         Action::Tab | Action::CursorDown => form.focus_next(),
         Action::CursorUp => form.focus_previous(),
         Action::Enter if form.on_run_button() => launch(app),
+        Action::Enter if form.open_choice_list() => {}
         Action::Enter => form.focus_next(),
         Action::CursorLeft | Action::CursorRight | Action::InsertChar(' ')
             if form.focused_input().is_none() =>
         {
             let delta = if action == Action::CursorLeft { -1 } else { 1 };
+            let role = form.focused_role();
             form.cycle_focused_choice(delta);
+            if matches!(role, Some(FieldRole::Folder | FieldRole::Profile)) {
+                reload_profile_info(app);
+            }
             refresh_form_warnings(app);
         }
         other => {
@@ -1629,6 +1662,97 @@ workflow run {
         assert!(request.contains("the moon"), "prompt reached the agent: {request}");
     }
 
+    /// Open the form with a profile offering two clients, apply `choose` to
+    /// it, press Run, and return the model the `writer` agent was planned on
+    /// and the run's notes.
+    fn run_with_model_choices(choose: impl Fn(&mut App)) -> (Option<String>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let profiles = root.join(".gaviero/dsl/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("default.gaviero"),
+            concat!(
+                "client local { model \"ollama:qwen\" privacy public }
+",
+                "client other { model \"ollama:llama\" privacy public }
+",
+                "tier local local
+tier spare other
+",
+            ),
+        )
+        .unwrap();
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        open_filled_form(&mut app);
+        choose(&mut app);
+        press_run(&mut app);
+        let dash = &mut app.swarm_dashboard;
+        assert_eq!(
+            dash.view,
+            SwarmView::Run,
+            "error: {:?}",
+            dash.form.as_ref().and_then(|f| f.error.clone())
+        );
+        if let Some(abort) = dash.abort.take() {
+            abort.abort();
+        }
+        (dash.agents[0].backend.clone(), dash.status_message.clone())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_form_moves_an_agent_to_another_tier() {
+        let (model, notes) = run_with_model_choices(|app| {
+            let form = app.swarm_dashboard.form.as_mut().unwrap();
+            form.focus_field("writer");
+            assert_eq!(form.fields[form.focus].choice(), Some("local"));
+            handle_action(app, Action::CursorRight);
+            let form = app.swarm_dashboard.form.as_ref().unwrap();
+            assert_eq!(form.fields[form.focus].choice(), Some("spare"));
+        });
+        assert_eq!(model.as_deref(), Some("ollama:llama"));
+        assert!(notes.contains("Agent writer runs on tier spare"), "{notes}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_form_points_a_tier_at_another_client_of_the_profile() {
+        let (model, notes) = run_with_model_choices(|app| {
+            let form = app.swarm_dashboard.form.as_mut().unwrap();
+            let tier_row = form
+                .fields
+                .iter()
+                .position(|f| f.role == FieldRole::TierModel && f.name == "local")
+                .unwrap();
+            form.focus = tier_row;
+            handle_action(app, Action::InsertChar(' '));
+        });
+        assert_eq!(model.as_deref(), Some("ollama:llama"));
+        assert!(notes.contains("Tier local runs on client other"), "{notes}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tier_model_is_picked_from_its_list_with_enter_and_arrows() {
+        let (model, notes) = run_with_model_choices(|app| {
+            let form = app.swarm_dashboard.form.as_mut().unwrap();
+            form.focus = form
+                .fields
+                .iter()
+                .position(|f| f.role == FieldRole::TierModel && f.name == "local")
+                .unwrap();
+            handle_action(app, Action::Enter);
+            let form = app.swarm_dashboard.form.as_ref().unwrap();
+            assert!(form.completion.is_open(), "Enter lists the clients");
+            assert_eq!(form.completion.matches.len(), 2);
+            handle_action(app, Action::CursorDown);
+            handle_action(app, Action::Enter);
+            let form = app.swarm_dashboard.form.as_ref().unwrap();
+            assert!(!form.completion.is_open());
+            assert_eq!(form.fields[form.focus].role, FieldRole::TierEffort);
+        });
+        assert_eq!(model.as_deref(), Some("ollama:llama"));
+        assert!(notes.contains("Tier local runs on client other"), "{notes}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn stopping_ends_a_run_that_would_otherwise_never_finish() {
         let dir = tempfile::tempdir().unwrap();
@@ -1852,6 +1976,8 @@ workflow run {
             prompt: None,
             vars: vec![("IN".to_string(), value.to_string())],
             params: Vec::new(),
+            agent_tiers: Vec::new(),
+            tier_overrides: Vec::new(),
         };
 
         let mut labelled = values("one/docs/a.md");
@@ -1896,6 +2022,7 @@ workflow run {
             accepts_prompt: false,
             default_execution: ExecutionMode::Repo,
             tiers: Vec::new(),
+            agents: Vec::new(),
         }
     }
 

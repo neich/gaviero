@@ -19,9 +19,11 @@ pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
 pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
 pub use ast::VarKind;
+pub use profile::TierOverride;
 pub use inspect::{
-    ParamInspection, ParamKindInfo, ScriptInspection, VarInspection, WorkflowInspection,
-    inspect_file, profile_tier_names,
+    AgentInspection, ParamInspection, ParamKindInfo, ProfileClient, ProfileInspection,
+    ScriptInspection, VarInspection, WorkflowInspection, inspect_file, inspect_profile,
+    profile_tier_names,
 };
 
 use gaviero_core::script_profiles::SelectedProfile;
@@ -102,7 +104,8 @@ pub fn compile_with_vars(
     let mut sources = vec![(filename.to_string(), source.to_string())];
     profile::reject_model_tables(&script, &sources).map_err(miette::Report::new)?;
     if let Some(profile) = profile {
-        profile::apply_profile(&mut script, &mut sources, profile).map_err(miette::Report::new)?;
+        profile::apply_profile(&mut script, &mut sources, profile, &[])
+            .map_err(miette::Report::new)?;
     }
 
     // Phase 3: Compile
@@ -163,10 +166,47 @@ pub fn compile_file_with_profile(
     agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
+    compile_file_with_models(
+        entry_path,
+        profile,
+        &[],
+        workflow,
+        runtime_prompt,
+        override_vars,
+        agent_tiers,
+        override_params,
+    )
+}
+
+/// Like [`compile_file_with_profile`], with some of the profile's tiers
+/// changed for this run only: pointed at other clients of the same profile
+/// (`--tier-client TIER=CLIENT`) and/or run at another effort
+/// (`--tier-effort TIER=EFFORT`). A tier the profile does not bind is added
+/// when it is given a client. Models are still declared only by the profile.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_file_with_models(
+    entry_path: &std::path::Path,
+    profile: Option<&SelectedProfile>,
+    tier_overrides: &[TierOverride],
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+    agent_tiers: &[(String, String)],
+    override_params: &[(String, String)],
+) -> Result<CompiledPlan, miette::Report> {
     let (mut script, mut sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
     profile::reject_model_tables(&script, &sources).map_err(miette::Report::new)?;
-    if let Some(profile) = profile {
-        profile::apply_profile(&mut script, &mut sources, profile).map_err(miette::Report::new)?;
+    match profile {
+        Some(profile) => {
+            profile::apply_profile(&mut script, &mut sources, profile, tier_overrides)
+                .map_err(miette::Report::new)?;
+        }
+        None if !tier_overrides.is_empty() => {
+            return Err(miette::Report::msg(
+                "--tier-client / --tier-effort need a model profile: no profile is selected",
+            ));
+        }
+        None => {}
     }
     compiler::compile_ast_with_sources(
         &script,

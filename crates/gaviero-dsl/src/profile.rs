@@ -10,11 +10,62 @@
 use std::collections::HashSet;
 
 use gaviero_core::script_profiles::SelectedProfile;
+use gaviero_core::swarm::backend::effort::{is_known_effort, known_effort_names};
 use miette::NamedSource;
 
 use crate::ast::{ClientDecl, Item, Script, Span, TierAlias};
 use crate::error::{DslError, DslErrors};
 use crate::resolver;
+
+/// One run's change to what a tier means: another client of the same
+/// profile (`--tier-client TIER=CLIENT`), another effort
+/// (`--tier-effort TIER=EFFORT`), or both. Models stay declared only in the
+/// profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierOverride {
+    pub tier: String,
+    /// A client the profile declares; `None` keeps the tier's own.
+    pub client: Option<String>,
+    /// An effort name; `None` keeps the client's.
+    pub effort: Option<String>,
+}
+
+impl TierOverride {
+    /// Merge `--tier-client` and `--tier-effort` pairs into one override per
+    /// tier, in order of first mention.
+    pub fn from_pairs(clients: &[(String, String)], efforts: &[(String, String)]) -> Vec<Self> {
+        let mut overrides: Vec<Self> = Vec::new();
+        let mut entry = |tier: &str| -> usize {
+            match overrides.iter().position(|o| o.tier == tier) {
+                Some(i) => i,
+                None => {
+                    overrides.push(Self {
+                        tier: tier.to_string(),
+                        client: None,
+                        effort: None,
+                    });
+                    overrides.len() - 1
+                }
+            }
+        };
+        let mut set = Vec::new();
+        for (tier, client) in clients {
+            set.push((entry(tier), Some(client.clone()), None));
+        }
+        for (tier, effort) in efforts {
+            set.push((entry(tier), None, Some(effort.clone())));
+        }
+        for (i, client, effort) in set {
+            if client.is_some() {
+                overrides[i].client = client;
+            }
+            if effort.is_some() {
+                overrides[i].effort = effort;
+            }
+        }
+        overrides
+    }
+}
 
 /// Name a profile client takes inside the merged script.
 pub fn profile_client_name(client: &str) -> String {
@@ -58,13 +109,19 @@ pub(crate) fn reject_model_tables(
 
 /// Merge `selected` into `script`. Diagnostics for the profile point at the
 /// profile's own files, which are appended to `sources`.
+///
+/// `overrides` change tiers for this run only, to other clients of the same
+/// profile and/or another effort: the profile stays the one place a model
+/// is declared. A tier the profile lacks is added (it needs a client).
 pub(crate) fn apply_profile(
     script: &mut Script,
     sources: &mut Vec<(String, String)>,
     selected: &SelectedProfile,
+    overrides: &[TierOverride],
 ) -> Result<(), DslErrors> {
     let (profile, profile_sources) = resolver::resolve(&selected.path)?;
-    let (clients, tiers) = split_profile(profile, &profile_sources)?;
+    let (mut clients, mut tiers) = split_profile(profile, &profile_sources)?;
+    rebind_tiers(&mut clients, &mut tiers, overrides)?;
 
     let offset = sources.len() as u32;
     sources.extend(profile_sources);
@@ -79,6 +136,82 @@ pub(crate) fn apply_profile(
         script.items.push(Item::TierAlias(tier));
     }
     Ok(())
+}
+
+/// Apply each override: point the tier at the named client, then, for an
+/// effort, at a copy of its client with that effort (named
+/// `<client>__<tier>`, so the profile's own client and every other tier on
+/// it are untouched). A rebound tier keeps the span of the line it replaces;
+/// an added tier takes its client's.
+fn rebind_tiers(
+    clients: &mut Vec<ClientDecl>,
+    tiers: &mut Vec<TierAlias>,
+    overrides: &[TierOverride],
+) -> Result<(), DslErrors> {
+    let mut errors = Vec::new();
+    let error = |reason: String| DslError::Compile {
+        src: NamedSource::new("<run>", String::new()),
+        span: (0, 0).into(),
+        reason,
+    };
+    for o in overrides {
+        let tier = &o.tier;
+        let client_name = match (&o.client, tiers.iter().find(|t| t.name == *tier)) {
+            (Some(name), _) => name.clone(),
+            (None, Some(existing)) => existing.client_ref.clone(),
+            (None, None) => {
+                errors.push(error(format!(
+                    "--tier-effort {tier}=…: the profile has no tier `{tier}`; \
+                     give it a client with --tier-client {tier}=CLIENT"
+                )));
+                continue;
+            }
+        };
+        let Some(client) = clients.iter().find(|c| c.name == client_name).cloned() else {
+            let known: Vec<&str> = clients.iter().map(|c| c.name.as_str()).collect();
+            errors.push(error(format!(
+                "--tier-client {tier}={client_name}: the profile has no client \
+                 `{client_name}` (it has: {})",
+                known.join(", ")
+            )));
+            continue;
+        };
+        let bound = match &o.effort {
+            None => client.name.clone(),
+            Some(effort) if !is_known_effort(effort) => {
+                errors.push(error(format!(
+                    "--tier-effort {tier}={effort}: unknown effort (known: {})",
+                    known_effort_names()
+                )));
+                continue;
+            }
+            Some(effort) => {
+                let mut copy = client.clone();
+                copy.name = format!("{}__{tier}", client.name);
+                copy.effort = Some((effort.clone(), client.name_span));
+                clients.retain(|c| c.name != copy.name);
+                let name = copy.name.clone();
+                clients.push(copy);
+                name
+            }
+        };
+        match tiers.iter_mut().find(|t| t.name == *tier) {
+            Some(existing) => existing.client_ref = bound,
+            None => tiers.push(TierAlias {
+                name: tier.clone(),
+                name_span: client.name_span,
+                client_ref: bound,
+                client_ref_span: client.name_span,
+                span: client.span,
+                file_id: client.file_id,
+            }),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DslErrors::new(errors))
+    }
 }
 
 /// Separate a resolved profile into its clients and tiers, rejecting anything

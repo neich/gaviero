@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::{Item, Script, VarKind};
+use crate::ast::{Item, PatternDecl, Script, StepItem, VarKind, WorkflowDecl};
 use crate::compiler::peek_workflow_execution_mode;
 use crate::resolver;
 use crate::workflow_params::describe_workflow_params;
@@ -42,6 +42,16 @@ pub struct ScriptInspection {
     /// Tiers the script asks for (agents, `tiers { }` blocks, list items),
     /// in order of appearance. The profile must define each of them.
     pub tiers: Vec<String>,
+    /// Every agent, in declaration order, with the tier it declares.
+    pub agents: Vec<AgentInspection>,
+}
+
+/// An agent and the tier it declares (`None` only in a script that does not
+/// compile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInspection {
+    pub name: String,
+    pub tier: Option<String>,
 }
 
 impl ScriptInspection {
@@ -76,6 +86,28 @@ impl ScriptInspection {
         }
         vars
     }
+
+    /// The agents a run of workflow `workflow` (an index into
+    /// [`Self::workflows`]) dispatches, in declaration order, each with the
+    /// tier it runs on unless the run moves it: the workflow's `tiers { }`
+    /// entry, else its own. With no such workflow, or one whose agents cannot
+    /// be told from its steps, every agent is listed.
+    pub fn agent_tiers(&self, workflow: usize) -> Vec<(String, String)> {
+        let wf = self.workflows.get(workflow);
+        let used = wf.map(|w| w.agents.as_slice()).unwrap_or_default();
+        self.agents
+            .iter()
+            .filter(|a| used.is_empty() || used.contains(&a.name))
+            .map(|a| {
+                let moved = wf.and_then(|w| w.tiers.iter().find(|(agent, _)| *agent == a.name));
+                let tier = moved
+                    .map(|(_, t)| t.clone())
+                    .or_else(|| a.tier.clone())
+                    .unwrap_or_default();
+                (a.name.clone(), tier)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +115,11 @@ pub struct WorkflowInspection {
     pub name: String,
     pub execution: ExecutionMode,
     pub params: Vec<ParamInspection>,
+    /// Agents its steps, loops, judges, `for` bodies and pattern name, in
+    /// order of appearance; empty when it has no steps.
+    pub agents: Vec<String>,
+    /// Its `tiers { <agent> <tier> }` block.
+    pub tiers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +149,74 @@ pub struct ParamInspection {
 pub fn profile_tier_names(profile_path: &Path) -> Result<Vec<String>, miette::Report> {
     let (profile, _) = resolver::resolve(profile_path).map_err(miette::Report::new)?;
     Ok(tier_names(&profile))
+}
+
+/// What a model profile offers: its clients and which one each tier means.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileInspection {
+    /// In declaration order.
+    pub clients: Vec<ProfileClient>,
+    /// `(tier, client)`, in declaration order.
+    pub tiers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileClient {
+    pub name: String,
+    /// `provider:model`.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl ProfileInspection {
+    /// The client tier `tier` is bound to.
+    pub fn client_of(&self, tier: &str) -> Option<&str> {
+        self.tiers
+            .iter()
+            .find(|(t, _)| t == tier)
+            .map(|(_, c)| c.as_str())
+    }
+
+    pub fn client(&self, name: &str) -> Option<&ProfileClient> {
+        self.clients.iter().find(|c| c.name == name)
+    }
+
+    pub fn tier_names(&self) -> Vec<String> {
+        self.tiers.iter().map(|(t, _)| t.clone()).collect()
+    }
+}
+
+impl ProfileClient {
+    /// `claude:opus · high`, or the client's name when it has no model.
+    pub fn summary(&self) -> String {
+        match (&self.model, &self.effort) {
+            (Some(model), Some(effort)) => format!("{model} · {effort}"),
+            (Some(model), None) => model.clone(),
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// Read a profile file (its includes resolved) without compiling a script.
+pub fn inspect_profile(profile_path: &Path) -> Result<ProfileInspection, miette::Report> {
+    let (profile, _) = resolver::resolve(profile_path).map_err(miette::Report::new)?;
+    let mut info = ProfileInspection::default();
+    for item in &profile.items {
+        match item {
+            Item::Client(c) if info.client(&c.name).is_none() => {
+                info.clients.push(ProfileClient {
+                    name: c.name.clone(),
+                    model: c.model.as_ref().map(|(m, _)| m.clone()),
+                    effort: c.effort.as_ref().map(|(e, _)| e.clone()),
+                });
+            }
+            Item::TierAlias(t) if info.client_of(&t.name).is_none() => {
+                info.tiers.push((t.name.clone(), t.client_ref.clone()));
+            }
+            _ => {}
+        }
+    }
+    Ok(info)
 }
 
 fn tier_names(script: &Script) -> Vec<String> {
@@ -160,6 +265,46 @@ fn used_tier_names(script: &Script) -> Vec<String> {
     names
 }
 
+fn push_unique(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+    }
+}
+
+/// The agents a workflow dispatches, as its steps name them.
+fn workflow_agents(wf: &WorkflowDecl) -> Vec<String> {
+    let mut names = Vec::new();
+    for step in wf.steps.iter().flat_map(|(steps, _)| steps) {
+        match step {
+            StepItem::Agent(name, _) => push_unique(&mut names, name),
+            StepItem::For(block) => {
+                for (name, _) in &block.agents {
+                    push_unique(&mut names, name);
+                }
+            }
+            StepItem::Loop(block) => {
+                for (name, _) in &block.agents {
+                    push_unique(&mut names, name);
+                }
+                for (name, _) in block.fors.iter().flat_map(|f| &f.agents) {
+                    push_unique(&mut names, name);
+                }
+                for (name, _) in block.template_init.iter().chain(&block.template_refine) {
+                    push_unique(&mut names, name);
+                }
+                for (name, _) in block.until.agents() {
+                    push_unique(&mut names, name);
+                }
+            }
+        }
+    }
+    if let Some(PatternDecl::MapReduce(pattern)) = &wf.pattern {
+        push_unique(&mut names, &pattern.discover.0);
+        push_unique(&mut names, &pattern.reduce.0);
+    }
+    names
+}
+
 /// Inspect a script on disk, resolving its includes.
 pub fn inspect_file(entry_path: &Path) -> Result<ScriptInspection, miette::Report> {
     let (script, sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
@@ -175,6 +320,12 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
                 name: wf.name.clone(),
                 execution: peek_workflow_execution_mode(script, Some(&wf.name)),
                 params: describe_workflow_params(script, wf),
+                agents: workflow_agents(wf),
+                tiers: wf
+                    .tiers
+                    .iter()
+                    .map(|t| (t.agent.clone(), t.tier.clone()))
+                    .collect(),
             }),
             _ => None,
         })
@@ -230,6 +381,17 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
         accepts_prompt: requires_prompt || agent_without_prompt,
         default_execution: peek_workflow_execution_mode(script, None),
         tiers: used_tier_names(script),
+        agents: script
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Agent(agent) => Some(AgentInspection {
+                    name: agent.name.clone(),
+                    tier: agent.tier_ref.as_ref().map(|(t, _)| t.clone()),
+                }),
+                _ => None,
+            })
+            .collect(),
     }
 }
 
@@ -427,6 +589,58 @@ mod tests {
             "}\n",
         ));
         assert_eq!(info.tiers, ["mine", "low", "top", "high"]);
+    }
+
+    #[test]
+    fn agents_are_listed_with_the_tier_each_workflow_runs_them_on() {
+        let info = inspect(concat!(
+            "agent scout { tier high prompt #\"x\"# }\n",
+            "agent unused { tier low prompt #\"x\"# }\n",
+            "agent worker { tier high prompt #\"x\"# }\n",
+            "agent judge { tier medium prompt #\"x\"# }\n",
+            "workflow w {\n",
+            "  tiers { judge top }\n",
+            "  steps [ scout loop { agents [worker] until agent judge } ]\n",
+            "}\n",
+            "workflow all { steps [ unused ] }\n",
+        ));
+        assert_eq!(info.workflows[0].agents, ["scout", "worker", "judge"]);
+        let tiers = info.agent_tiers(0);
+        let shown: Vec<(&str, &str)> =
+            tiers.iter().map(|(a, t)| (a.as_str(), t.as_str())).collect();
+        assert_eq!(shown, [("scout", "high"), ("worker", "high"), ("judge", "top")]);
+        assert_eq!(info.agent_tiers(1), [("unused".to_string(), "low".to_string())]);
+        assert_eq!(info.agent_tiers(9).len(), 4, "no such workflow lists every agent");
+    }
+
+    #[test]
+    fn the_deep_explore_example_lists_every_agent_including_the_judge_and_the_for_body() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/deep_explore.gaviero");
+        let info = inspect_file(&path).unwrap();
+        let names: Vec<String> = info.agent_tiers(0).into_iter().map(|(a, _)| a).collect();
+        for agent in ["scout", "curator", "investigator", "verifier", "stop_judge"] {
+            assert!(names.iter().any(|n| n == agent), "{agent} missing from {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_profile_reports_its_clients_and_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("p.gaviero");
+        std::fs::write(
+            &profile,
+            concat!(
+                "client opus { model \"claude:opus\" privacy public effort high }\n",
+                "client sol { model \"codex:gpt-6.1-sol\" privacy public }\n",
+                "tier high opus\ntier high-codex sol\n",
+            ),
+        )
+        .unwrap();
+        let info = inspect_profile(&profile).unwrap();
+        assert_eq!(info.tier_names(), ["high", "high-codex"]);
+        assert_eq!(info.client_of("high-codex"), Some("sol"));
+        assert_eq!(info.client("opus").unwrap().summary(), "claude:opus · high");
+        assert_eq!(info.client("sol").unwrap().summary(), "codex:gpt-6.1-sol");
     }
 
     #[test]
