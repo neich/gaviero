@@ -179,6 +179,8 @@ impl IterationEngine {
 
         let mut best: Option<(AgentManifest, usize)> = None;
         let mut detector = ConvergenceDetector::new();
+        // Every attempt is paid for; the returned manifest carries the sum.
+        let mut total_cost_usd = 0.0_f64;
 
         for attempt in 0..n_attempts {
             let unit = self.unit_for_attempt(&work_unit, attempt);
@@ -216,6 +218,7 @@ impl IterationEngine {
                 },
             };
 
+            total_cost_usd += manifest.cost_usd;
             let succeeded = manifest.status == AgentStatus::Completed;
             let file_count = manifest.modified_files.len();
 
@@ -225,6 +228,8 @@ impl IterationEngine {
             }
 
             if succeeded {
+                let mut manifest = manifest;
+                manifest.cost_usd = total_cost_usd;
                 return IterationResult {
                     manifest,
                     attempts_run: attempt + 1,
@@ -239,7 +244,7 @@ impl IterationEngine {
             }
         }
 
-        let (manifest, _) = best.unwrap_or_else(|| {
+        let (mut manifest, _) = best.unwrap_or_else(|| {
             (
                 AgentManifest {
                     work_unit_id: work_unit.id.clone(),
@@ -254,6 +259,7 @@ impl IterationEngine {
             )
         });
 
+        manifest.cost_usd = total_cost_usd;
         IterationResult {
             attempts_run: n_attempts,
             all_passed: false,
@@ -330,6 +336,8 @@ impl IterationEngine {
 
         let mut best: Option<(AgentManifest, usize)> = None;
         let mut detector = ConvergenceDetector::new();
+        // Every attempt is paid for; the returned manifest carries the sum.
+        let mut total_cost_usd = 0.0_f64;
 
         for attempt in 0..n_attempts {
             let unit = self.unit_for_attempt(&work_unit, attempt);
@@ -378,6 +386,7 @@ impl IterationEngine {
                 },
             };
 
+            total_cost_usd += manifest.cost_usd;
             let succeeded = manifest.status == AgentStatus::Completed;
             let file_count = manifest.modified_files.len();
 
@@ -386,6 +395,8 @@ impl IterationEngine {
             }
 
             if succeeded {
+                let mut manifest = manifest;
+                manifest.cost_usd = total_cost_usd;
                 return IterationResult {
                     manifest,
                     attempts_run: attempt + 1,
@@ -399,7 +410,7 @@ impl IterationEngine {
             }
         }
 
-        let (manifest, _) = best.unwrap_or_else(|| {
+        let (mut manifest, _) = best.unwrap_or_else(|| {
             (
                 AgentManifest {
                     work_unit_id: work_unit.id.clone(),
@@ -414,6 +425,7 @@ impl IterationEngine {
             )
         });
 
+        manifest.cost_usd = total_cost_usd;
         IterationResult {
             attempts_run: n_attempts,
             all_passed: false,
@@ -477,6 +489,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces_json: vec![],
             produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]
@@ -596,6 +609,61 @@ mod tests {
             .await;
         assert_eq!(result.attempts_run, 1);
         assert!(result.all_passed);
+    }
+
+    /// `best_of_N` pays for every attempt it runs; the manifest it returns
+    /// must say so, not just the winning (or last) attempt's cost.
+    #[tokio::test]
+    async fn best_of_n_reports_total_cost() {
+        let engine = IterationEngine::new(IterationConfig {
+            strategy: Strategy::BestOfN { n: 2 },
+            ..Default::default()
+        });
+        let mut unit = make_unit("t");
+        unit.max_retries = 0;
+
+        let result = engine
+            .run_with_backend_factory(
+                unit,
+                make_gate(),
+                Path::new("/tmp"),
+                None,
+                &[],
+                &NoopObserver,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
+                None,
+                |_unit| {
+                    Ok(Box::new(MockBackend::new(
+                        "failing",
+                        vec![
+                            UnifiedStreamEvent::Usage(crate::swarm::backend::TokenUsage {
+                                input_tokens: 1,
+                                output_tokens: 1,
+                                cost_usd: Some(0.25),
+                                duration_ms: None,
+                            }),
+                            UnifiedStreamEvent::Error("attempt failed".into()),
+                            UnifiedStreamEvent::Done(StopReason::Error),
+                        ],
+                    )) as Box<dyn crate::swarm::backend::AgentBackend>)
+                },
+            )
+            .await;
+
+        assert_eq!(result.attempts_run, 2);
+        assert!(
+            (result.manifest.cost_usd - 0.5).abs() < 1e-9,
+            "two attempts at $0.25 each, got {}",
+            result.manifest.cost_usd
+        );
     }
 
     #[tokio::test]
