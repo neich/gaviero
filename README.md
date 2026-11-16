@@ -115,22 +115,16 @@ review src/auth/session.rs for race conditions
 **DSL workflow** (`review.gaviero`):
 
 ```gaviero
-client sonnet { tier cheap     model "claude:sonnet" effort low  default }
-client opus   { tier expensive model "claude:opus"   effort high }
-
-tier cheap     sonnet
-tier expensive opus
-
 agent reviewer {
     description "Review the PR and identify issues"
-    client opus
+    tier high
     scope { read_only ["src/" "tests/"] }
     prompt "Review {{PROMPT}} and list all bugs and style issues."
 }
 
 agent fixer {
     description "Fix all issues found by the reviewer"
-    client sonnet
+    tier medium
     depends_on [reviewer]
     scope { owned ["src/" "tests/"] impact_scope true }
     prompt "Fix every issue in the reviewer's list."
@@ -142,8 +136,20 @@ workflow review_and_fix {
 }
 ```
 
+A script names tiers only; a model profile (`.gaviero/dsl/profiles/default.gaviero`, see [the shipped one](crates/gaviero-dsl/examples/profiles/default.gaviero)) says which model each tier is:
+
+```gaviero
+client sonnet { model "claude:sonnet" effort medium privacy public }
+client opus   { model "claude:opus"   effort high   privacy public }
+
+tier medium sonnet
+tier high   opus
+```
+
 ```bash
 gaviero-cli --script review.gaviero --prompt "the auth module"
+gaviero-cli --script review.gaviero --prompt "the auth module" --tier fixer=high   # one agent, one run
+gaviero-cli --script review.gaviero --prompt "the auth module" --profile codex     # every model at once
 ```
 
 **Skills** — turn-scoped instruction templates under `.gaviero/skills/<name>/SKILL.md`, invoked in chat with `$skill-name`. They are found in each folder's `.gaviero/skills/`, in the workspace's — the `.gaviero/skills/` beside the `.gaviero-workspace` file, also for a one-folder workspace or a member folder opened on its own — and in the global `$GAVIERO_ROOT/.gaviero/skills/` (folder beats workspace beats global). Adding or removing a skill is picked up while gaviero runs, even when the `skills/` directory is created after launch. Use `/skills` to list or `/skills search <query>` for semantic discovery; `/skills` also lists every folder it scanned and each skill it could not load, with the reason (a missing `description`, a frontmatter `name` that differs from the folder name, a folder name outside `A-Za-z0-9_-`). `SKILL.md` may be any letter case, start with a BOM, and use YAML block values (`description: >`). Optional `skills.extraRoots` (array of paths, default `[]`, `~` expanded) adds foreign roots such as `~/.claude/skills` or `~/.codex/skills`; a missing configured root is a chat warning, not a silent skip.

@@ -28,8 +28,10 @@
 // Probe a single client (used by the wrapper for fail-fast):
 //   --workflow probe-claude | probe-codex | probe-cursor
 //
-// To change a model, edit the `client` blocks below (e.g. claude:haiku for an
-// even cheaper probe). Effort is kept low — this only checks connectivity.
+// Each probe runs on a provider-pinned tier of the model profile
+// (`low-claude`, `low-codex`, `low-cursor` in the shipped default profile).
+// To change a model, edit the profile, or move one probe with
+// `--tier probe_codex=medium-codex`.
 
 vars {
     OUT_DIR    "."
@@ -37,29 +39,6 @@ vars {
     // What each probe should do. Override per server's tool surface, e.g.
     //   --var PROBE_TASK="Call search_papers with query \"attention\", limit 1."
     PROBE_TASK "List the tools this server exposes, then call exactly one safe, read-only tool with a minimal argument and capture its raw response."
-}
-
-// ── Clients ──────────────────────────────────────────────────────────────────
-// Top-level (not workflow params) so every workflow in this file — including
-// the single-client ones — resolves them regardless of which `--workflow` runs.
-
-client claude_probe {
-    model "claude:sonnet"
-    privacy public
-    effort low
-    default
-}
-
-client codex_probe {
-    // Luna is the fast/affordable GPT-5.6 tier — right for a connectivity probe.
-    model "codex:gpt-5.6-luna"
-    privacy public
-    effort low
-}
-
-client cursor_probe {
-    model "cursor:composer-2.5"
-    privacy public
 }
 
 // ── Probe prompt (shared) ────────────────────────────────────────────────────
@@ -89,7 +68,7 @@ prompt probe-body #"
 
 agent probe_claude {
     description "MCP probe via Claude: {{MCP_SERVER}}"
-    client claude_probe
+    tier low-claude
     scope { owned ["{{OUT_DIR}}/probe_claude.probe"] }
     prompt probe-body
     max_retries 0
@@ -97,7 +76,7 @@ agent probe_claude {
 
 agent probe_codex {
     description "MCP probe via Codex: {{MCP_SERVER}}"
-    client codex_probe
+    tier low-codex
     scope { owned ["{{OUT_DIR}}/probe_codex.probe"] }
     prompt probe-body
     max_retries 0
@@ -105,7 +84,7 @@ agent probe_codex {
 
 agent probe_cursor {
     description "MCP probe via Cursor: {{MCP_SERVER}}"
-    client cursor_probe
+    tier low-cursor
     scope { owned ["{{OUT_DIR}}/probe_cursor.probe"] }
     prompt probe-body
     max_retries 0

@@ -151,9 +151,9 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--prompt` | `<text>` | Inline text replacing every `{{PROMPT}}` (requires `--script`) |
 | `--prompt-file` | `<path>` | File contents replacing every `{{PROMPT}}` (requires `--script`) |
 | `--var` | `KEY=VALUE` | Override a `vars {}` entry (repeatable, requires `--script`) |
-| `--param` | `NAME=VALUE` | Supply a workflow `param` (repeatable, requires `--script`) |
-| `--profile` | `<name|path>` | Model profile from `.gaviero/dsl/profiles/` or a file path (`client` + `tier` only; requires `--script`; conflicts with `--tiers-file`) |
-| `--tiers-file` | `<path>` | Tier overrides (`tier <role> <client>` lines only; requires `--script`) |
+| `--param` | `NAME=VALUE` | Supply a workflow list `param`: `id=tier,…`, ids, or a list literal (repeatable, requires `--script`) |
+| `--profile` | `<name|path>` | Model profile from `.gaviero/dsl/profiles/` or a file path (`client` + `tier` only; requires `--script`); default: the profile named `default` |
+| `--tier` | `AGENT=TIER` | Run one agent on another tier; beats the workflow's `tiers { }` entry (repeatable; requires `--script`) |
 | `--coordinated` | — | Emit a reviewable plan and exit (requires `--task`) |
 | `--output` | `<path>` | Save the generated plan (`--coordinated` only) |
 
@@ -204,7 +204,7 @@ instead of overwriting it** — no flag required:
 gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
   --workflow feature-plan-refinement \
   --prompt-file brief.md --var OUT_DIR=plans/my-feature \
-  --param roster=claude=claude:opus@max,codex=codex:gpt-5.6-sol@high
+  --param roster=claude=top-claude,codex=high-codex
 
 # Same command again: detects v3, resumes at v4 reading the v3 plans
 ```

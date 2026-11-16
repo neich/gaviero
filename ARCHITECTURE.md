@@ -53,9 +53,9 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 `acp`, `agent_session` (+ `tool_agent/`), `context_planner`, `diff_engine`, `git`, `git_conflict`, `history`, `indent`, `iteration`, `mcp`, `memory`, `observer`, `path_pattern`, `query_loader`, `repo_map` (+ topology / symbol enrichment), `scope_enforcer`, `session_state`, `skills`, `swarm` (+ backends incl. `deepseek`), `terminal`, `tree_sitter`, `types`, `util`, `validation_gate`, `workspace`, `write_gate`.
 
-### DSL (9) — [`lib.rs`](crates/gaviero-dsl/src/lib.rs)
+### DSL (11) — [`lib.rs`](crates/gaviero-dsl/src/lib.rs)
 
-`ast`, `compiler`, `reviewers`, `workflow_params`, `error`, `lexer`, `parser`, `resolver`, `tiers`.
+`ast`, `compiler`, `reviewers`, `workflow_params`, `error`, `lexer`, `parser`, `resolver`, `profile`, `patterns`, `inspect`. A script names tiers only; the model profile (`profile.rs`) is the one place a tier becomes a model.
 
 ### Other crates
 
@@ -165,10 +165,9 @@ pub use ::tree_sitter::{Language, Parser, Tree, Node, Query, QueryCursor, Point,
 
 // gaviero-dsl
 pub fn compile(...) -> Result<CompiledPlan, miette::Report>;
-pub fn compile_with_vars(..., override_vars, override_tiers, override_params) -> …;
-pub fn compile_file(..., override_vars, override_tiers, override_params) -> …;
+pub fn compile_with_vars(source, filename, profile, ..., override_vars, agent_tiers, override_params) -> …;
+pub fn compile_file_with_profile(path, profile, ..., override_vars, agent_tiers, override_params) -> …;
 pub fn workflow_execution_mode(...) -> Result<ExecutionMode, miette::Report>;
-pub use tiers::load_tier_overrides;
 ```
 
 Binaries expose no library API.

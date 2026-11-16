@@ -9,7 +9,7 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-Examples: **11** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `doc-cursor`) + **3** model profiles (`claude`, `codex`, `mixed`) under [`examples/`](examples/).
+Examples: **12** workflows + **4** model profiles (`default`, `claude`, `codex`, `mixed`) under [`examples/`](examples/).
 
 ## Architecture
 
@@ -19,24 +19,22 @@ Examples: **11** workflows + **3** tier overrides (`doc-claude`, `doc-codex`, `d
 |---|---|
 | [`ast.rs`](src/ast.rs) | AST types. **Authoritative** DSL surface — read before extending docs or the parser. |
 | [`lexer.rs`](src/lexer.rs) / [`parser.rs`](src/parser.rs) | Logos → chumsky → AST. |
-| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (cycles, tier resolution, var substitution). Scope overlap is validated at swarm runtime. |
-| [`workflow_params.rs`](src/workflow_params.rs) | `param` materialization: client params + roster expansion (`--param`). |
+| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (cycles, tier → profile client resolution, var substitution). Scope overlap is validated at swarm runtime. |
+| [`workflow_params.rs`](src/workflow_params.rs) | Workflow `tiers { }` + `--tier` (`apply_agent_tiers`), list `param`s and roster expansion (`--param`). |
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports only; impl lives in `workflow_params`. |
-| [`for_loops.rs`](src/for_loops.rs) | Private: `for <var> in <list> parallel/sequential` expansion (last pass of `workflow_params`). |
+| [`for_loops.rs`](src/for_loops.rs) | Private: `for <var> in <list> parallel/sequential` expansion (last pass of `workflow_params`); `for … in json` blocks are validated and lowered to their body agent + `WorkflowDecl::runtime_fors`, cloned at run time by core. |
 | [`resolver.rs`](src/resolver.rs) | `include` graph; drives `compile_file`. |
-| [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader (`tier` lines only). |
-| [`profile.rs`](src/profile.rs) | Merges a model profile (`client` + `tier`) into a resolved script. |
+| [`profile.rs`](src/profile.rs) | Merges a model profile (`client` + `tier`) into a resolved script; `reject_model_tables` refuses `client` / `tier <a> <c>` in scripts. |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette spans). |
 
 **Public API** ([`lib.rs`](src/lib.rs)):
 
-- `compile` / `compile_with_vars` / `compile_file` — `override_vars`, `override_tiers`, `override_params`.
-- `compile_file_with_profile` — `compile_file` plus a [`SelectedProfile`](../gaviero-core/src/script_profiles.rs).
-- `load_tier_overrides` — backs `--tiers-file`.
+- `compile` / `compile_with_vars` (inline, take a profile) / `compile_file` — `override_vars`, `agent_tiers` (`--tier`), `override_params`.
+- `compile_file_with_profile` — `compile_file` plus a [`SelectedProfile`](../gaviero-core/src/script_profiles.rs). Without a profile no tier is bound, so any script with agents fails to compile.
 - `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
 - `inspect_file` ([`inspect.rs`](src/inspect.rs)) — a script's inputs (workflows, params, vars, prompt use) without compiling; backs the TUI SWARM form.
 
-**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Item vars (`for` / roster) are substituted before agent, CLI and script vars. Tier: `--tiers-file` > chosen profile > script/includes `tier` lines > implicit `default` profile.
+**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Item vars (`for` / roster) are substituted before agent, CLI and script vars. Models — one way only: the profile (chosen, else the one named `default`) maps tiers to clients; an agent's tier is `--tier` > the workflow's `tiers { }` > its own required `tier`, and a list item's `tier` moves its clone. Scripts declare no clients or tier lines.
 
 Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](README.md).
 
@@ -55,9 +53,8 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 
 - **Never extend the AST without updating [`ast.rs`](src/ast.rs).** Drift between AST and parser is the top DSL bug source.
 - **`effort` is checked twice** ([`swarm/backend/effort.rs`](../gaviero-core/src/swarm/backend/effort.rs)): a misspelled name fails compilation (`is_known_effort`), and a wrong model + effort pair fails `preflight_plan_models` before any agent starts. Pairs are checked on the agents a run uses, so an unused client in a shared pool blocks nothing.
-- **Tier-override files contain `tier` lines only** ([`tiers.rs`](src/tiers.rs)). Reject other items with a diagnostic.
+- **Scripts choose models by tier only.** Every agent declares `tier`; `client` blocks and `tier <a> <c>` lines are profile-only (rejected in scripts and their includes by `reject_model_tables`); there are no model-valued params; list items and runtime JSON items carry `tier`, never `model` / `effort`. Do not add a second way.
 - **Profiles are closed model tables** ([`profile.rs`](src/profile.rs)): only `client` and `tier`, tiers point at the profile's own clients, and those clients are renamed on merge so they can never collide with the script's.
-- **`tier:<name>` is a model-spec form, not a provider.** It is accepted only where `workflow_params` reads a model (`param`, roster entries, `--param`), and cannot be combined with effort, privacy or extra.
 - **`include` is whole-file.** Inline paths (`compile`, `compile_with_vars`) must reject `include` and point callers to `compile_file`.
 - **Cycle detection lives in the resolver,** not the compiler.
 

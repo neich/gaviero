@@ -26,14 +26,16 @@
 //   gaviero-cli --script for_loops.gaviero --prompt "the release" \
 //     --param 'topics=[{id "db" focus "storage"} {id "net" focus "network"}]'
 //   gaviero-cli --script for_loops.gaviero --prompt "the release" --param topics=db,net
-
-client sonnet { model "claude:sonnet" effort medium default }
+//
+// An item may carry `tier <name>`: its clones run on that tier instead of
+// the body agent's (here `c` runs its analyst and reviewer on `high`).
 
 vars {
     OUT_DIR "for-loops"
 }
 
 agent analyst {
+    tier medium
     description "Analyse {{t.focus}} for {{PROMPT}}"
     scope { owned ["{{OUT_DIR}}/{{t.id}}-notes.md"] }
     produces ["{{OUT_DIR}}/{{t.id}}-notes.md"]
@@ -47,6 +49,7 @@ agent analyst {
 }
 
 agent editor {
+    tier medium
     description "Draft section {{t.id}}"
     scope {
         owned ["{{OUT_DIR}}/{{t.id}}-draft.md"]
@@ -60,6 +63,7 @@ agent editor {
 }
 
 agent summarizer {
+    tier medium
     description "Summarise every analysis"
     depends_on [analyst]
     scope {
@@ -72,6 +76,7 @@ agent summarizer {
 }
 
 agent reviewer {
+    tier medium
     description "Review the drafts ({{t.id}})"
     scope {
         owned ["{{OUT_DIR}}/{{t.id}}-review-v*.md"]
@@ -85,6 +90,7 @@ agent reviewer {
 }
 
 agent judge {
+    tier medium
     description "Decide whether the reviews agree"
     scope { read_only ["{{OUT_DIR}}/"] }
     prompt #"
@@ -98,7 +104,7 @@ workflow for-loops {
     param topics [
         { id "a" focus "storage" }
         { id "b" focus "network" }
-        { id "c" focus "ui" }
+        { id "c" focus "ui" tier high }
     ]
     steps [
         for t in topics parallel {
