@@ -243,8 +243,12 @@ fn open_form(app: &mut App, script: ScriptRow) {
             let profiles =
                 ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
                     .names();
-            app.swarm_dashboard.form =
-                Some(SwarmForm::new(script, inspection, folders, selected).with_profiles(profiles));
+            let mut form =
+                SwarmForm::new(script, inspection, folders, selected).with_profiles(profiles);
+            if let Some(previous) = app.swarm_dashboard.last_forms.get(&form.script.path) {
+                form.restore_from(previous);
+            }
+            app.swarm_dashboard.form = Some(form);
             app.swarm_dashboard.view = SwarmView::Form;
             reload_profile_info(app);
             refresh_form_warnings(app);
@@ -1156,6 +1160,17 @@ fn handle_run(app: &mut App, action: Action) {
             show_selected_diff(app);
             return;
         }
+        Action::InsertChar('r') if !dash.running => {
+            let script = dash
+                .last_script
+                .as_ref()
+                .and_then(|path| dash.last_forms.get(path))
+                .map(|form| form.script.clone());
+            if let Some(script) = script {
+                open_form(app, script);
+            }
+            return;
+        }
         Action::InsertChar('u') if !dash.running => {
             undo_pressed(app);
             return;
@@ -1751,6 +1766,69 @@ tier spare other
         });
         assert_eq!(model.as_deref(), Some("ollama:llama"));
         assert!(notes.contains("Tier local runs on client other"), "{notes}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_a_script_again_starts_from_the_values_of_its_last_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, _asked) = fake_ollama("custom_out/report.md");
+        let (mut app, mut rx) = app_with_script(&root, &url);
+
+        open_filled_form(&mut app);
+        handle_action(&mut app, Action::Tab);
+        for _ in 0.."default_out".len() {
+            handle_action(&mut app, Action::Backspace);
+        }
+        type_text(&mut app, "custom_out");
+        press_run(&mut app);
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Run);
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        // `r` on the finished run: the same values, ready to run again.
+        handle_action(&mut app, Action::InsertChar('r'));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Form);
+        assert_eq!(field_text(&app, "Prompt"), "the moon");
+        assert_eq!(field_text(&app, "OUT_DIR"), "custom_out");
+        assert!(app.swarm_dashboard.form.as_ref().unwrap().on_run_button());
+
+        // Picking the script from the list restores them too.
+        handle_escape(&mut app);
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Picker);
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(field_text(&app, "Prompt"), "the moon");
+        assert_eq!(field_text(&app, "OUT_DIR"), "custom_out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_run_keeps_its_values_for_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, mut rx) = app_with_script(&root, &silent_ollama());
+
+        open_filled_form(&mut app);
+        press_run(&mut app);
+        pump_until(&mut app, &mut rx, |a| {
+            matches!(a.swarm_dashboard.agents[0].status, AgentStatus::Running)
+        })
+        .await;
+        assert!(
+            handle_action_is_ignored_while_running(&mut app),
+            "`r` does nothing while the run is going"
+        );
+        handle_action(&mut app, Action::InsertChar('x'));
+        handle_action(&mut app, Action::InsertChar('x'));
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        handle_action(&mut app, Action::InsertChar('r'));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Form);
+        assert_eq!(field_text(&app, "Prompt"), "the moon");
+    }
+
+    /// Press `r` during a run; true when the run view stayed on screen.
+    fn handle_action_is_ignored_while_running(app: &mut App) -> bool {
+        handle_action(app, Action::InsertChar('r'));
+        app.swarm_dashboard.view == SwarmView::Run
     }
 
     #[tokio::test(flavor = "multi_thread")]

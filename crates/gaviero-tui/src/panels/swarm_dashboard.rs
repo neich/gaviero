@@ -5,6 +5,7 @@
 //! [`crate::app::swarm_run`]; every change arrives through the event loop as a
 //! [`SwarmUpdate`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -684,9 +685,54 @@ impl SwarmForm {
         }
     }
 
+    /// Take every value `previous` (this script's last run) was launched
+    /// with: the Folder / Workflow / Profile choices, the agent and tier rows,
+    /// and every typed input still on the form. Values for inputs the script
+    /// no longer has are dropped. Focus lands on Run.
+    pub fn restore_from(&mut self, previous: &SwarmForm) {
+        for role in [FieldRole::Folder, FieldRole::Workflow, FieldRole::Profile] {
+            let Some(name) = previous
+                .fields
+                .iter()
+                .find(|f| f.role == role)
+                .and_then(FormField::choice)
+            else {
+                continue;
+            };
+            if let Some(field) = self.fields.iter_mut().find(|f| f.role == role)
+                && let FieldValue::Choice { options, selected } = &mut field.value
+                && let Some(index) = options.iter().position(|o| o == name)
+            {
+                *selected = index;
+            }
+        }
+        self.profile_info = previous.profile_info.clone();
+        let (folder, workflow, profile) = (
+            self.selected_folder(),
+            self.selected_workflow(),
+            self.choice_of(FieldRole::Profile),
+        );
+        let mut fresh = self.build_fields(folder, workflow, profile, &previous.fields);
+        for field in &mut fresh {
+            if matches!(field.value, FieldValue::Choice { .. }) {
+                continue;
+            }
+            if let Some(old) = previous
+                .fields
+                .iter()
+                .find(|o| o.name == field.name && o.role == field.role && o.is_edited())
+            {
+                field.value = old.value.clone();
+            }
+        }
+        self.fields = fresh;
+        self.focus = self.fields.len();
+    }
+
     /// Rebuild every field from the current choices, keeping what the user
     /// typed or chose under the same name.
     fn rebuild(&mut self) {
+        let on_run = self.on_run_button();
         let focused = self.focus;
         let folder = self.selected_folder();
         let workflow = self.selected_workflow();
@@ -705,7 +751,11 @@ impl SwarmForm {
             }
         }
         self.fields = fresh;
-        self.focus = focused.min(self.fields.len());
+        self.focus = if on_run {
+            self.fields.len()
+        } else {
+            focused.min(self.fields.len())
+        };
     }
 
     /// The first field to type into. The Folder / Workflow / Profile
@@ -1441,6 +1491,11 @@ pub struct SwarmDashboardState {
     pub table_rect: Rect,
     pub detail_rect: Rect,
     wrapped: WrappedOutput,
+    /// The form each script was last launched with, by script path, so the
+    /// next run of that script starts from the same values (this session).
+    pub last_forms: HashMap<PathBuf, SwarmForm>,
+    /// Script of the run on screen, for `r`.
+    pub last_script: Option<PathBuf>,
 }
 
 impl SwarmDashboardState {
@@ -1474,6 +1529,8 @@ impl SwarmDashboardState {
             table_rect: Rect::default(),
             detail_rect: Rect::default(),
             wrapped: WrappedOutput::default(),
+            last_forms: HashMap::new(),
+            last_script: None,
         }
     }
 
@@ -1494,7 +1551,13 @@ impl SwarmDashboardState {
         self.running = true;
         self.abort = None;
         self.view = SwarmView::Run;
-        self.form = None;
+        // Kept, so running the script again starts from these values.
+        if let Some(mut form) = self.form.take() {
+            form.completion.reset();
+            form.error = None;
+            self.last_script = Some(form.script.path.clone());
+            self.last_forms.insert(form.script.path.clone(), form);
+        }
         self.script_label = script_label;
         self.run_root = Some(run_root);
         self.agents = planned
@@ -2285,7 +2348,7 @@ impl SwarmDashboardState {
         } else if self.running {
             "↑↓ agent  Enter expand  Tab scroll output  x stop"
         } else {
-            "Esc scripts  ↑↓ agent  Enter expand  d diff  u undo"
+            "Esc scripts  r run again  ↑↓ agent  Enter expand  d diff  u undo"
         }
     }
 
