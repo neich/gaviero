@@ -1399,9 +1399,16 @@ impl AgentEntry {
         }
     }
 
-    fn elapsed(&self) -> Option<Duration> {
+    /// Run time so far, or the frozen time once finished.
+    pub fn elapsed(&self) -> Option<Duration> {
         self.finished_after
             .or_else(|| self.started_at.map(|s| s.elapsed()))
+    }
+
+    /// Bumped on every activity change, so a remote client can skip
+    /// output it already has.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn is_finished(&self) -> bool {

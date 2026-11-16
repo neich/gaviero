@@ -39,6 +39,8 @@ pub enum ClientFrame {
     TurnReviewAction(TurnReviewAction),
     /// 1.8 (`skill_completions`): catalog skills for a `$skill` invocation.
     RequestSkillCompletions(RequestSkillCompletions),
+    /// 1.10 (`swarm_activity`): the SWARM panel's run and one agent's output.
+    RequestSwarm(RequestSwarm),
 }
 
 impl ClientFrame {
@@ -64,6 +66,7 @@ impl ClientFrame {
         "read_file",
         "turn_review_action",
         "request_skill_completions",
+        "request_swarm",
     ];
 }
 
@@ -204,6 +207,21 @@ pub struct RequestSkillCompletions {
     /// Clamped server-side to 1–50; absent ⇒ 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Read the SWARM panel's run (1.10, `swarm_activity`). Polled; never moves
+/// the desktop's selection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RequestSwarm {
+    /// Agent whose output to return. Absent, or no longer in the run ⇒ the
+    /// agent selected on the desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// `output.token` from the previous reply. When the chosen agent's output
+    /// has not changed since, the reply carries `output.unchanged: true` and
+    /// no lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

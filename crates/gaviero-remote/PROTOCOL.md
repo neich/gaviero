@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.9 (1.0 frozen; 1.1 through 1.9 additive)
+# Gaviero Remote Protocol — v1.10 (1.0 frozen; 1.1 through 1.10 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,7 +8,7 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 9 }
+PROTOCOL_VERSION  = { major: 1, minor: 10 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
@@ -182,6 +182,7 @@ holds the current token.
 | `read_file` | `{ path }` — requires `file_browser`; reads one regular UTF-8 file, read-only. |
 | `turn_review_action` | `{ turn_id, action, path?, folder? }` — requires `turn_review` (1.2); see §1.2 additions; `folder` since 1.5 (§Turn review folders) |
 | `request_skill_completions` | `{ query, limit? }` — requires `skill_completions` (1.8); catalog skills for a `$skill` invocation |
+| `request_swarm` | `{ agent_id?, output_token? }` — requires `swarm_activity` (1.10); the desktop SWARM panel's run and one agent's output, read-only |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -220,7 +221,7 @@ share a folder name, each gains the nearest parent folder that tells them apart
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`; 1.8 adds `skill_completions`. Clients
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`; 1.8 adds `skill_completions`; 1.10 adds `swarm_activity`. Clients
 ignore unknown entries.
 
 ## DTOs
@@ -484,6 +485,58 @@ uses the desktop trigger — a `$` that starts the text or follows whitespace
 and is not escaped, with at least two characters typed and no space between it
 and the caret — and on tap replaces the token with `insert` plus a space.
 Older servers receive no skill completion requests.
+
+## Swarm activity (`swarm_activity` capability, 1.10)
+
+Servers advertising `swarm_activity` answer `request_swarm` with what the desktop SWARM panel
+(`Alt+w`) shows for its run: the header, one row per agent, and one agent's output. The desktop
+runs one script at a time, so there is at most one run; after it ends it stays readable until the
+next one starts. The view is read-only — there is no start, stop or undo command.
+
+`request_swarm`: `{ "agent_id": "scout", "output_token": "3:17" }`, both optional. `agent_id`
+picks whose output to return; absent, or not in the run, ⇒ the agent selected on the desktop
+(which follows the agent that started last until the user picks one). The phone's choice never
+moves the desktop selection. `output_token` is the `output.token` of the previous reply.
+
+The completed `command_result.result`:
+
+```json
+{ "run": { "run_id": 3, "script": "deep_explore", "phase": "running", "running": true,
+           "tier_current": 1, "tier_total": 3, "cost_usd": 0.042, "message": "",
+           "counts": { "running": 1, "queued": 1, "done": 0, "failed": 0 },
+           "agents": [ { "id": "scout", "status": "running", "error": null,
+                         "detail": "[Read src/main.rs]", "tier": "cheap",
+                         "backend": "claude:haiku", "elapsed_ms": 12000,
+                         "branch": null, "modified_files": [] } ] },
+  "selected_id": "scout",
+  "output": { "agent_id": "scout", "token": "3:17", "unchanged": false,
+              "lines": [ { "kind": "status", "text": "Running: reading" },
+                         { "kind": "text", "text": "Looking at the entry point…" },
+                         { "kind": "tool_call", "text": "[Read src/main.rs]" } ],
+              "truncated": false } }
+```
+
+No run since the desktop started ⇒ `{ "run": null, "selected_id": null, "output": null }`.
+
+- `phase` is the desktop's display string (`starting`, a pipeline phase, `completed`,
+  `completed with failures`, `failed`, `stopped`, `reverted`). `message` is the run-wide note the
+  desktop shows under the header (preparation notes, the failure, gate results); may be empty.
+- `status ∈ queued | running | completed | failed`; `error` is the reason when `failed`
+  (`not run`, `stopped`, … for agents a run never finished). `tier ∈ cheap | expensive | null`;
+  `backend` is the `provider:model` it was dispatched to, once known. `elapsed_ms` is the run time
+  at reply time (frozen once the agent finished; null before it started) — clients may tick it
+  locally for running agents between polls. `branch` and `modified_files` come from the agent's
+  manifest when the run completes.
+- `output.lines` are the agent's activity, oldest first: `text` (streamed answer, ANSI stripped;
+  may contain newlines), `tool_call`, `status` (state changes), `file_change` (`[wrote path +a -d]`).
+  At most the newest 64 KiB; `truncated: true` when older output was left out (the desktop itself
+  keeps 500 lines / 256 KiB per agent).
+- `output.token` changes whenever that agent's output changes (and with every new run). When the
+  request's `output_token` equals it, `output` is `{ agent_id, token, unchanged: true }` with no
+  `lines` — keep what you have. The header and agents are always sent in full.
+
+The Flutter client polls it about once a second while its Swarm section is on screen. Older
+servers receive no swarm requests.
 
 ## File browser (`file_browser` capability)
 
