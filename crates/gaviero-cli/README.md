@@ -154,6 +154,8 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--param` | `NAME=VALUE` | Supply a workflow list `param`: `id=tier,…`, ids, or a list literal (repeatable, requires `--script`) |
 | `--profile` | `<name|path>` | Model profile from `.gaviero/dsl/profiles/` or a file path (`client` + `tier` only; requires `--script`); default: the profile named `default` |
 | `--tier` | `AGENT=TIER` | Run one agent on another tier; beats the workflow's `tiers { }` entry (repeatable; requires `--script`) |
+| `--tier-client` | `TIER=CLIENT` | For this run, point a tier at another client of the selected profile; a tier the profile lacks is added (repeatable; requires `--script`) |
+| `--tier-effort` | `TIER=EFFORT` | For this run, run a tier at another effort (on its client, or the `--tier-client` one); other tiers sharing that client keep theirs (repeatable; requires `--script`) |
 | `--coordinated` | — | Emit a reviewable plan and exit (requires `--task`) |
 | `--output` | `<path>` | Save the generated plan (`--coordinated` only) |
 

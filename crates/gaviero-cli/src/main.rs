@@ -258,6 +258,23 @@ struct Cli {
     #[arg(long = "profile", value_name = "NAME|PATH", requires = "script")]
     profile: Option<String>,
 
+    /// Point one tier of the model profile at another of the profile's
+    /// clients for this run. Format: `TIER=CLIENT` (e.g. `--tier-client
+    /// high=sol` runs every `high` agent on the profile's `sol` client). A
+    /// tier the profile lacks is added. The profile file is not changed and
+    /// stays the only place a model is declared. Can be specified multiple
+    /// times. Only valid with `--script`.
+    #[arg(long = "tier-client", value_name = "TIER=CLIENT", requires = "script")]
+    tier_clients: Vec<String>,
+
+    /// Run one tier of the model profile at another effort for this run.
+    /// Format: `TIER=EFFORT` (e.g. `--tier-effort high=xhigh`). Applies to
+    /// the tier's client, or the one `--tier-client` gives it; other tiers on
+    /// the same client keep theirs. The model must offer that effort.
+    /// Can be specified multiple times. Only valid with `--script`.
+    #[arg(long = "tier-effort", value_name = "TIER=EFFORT", requires = "script")]
+    tier_efforts: Vec<String>,
+
     /// Print the N most recent retrieval manifests (Tier S / S4) and exit.
     /// Useful for auditing what memory was injected into recent chat turns.
     #[arg(long = "manifest-last")]
@@ -1393,14 +1410,30 @@ fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
 
 /// `--tier AGENT=TIER` pairs.
 fn parse_agent_tiers(raw: &[String]) -> Result<Vec<(String, String)>> {
+    parse_pairs(raw, "--tier", "AGENT=TIER")
+}
+
+/// `--tier-client TIER=CLIENT` and `--tier-effort TIER=EFFORT`, one override
+/// per tier.
+fn parse_tier_overrides(
+    clients: &[String],
+    efforts: &[String],
+) -> Result<Vec<gaviero_dsl::TierOverride>> {
+    Ok(gaviero_dsl::TierOverride::from_pairs(
+        &parse_pairs(clients, "--tier-client", "TIER=CLIENT")?,
+        &parse_pairs(efforts, "--tier-effort", "TIER=EFFORT")?,
+    ))
+}
+
+fn parse_pairs(raw: &[String], flag: &str, shape: &str) -> Result<Vec<(String, String)>> {
     raw.iter()
         .map(|s| {
-            let (agent, tier) = s
+            let (key, value) = s
                 .split_once('=')
-                .map(|(a, t)| (a.trim(), t.trim()))
-                .filter(|(a, t)| !a.is_empty() && !t.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("--tier `{s}`: expected AGENT=TIER"))?;
-            Ok((agent.to_string(), tier.to_string()))
+                .map(|(k, v)| (k.trim(), v.trim()))
+                .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{flag} `{s}`: expected {shape}"))?;
+            Ok((key.to_string(), value.to_string()))
         })
         .collect()
 }
@@ -4475,6 +4508,7 @@ async fn main() -> Result<()> {
         );
         let override_params = parse_param_overrides(&cli.params)?;
         let agent_tiers = parse_agent_tiers(&cli.agent_tiers)?;
+        let tier_overrides = parse_tier_overrides(&cli.tier_clients, &cli.tier_efforts)?;
         let profile = ProfileCatalog::scan(&workspace, &ScriptCatalog::global_scripts_dir())
             .select(
                 cli.profile.as_deref(),
@@ -4487,9 +4521,18 @@ async fn main() -> Result<()> {
         }
         // Resolves any `include "..."` directives transitively, so multi-file
         // scripts (shared clients/prompts/etc.) work here.
-        gaviero_dsl::compile_file_with_profile(
+        for o in &tier_overrides {
+            eprintln!(
+                "[tier] {} -> client {}, effort {}",
+                o.tier,
+                o.client.as_deref().unwrap_or("(profile's)"),
+                o.effort.as_deref().unwrap_or("(client's)")
+            );
+        }
+        gaviero_dsl::compile_file_with_models(
             script_path,
             profile.as_ref(),
+            &tier_overrides,
             cli.workflow.as_deref(),
             runtime_prompt.as_deref(),
             &override_vars,

@@ -114,6 +114,8 @@ The DSL has no runtime config — behaviour is declared in the script and adjust
 | Vars | `--var KEY=VALUE` | agent `vars {}` > CLI > script `vars {}` |
 | What each tier means | `--profile NAME\|PATH` | chosen profile, else the profile named `default` |
 | An agent's tier | `--tier AGENT=TIER` | CLI > workflow `tiers { }` > the agent's own `tier`; a list item's `tier` moves its clone |
+| A tier's model, this run | `--tier-client TIER=CLIENT` | Points a tier at another client **of the same profile** (adds the tier if the profile lacks it); the profile file is unchanged |
+| A tier's effort, this run | `--tier-effort TIER=EFFORT` | Runs that tier's client at another effort; other tiers on the same client are untouched |
 | Workflow list params | `--param NAME=VALUE` | Required params without defaults must be supplied |
 
 Provider resolution, memory namespaces, and verification execution are configured via `.gaviero/settings.json` on the `gaviero-core` side. See [gaviero-cli](../gaviero-cli/README.md#configuration).
@@ -144,6 +146,7 @@ A script chooses models in one way only: by tier. Tier names are free-form; `low
 - **Every agent declares its default tier** with `tier <name>`. An agent without one is a compile error.
 - **A workflow may move agents** to other tiers in its `tiers { <agent> <tier> … }` block; agents it does not name keep their own.
 - **A run may move agents** with `--tier AGENT=TIER`, which overrides the block.
+- **A run may rebind a tier** with `--tier-client TIER=CLIENT` to another client the profile declares, and change its effort with `--tier-effort TIER=EFFORT` (the SWARM form's Tiers rows do both). Models are still declared only in the profile.
 - **A list item's `tier`** (`{ id "a" tier top }`, `--param panel=a=top`) moves that item's clones; items without one keep their body agent's tier.
 
 ```gaviero

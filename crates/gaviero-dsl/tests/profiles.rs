@@ -332,3 +332,92 @@ fn compile_file_without_a_profile_names_the_fix() {
     let error = gaviero_dsl::compile_file(&script, None, None, &[], &[], &[]).unwrap_err();
     assert!(format!("{error:?}").contains("no model profile is bound"), "{error:?}");
 }
+
+/// A run can point a tier at another client of the same profile, or add a
+/// tier bound to one, without editing the profile file.
+#[test]
+fn a_run_rebinds_tiers_to_other_clients_of_the_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write(dir.path(), "s.gaviero", AGNOSTIC_SCRIPT);
+    let claude = chosen(write(dir.path(), "claude.gaviero", CLAUDE_PROFILE));
+    let rebind = |pairs: &[(&str, &str)], agent_tiers: &[(String, String)]| {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(t, c)| (t.to_string(), c.to_string()))
+            .collect();
+        gaviero_dsl::compile_file_with_models(
+            &script,
+            Some(&claude),
+            &gaviero_dsl::TierOverride::from_pairs(&pairs, &[]),
+            None,
+            None,
+            &[],
+            agent_tiers,
+            &[],
+        )
+        .map_err(|report| format!("{report:?}"))
+    };
+
+    let plan = rebind(&[("low", "big")], &[]).unwrap();
+    assert_eq!(models(&plan)["worker"], pair("claude:fable", "max"));
+    assert_eq!(models(&plan)["planner"], pair("claude:fable", "max"));
+
+    // A tier the profile lacks is added, and an agent can be moved onto it.
+    let moved = [("planner".to_string(), "extra".to_string())];
+    let plan = rebind(&[("extra", "small")], &moved).unwrap();
+    assert_eq!(models(&plan)["planner"], pair("claude:haiku", "low"));
+
+    let error = rebind(&[("low", "nope")], &[]).unwrap_err();
+    assert!(error.contains("no client `nope`"), "{error}");
+    assert!(error.contains("it has: small"), "{error}");
+}
+
+/// A run can change a tier's effort, alone or with its client, without
+/// touching the client the other tiers share.
+#[test]
+fn a_run_changes_the_effort_of_one_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write(
+        dir.path(),
+        "s.gaviero",
+        "agent worker { tier low prompt \"w\" }\nagent other { tier same prompt \"o\" }\n",
+    );
+    let profile = chosen(write(
+        dir.path(),
+        "p.gaviero",
+        concat!(
+            "client small { model \"claude:haiku\" effort low }\n",
+            "client big { model \"claude:fable\" effort max }\n",
+            "tier low small\ntier same small\n",
+        ),
+    ));
+    let run = |clients: &[(&str, &str)], efforts: &[(&str, &str)]| {
+        let owned = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        gaviero_dsl::compile_file_with_models(
+            &script,
+            Some(&profile),
+            &gaviero_dsl::TierOverride::from_pairs(&owned(clients), &owned(efforts)),
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+        )
+        .map(|plan| models(&plan))
+        .map_err(|report| format!("{report:?}"))
+    };
+
+    let effort_only = run(&[], &[("low", "high")]).unwrap();
+    assert_eq!(effort_only["worker"], pair("claude:haiku", "high"));
+    assert_eq!(effort_only["other"], pair("claude:haiku", "low"), "the shared client is untouched");
+
+    let both = run(&[("low", "big")], &[("low", "medium")]).unwrap();
+    assert_eq!(both["worker"], pair("claude:fable", "medium"));
+
+    let error = run(&[], &[("low", "turbo")]).unwrap_err();
+    assert!(error.contains("unknown effort"), "{error}");
+    let error = run(&[], &[("nowhere", "high")]).unwrap_err();
+    assert!(error.contains("no tier `nowhere`"), "{error}");
+}

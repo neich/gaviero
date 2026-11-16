@@ -31,10 +31,12 @@ Examples: **12** workflows + **4** model profiles (`default`, `claude`, `codex`,
 
 - `compile` / `compile_with_vars` (inline, take a profile) / `compile_file` — `override_vars`, `agent_tiers` (`--tier`), `override_params`.
 - `compile_file_with_profile` — `compile_file` plus a [`SelectedProfile`](../gaviero-core/src/script_profiles.rs). Without a profile no tier is bound, so any script with agents fails to compile.
+- `compile_file_with_models` — plus `&[TierOverride]` (`--tier-client TIER=CLIENT`, `--tier-effort TIER=EFFORT`): per-run rebinding of a tier to another client **of the same profile** and/or another effort (`profile::rebind_tiers`; an effort clones the client as `<client>__<tier>` so tiers sharing it are untouched; unknown client or effort = error; a missing tier is added only with a client).
+- `inspect_profile` — a profile's clients (model, effort) and tier bindings; `ScriptInspection::agent_tiers(workflow)` — the agents a workflow runs and their default tier. Both back the SWARM form's Agents / Tiers rows.
 - `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
 - `inspect_file` ([`inspect.rs`](src/inspect.rs)) — a script's inputs (workflows, params, vars, prompt use) without compiling; backs the TUI SWARM form.
 
-**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Item vars (`for` / roster) are substituted before agent, CLI and script vars. Models — one way only: the profile (chosen, else the one named `default`) maps tiers to clients; an agent's tier is `--tier` > the workflow's `tiers { }` > its own required `tier`, and a list item's `tier` moves its clone. Scripts declare no clients or tier lines.
+**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Item vars (`for` / roster) are substituted before agent, CLI and script vars. Models — one way only: the profile (chosen, else the one named `default`) maps tiers to clients; an agent's tier is `--tier` > the workflow's `tiers { }` > its own required `tier`, and a list item's `tier` moves its clone; `--tier-client` / `--tier-effort` may point a tier at another of the profile's own clients and change its effort for one run. Scripts declare no clients or tier lines.
 
 Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](README.md).
 
