@@ -1242,7 +1242,6 @@ pub async fn execute(
                     unit
                 };
 
-                let sem = semaphore.clone();
                 let root = config.workspace_root.clone();
                 let mem = memory.clone();
                 let ns: Vec<String> = unit
@@ -1277,8 +1276,10 @@ pub async fn execute(
                     root.clone()
                 };
 
+                let permit =
+                    claim_slot(&semaphore, observer, unit_id, &unit.description).await?;
                 handles.push(AbortOnDrop(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
+                    let _permit = permit;
 
                     invalidate_stale_sources(&mem, &unit, &root).await;
 
@@ -2067,7 +2068,6 @@ pub async fn execute(
                     AbortOnDrop<anyhow::Result<AgentManifest>>,
                 )> = Vec::new();
                 for (agent_id, unit, agent_root, branch_override) in prepared {
-                    let sem = semaphore.clone();
                     let mem = memory.clone();
                     let ns: Vec<String> = unit
                         .read_namespaces
@@ -2091,11 +2091,13 @@ pub async fn execute(
                     let in_worktree = worktree_mgr.is_some();
                     let override_branch_name = branch_override.as_ref().map(|ov| ov.branch.clone());
 
+                    let permit =
+                        claim_slot(&semaphore, observer, &agent_id, &unit.description).await?;
                     handles.push((
                         agent_id.clone(),
                         unit.clone(),
                         AbortOnDrop(tokio::spawn(async move {
-                            let _permit = sem.acquire().await.unwrap();
+                            let _permit = permit;
                             let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
                                 WriteMode::AutoAccept,
                                 Box::new(NoopWriteGateObserver),
@@ -4328,6 +4330,25 @@ fn warn_unreported_budget_costs(plan: &CompiledPlan, observer: &dyn SwarmObserve
     observer.on_phase_changed(&msg);
 }
 
+/// Take a `max_parallel` slot for a unit about to be spawned, then report it
+/// running. The dispatcher does this, not the task: the observer cannot move
+/// into the task, and "queued" must mean "waiting for a slot". The permit
+/// goes into the task, so the dispatcher never holds one while it waits.
+async fn claim_slot(
+    semaphore: &Arc<Semaphore>,
+    observer: &dyn SwarmObserver,
+    unit_id: &str,
+    detail: &str,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let permit = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .context("swarm dispatch semaphore closed")?;
+    observer.on_agent_state_changed(unit_id, &AgentStatus::Running, detail);
+    Ok(permit)
+}
+
 /// Everything a dynamically materialised unit needs to run, borrowed from
 /// `execute`. Dynamic units — runtime `for` clones and `pattern map_reduce`
 /// workers — are not plan nodes, so they run outside the tier loop, in the
@@ -4407,6 +4428,14 @@ where
         }
     }
 
+    // Every unit is listed as queued before the first one takes a slot.
+    for unit in &units {
+        if !(resume_skip && exec_state.status(&unit.id) == NodeStatus::Completed) {
+            ctx.observer
+                .on_agent_state_changed(&unit.id, &AgentStatus::Pending, "queued");
+        }
+    }
+
     let mut handles: Vec<(String, WorkUnit, AbortOnDrop<AgentManifest>)> = Vec::new();
     for unit in units {
         if let Some(reason) = ctx.limits.exhausted(spent_usd(all_manifests)) {
@@ -4425,11 +4454,9 @@ where
                 unit.id
             );
         }
+        let permit = claim_slot(&ctx.semaphore, ctx.observer, &unit.id, &unit.description).await?;
         exec_state.set_status(&unit.id, NodeStatus::Running);
-        ctx.observer
-            .on_agent_state_changed(&unit.id, &AgentStatus::Pending, "queued");
 
-        let sem = ctx.semaphore.clone();
         let root = ctx.config.workspace_root.clone();
         let mem = ctx.memory.clone();
         let ns: Vec<String> = unit
@@ -4452,7 +4479,7 @@ where
         let skill_catalog = ctx.config.skill_catalog.clone();
         let task_unit = unit.clone();
         let handle = AbortOnDrop(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let _permit = permit;
             invalidate_stale_sources(&mem, &task_unit, &root).await;
             let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
                 WriteMode::AutoAccept,
@@ -4615,6 +4642,12 @@ where
             .collect(),
         None => clones.clone(),
     };
+    // The template's row is the barrier: it runs while its clones do.
+    ctx.observer.on_agent_state_changed(
+        &op.unit_id,
+        &AgentStatus::Running,
+        &format!("{} item(s)", clones.len()),
+    );
     run_dynamic_units(
         dispatched,
         pass.is_none(),

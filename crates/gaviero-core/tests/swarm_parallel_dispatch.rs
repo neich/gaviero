@@ -88,6 +88,44 @@ impl SwarmObserver for QuietObserver {
     fn on_completed(&self, _result: &gaviero_core::swarm::models::SwarmResult) {}
 }
 
+/// Records every agent status change as `(id, "pending" | "running" | …)`.
+#[derive(Default)]
+struct RecordingObserver {
+    states: std::sync::Mutex<Vec<(String, &'static str)>>,
+}
+
+impl RecordingObserver {
+    /// The statuses `id` went through, in order.
+    fn of(&self, id: &str) -> Vec<&'static str> {
+        self.states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(agent, _)| agent == id)
+            .map(|(_, status)| *status)
+            .collect()
+    }
+}
+
+impl SwarmObserver for RecordingObserver {
+    fn on_phase_changed(&self, _phase: &str) {}
+    fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, _detail: &str) {
+        let label = match status {
+            AgentStatus::Pending => "pending",
+            AgentStatus::Running => "running",
+            AgentStatus::Completed => "completed",
+            AgentStatus::Failed(_) => "failed",
+        };
+        self.states
+            .lock()
+            .unwrap()
+            .push((work_unit_id.to_string(), label));
+    }
+    fn on_tier_started(&self, _current: usize, _total: usize) {}
+    fn on_merge_conflict(&self, _branch: &str, _files: &[String]) {}
+    fn on_completed(&self, _result: &gaviero_core::swarm::models::SwarmResult) {}
+}
+
 struct NoopAcpObserver;
 impl AcpObserver for NoopAcpObserver {
     fn on_stream_chunk(&self, _text: &str) {}
@@ -364,4 +402,97 @@ async fn a_loop_whose_first_pass_ran_in_parallel_iterates() {
         "y must run on pass 1 and pass 2, saw {}",
         count_containing(&prompts, "MARK-YYY")
     );
+}
+
+/// Each run must be reported: a unit that finished without a `running` just
+/// before it shows as queued for its whole run in the SWARM panel.
+fn assert_each_run_reported(statuses: &[&str], id: &str, runs: usize) {
+    let running = statuses.iter().filter(|s| **s == "running").count();
+    assert_eq!(running, runs, "{id} reported running {running} times: {statuses:?}");
+    for (i, status) in statuses.iter().enumerate() {
+        if *status == "completed" {
+            assert!(
+                i > 0 && statuses[i - 1] == "running",
+                "{id} completed without running first: {statuses:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn parallel_tier_agents_are_reported_running_even_when_waiting_for_a_slot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+    std::fs::create_dir_all(workspace.join("out")).unwrap();
+    let server = MockServer::start().await;
+    answer(&server, "MARK-AAA", "out/a.md").await;
+    answer(&server, "MARK-BBB", "out/b.md").await;
+    answer(&server, "MARK-DDD", "out/d.md").await;
+    // Three units in one tier, two slots: one of them must wait.
+    let mut plan = CompiledPlan::from_work_units(
+        vec![
+            unit("a", &["out/a.md"], "Write. MARK-AAA", &[]),
+            unit("b", &["out/b.md"], "Write. MARK-BBB", &[]),
+            unit("d", &["out/d.md"], "Write. MARK-DDD", &[]),
+        ],
+        Some(2),
+    );
+    plan.execution_mode = ExecutionMode::Document;
+    let observer = RecordingObserver::default();
+
+    execute(
+        &plan,
+        &config_for(workspace, &server.uri(), 2),
+        None,
+        None,
+        &observer,
+        make_obs,
+    )
+    .await
+    .expect("run succeeds");
+
+    for id in ["a", "b", "d"] {
+        assert_eq!(
+            observer.of(id),
+            vec!["pending", "running", "completed"],
+            "{id}: queued, then running, then completed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn parallel_loop_pass_agents_are_reported_running_every_pass() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+    std::fs::create_dir_all(workspace.join("out")).unwrap();
+    let server = MockServer::start().await;
+    answer(&server, "MARK-XXX", "out/x.md").await;
+    answer(&server, "MARK-YYY", "out/y.md").await;
+    let mut plan = CompiledPlan::from_work_units(
+        vec![
+            unit("x", &["out/x.md"], "Iteration {{ITER}}. MARK-XXX", &[]),
+            unit("y", &["out/y.md"], "Iteration {{ITER}}. MARK-YYY", &[]),
+        ],
+        Some(2),
+    );
+    plan.execution_mode = ExecutionMode::Document;
+    plan.loop_configs = vec![command_loop(&["x", "y"], 2)];
+    let observer = RecordingObserver::default();
+
+    let _ = execute(
+        &plan,
+        &config_for(workspace, &server.uri(), 2),
+        None,
+        None,
+        &observer,
+        make_obs,
+    )
+    .await;
+
+    let prompts = prompts_seen(&server).await;
+    for (id, marker) in [("x", "MARK-XXX"), ("y", "MARK-YYY")] {
+        let runs = count_containing(&prompts, marker);
+        assert!(runs >= 2, "{id} ran {runs} times");
+        assert_each_run_reported(&observer.of(id), id, runs);
+    }
 }
