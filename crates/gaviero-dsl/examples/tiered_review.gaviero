@@ -1,13 +1,17 @@
 // description: Provider-agnostic review; models come from the profile
 //
-// This script names no provider and declares no client: agents ask for a tier
-// (`low`, `medium`, `high`, `top`), and the profile says what each one means.
-// Run the same file on different models without editing it:
+// This script names no provider and declares no client: every agent asks
+// for a tier (`low`, `medium`, `high`, `top`), and the profile says what
+// each one means. Run the same file on different models without editing it:
 //
 //   gaviero-cli --script tiered_review.gaviero --profile claude --prompt "the auth module"
 //   gaviero-cli --script tiered_review.gaviero --profile mixed  --prompt "the auth module"
 //
-// `model "tier:<name>"` does the same for workflow params and rosters.
+// Three places choose a tier, and each beats the one before it:
+//   1. the agent's own `tier` — its default;
+//   2. the workflow's `tiers { }` block — this workflow moves `verdict`;
+//   3. `--tier <agent>=<tier>` on the command line, for one run.
+// A roster or list item's `tier` moves that item's clone.
 
 agent gather {
     description "List the files relevant to the review"
@@ -21,6 +25,7 @@ agent gather {
 
 agent reviewer_template {
     template true
+    tier high
     description "Review the listed files"
     scope { owned [".gaviero/review/{{REVIEWER_ID}}.md"] }
     prompt #"
@@ -31,7 +36,7 @@ agent reviewer_template {
 
 agent verdict {
     description "Decide whether the reviews agree"
-    client judge
+    tier low
     scope { read_only [".gaviero/review/**"] }
     prompt #"
         Read the reviews in .gaviero/review/ and reply with a verdict on
@@ -40,10 +45,12 @@ agent verdict {
 }
 
 workflow tiered_review {
-    param judge { model "tier:medium" }
+    tiers {
+        verdict medium
+    }
     param panel [
-        { id "first"  model "tier:high" }
-        { id "second" model "tier:top" }
+        { id "first" }
+        { id "second" tier top }
     ]
     steps [
         gather

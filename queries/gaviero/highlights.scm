@@ -30,6 +30,7 @@
 "steps" @keyword
 "max_parallel" @keyword
 "param" @keyword
+"tiers" @keyword
 "template" @keyword
 "id" @keyword
 
@@ -65,6 +66,8 @@
 "in" @keyword
 "parallel" @keyword
 "sequential" @keyword
+"json" @keyword
+"max" @keyword
 "peer_template" @keyword
 "agents" @keyword
 "reviewers" @keyword
@@ -109,6 +112,9 @@
 (step_list (identifier) @variable)
 (agent_field (identifier) @variable)
 (agent_field (tier_alias_name) @variable)
+(agent_tier (identifier) @variable)
+(agent_tier (tier_alias_name) @variable)
+(reviewer_field (tier_alias_name) @variable)
 (until_agent (identifier) @variable)
 
 ; ── Vars / extra pair keys ────────────────────────────────────

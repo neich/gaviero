@@ -25,6 +25,7 @@ fn unit(id: &str, owned: &[&str]) -> WorkUnit {
             read_only_paths: vec![],
             interface_contracts: HashMap::new(),
         },
+        produces_json: vec![],
         produces: vec![],
         depends_on: vec![],
         backend: Default::default(),

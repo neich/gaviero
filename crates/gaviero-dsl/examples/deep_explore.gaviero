@@ -1,0 +1,686 @@
+// description: Autonomous literature explorer — scouts a field through the academic MCP server, grows a frontier of questions, investigates, audits every claim, and reports
+//
+// What it does
+//
+//   0. `scout` maps the actively researched field before any question is
+//      asked — what is settled, what the research front is working on now,
+//      and where it is not looking: a dozen reformulated searches, citation
+//      graphs around the anchor papers, the newest work citing them, and
+//      one async Consensus review.
+//      It opens a per-run corpus collection on the academic server, so full
+//      texts are ingested in the background while the loop runs.
+//
+//   Each pass N of the loop:
+//   1. `curator` folds pass N-1 (findings + the audit of them) into the
+//      frontier, generates new avenues with explicit operators (decompose,
+//      falsify, bridge, analogy, recency, gap, method transfer), scores
+//      them, and picks a portfolio: exploit / explore / falsify.
+//      Writes frontier-vN.json, assignments-vN.json, journal + archive.
+//   2. `for q in json "…assignments-vN.json"` clones `investigator` once
+//      per assignment (`investigator@<id>`). Each runs a fixed research
+//      protocol on the academic server: corpus passages first, then search,
+//      full-text reading, backward + forward snowballing with citation
+//      contexts, retraction and venue checks, and one deliberate attempt
+//      to falsify its own best claim.
+//   3. `verifier` — on a different model family — audits every claim of
+//      the pass against the source itself: the work resolves, it is not
+//      retracted, and a passage in its full text says what the claim says.
+//      It also checks task fidelity (did the lane answer the question it
+//      was given, or a nearby easier one?). Writes audit-vN.json.
+//   4. `stop_judge` (read-only, another family) ends the loop when the
+//      frontier is exhausted or saturated — never because lanes agree.
+//
+//   Then `synthesize` writes the report from verified claims only, and
+//   `citation_check` resolves every reference in it once more.
+//
+// Why this shape (research/gaviero-dsl-autonomous-deep-research-2026-11-13-v2.md):
+//   an archive/frontier with recorded failures, explicit generation
+//   operators and a selection rule, an external auditor that checks claims
+//   against artefacts, critique and judging by a different family than
+//   the generator, fresh-context units well under an hour, a budget.
+//
+// The academic MCP server
+//
+//   Every agent calls the `academic` server (`--var ACADEMIC_SERVER=…` to
+//   rename). It must be listed in `mcp.extraServers` of
+//   .gaviero/settings.json and allowed by `mcp.permissions`. Claude agents
+//   see its tools as `mcp__academic__<tool>`. The tools used:
+//
+//     search_works      OpenAlex + Semantic Scholar + Europe PMC search;
+//                       with `collection`, queues open-access full text
+//     search_corpus     passage search over ingested full text
+//     get_fulltext      sections of a stored work (queues it when missing)
+//     resolve_work      any id / title → one merged record
+//     get_references    backward snowball (with_contexts)
+//     get_citations     forward snowball, newest first (with_contexts)
+//     citation_graph    subgraph around a work, or a whole collection
+//     expand_collection works cited by many papers of the collection but
+//                       not in it — the blind spots of the corpus
+//     check_retraction  Crossref / OpenAlex / PubMed retraction status
+//     search_evidence   Consensus: study design, sample size, takeaway
+//     start_review / get_review  async Consensus literature review
+//     get_author, get_journal, ingest_status, list_collections, server_status
+//
+//   The Consensus-backed tools go through the academic server, which
+//   holds the Consensus subscription; no key or switch lives here.
+//
+//   Throughput: the server is a URL server, and gaviero runs document-mode
+//   workflows with a remote MCP server one agent at a time (pipeline.rs:
+//   "document mode with remote MCP: reducing max_parallel … to 1"). Lanes
+//   of a pass therefore run in sequence; the curator sizes passes for that.
+//
+// Models
+//
+//   The script names no provider: every agent declares a tier and the
+//   model profile says what each one means — the `default` profile in
+//   .gaviero/dsl/profiles/ unless the run picks another (`--profile`).
+//   `verifier`, `stop_judge` and `citation_check` default to `medium`.
+//   Run them on a family different from the investigators', either with a
+//   profile whose `medium` is another provider (the shipped `mixed`
+//   profile: Codex against Claude lanes) or per run with `--tier`, e.g.
+//   `--tier verifier=medium-codex --tier stop_judge=medium-codex`.
+//   Set FALSIFY_TIER to a tier of your profile on another provider (e.g.
+//   `high-codex` in the shipped default profile) and the curator puts each
+//   falsification lane on it, against the family that made the claim.
+//
+// Inputs
+//
+//   The run's prompt is the research brief (SWARM form Prompt box, or
+//   `--prompt`). Name a document's path in it to build on that document.
+//   OUT_DIR        where every artefact goes (one directory per run)
+//   COLLECTION     academic-server collection; empty = the scout picks
+//                  `explore-<slug>` and records it in landscape.json
+//   FALSIFY_TIER   tier for falsification lanes; empty = the
+//                  investigator's own tier
+//
+//   gaviero-cli --script deep_explore.gaviero --prompt "<the research brief>"
+//   gaviero-cli --script deep_explore.gaviero --var OUT_DIR=research/explore-x \
+//       --tier verifier=medium-codex --tier stop_judge=medium-codex --prompt "…"
+//
+// Artefacts (all under OUT_DIR)
+//
+//   landscape.json / landscape.md         scout's field map (pass 0)
+//   frontier-vN.json                      every question: open / active / closed / dead / parked
+//   assignments-vN.json                   this pass's lanes (the `for` list)
+//   <id>-finding-vN.json                  one per lane, typed claims + search log
+//   audit-vN.json                         per-claim verification + pass metrics
+//   journal.md                            curator's decisions, one section per pass
+//   archive.md                            dead ends and why (never re-explored)
+//   report-draft.md, report.md, report-audit.md
+
+vars {
+    OUT_DIR         "research/explore"
+    COLLECTION      ""
+    ACADEMIC_SERVER "academic"
+    FALSIFY_TIER    ""
+}
+
+// ── Scout ─────────────────────────────────────────────────────────────────────
+
+prompt scout-body #"
+    You are the scout of an autonomous literature exploration. The field
+    is actively researched: many groups are publishing on it right now.
+    This run is not after a summary of that work — it is after avenues the
+    field is NOT already pursuing. So your map must show three things
+    precisely: what is settled, what the research front is working on
+    today (so the run does not re-propose it), and where nobody is
+    looking. Your map decides where the run starts; breadth and honesty
+    matter more than conclusions.
+
+    The research brief:
+    {{PROMPT}}
+
+    Tools: the `{{ACADEMIC_SERVER}}` MCP server (Claude names its tools
+    mcp__{{ACADEMIC_SERVER}}__<tool>). WebSearch / WebFetch only as a
+    fallback (see Failures). Budget: about 60 tool calls.
+
+    1. Call server_status to confirm the server is up.
+    2. Collection. If "{{COLLECTION}}" is non-empty use it; otherwise pick
+       `explore-<3-5 word slug of the brief>` and call list_collections to
+       make sure it is new (append -2, -3 … if not). Pass it as
+       `collection` on every search_works call of this run.
+    3. Decompose the brief into 4-8 facets: the core question, its
+       mechanisms, its measurements/methods, the populations or settings,
+       the competing explanations, and the adjacent fields that study the
+       same mechanism under another name. For each facet write 2-3 query
+       formulations in DIFFERENT vocabularies (the field's jargon, a
+       neighbouring field's jargon, plain language). LLM-chosen queries
+       collapse onto one vocabulary; that is the main way a scout misses
+       half a field.
+    4. Run search_works for every formulation (limit 20-30). Rerun the two
+       most important ones with year_min set to two years ago — the newest
+       work is what search ranks lowest.
+    5. Pick 3-6 anchor works: the most cited foundational work, the most
+       recent review, and the works several facets keep returning. For
+       each: resolve_work, then citation_graph (depth 2, max_nodes 60) and
+       get_citations sorted year_desc (limit 30). Anchors define the
+       field's clusters; their newest citers define its frontier.
+    6. Run search_evidence for the core question (limit 20) to see study
+       designs and sample sizes, and start ONE start_review (mode "pro")
+       on the core question. Do not wait for it; record its thread_id —
+       the curator collects it later.
+    7. Identify for the curator:
+         - settled: what the field treats as established, with the
+           strongest evidence for it;
+         - research front: the questions the last 2 years of work are
+           actively pursuing, and who is pursuing them. An avenue that is
+           already a research front is not new — the run may build on it
+           but must not re-propose it;
+         - clusters: groups of works that cite each other, with a label,
+           representative works and what each believes;
+         - live controversies: claims that citers dispute (look at
+           get_citations contexts: "in contrast to", "failed to
+           replicate", "however");
+         - leading groups/authors (get_author on 2-3 recurring names);
+         - stated open problems ("remains unknown", "future work");
+         - bridges: works cited from two clusters that rarely cite each
+           other — where new avenues usually are;
+         - blind spots: assumptions every cluster shares, methods or
+           populations nobody uses, results that stopped being followed
+           up, adjacent fields that study the same mechanism but are
+           never cited.
+       Seed questions come mostly from controversies, open problems,
+       bridges and blind spots — not from the research front.
+
+    Failures. If a tool times out or returns 429, wait and retry once,
+    then move on and record it. If the academic server is unreachable
+    altogether, use WebSearch/WebFetch, mark every source `channel: web`,
+    and say so in `channels`. Never invent a work, an id or a number.
+
+    Write {{OUT_DIR}}/landscape.json:
+    {"collection": "<name>",
+     "consensus_thread": "<thread_id or empty>",
+     "channels": {"academic": "ok|degraded|down", "web": "used|unused"},
+     "facets": [{"id": "f1", "label": "…", "queries": ["…"]}],
+     "anchors": [{"work_id": "<OpenAlex W-id or DOI>", "title": "…", "year": 0, "why": "…"}],
+     "settled": [{"claim": "…", "evidence": ["<id>"]}],
+     "research_front": [{"question": "…", "pursued_by": ["<author or group>"], "recent_works": ["<id>"]}],
+     "blind_spots": [{"text": "…", "why": "<what shows nobody is looking>"}],
+     "clusters": [{"id": "c1", "label": "…", "works": ["<id>"], "position": "…"}],
+     "controversies": [{"claim": "…", "for": ["<id>"], "against": ["<id>"]}],
+     "open_problems": [{"text": "…", "source": "<id>"}],
+     "bridges": [{"work_id": "…", "connects": ["c1", "c2"], "why": "…"}],
+     "groups": [{"author": "…", "openalex_id": "…", "focus": "…"}],
+     "seed_questions": [{"question": "…", "kind": "core|mechanism|method|contrarian|adjacent|gap|bridge|blind_spot", "why": "<evidence hook>"}],
+     "search_log": [{"tool": "…", "args": "…", "result": "<count or error>"}]}
+
+    And {{OUT_DIR}}/landscape.md: a one-page human-readable map of the
+    same, ending with the 8-15 seed questions you would ask first and the
+    evidence that makes each one promising.
+"#
+
+// ── Curator ───────────────────────────────────────────────────────────────────
+
+prompt curate-body #"
+    You curate an autonomous literature exploration. Pass {{ITER}}. You
+    are the only agent that sees the whole run; investigators see one
+    question each. Your job is to make the frontier grow where the
+    evidence is thin or surprising, and shrink where it is settled.
+
+    The research brief:
+    {{PROMPT}}
+
+    Read, in this order:
+      - {{OUT_DIR}}/landscape.json (the scout's map; it names the
+        collection to use);
+      - {{OUT_DIR}}/frontier-v{{PREV_ITER}}.json,
+        {{OUT_DIR}}/audit-v{{PREV_ITER}}.json and every
+        {{OUT_DIR}}/*-finding-v{{PREV_ITER}}.json (none exist on pass 1;
+        seed the frontier from landscape.json instead);
+      - {{OUT_DIR}}/archive.md and {{OUT_DIR}}/journal.md if they exist.
+
+    Tools: the `{{ACADEMIC_SERVER}}` MCP server, about 25 calls.
+
+    A. Merge the previous pass.
+       - A question becomes `closed` only when the audit marks the claims
+         that answer it `supported`. `partial` keeps it open with a
+         narrower wording; `not_supported` or `cannot_verify` never close
+         anything. A lane the audit flags for task substitution did not
+         answer its question: reopen it.
+       - Unresolvable or retracted sources: drop their claims and log
+         them in archive.md.
+       - Add each finding's `children` as candidate questions, with the
+         finding as parent and depth = parent depth + 1.
+       - Move a question to `dead` (and append a line to archive.md:
+         question, why, evidence) when two lanes found nothing usable, or
+         the literature cannot answer it (it needs an experiment nobody
+         ran — mark it `parked` instead and keep it for the report).
+       - If landscape.json has a consensus_thread and pass 1 or 2 has not
+         collected it yet, call get_review; when finished, mine it for
+         claims to check and questions to add.
+
+    B. Generate new avenues. Novel directions do not appear by asking
+       for "more questions"; apply each operator below to the current
+       state and keep only candidates with a concrete evidence hook:
+       - decompose: split a broad open question into testable parts;
+       - falsify: for the leading claim of the run, what result would
+         refute it — and has anyone looked?
+       - bridge: call expand_collection (dry_run true) on the collection —
+         works many of our papers cite but we have not read are blind
+         spots; also citation_graph on the collection to find clusters
+         that never cite each other;
+       - analogy: which other field studies the same mechanism under
+         another name?
+       - recency: what appeared in the last 12 months that cites our
+         anchors (get_citations year_desc on 1-2 anchors)?
+       - gap: open problems and "future work" statements found by lanes;
+       - method transfer: a method used in one cluster that would test a
+         claim of another.
+
+    C. Score and dedupe. Each open question gets scores 0-3 for
+       relevance to the brief, expected information gain (how much the
+       answer would change the report), novelty (distance from the
+       field's own research front in landscape.json — a question active
+       groups are already pursuing scores 0 — and from closed, dead and
+       archived questions — near-duplicates are merged, not re-asked),
+       and tractability (can literature answer it?).
+       priority = relevance + gain + novelty + tractability − depth.
+       Limits: depth ≤ 3; at most 40 questions ever created; each depth
+       level gets at most half the new questions of the level above.
+
+    D. Choose this pass's assignments — a portfolio, not a top-k:
+       - 1-2 exploit lanes: the highest-priority open questions;
+       - 1 explore lane: a high-novelty question from a bridge, analogy
+         or recency operator, even if its priority is lower;
+       - from pass 2 on, 1 falsify lane: attack the run's strongest
+         current claim. If "{{FALSIFY_TIER}}" is non-empty, give that lane
+         `"tier": "{{FALSIFY_TIER}}"` (a tier on another model family than
+         the investigators'); otherwise leave `tier` out. Never invent a
+         tier name: an unknown tier stops the run.
+       At most 5 lanes (lanes run one after another, ~40 min each). Fewer
+       when little is open. `[]` when nothing open is worth a lane.
+       Never assign a question already in archive.md.
+
+    Write {{OUT_DIR}}/frontier-v{{ITER}}.json:
+    {"pass": {{ITER}}, "collection": "<name>",
+     "questions": [{"id": "q7", "question": "…", "kind": "core|mechanism|method|contrarian|adjacent|gap|bridge|blind_spot",
+                    "operator": "seed|decompose|falsify|bridge|analogy|recency|gap|method_transfer|child",
+                    "parent": "<id or empty>", "depth": 0,
+                    "status": "open|active|closed|dead|parked",
+                    "scores": {"relevance": 0, "gain": 0, "novelty": 0, "tractability": 0}, "priority": 0,
+                    "visits": 0, "supported_claims": ["<finding id>#<claim index>"],
+                    "why": "<evidence hook>"}],
+     "leading_claims": ["<the run's current strongest verified claims>"],
+     "metrics": {"open": 0, "closed": 0, "dead": 0, "parked": 0, "created_total": 0}}
+
+    Write {{OUT_DIR}}/assignments-v{{ITER}}.json: a JSON array, one flat
+    object per lane, EVERY field present on every item (use "" when
+    empty) — a missing field stops the run:
+    [{"id": "<question id>-p{{ITER}}", "question": "…",
+      "lens": "exploit|explore|falsify",
+      "kind": "<as in frontier>",
+      "why": "<the evidence hook that makes this worth a lane>",
+      "start_from": "<2-5 work ids or DOIs to start from, comma-separated>",
+      "avoid": "<dead ends and already-settled points this lane must not redo>",
+      "done_when": "<what a sufficient answer looks like>"}]
+    A falsify lane may add "tier" (see D); no item names a model.
+
+    Append a `## Pass {{ITER}}` section to {{OUT_DIR}}/journal.md: what
+    the previous pass changed, which operators produced which questions,
+    why these lanes, and what you deliberately did not pursue.
+"#
+
+// ── Investigator ──────────────────────────────────────────────────────────────
+
+prompt investigate-body #"
+    You investigate one question of an autonomous literature exploration,
+    from a fresh context. Other lanes cover other questions; stay on yours.
+
+    The research brief (context only — your question is below):
+    {{PROMPT}}
+
+    Your assignment (lane {{q.index}} of {{q.count}}, pass {{ITER}}):
+      question:   {{q.question}}
+      lens:       {{q.lens}}   (exploit = answer it well; explore = map
+                  an unfamiliar direction and report what is there;
+                  falsify = try hard to refute the named claim)
+      kind:       {{q.kind}}
+      why:        {{q.why}}
+      start from: {{q.start_from}}
+      avoid:      {{q.avoid}}
+      done when:  {{q.done_when}}
+
+    Read {{OUT_DIR}}/landscape.json for the collection name and the
+    field map. Read other files under {{OUT_DIR}}/ only when you need them.
+
+    Tools: the `{{ACADEMIC_SERVER}}` MCP server (Claude:
+    mcp__{{ACADEMIC_SERVER}}__<tool>), at most 3 search_evidence calls.
+    Budget: about 45 tool calls; stop searching when two consecutive searches bring
+    nothing new, and write up.
+
+    Protocol:
+    1. Corpus first. search_corpus (collection = the run's) with 2-3
+       phrasings of the question: earlier lanes may already have ingested
+       the key texts.
+    2. Search. search_works with 3+ formulations in different vocabularies
+       (pass the collection, so open-access full texts get ingested for
+       the verifier), plus one with year_min two years back.
+    3. Read, do not skim. Pick the 3-6 works your answer will rest on and
+       read the relevant sections with get_fulltext (section = "results",
+       "discussion", "methods" …). A claim backed only by an abstract is
+       labelled `abstract_only`. If a work is not stored yet, get_fulltext
+       with the collection queues it; continue and check back at the end.
+    4. Snowball. For each load-bearing work: get_references (backward —
+       what it rests on) and get_citations sorted year_desc with
+       with_contexts true (forward — how the field received it; look for
+       disputes, failed replications, extensions). Follow at most 2 hops.
+    5. Weigh. check_retraction on every load-bearing source. When study
+       quality matters, search_evidence for design and sample size and
+       get_journal for the venue. Prefer primary studies and replications
+       over reviews; say when evidence is one group, one dataset or one
+       paper.
+    6. Falsify. Make at least one deliberate search for evidence against
+       your strongest claim ("failed to replicate", "no effect",
+       "contrary to", the opposite mechanism). Report what you found,
+       including nothing.
+    7. Propose. 1-3 child questions that your evidence makes promising —
+       each with the evidence hook (a dispute, a gap statement, an
+       unexpected result, a bridge). No generic "more research is needed".
+
+    Fidelity. If the question as asked cannot be answered from the
+    literature, say so and set fidelity to "narrowed" or "substituted"
+    with the reason. Answering a nearby easier question while presenting
+    it as the asked one is the failure this run audits for.
+
+    Failures. A timeout or 429: wait, retry once, then move on and log
+    it. If the academic server is down, use WebSearch/WebFetch and mark
+    those sources `channel: web`. Never invent a work, an id, a quote or
+    a number. Always write the file below, even if you found nothing —
+    set "outcome": "blocked" and explain.
+
+    Write {{OUT_DIR}}/{{q.id}}-finding-v{{ITER}}.json:
+    {"assignment_id": "{{q.id}}", "question": "<as assigned>",
+     "outcome": "answered|partial|nothing_found|blocked",
+     "fidelity": "exact|narrowed|substituted", "fidelity_note": "…",
+     "analysis_run": "<what you actually did, in 2-4 sentences>",
+     "answer": "<the direct answer, 3-8 sentences>",
+     "claims": [{"text": "<one checkable statement>",
+                 "work_id": "<OpenAlex W-id, DOI or arXiv id>", "title": "…", "year": 0,
+                 "locator": "<section name or passage anchor>",
+                 "quote": "<≤40 words copied from the source, or empty>",
+                 "evidence": "fulltext|abstract_only|citation_context|consensus",
+                 "strength": "replicated|single_study|review|preprint|contested",
+                 "confidence": "high|medium|low",
+                 "channel": "academic|web"}],
+     "counter_evidence": [{"text": "…", "work_id": "…"}],
+     "children": [{"question": "…", "kind": "…", "why": "<evidence hook>"}],
+     "dead_ends": [{"what": "…", "why": "…"}],
+     "search_log": [{"tool": "…", "args": "<short>", "result": "<count, hit or error>"}]}
+"#
+
+// ── Verifier ──────────────────────────────────────────────────────────────────
+
+prompt verify-body #"
+    You audit pass {{ITER}} of an autonomous literature exploration. You
+    are on a different model family from the investigators on purpose:
+    do not trust their summaries, check the sources. LLM research agents
+    routinely cite works that do not exist, cite real works for claims
+    they do not make, and answer an easier question than the one asked.
+
+    The research brief: {{PROMPT}}
+
+    Read {{OUT_DIR}}/assignments-v{{ITER}}.json and every
+    {{OUT_DIR}}/*-finding-v{{ITER}}.json listed there, plus
+    {{OUT_DIR}}/landscape.json for the collection name. If the assignment
+    list is empty, write the audit below with empty lists.
+
+    Tools: the `{{ACADEMIC_SERVER}}` MCP server, about 60 calls. If there
+    are more claims than you can check, check every claim marked
+    confidence high or that would close a question, then a sample of the
+    rest, and say which were sampled.
+
+    For each claim:
+    1. Existence: resolve_work on its work_id (or title + year). A work
+       that does not resolve, or whose title/year differ materially, is
+       `not_supported` with reason "unresolvable".
+    2. Status: check_retraction. Retracted → `not_supported`.
+    3. Support: find the passage. search_corpus (collection) with the
+       claim's wording, or get_fulltext of the work at the claimed
+       locator. Compare the claim with what the passage says — scope,
+       direction, magnitude, population. Label:
+         supported      the passage states it;
+         partial        the passage states a weaker or narrower version;
+         not_supported  the source does not say it, or says the opposite;
+         cannot_verify  no full text yet (the claim stays unverified and
+                        is rechecked next pass — say so).
+       Quote the passage you relied on (≤40 words).
+    4. Reception: for supported claims that would close a question, one
+       get_citations (with_contexts) look for later disputes.
+
+    For each finding: compare `analysis_run` and `answer` with the
+    assigned question. Flag `substituted` when it answered something else,
+    even if it said "exact". Flag claims that two lanes state in
+    contradiction.
+
+    Write {{OUT_DIR}}/audit-v{{ITER}}.json:
+    {"pass": {{ITER}},
+     "claims": [{"finding": "<assignment id>", "index": 0, "verdict": "supported|partial|not_supported|cannot_verify",
+                 "reason": "…", "passage": "<quote>", "checked_via": "corpus|fulltext|abstract|citations",
+                 "retracted": false, "resolved": true, "sampled": false}],
+     "fidelity": [{"finding": "<id>", "verdict": "exact|narrowed|substituted", "note": "…"}],
+     "contradictions": [{"a": "<id>#<i>", "b": "<id>#<i>", "note": "…"}],
+     "metrics": {"claims": 0, "checked": 0, "supported": 0, "partial": 0, "not_supported": 0,
+                 "cannot_verify": 0, "unresolvable": 0, "retracted": 0,
+                 "new_children": 0, "novel_children": 0},
+     "saturation": "<one sentence: did this pass add verified knowledge, or restate known points?>"}
+    `novel_children` counts children that are not near-duplicates of
+    questions already in {{OUT_DIR}}/frontier-v{{ITER}}.json or archive.md.
+"#
+
+// ── Stop judge ────────────────────────────────────────────────────────────────
+
+prompt stop-body #"
+    Decide whether an autonomous literature exploration should run another
+    pass. The research brief: {{PROMPT}}
+
+    Read {{OUT_DIR}}/frontier-v{{ITER}}.json (the questions as they stood
+    when this pass started), {{OUT_DIR}}/assignments-v{{ITER}}.json and
+    {{OUT_DIR}}/audit-v{{ITER}}.json (what this pass returned and how
+    much of it held up). Read findings only when the audit is ambiguous.
+    If {{OUT_DIR}}/audit-v{{PREV_ITER}}.json exists, compare the metrics.
+
+    Return pass (stop) only when one of these holds:
+      - exhausted: no open question has priority ≥ 6 that the literature
+        can answer, and this pass's children are not novel;
+      - saturated: this pass and the previous one each added fewer than 2
+        newly supported claims and fewer than 2 novel children;
+      - the brief's core questions all have supported answers and every
+        remaining open question is marginal to the brief.
+    Return fail (continue) otherwise — in particular when this pass opened
+    novel high-priority questions, or when key claims are still
+    cannot_verify and the next pass can check them.
+
+    Never stop because the lanes agree with each other: agreement between
+    language models is not evidence. Never continue only because questions
+    exist: some questions are parked for the report on purpose.
+
+    Reply with exactly one JSON object as your last output:
+    {"verdict": "pass" | "fail", "reason": "<one sentence citing the metrics>"}
+"#
+
+// ── Report ────────────────────────────────────────────────────────────────────
+
+prompt synth-body #"
+    Write the report of an autonomous literature exploration.
+
+    The research brief:
+    {{PROMPT}}
+
+    Inputs under {{OUT_DIR}}/: landscape.md / landscape.json, the latest
+    frontier-v*.json, every *-finding-v*.json, every audit-v*.json,
+    journal.md and archive.md.
+
+    Use only claims some audit marked `supported` (or `partial`, stated
+    at the strength the audit found). A claim with no audit verdict, or
+    `cannot_verify`, may appear only in the "Unverified leads" section,
+    labelled as such. Do not add sources the run did not find.
+
+    Write {{OUT_DIR}}/report-draft.md with these sections:
+      ## Answer — the direct answer to the brief, 1-3 paragraphs.
+      ## Findings — one subsection per closed question, ranked by
+         relevance to the brief: the claim, the evidence (strength:
+         replicated / single study / review / preprint), the counter-
+         evidence, and references as [n].
+      ## New avenues — the directions this run opened that neither the
+         brief nor the field's current research front (landscape.json)
+         names: where each came from (bridge, analogy, blind spot, gap…),
+         why active groups are not already on it,
+         what evidence makes it promising, and the first study or
+         analysis that would test it.
+      ## Contested and open — live disputes, parked questions (what
+         experiment or data would answer them), and unverified leads.
+      ## How the field was explored — passes, lanes, operators used,
+         what was abandoned and why (from journal.md and archive.md).
+      ## Audit — claims checked, share supported / partial / not
+         supported / unverifiable, unresolvable or retracted sources,
+         task substitutions caught.
+      ## References — numbered; title, authors, venue, year, DOI or
+         OpenAlex id.
+"#
+
+prompt cite-body #"
+    You are the final citation check of an autonomous literature
+    exploration. Read {{OUT_DIR}}/report-draft.md and the audit files
+    {{OUT_DIR}}/audit-v*.json.
+
+    Tools: the `{{ACADEMIC_SERVER}}` MCP server.
+    1. resolve_work every entry of `## References`; fix wrong metadata,
+       remove entries that do not resolve and every sentence that relied
+       only on them.
+    2. check_retraction every entry.
+    3. For each sentence in Findings and New avenues that cites [n],
+       confirm an audit verdict supports it; when none does, move the
+       sentence to "Unverified leads" or soften it to what the audit
+       found.
+
+    Write {{OUT_DIR}}/report.md (the corrected report) and
+    {{OUT_DIR}}/report-audit.md (each change you made and why, plus
+    references checked / fixed / removed).
+"#
+
+// ── Agents ────────────────────────────────────────────────────────────────────
+
+agent scout {
+    description "Map the field before the first question"
+    tier high
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/landscape.json"
+            "{{OUT_DIR}}/landscape.md"
+        ]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/landscape.md"]
+    produces json ["{{OUT_DIR}}/landscape.json"]
+    timeout 2400
+    prompt scout-body
+}
+
+agent curator {
+    description "Curate the frontier, pass {{ITER}}"
+    tier top
+    depends_on [scout]
+    scope {
+        owned [
+            "{{OUT_DIR}}/frontier-v*.json"
+            "{{OUT_DIR}}/assignments-v*.json"
+            "{{OUT_DIR}}/archive.md"
+            "{{OUT_DIR}}/journal.md"
+        ]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/journal.md"]
+    produces json [
+        "{{OUT_DIR}}/frontier-v{{ITER}}.json"
+        "{{OUT_DIR}}/assignments-v{{ITER}}.json"
+    ]
+    timeout 1800
+    prompt curate-body
+}
+
+agent investigator {
+    description "Investigate {{q.id}} ({{q.lens}})"
+    tier high
+    depends_on [curator]
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned ["{{OUT_DIR}}/{{q.id}}-finding-v*.json"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces json ["{{OUT_DIR}}/{{q.id}}-finding-v{{ITER}}.json"]
+    timeout 2400
+    prompt investigate-body
+}
+
+agent verifier {
+    description "Audit the claims of pass {{ITER}}"
+    tier medium
+    depends_on [investigator]
+    scope {
+        owned ["{{OUT_DIR}}/audit-v*.json"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces json ["{{OUT_DIR}}/audit-v{{ITER}}.json"]
+    timeout 2400
+    prompt verify-body
+}
+
+agent stop_judge {
+    description "Decide whether the frontier is exhausted"
+    tier medium
+    scope { read_only ["{{OUT_DIR}}/"] }
+    prompt stop-body
+}
+
+agent synthesize {
+    description "Write the report draft"
+    tier top
+    depends_on [verifier]
+    scope {
+        owned ["{{OUT_DIR}}/report-draft.md"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/report-draft.md"]
+    timeout 2400
+    prompt synth-body
+}
+
+agent citation_check {
+    description "Resolve every reference of the report"
+    tier medium
+    depends_on [synthesize]
+    scope {
+        owned [
+            "{{OUT_DIR}}/report.md"
+            "{{OUT_DIR}}/report-audit.md"
+        ]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces [
+        "{{OUT_DIR}}/report.md"
+        "{{OUT_DIR}}/report-audit.md"
+    ]
+    timeout 1800
+    prompt cite-body
+}
+
+workflow deep-explore {
+    execution_mode document
+    max_parallel 4
+    budget { wall "10h" usd 60 }
+    steps [
+        scout
+        loop {
+            agents [curator verifier]
+            for q in json "{{OUT_DIR}}/assignments-v{{ITER}}.json" parallel max 6 { investigator }
+            max_iterations 6
+            irreconcilable_after 0
+            strict_judge false
+            judge_timeout 300
+            until agent stop_judge
+        }
+        synthesize
+        citation_check
+    ]
+}

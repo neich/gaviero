@@ -10,8 +10,9 @@
 //     --var PROBLEM_FILE=consensus/problem.md \
 //     --var OUT_DIR=consensus_runs/latest
 //
-// Override the roster from the CLI (each entry is `id=provider:model[@effort]`):
-//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.6-sol@high,cursor=cursor:composer-2.5
+// Override the roster from the CLI (each entry is `id=tier`, a tier of the
+// run's model profile):
+//   --param roster=claude=top-claude,codex=high-codex,cursor=medium-cursor
 //
 // Modes (loop consensus_mode):
 //   strict      — only PASS ends early (after stability)
@@ -110,11 +111,11 @@ prompt judge-body #"
     ```
 "#
 
-// Reviewer agent templates. They have no `client` of their own — each
-// roster entry brings its model + effort, and the expansion pass binds the
-// cloned agent to an anonymous client built from that entry.
+// Reviewer agent templates. Their `tier` is the default; a roster entry's
+// `tier` replaces it for that reviewer's clones.
 agent reviewer-init {
     template true
+    tier high
     description "Initial conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
     scope {
         owned ["{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"]
@@ -125,6 +126,7 @@ agent reviewer-init {
 
 agent reviewer-refine {
     template true
+    tier high
     description "Refine conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
     scope {
         owned [
@@ -138,7 +140,7 @@ agent reviewer-refine {
 
 agent consensus-judge {
     description "Judge consensus: {{PROMPT}}"
-    client judge
+    tier medium
     scope {
         read_only ["{{OUT_DIR}}/"]
     }
@@ -146,16 +148,12 @@ agent consensus-judge {
 }
 
 workflow generic-consensus {
-    param judge {
-        model "claude:sonnet"
-        effort medium
-    }
     // Roster parameter — supplied externally. The default below runs a
     // two-reviewer panel (Claude + Codex) so the example works with no
     // CLI flag. Override via `--param roster=...` for a different panel.
     param roster [
-        { id "claude" model "claude:opus" effort max }
-        { id "codex"  model "codex:gpt-5.6-sol" effort high }
+        { id "claude" tier top-claude }
+        { id "codex"  tier high-codex }
     ]
 
     steps [

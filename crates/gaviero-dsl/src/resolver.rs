@@ -257,7 +257,7 @@ mod tests {
             "main.gaviero",
             r#"
                 include "lib.gaviero"
-                agent worker { client base prompt "hi" }
+                agent worker { tier base prompt "hi" }
                 workflow w { steps [worker] }
             "#,
         );

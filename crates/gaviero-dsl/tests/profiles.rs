@@ -1,4 +1,8 @@
 //! Model profiles: one provider-agnostic script, many sets of models.
+//!
+//! A profile is the only place a tier gets a model. A script names tiers:
+//! every agent declares one, a workflow's `tiers { }` block or `--tier`
+//! moves an agent to another, and a list item's `tier` moves its clone.
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,12 +44,14 @@ fn chosen(path: PathBuf) -> SelectedProfile {
     }
 }
 
-fn implicit(path: PathBuf) -> SelectedProfile {
-    SelectedProfile {
-        name: "default".into(),
-        path,
-        precedence: ProfilePrecedence::FillsGaps,
-    }
+fn compile_with(
+    script: &Path,
+    profile: Option<&SelectedProfile>,
+    agent_tiers: &[(String, String)],
+    params: &[(String, String)],
+) -> Result<CompiledPlan, String> {
+    compile_file_with_profile(script, profile, None, None, &[], agent_tiers, params)
+        .map_err(|report| format!("{report:?}"))
 }
 
 fn compile(
@@ -53,8 +59,7 @@ fn compile(
     profile: Option<&SelectedProfile>,
     params: &[(String, String)],
 ) -> Result<CompiledPlan, String> {
-    compile_file_with_profile(script, profile, None, None, &[], &[], params)
-        .map_err(|report| format!("{report:?}"))
+    compile_with(script, profile, &[], params)
 }
 
 /// (model, effort) of every unit, by id.
@@ -71,6 +76,10 @@ fn model_of(plan: &CompiledPlan, id: &str) -> String {
     models(plan)[id].0.clone().expect("unit has a model")
 }
 
+fn pair(model: &str, effort: &str) -> (Option<String>, Option<String>) {
+    (Some(model.into()), Some(effort.into()))
+}
+
 #[test]
 fn the_same_script_runs_on_different_providers_per_profile() {
     let dir = tempfile::tempdir().unwrap();
@@ -79,24 +88,12 @@ fn the_same_script_runs_on_different_providers_per_profile() {
     let mixed = chosen(write(dir.path(), "mixed.gaviero", MIXED_PROFILE));
 
     let on_claude = models(&compile(&script, Some(&claude), &[]).unwrap());
-    assert_eq!(
-        on_claude["worker"],
-        (Some("claude:haiku".into()), Some("low".into()))
-    );
-    assert_eq!(
-        on_claude["planner"],
-        (Some("claude:fable".into()), Some("max".into()))
-    );
+    assert_eq!(on_claude["worker"], pair("claude:haiku", "low"));
+    assert_eq!(on_claude["planner"], pair("claude:fable", "max"));
 
     let on_mixed = models(&compile(&script, Some(&mixed), &[]).unwrap());
-    assert_eq!(
-        on_mixed["worker"],
-        (Some("dsh:deepseek-flash".into()), Some("high".into()))
-    );
-    assert_eq!(
-        on_mixed["planner"],
-        (Some("codex:gpt-6-astra".into()), Some("xhigh".into()))
-    );
+    assert_eq!(on_mixed["worker"], pair("dsh:deepseek-flash", "high"));
+    assert_eq!(on_mixed["planner"], pair("codex:gpt-6-astra", "xhigh"));
 }
 
 #[test]
@@ -104,102 +101,55 @@ fn a_tier_nothing_binds_says_how_to_fix_it() {
     let dir = tempfile::tempdir().unwrap();
     let script = write(dir.path(), "s.gaviero", AGNOSTIC_SCRIPT);
     let error = compile(&script, None, &[]).unwrap_err();
-    assert!(error.contains("undefined tier alias"), "{error}");
-    assert!(error.contains("profile"), "{error}");
+    assert!(error.contains("no model profile is bound"), "{error}");
+    assert!(error.contains("--profile"), "{error}");
+
+    let partial = chosen(write(
+        dir.path(),
+        "p.gaviero",
+        "client small { model \"claude:haiku\" }\ntier low small\n",
+    ));
+    let error = compile(&script, Some(&partial), &[]).unwrap_err();
+    assert!(error.contains("uses tier `top`"), "{error}");
+    assert!(error.contains("it defines: low"), "{error}");
 }
 
+/// A script cannot choose a model itself: no clients, no tier lines, no
+/// agent bound to a client — so a profile can never be shadowed.
 #[test]
-fn a_chosen_profile_replaces_the_scripts_own_binding() {
+fn a_script_cannot_declare_its_own_models() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        r#"
-        client pinned { model "claude:sonnet" }
-        tier low pinned
-        agent worker { tier low prompt "w" }
-        "#,
-    );
     let profile = chosen(write(dir.path(), "p.gaviero", CLAUDE_PROFILE));
-    let plan = compile(&script, Some(&profile), &[]).unwrap();
-    assert_eq!(model_of(&plan, "worker"), "claude:haiku");
+    for (body, needle) in [
+        (
+            "client pinned { model \"claude:sonnet\" }\nagent worker { tier low prompt \"w\" }\n",
+            "cannot declare `client pinned`",
+        ),
+        (
+            "tier low small\nagent worker { tier low prompt \"w\" }\n",
+            "cannot declare `tier low small`",
+        ),
+        ("agent worker { client small prompt \"w\" }\n", "found 'client'"),
+    ] {
+        let script = write(dir.path(), "s.gaviero", body);
+        let error = compile(&script, Some(&profile), &[]).unwrap_err();
+        assert!(error.contains(needle), "{body}: {error}");
+    }
 }
 
+/// With every agent declaring a tier, a `default` client means nothing; a
+/// profile that marks one is told so.
 #[test]
-fn the_implicit_default_only_fills_what_the_script_leaves_open() {
+fn a_profile_default_client_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write(
+    let script = write(dir.path(), "s.gaviero", AGNOSTIC_SCRIPT);
+    let profile = chosen(write(
         dir.path(),
-        "s.gaviero",
-        r#"
-        client pinned { model "claude:sonnet" }
-        tier low pinned
-        agent worker { tier low prompt "w" }
-        agent planner { tier top prompt "p" }
-        "#,
-    );
-    let profile = implicit(write(dir.path(), "default.gaviero", CLAUDE_PROFILE));
-    let plan = compile(&script, Some(&profile), &[]).unwrap();
-    assert_eq!(model_of(&plan, "worker"), "claude:sonnet", "script keeps its tier");
-    assert_eq!(model_of(&plan, "planner"), "claude:fable", "profile fills the gap");
-}
-
-#[test]
-fn a_concrete_client_binding_is_left_alone() {
-    let dir = tempfile::tempdir().unwrap();
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        r#"
-        client pinned { model "claude:sonnet" }
-        agent worker { client pinned prompt "w" }
-        "#,
-    );
-    let profile = chosen(write(dir.path(), "p.gaviero", CLAUDE_PROFILE));
-    let plan = compile(&script, Some(&profile), &[]).unwrap();
-    assert_eq!(model_of(&plan, "worker"), "claude:sonnet");
-}
-
-#[test]
-fn profile_and_script_may_use_the_same_client_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        r#"
-        client small { model "codex:gpt-5.5" }
-        agent pinned { client small prompt "p" }
-        agent worker { tier low prompt "w" }
-        "#,
-    );
-    let profile = chosen(write(dir.path(), "p.gaviero", CLAUDE_PROFILE));
-    let plan = compile(&script, Some(&profile), &[]).unwrap();
-    assert_eq!(model_of(&plan, "pinned"), "codex:gpt-5.5");
-    assert_eq!(model_of(&plan, "worker"), "claude:haiku");
-}
-
-#[test]
-fn profile_default_client_covers_unbound_agents() {
-    let dir = tempfile::tempdir().unwrap();
-    let body = r#"
-        client main { model "claude:opus" default }
-        tier high main
-    "#;
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        r#"
-        client own { model "claude:sonnet" default }
-        agent worker { prompt "w" }
-        "#,
-    );
-    let path = write(dir.path(), "p.gaviero", body);
-
-    let plan = compile(&script, Some(&chosen(path.clone())), &[]).unwrap();
-    assert_eq!(model_of(&plan, "worker"), "claude:opus", "chosen profile wins");
-
-    let plan = compile(&script, Some(&implicit(path)), &[]).unwrap();
-    assert_eq!(model_of(&plan, "worker"), "claude:sonnet", "script default stays");
+        "p.gaviero",
+        "client small { model \"claude:haiku\" default }\nclient big { model \"claude:opus\" }\ntier low small\ntier top big\n",
+    ));
+    let error = compile(&script, Some(&profile), &[]).unwrap_err();
+    assert!(error.contains("marked `default`"), "{error}");
 }
 
 #[test]
@@ -223,7 +173,7 @@ fn a_profile_is_only_a_model_table() {
     let profile = chosen(write(
         dir.path(),
         "p.gaviero",
-        r#"client c { model "claude:opus" } tier low c agent stray { prompt "x" }"#,
+        r#"client c { model "claude:opus" } tier low c agent stray { tier t prompt "x" }"#,
     ));
     let error = compile(&script, Some(&profile), &[]).unwrap_err();
     assert!(error.contains("only declare"), "{error}");
@@ -232,11 +182,7 @@ fn a_profile_is_only_a_model_table() {
 #[test]
 fn a_profile_tier_must_use_the_profiles_own_client() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        "client theirs { model \"claude:opus\" }\nagent w { client theirs prompt \"p\" }\n",
-    );
+    let script = write(dir.path(), "s.gaviero", AGNOSTIC_SCRIPT);
     let profile = chosen(write(dir.path(), "p.gaviero", "tier low theirs\n"));
     let error = compile(&script, Some(&profile), &[]).unwrap_err();
     assert!(error.contains("does not declare"), "{error}");
@@ -255,8 +201,11 @@ fn examples() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")
 }
 
+/// `tiered_review.gaviero` uses all three ways a tier is chosen: an agent's
+/// own tier (`gather`, the reviewer template), the workflow's `tiers { }`
+/// block (`verdict`) and a roster item's tier (`second`).
 #[test]
-fn shipped_profiles_drive_the_agnostic_example_through_params_and_roster() {
+fn shipped_profiles_drive_the_agnostic_example() {
     let script = examples().join("tiered_review.gaviero");
     let expectations = [
         ("claude", "claude:haiku", "claude:sonnet", "claude:opus", "claude:fable"),
@@ -267,54 +216,39 @@ fn shipped_profiles_drive_the_agnostic_example_through_params_and_roster() {
         let profile = chosen(examples().join("profiles").join(format!("{name}.gaviero")));
         let plan = compile(&script, Some(&profile), &[]).unwrap();
         assert_eq!(model_of(&plan, "gather"), low, "{name}: agent tier");
-        assert_eq!(model_of(&plan, "verdict"), medium, "{name}: client param");
-        assert_eq!(model_of(&plan, "first-refine"), high, "{name}: roster");
-        assert_eq!(model_of(&plan, "second-refine"), top, "{name}: roster");
+        assert_eq!(model_of(&plan, "verdict"), medium, "{name}: workflow tiers block");
+        assert_eq!(model_of(&plan, "first-refine"), high, "{name}: template tier");
+        assert_eq!(model_of(&plan, "second-refine"), top, "{name}: item tier");
     }
 }
 
+/// A run moves an agent with `--tier` and a roster item with `--param`;
+/// both name tiers, never models.
 #[test]
-fn param_overrides_can_move_an_agent_to_another_tier_or_a_concrete_model() {
+fn a_run_moves_agents_and_items_by_tier() {
     let script = examples().join("tiered_review.gaviero");
     let profile = chosen(examples().join("profiles/claude.gaviero"));
 
-    let params = vec![
-        ("judge".to_string(), "tier:top".to_string()),
-        ("panel".to_string(), "only=tier:low,pinned=codex:gpt-5.5@high".to_string()),
-    ];
-    let plan = compile(&script, Some(&profile), &params).unwrap();
-    assert_eq!(model_of(&plan, "verdict"), "claude:fable");
+    let tiers = vec![("verdict".to_string(), "top".to_string())];
+    let params = vec![("panel".to_string(), "only=low,plain".to_string())];
+    let plan = compile_with(&script, Some(&profile), &tiers, &params).unwrap();
+    assert_eq!(model_of(&plan, "verdict"), "claude:fable", "--tier beats the block");
     assert_eq!(model_of(&plan, "only-refine"), "claude:haiku");
-    assert_eq!(model_of(&plan, "pinned-refine"), "codex:gpt-5.5");
+    assert_eq!(model_of(&plan, "plain-refine"), "claude:opus", "template tier");
+
+    for bad in ["only=tier:low", "pinned=codex:gpt-5.5@high"] {
+        let params = vec![("panel".to_string(), bad.to_string())];
+        let error = compile(&script, Some(&profile), &params).unwrap_err();
+        assert!(error.contains("id=<tier>"), "{bad}: {error}");
+    }
 }
 
-#[test]
-fn a_tier_param_cannot_also_set_effort() {
-    let script = examples().join("tiered_review.gaviero");
-    let profile = chosen(examples().join("profiles/claude.gaviero"));
-
-    let client = vec![("judge".to_string(), "tier:top@low".to_string())];
-    let error = compile(&script, Some(&profile), &client).unwrap_err();
-    assert!(error.contains("cannot be combined"), "{error}");
-
-    let roster = vec![("panel".to_string(), "a=tier:top@low".to_string())];
-    let error = compile(&script, Some(&profile), &roster).unwrap_err();
-    assert!(error.contains("cannot be combined"), "{error}");
-}
-
-#[test]
-fn a_misspelled_effort_in_a_param_override_is_rejected() {
-    let script = examples().join("tiered_review.gaviero");
-    let profile = chosen(examples().join("profiles/claude.gaviero"));
-    let params = vec![("judge".to_string(), "claude:opus@hgih".to_string())];
-    let error = compile(&script, Some(&profile), &params).unwrap_err();
-    assert!(error.contains("unknown effort `hgih`"), "{error}");
-}
-
-fn preflight(body: &str) -> Result<(), String> {
+/// A profile client's model + effort pair is checked when a run starts.
+fn preflight(profile: &str, script: &str) -> Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
-    let script = write(dir.path(), "s.gaviero", body);
-    let plan = compile(&script, None, &[]).expect("compiles: the check is at run start");
+    let profile = chosen(write(dir.path(), "p.gaviero", profile));
+    let script = write(dir.path(), "s.gaviero", script);
+    let plan = compile(&script, Some(&profile), &[]).expect("compiles: the check is at run start");
     gaviero_core::swarm::pipeline::preflight_plan_models(&plan, "claude:sonnet", None)
         .map_err(|e| e.to_string())
 }
@@ -328,9 +262,10 @@ fn a_wrong_model_and_effort_pair_never_starts() {
         ("cursor:grok-4.7-high", "high", "model id"),
         ("ollama:llama3", "high", "does not use effort"),
     ] {
-        let error = preflight(&format!(
-            "client c {{ model \"{model}\" effort {effort} default }}\nagent worker {{ prompt \"p\" }}\n"
-        ))
+        let error = preflight(
+            &format!("client c {{ model \"{model}\" effort {effort} }}\ntier x c\n"),
+            "agent worker { tier x prompt \"p\" }\n",
+        )
         .unwrap_err();
         assert!(error.contains(expected), "{model} {effort}: {error}");
         assert!(error.contains("agent 'worker'"), "names the agent: {error}");
@@ -345,69 +280,55 @@ fn a_right_pair_and_choosing_no_level_both_start() {
         ("cursor:grok-4.7-high", "auto"),
         ("ollama:llama3", "off"),
     ] {
-        preflight(&format!(
-            "client c {{ model \"{model}\" effort {effort} default }}\nagent worker {{ prompt \"p\" }}\n"
-        ))
+        preflight(
+            &format!("client c {{ model \"{model}\" effort {effort} }}\ntier x c\n"),
+            "agent worker { tier x prompt \"p\" }\n",
+        )
         .unwrap_or_else(|e| panic!("{model} {effort}: {e}"));
     }
 }
 
 #[test]
-fn an_unused_wrong_client_in_a_shared_pool_does_not_block_a_run() {
+fn an_unused_wrong_tier_in_a_profile_does_not_block_a_run() {
     preflight(
         "client unused { model \"cursor:composer-2.5\" effort high }\n\
-         client used { model \"claude:opus\" effort high default }\n\
-         agent worker { prompt \"p\" }\n",
+         client used { model \"claude:opus\" effort high }\n\
+         tier spare unused\n\
+         tier main used\n",
+        "agent worker { tier main prompt \"p\" }\n",
     )
     .unwrap();
 }
 
 #[test]
-fn a_roster_entry_is_checked_too() {
+fn a_roster_item_tier_is_checked_too() {
     let error = preflight(
-        "client j { model \"claude:opus\" default }\n\
-         agent tpl { template true prompt \"p\" }\n\
-         agent judge { prompt \"j\" }\n\
-         workflow w { steps [ loop { reviewers [ { id \"a\" model \"dsh:deepseek-flash\" effort medium } ] template_refine tpl until agent judge max_iterations 1 } ] }\n",
+        "client j { model \"claude:opus\" }\n\
+         client bad { model \"dsh:deepseek-flash\" effort medium }\n\
+         tier main j\n\
+         tier flawed bad\n",
+        "agent tpl { tier main template true prompt \"p\" }\n\
+         agent judge { tier main prompt \"j\" }\n\
+         workflow w { steps [ loop { reviewers [ { id \"a\" tier flawed } ] template_refine tpl until agent judge max_iterations 1 } ] }\n",
     )
     .unwrap_err();
     assert!(error.contains("agent 'a-refine'"), "{error}");
 }
 
 #[test]
-fn a_tier_param_needs_a_tier_name() {
-    let script = examples().join("tiered_review.gaviero");
-    let profile = chosen(examples().join("profiles/claude.gaviero"));
-    let params = vec![("judge".to_string(), "tier:".to_string())];
-    let error = compile(&script, Some(&profile), &params).unwrap_err();
-    assert!(error.contains("needs a tier name"), "{error}");
-}
-
-#[test]
-fn the_form_shows_tier_params_in_override_syntax() {
+fn the_form_shows_list_params_in_override_syntax() {
     let inspection = gaviero_dsl::inspect_file(&examples().join("tiered_review.gaviero")).unwrap();
     let params = &inspection.workflows[0].params;
-    let default_of = |name: &str| {
-        params
-            .iter()
-            .find(|p| p.name == name)
-            .and_then(|p| p.default.clone())
-    };
-    assert_eq!(default_of("judge").as_deref(), Some("tier:medium"));
-    assert_eq!(
-        default_of("panel").as_deref(),
-        Some("first=tier:high,second=tier:top")
-    );
+    assert_eq!(params.len(), 1, "params are lists only");
+    assert_eq!(params[0].name, "panel");
+    assert_eq!(params[0].default.as_deref(), Some("first,second=top"));
+    assert_eq!(inspection.tiers, ["low", "high", "medium", "top"]);
 }
 
 #[test]
-fn compile_file_still_works_with_no_profile() {
+fn compile_file_without_a_profile_names_the_fix() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write(
-        dir.path(),
-        "s.gaviero",
-        "client c { model \"claude:opus\" default }\nagent w { prompt \"p\" }\n",
-    );
-    let plan = gaviero_dsl::compile_file(&script, None, None, &[], &[], &[]).unwrap();
-    assert_eq!(model_of(&plan, "w"), "claude:opus");
+    let script = write(dir.path(), "s.gaviero", "agent w { tier low prompt \"p\" }\n");
+    let error = gaviero_dsl::compile_file(&script, None, None, &[], &[], &[]).unwrap_err();
+    assert!(format!("{error:?}").contains("no model profile is bound"), "{error:?}");
 }

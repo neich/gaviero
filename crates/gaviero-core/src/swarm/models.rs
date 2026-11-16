@@ -32,6 +32,11 @@ pub struct WorkUnit {
     /// gate then falls back to detecting whether its owned files changed at all.
     #[serde(default)]
     pub produces: Vec<String>,
+    /// The subset of `produces` declared with `produces json [...]`: each must
+    /// also parse as JSON, or it counts as missing (same corrective retry and
+    /// loop delivery gate).
+    #[serde(default)]
+    pub produces_json: Vec<String>,
     /// IDs of work units that must complete before this one starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -187,6 +192,27 @@ impl WorkUnit {
                 }
             })
             .cloned()
+            .chain(self.invalid_json_artifacts(root))
+            .collect()
+    }
+
+    /// `produces json` paths that exist and are non-empty but do not parse
+    /// as JSON, each as `"<path> (invalid JSON: <error>)"`. Absent or empty
+    /// files are already reported by [`Self::missing_declared_artifacts`].
+    fn invalid_json_artifacts(&self, root: &std::path::Path) -> Vec<String> {
+        self.produces_json
+            .iter()
+            .filter(|rel| !rel.contains("{{"))
+            .filter_map(|rel| {
+                let text = std::fs::read_to_string(root.join(rel)).ok()?;
+                if text.is_empty() {
+                    return None;
+                }
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("{rel} (invalid JSON: {e})")),
+                }
+            })
             .collect()
     }
 }
@@ -292,4 +318,40 @@ pub struct MergeConflict {
     pub file: PathBuf,
     pub resolved: bool,
     pub resolution_method: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `WorkUnit` field but `id` has a serde default.
+    fn json_unit(path: &str) -> WorkUnit {
+        serde_json::from_value(serde_json::json!({
+            "id": "u",
+            "produces": [path],
+            "produces_json": [path],
+        }))
+        .expect("work unit fixture")
+    }
+
+    #[test]
+    fn invalid_json_output_counts_as_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("out.json"), "{not json").unwrap();
+        let missing = json_unit("out.json").missing_declared_artifacts(tmp.path());
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].starts_with("out.json (invalid JSON:"), "{missing:?}");
+    }
+
+    #[test]
+    fn valid_json_output_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("out.json"), r#"{"claims":[]}"#).unwrap();
+        assert!(json_unit("out.json")
+            .missing_declared_artifacts(tmp.path())
+            .is_empty());
+        // Absent is reported once, as plain missing.
+        let absent = json_unit("nope.json").missing_declared_artifacts(tmp.path());
+        assert_eq!(absent, vec!["nope.json".to_string()]);
+    }
 }

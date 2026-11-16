@@ -649,6 +649,7 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         scope,
         // Coordinator-planned units have no declared output contract; the DSL
         // `produces` clause is the only source for one.
+        produces_json: vec![],
         produces: Vec::new(),
         depends_on,
         backend: AgentBackend::default(),
@@ -927,16 +928,16 @@ fn build_coordinator_dsl_prompt(file_list: &[String], memory_context: &str) -> S
          OUTPUT FORMAT — you MUST respond with ONLY a valid `.gaviero` file, no prose:\n\n\
          ```\n\
          // Optional comment\n\
-         client <name> { tier <tier>  model \"<model-id>\" }\n\
-         // tier is one of: coordinator | reasoning | execution | mechanical\n\n\
          agent <id> {\n\
              description \"<one-line summary>\"\n\
-             client <client-name>\n\
+             tier <low | medium | high>\n\
              scope {\n\
                  owned    [\"path/\" \"file.rs\"]   // files this agent may write\n\
                  read_only [\"other/\"]             // files this agent may only read\n\
              }\n\
              depends_on [<other-agent-id> ...]    // omit if no dependencies\n\
+             produces [\"path/exact-file.md\"]   // optional: exact files the agent must write\n\
+             timeout <secs>    // optional: per-dispatch seconds, default 3600\n\
              prompt #\"\n\
                  <self-contained task specification>\n\
              \"#\n\
@@ -955,16 +956,16 @@ fn build_coordinator_dsl_prompt(file_list: &[String], memory_context: &str) -> S
          - Maximize agents that can run simultaneously (same tier with no depends_on)\n\
          - Only add depends_on when an agent TRULY needs another's output\n\
          - Prefer wide shallow DAGs (2-3 tiers) over deep linear chains\n\n\
-         TIER ASSIGNMENT:\n\
-         - reasoning: multi-file semantic changes, interface redesigns, complex logic\n\
-         - execution: single-file focused changes, test writing, error handling\n\
-         - mechanical: renames, import updates, call-site propagation, formatting\n\n\
-         CLIENT NAMES to use:\n\
-         - `reasoning` for reasoning-tier agents\n\
-         - `execution` for execution-tier agents\n\
-         - `mechanical` for mechanical-tier agents\n\
-         - Prefer omitting explicit `model` fields so runtime routing can choose the active provider.\n\
-           Only set a concrete model when the task truly requires a provider-specific override.\n\n\
+         TIER ASSIGNMENT — every agent declares exactly one `tier`:\n\
+         - high: multi-file semantic changes, interface redesigns, complex logic\n\
+         - medium: single-file focused changes, test writing, error handling\n\
+         - low: renames, import updates, call-site propagation, formatting\n\
+         - Never declare `client` blocks, `tier <name> <client>` lines or model names: the run's\n\
+           model profile decides which model each tier uses.\n\n\
+         OUTPUTS AND TIME:\n\
+         - `produces` lists literal file paths (not globs) the agent must have written when it\n\
+           finishes; the run fails the agent if one is missing. Use it for deliverables.\n\
+         - `timeout` bounds one dispatch in seconds (default 3600); raise it for long tasks.\n\n\
          PROMPT CONTENT:\n\
          - Each agent's prompt must be SELF-CONTAINED — include all context needed\n\
          - Agents run in isolated git worktrees; they cannot access tmp/ or gitignored files\n\
@@ -1089,6 +1090,19 @@ mod tests {
     use crate::types::{FileScope, PrivacyLevel};
     use std::collections::HashMap;
 
+    /// Scripts choose models by tier only, so the template teaches `tier`
+    /// on every agent and no `client` blocks — a plan with clients fails to
+    /// compile. It also teaches the output contract and the dispatch timeout.
+    #[test]
+    fn coordinator_prompt_teaches_tiers_only() {
+        let prompt = build_coordinator_dsl_prompt(&[], "");
+        assert!(!prompt.contains("client deep"), "prompt still declares clients");
+        assert!(!prompt.contains("client <"), "prompt still binds agents to clients");
+        for needed in ["tier <low | medium | high>", "produces", "timeout"] {
+            assert!(prompt.contains(needed), "prompt lacks {needed}");
+        }
+    }
+
     fn make_unit(id: &str, deps: &[&str]) -> WorkUnit {
         WorkUnit {
             id: id.into(),
@@ -1098,6 +1112,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces_json: vec![],
             produces: vec![],
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),

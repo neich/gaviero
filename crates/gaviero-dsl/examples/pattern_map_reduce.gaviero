@@ -11,15 +11,9 @@
 // Consensus-style multi-reviewer loops are not pattern sugar — use
 // examples/generic_consensus.gaviero (loop + reviewers roster) instead.
 
-client scout {
-    model "claude:sonnet"
-    effort medium
-    default
-}
-
 agent discover {
     description "Discover work shards and write spawn_manifest.json"
-    client scout
+    tier medium
     scope {
         owned ["spawn_manifest.json" "artifacts/"]
         read_only ["docs/" "src/"]
@@ -33,7 +27,7 @@ agent discover {
           "workers": [
             {
               "id": "shard-1",
-              "model": "claude:sonnet",
+              "tier": "medium",
               "description": "Review shard 1",
               "prompt": "…",
               "owned": ["artifacts/shard-1/"],
@@ -42,13 +36,15 @@ agent discover {
           ]
         }
 
-        Cap workers at a small number. Do not implement the shards yourself.
+        Each worker's `tier` is a tier of the run's model profile (low,
+        medium, high, top); never name a model. Cap workers at a small
+        number. Do not implement the shards yourself.
     "#
 }
 
 agent reduce {
     description "Aggregate fan-out worker results"
-    client scout
+    tier medium
     depends_on [discover]
     scope {
         owned ["artifacts/summary.md"]

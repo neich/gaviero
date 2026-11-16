@@ -1,14 +1,90 @@
 use gaviero_core::iteration::Strategy;
+use gaviero_core::script_profiles::{ProfilePrecedence, SelectedProfile};
 use gaviero_core::types::ModelTier;
-use gaviero_dsl::compile;
+
+/// The profile every inline test compiles against: `tests/fixtures/test-profile.gaviero`.
+fn test_profile() -> SelectedProfile {
+    SelectedProfile {
+        name: "test".into(),
+        path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test-profile.gaviero"),
+        precedence: ProfilePrecedence::OverridesScript,
+    }
+}
+
+/// The model profile shipped with the examples (`examples/profiles/default.gaviero`).
+fn example_profile() -> SelectedProfile {
+    SelectedProfile {
+        name: "default".into(),
+        path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/profiles/default.gaviero"),
+        precedence: ProfilePrecedence::FillsGaps,
+    }
+}
+
+/// `gaviero_dsl::compile_file` with a profile: the examples' default profile
+/// for a script under `examples/`, the test profile for any other file.
+fn compile_file(
+    path: &std::path::Path,
+    workflow: Option<&str>,
+    prompt: Option<&str>,
+    vars: &[(String, String)],
+    agent_tiers: &[(String, String)],
+    params: &[(String, String)],
+) -> Result<gaviero_dsl::CompiledPlan, miette::Report> {
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let profile = if path.starts_with(&examples) {
+        example_profile()
+    } else {
+        test_profile()
+    };
+    gaviero_dsl::compile_file_with_profile(
+        path,
+        Some(&profile),
+        workflow,
+        prompt,
+        vars,
+        agent_tiers,
+        params,
+    )
+}
+
+/// `gaviero_dsl::compile` with the test profile.
+fn compile(
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<gaviero_dsl::CompiledPlan, miette::Report> {
+    gaviero_dsl::compile(source, filename, Some(&test_profile()), workflow, prompt)
+}
+
+/// `gaviero_dsl::compile_with_vars` with the test profile.
+fn compile_with_vars(
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+    prompt: Option<&str>,
+    vars: &[(String, String)],
+    agent_tiers: &[(String, String)],
+    params: &[(String, String)],
+) -> Result<gaviero_dsl::CompiledPlan, miette::Report> {
+    gaviero_dsl::compile_with_vars(
+        source,
+        filename,
+        Some(&test_profile()),
+        workflow,
+        prompt,
+        vars,
+        agent_tiers,
+        params,
+    )
+}
 
 const FULL_EXAMPLE: &str = r##"
-    client opus   { tier coordinator model "claude-opus-4-7"    privacy public }
-    client sonnet { tier execution   model "claude-sonnet-4-6"  }
-
     agent researcher {
         description "Research and document the codebase architecture"
-        client opus
+        tier opus
         scope {
             owned    ["docs/architecture.md"]
             read_only ["src/**"]
@@ -22,7 +98,7 @@ const FULL_EXAMPLE: &str = r##"
 
     agent implementer {
         description "Implement the feature"
-        client sonnet
+        tier sonnet
         depends_on [researcher]
         scope {
             owned    ["src/feature/"]
@@ -88,18 +164,149 @@ fn lex_error_is_reported() {
 }
 
 #[test]
-fn undefined_client_error() {
-    let src = r#"agent x { client ghost }"#;
+fn undefined_tier_error_lists_the_profile_tiers() {
+    let src = r#"agent x { tier ghost }"#;
     let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
     assert!(report.contains("ghost"), "report: {}", report);
+    assert!(report.contains("it defines: local, low, opus, sonnet, t"), "report: {}", report);
+}
+
+// ── Tiers only ───────────────────────────────────────────────────
+
+/// Every agent declares its default tier; there is no fallback client.
+#[test]
+fn an_agent_without_a_tier_is_an_error() {
+    let err = compile(r#"agent x { description "d" }"#, "test.gaviero", None, None).unwrap_err();
+    let report = format!("{:?}", err);
+    assert!(report.contains("agent `x` declares no tier"), "report: {report}");
+}
+
+/// What a tier means lives in the profile alone: a script may not declare
+/// a client or a tier line, nor bind an agent to a client.
+#[test]
+fn a_script_cannot_choose_models_itself() {
+    for (src, needle) in [
+        (
+            r#"client c { model "claude:opus" } agent x { tier t }"#,
+            "cannot declare `client c`",
+        ),
+        (r#"tier fast t agent x { tier t }"#, "cannot declare `tier fast t`"),
+    ] {
+        let report = format!("{:?}", compile(src, "test.gaviero", None, None).unwrap_err());
+        assert!(report.contains(needle), "{src}: {report}");
+        assert!(report.contains("model profile"), "{src}: {report}");
+    }
+    // `client` is no longer an agent field at all.
+    assert!(compile(r#"agent x { client c }"#, "test.gaviero", None, None).is_err());
+    // Nor is a model-valued param.
+    assert!(
+        compile(
+            r#"agent x { tier t } workflow w { param j { model "claude:opus" } steps [x] }"#,
+            "test.gaviero",
+            None,
+            None
+        )
+        .is_err()
+    );
+}
+
+/// Without a profile no tier is bound, and the diagnostic says how to get one.
+#[test]
+fn no_profile_means_no_tier() {
+    let err = gaviero_dsl::compile(r#"agent x { tier t }"#, "test.gaviero", None, None, None)
+        .unwrap_err();
+    let report = format!("{err:?}");
+    assert!(report.contains("no model profile is bound"), "report: {report}");
+}
+
+const TIERED: &str = r#"
+    agent a { tier t }
+    agent b { tier t }
+    agent j { tier t prompt "judge" }
+    workflow w {
+        tiers {
+            b opus
+            j sonnet
+        }
+        steps [ a b loop { agents [a] until agent j } ]
+    }
+"#;
+
+fn model_of(plan: &gaviero_dsl::CompiledPlan, id: &str) -> Option<String> {
+    plan.work_units_unordered()
+        .into_iter()
+        .chain(plan.loop_judge_units.iter())
+        .find(|u| u.id == id)
+        .unwrap_or_else(|| panic!("no unit {id}"))
+        .model
+        .clone()
+}
+
+/// The workflow's `tiers { }` block moves an agent (and a loop judge) to
+/// another tier; agents it does not name keep their own.
+#[test]
+fn the_workflow_tiers_block_overrides_an_agent_tier() {
+    let plan = compile(TIERED, "test.gaviero", None, None).expect("compile");
+    assert_eq!(model_of(&plan, "a"), None, "tier t keeps its own");
+    assert_eq!(model_of(&plan, "b").as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(model_of(&plan, "j").as_deref(), Some("claude-sonnet-4-6"));
+}
+
+/// `--tier agent=tier` beats the block, and reaches agents it does not name.
+#[test]
+fn cli_tier_overrides_the_block() {
+    let cli = vec![
+        ("b".to_string(), "low".to_string()),
+        ("a".to_string(), "sonnet".to_string()),
+    ];
+    let plan = compile_with_vars(TIERED, "test.gaviero", None, None, &[], &cli, &[]).unwrap();
+    assert_eq!(model_of(&plan, "b").as_deref(), Some("claude:haiku"));
+    assert_eq!(model_of(&plan, "a").as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(model_of(&plan, "j").as_deref(), Some("claude-sonnet-4-6"));
+}
+
+#[test]
+fn tier_overrides_must_name_real_agents_and_tiers() {
+    let unknown_agent = r#"agent a { tier t } workflow w { tiers { ghost opus } steps [a] }"#;
+    let report = format!("{:?}", compile(unknown_agent, "t.gaviero", None, None).unwrap_err());
+    assert!(report.contains("`tiers` names `ghost`"), "{report}");
+
+    let twice = r#"agent a { tier t } workflow w { tiers { a opus a low } steps [a] }"#;
+    let report = format!("{:?}", compile(twice, "t.gaviero", None, None).unwrap_err());
+    assert!(report.contains("sets agent `a` twice"), "{report}");
+
+    let cli = vec![("ghost".to_string(), "opus".to_string())];
+    let err = compile_with_vars(TIERED, "t.gaviero", None, None, &[], &cli, &[]).unwrap_err();
+    assert!(format!("{err:?}").contains("--tier ghost=opus"), "{err:?}");
+
+    let cli = vec![("a".to_string(), "nope".to_string())];
+    let err = compile_with_vars(TIERED, "t.gaviero", None, None, &[], &cli, &[]).unwrap_err();
+    assert!(format!("{err:?}").contains("uses tier `nope`"), "{err:?}");
+}
+
+/// A list item's `tier` moves its own clone; items without one keep the
+/// body agent's tier — which the `tiers { }` block may have moved.
+#[test]
+fn a_list_item_tier_wins_for_its_clone() {
+    let src = r#"
+        agent worker { tier t scope { owned ["out/{{x.id}}.md"] } }
+        workflow w {
+            tiers { worker sonnet }
+            param items [ { id "a" } { id "b" tier opus } ]
+            steps [ for x in items parallel { worker } ]
+        }
+    "#;
+    let plan = compile(src, "test.gaviero", None, None).expect("compile");
+    assert_eq!(model_of(&plan, "a-worker").as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(model_of(&plan, "b-worker").as_deref(), Some("claude-opus-4-7"));
 }
 
 #[test]
 fn no_workflow_runs_all_agents() {
     let src = r#"
-        agent a { description "first" }
-        agent b { description "second" }
+        agent a { tier t description "first" }
+        agent b { tier t description "second" }
     "#;
     let units = compile(src, "test.gaviero", None, None)
         .unwrap()
@@ -113,8 +320,8 @@ fn no_workflow_runs_all_agents() {
 #[test]
 fn workflow_name_selector() {
     let src = r#"
-        agent a { description "a" }
-        agent b { description "b" }
+        agent a { tier t description "a" }
+        agent b { tier t description "b" }
         workflow just_b { steps [b] }
         workflow both   { steps [a b] }
     "#;
@@ -129,7 +336,7 @@ fn workflow_name_selector() {
 #[test]
 fn multiple_workflows_without_selector_is_an_error() {
     let src = r#"
-        agent a { description "a" }
+        agent a { tier t description "a" }
         workflow first  { steps [a] }
         workflow second { steps [a] }
     "#;
@@ -140,7 +347,7 @@ fn multiple_workflows_without_selector_is_an_error() {
 
 #[test]
 fn parse_error_missing_closing_brace() {
-    let src = r#"agent x { description "hello" "#;
+    let src = r#"agent x { tier t description "hello" "#;
     let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
     assert!(!report.is_empty());
@@ -149,8 +356,8 @@ fn parse_error_missing_closing_brace() {
 #[test]
 fn dependency_cycle_detected() {
     let src = r#"
-        agent a { depends_on [b] }
-        agent b { depends_on [a] }
+        agent a { tier t depends_on [b] }
+        agent b { tier t depends_on [a] }
     "#;
     let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
@@ -162,7 +369,7 @@ fn dependency_cycle_detected() {
 #[test]
 fn strategy_refine_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] strategy refine }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -175,7 +382,7 @@ fn strategy_refine_propagated() {
 #[test]
 fn strategy_single_pass_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] strategy single_pass }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -188,7 +395,7 @@ fn strategy_single_pass_propagated() {
 #[test]
 fn strategy_best_of_n_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] strategy best_of_3 }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -205,7 +412,7 @@ fn strategy_best_of_n_propagated() {
 #[test]
 fn test_first_true_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] test_first true }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -218,7 +425,7 @@ fn test_first_true_propagated() {
 #[test]
 fn max_retries_workflow_level_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] max_retries 3 }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -228,7 +435,7 @@ fn max_retries_workflow_level_propagated() {
 #[test]
 fn verify_block_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w {
             steps [a]
             verify { compile true clippy true test false }
@@ -243,7 +450,7 @@ fn verify_block_propagated() {
 #[test]
 fn verify_block_all_true() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w {
             steps [a]
             verify { compile true clippy true test true }
@@ -257,7 +464,7 @@ fn verify_block_all_true() {
 
 #[test]
 fn iteration_config_defaults_when_no_workflow() {
-    let src = r#"agent a { description "task" }"#;
+    let src = r#"agent a { tier t description "task" }"#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
     // No workflow → defaults
     assert!(matches!(
@@ -274,7 +481,7 @@ fn iteration_config_defaults_when_no_workflow() {
 #[test]
 fn escalate_after_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] escalate_after 5 }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -284,7 +491,7 @@ fn escalate_after_propagated() {
 #[test]
 fn attempts_propagated() {
     let src = r#"
-        agent a { description "task" }
+        agent a { tier t description "task" }
         workflow w { steps [a] attempts 4 strategy best_of_4 }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
@@ -305,7 +512,7 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[], &[], &[])
+    compile_file(&path, None, None, &[], &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units_ordered()
         .expect("toposort")
@@ -378,6 +585,7 @@ fn example_codebase_review() {
             .model
             .clone()
     };
+    // Tier `medium` → sonnet, `high` → opus in the examples' default profile.
     assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet"));
     assert_eq!(model_of("review_module").as_deref(), Some("claude:opus"));
     assert_eq!(model_of("synthesize").as_deref(), Some("claude:sonnet"));
@@ -460,20 +668,20 @@ fn example_codebase_review() {
 }
 
 #[test]
-fn codebase_review_param_overrides_reviewer() {
+fn codebase_review_tier_overrides_reviewer() {
     let path = std::path::PathBuf::from(format!(
         "{}/examples/codebase_review.gaviero",
         env!("CARGO_MANIFEST_DIR")
     ));
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         None,
         None,
         &[],
+        &[("review_module".to_string(), "high-codex".to_string())],
         &[],
-        &[("reviewer".to_string(), "codex:gpt-5.6-sol@high".to_string())],
     )
-    .expect("compile codebase_review with --param reviewer");
+    .expect("compile codebase_review with --tier review_module");
     let units = plan.work_units_ordered().expect("toposort");
     let model_of = |id: &str| -> Option<String> {
         units
@@ -486,7 +694,7 @@ fn codebase_review_param_overrides_reviewer() {
     };
     assert_eq!(
         model_of("review_module").as_deref(),
-        Some("codex:gpt-5.6-sol")
+        Some("codex:gpt-6.1-sol")
     );
     assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet"));
     assert_eq!(model_of("halt_judge").as_deref(), Some("claude:sonnet"));
@@ -494,30 +702,30 @@ fn codebase_review_param_overrides_reviewer() {
 }
 
 #[test]
-fn codebase_review_param_overrides_both_roles() {
+fn codebase_review_tier_overrides_several_agents() {
     let path = std::path::PathBuf::from(format!(
         "{}/examples/codebase_review.gaviero",
         env!("CARGO_MANIFEST_DIR")
     ));
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         None,
         None,
         &[],
-        &[],
         &[
-            ("reviewer".to_string(), "codex:gpt-5.6-sol@high".to_string()),
-            ("judge".to_string(), "codex:gpt-5.6-luna@medium".to_string()),
+            ("review_module".to_string(), "high-codex".to_string()),
+            ("inventory".to_string(), "low-codex".to_string()),
         ],
+        &[],
     )
-    .expect("compile codebase_review with both --param overrides");
+    .expect("compile codebase_review with two --tier overrides");
     let units = plan.work_units_ordered().expect("toposort");
     let review = units.iter().find(|u| u.id == "review_module").unwrap();
     let inventory = units.iter().find(|u| u.id == "inventory").unwrap();
-    assert_eq!(review.model.as_deref(), Some("codex:gpt-5.6-sol"));
+    assert_eq!(review.model.as_deref(), Some("codex:gpt-6.1-sol"));
     assert_eq!(review.effort.as_deref(), Some("high"));
-    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-5.6-luna"));
-    assert_eq!(inventory.effort.as_deref(), Some("medium"));
+    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-6-luna"));
+    assert_eq!(inventory.effort.as_deref(), Some("low"));
 }
 
 #[test]
@@ -578,7 +786,7 @@ fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPl
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[], &[], &[])
+    compile_file(&path, None, None, &[], &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
 
@@ -588,7 +796,7 @@ fn codebase_review_var_relocates_out_dir() {
         "{}/examples/codebase_review.gaviero",
         env!("CARGO_MANIFEST_DIR")
     ));
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         None,
         None,
@@ -634,14 +842,13 @@ fn template_update_docs() {
         .iter()
         .find(|u| u.id == "inventory")
         .expect("inventory");
-    // Default profile is doc-cursor.gaviero (inventory → grok). The Cursor CLI
-    // id embeds the effort level, so `clients.gaviero` pins the full id.
-    assert_eq!(inventory.model.as_deref(), Some("cursor:grok-4.7-high"));
+    // inventory runs on `top`, the README writer on `medium`.
+    assert_eq!(inventory.model.as_deref(), Some("claude:fable"));
     let readme = units
         .iter()
         .find(|u| u.id == "write_readme_md")
         .expect("write_readme_md");
-    assert_eq!(readme.model.as_deref(), Some("cursor:composer-2.5"));
+    assert_eq!(readme.model.as_deref(), Some("claude:sonnet"));
     assert_eq!(units[0].id, "inventory");
     // Three write agents depend on inventory
     assert!(units[1].depends_on.contains(&"inventory".to_string()));
@@ -669,22 +876,24 @@ fn example_pattern_map_reduce_emits_fanout() {
     assert!(units[1].depends_on.contains(&"discover".to_string()));
 }
 
+/// Swapping every model at once is choosing another profile.
 #[test]
-fn update_docs_tiers_file_overrides_profile() {
+fn update_docs_profile_swaps_every_model() {
     let examples = std::path::PathBuf::from(format!("{}/examples", env!("CARGO_MANIFEST_DIR")));
     let entry = examples.join("update_docs.gaviero");
-    let codex_profile = examples.join("profiles/doc-codex.gaviero");
-    let overrides =
-        gaviero_dsl::load_tier_overrides(&codex_profile).expect("load codex tiers profile");
-    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &overrides, &[])
-        .expect("compile with --tiers-file overrides");
-    let inventory = plan
-        .work_units_ordered()
-        .expect("toposort")
-        .into_iter()
-        .find(|u| u.id == "inventory")
-        .expect("inventory");
-    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-6.1-sol"));
+    let codex = SelectedProfile {
+        name: "codex".into(),
+        path: examples.join("profiles/codex.gaviero"),
+        precedence: ProfilePrecedence::OverridesScript,
+    };
+    let plan = gaviero_dsl::compile_file_with_profile(&entry, Some(&codex), None, None, &[], &[], &[])
+        .expect("compile with the codex profile");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert!(
+        units.iter().all(|u| u.model.as_deref().is_some_and(|m| m.starts_with("codex:"))),
+        "{:?}",
+        units.iter().map(|u| u.model.clone()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -708,16 +917,9 @@ fn template_plan_refinement() {
         .find(|u| u.id == "cursor-refine")
         .expect("cursor-refine");
 
-    let expected_default = gaviero_core::types::ModelTier::default();
-    for u in &[crefine, xrefine, urefine] {
-        assert_eq!(
-            u.tier, expected_default,
-            "agent {} should resolve to the default tier (roster synth client)",
-            u.id
-        );
-    }
-    assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
-    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.6-sol"));
+    // Each roster entry's `tier` sets its clone's model through the profile.
+    assert_eq!(crefine.model.as_deref(), Some("claude:fable"));
+    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-6-astra"));
     assert_eq!(urefine.model.as_deref(), Some("cursor:grok-4.7-high"));
 
     assert!(
@@ -830,7 +1032,7 @@ fn template_plan_refinement() {
 fn plan_refinement_three_provider_roster() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plan_refinement.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("feature-plan-refinement"),
         Some("multi-provider plan test"),
@@ -838,7 +1040,7 @@ fn plan_refinement_three_provider_roster() {
         &[],
         &[(
             "roster".into(),
-            "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium"
+            "claude=top-claude,codex=high-codex,cursor=medium-cursor"
                 .into(),
         )],
     )
@@ -986,7 +1188,7 @@ fn template_phased_plan() {
 fn compile_file_generic_consensus_with_reviewers() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("generic-consensus"),
         Some("test topic"),
@@ -1015,9 +1217,9 @@ fn generic_consensus_param_roster_override_swaps_to_three_reviewers() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
     let overrides = vec![(
         "roster".to_string(),
-        "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5".to_string(),
+        "claude=top-claude,codex=high-codex,cursor=medium-cursor".to_string(),
     )];
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("generic-consensus"),
         Some("test topic"),
@@ -1050,7 +1252,7 @@ fn generic_consensus_param_roster_override_swaps_to_three_reviewers() {
 fn compile_file_scientific_research_default_roster() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/scientific_research.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("scientific-research-consensus"),
         Some("test topic"),
@@ -1092,13 +1294,13 @@ fn compile_file_scientific_research_default_roster() {
 fn compile_file_scientific_research_produces_is_per_reviewer() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/scientific_research.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("scientific-research-consensus"),
         Some("test topic"),
         &[],
         &[],
-        &[("roster".into(), "a=claude:opus,b=codex:gpt-5.6-sol".into())],
+        &[("roster".into(), "a=high-claude,b=high-codex".into())],
     )
     .expect("two-reviewer roster should compile");
 
@@ -1136,9 +1338,9 @@ fn compile_file_scientific_research_param_roster_override_to_two() {
         .join("examples/scientific_research.gaviero");
     let overrides = vec![(
         "roster".to_string(),
-        "claude=claude:opus@max,codex=codex:gpt-5.5@high".to_string(),
+        "claude=top-claude,codex=high-codex".to_string(),
     )];
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("scientific-research-consensus"),
         Some("test topic"),
@@ -1179,9 +1381,9 @@ fn scientific_research_peer_block_substitutes_out_dir() {
     let vars = vec![("OUT_DIR".to_string(), "research/run-a".to_string())];
     let overrides = vec![(
         "roster".to_string(),
-        "claude=claude:opus@max,codex=codex:gpt-5.5@high".to_string(),
+        "claude=top-claude,codex=high-codex".to_string(),
     )];
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("scientific-research-consensus"),
         Some("test topic"),
@@ -1213,14 +1415,13 @@ fn scientific_research_peer_block_substitutes_out_dir() {
 #[test]
 fn workflow_execution_document_parsed() {
     let src = r#"
-client c { tier cheap model "claude:sonnet" effort low default }
-agent a { client c scope { owned ["out/"] } prompt "x" }
+agent a { tier t scope { owned ["out/"] } prompt "x" }
 workflow w {
     execution_mode document
     steps [a]
 }
 "#;
-    let plan = gaviero_dsl::compile(src, "test.gaviero", Some("w"), None).expect("compile");
+    let plan = compile(src, "test.gaviero", Some("w"), None).expect("compile");
     assert_eq!(
         plan.execution_mode,
         gaviero_core::swarm::plan::ExecutionMode::Document
@@ -1228,10 +1429,10 @@ workflow w {
 }
 
 #[test]
-fn scientific_research_judge_uses_client_param_default() {
+fn scientific_research_judge_runs_on_its_own_tier() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/scientific_research.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = compile_file(
         &path,
         Some("scientific-research-consensus"),
         Some("topic"),
@@ -1249,19 +1450,19 @@ fn scientific_research_judge_uses_client_param_default() {
 }
 
 #[test]
-fn client_param_override_swaps_judge_model() {
+fn cli_tier_swaps_the_loop_judge_model() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
-    let overrides = vec![("judge".to_string(), "claude:haiku@low".to_string())];
-    let plan = gaviero_dsl::compile_file(
+    let tiers = vec![("consensus-judge".to_string(), "low".to_string())];
+    let plan = compile_file(
         &path,
         Some("generic-consensus"),
         Some("topic"),
         &[],
+        &tiers,
         &[],
-        &overrides,
     )
-    .expect("judge param override should compile");
+    .expect("--tier on the judge should compile");
     assert_eq!(
         plan.loop_judge_units[0].model.as_deref(),
         Some("claude:haiku")
@@ -1269,34 +1470,17 @@ fn client_param_override_swaps_judge_model() {
     assert_eq!(plan.loop_judge_units[0].effort.as_deref(), Some("low"));
 }
 
+/// A roster entry names a tier, never a model: `id=provider:model` is
+/// rejected with a pointer to the profile.
 #[test]
-fn client_param_without_default_requires_cli() {
-    let src = concat!(
-        "prompt p #\"x\"#\n",
-        "agent judge { client gate prompt \"j\" }\n",
-        "workflow w {\n",
-        "  param gate { }\n",
-        "  steps [ judge ]\n",
-        "}\n",
-    );
-    let err = gaviero_dsl::compile_with_vars(src, "inline.gaviero", Some("w"), None, &[], &[], &[])
-        .expect_err("required client param must fail");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("gate") && (msg.contains("model") || msg.contains("CLI")),
-        "expected client-param required diagnostic, got: {msg}"
-    );
-}
-
-#[test]
-fn generic_consensus_param_roster_missing_provider_is_rejected() {
+fn generic_consensus_roster_rejects_model_specs() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
     let overrides = vec![(
         "roster".to_string(),
-        "claude=opus,codex=gpt-5.5".to_string(),
+        "claude=claude:opus,codex=codex:gpt-5.5".to_string(),
     )];
-    let err = gaviero_dsl::compile_file(
+    let err = compile_file(
         &path,
         Some("generic-consensus"),
         Some("t"),
@@ -1304,12 +1488,15 @@ fn generic_consensus_param_roster_missing_provider_is_rejected() {
         &[],
         &overrides,
     )
-    .expect_err("model without provider prefix must fail");
+    .expect_err("a model spec in a roster must fail");
     let msg = format!("{err:?}");
-    assert!(
-        msg.contains("provider:model"),
-        "expected provider:model diagnostic, got: {msg}"
-    );
+    assert!(msg.contains("id=<tier>"), "expected id=<tier> diagnostic, got: {msg}");
+
+    // A tier the profile does not define names the agent and the tier.
+    let overrides = vec![("roster".to_string(), "claude=nope".to_string())];
+    let err = compile_file(&path, Some("generic-consensus"), Some("t"), &[], &[], &overrides)
+        .expect_err("an unknown tier must fail");
+    assert!(format!("{err:?}").contains("uses tier `nope`"), "{err:?}");
 }
 
 #[test]
@@ -1317,10 +1504,9 @@ fn param_without_default_or_cli_value_is_required_error() {
     let src = concat!(
         "prompt p #\"x\"#\n",
         "prompt r #\"y\"#\n",
-        "client c { model \"claude:sonnet\" }\n",
-        "agent tinit { template true prompt p scope { owned [\"out/x-*\"] } }\n",
-        "agent tref  { template true prompt r scope { owned [\"out/y-*\"] } }\n",
-        "agent judge { client c prompt \"j\" }\n",
+        "agent tinit { tier t template true prompt p scope { owned [\"out/x-*\"] } }\n",
+        "agent tref  { tier t template true prompt r scope { owned [\"out/y-*\"] } }\n",
+        "agent judge { tier t prompt \"j\" }\n",
         "workflow w {\n",
         "  param roster\n",
         "  steps [ loop {\n",
@@ -1332,7 +1518,7 @@ fn param_without_default_or_cli_value_is_required_error() {
         "  } ]\n",
         "}\n",
     );
-    let err = gaviero_dsl::compile(src, "inline.gaviero", None, None)
+    let err = compile(src, "inline.gaviero", None, None)
         .expect_err("required param without default must fail");
     let msg = format!("{err:?}");
     assert!(
@@ -1349,39 +1535,69 @@ fn compile_file_resolves_include_and_compiles_workflow() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    // Library: shared client + tier alias
+    // Library: a shared agent and prompt
     let mut lib = fs::File::create(dir.join("lib.gaviero")).unwrap();
     lib.write_all(
-        br#"
-            client sonnet { tier cheap model "claude:sonnet" }
-            tier cheap sonnet
-        "#,
+        br##"
+            prompt work #"do work"#
+            agent worker {
+                description "test"
+                tier sonnet
+                prompt work
+            }
+        "##,
     )
     .unwrap();
 
-    // Entry: agent + workflow that reference the included client
+    // Entry: a workflow that runs the included agent
     let entry = dir.join("main.gaviero");
     let mut f = fs::File::create(&entry).unwrap();
     f.write_all(
         br#"
             include "lib.gaviero"
-            agent worker {
-                description "test"
-                tier cheap
-                prompt "do work"
-            }
             workflow w { steps [worker] }
         "#,
     )
     .unwrap();
 
-    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &[], &[])
+    let plan = compile_file(&entry, None, None, &[], &[], &[])
         .expect("compile_file should succeed across include boundary");
     let units = plan.work_units_ordered().unwrap();
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].id, "worker");
-    assert_eq!(units[0].model, Some("claude:sonnet".to_string()));
+    assert_eq!(units[0].model, Some("claude-sonnet-4-6".to_string()));
     assert_eq!(units[0].tier, ModelTier::Cheap);
+}
+
+/// An included file is part of the script: it may not declare clients
+/// either, and the diagnostic points at the included file.
+#[test]
+fn compile_file_rejects_a_client_in_an_included_file() {
+    use std::fs;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    fs::File::create(dir.join("clients.gaviero"))
+        .unwrap()
+        .write_all(br#"client base { model "claude:sonnet" }"#)
+        .unwrap();
+    let entry = dir.join("main.gaviero");
+    fs::File::create(&entry)
+        .unwrap()
+        .write_all(
+            br#"
+                include "clients.gaviero"
+                agent w { tier t prompt "x" }
+                workflow wf { steps [w] }
+            "#,
+        )
+        .unwrap();
+
+    let err = compile_file(&entry, None, None, &[], &[], &[]).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(msg.contains("cannot declare `client base`"), "got: {msg}");
+    assert!(msg.contains("clients.gaviero"), "got: {msg}");
 }
 
 #[test]
@@ -1392,14 +1608,14 @@ fn compile_file_reports_duplicate_decl_across_files() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    // Both files declare `client base` — duplicate should be flagged.
+    // Both files declare `prompt base` — duplicate should be flagged.
     fs::File::create(dir.join("a.gaviero"))
         .unwrap()
-        .write_all(br#"client base { tier cheap model "claude:sonnet" }"#)
+        .write_all(br#"prompt base "one""#)
         .unwrap();
     fs::File::create(dir.join("b.gaviero"))
         .unwrap()
-        .write_all(br#"client base { tier cheap model "claude:haiku" }"#)
+        .write_all(br#"prompt base "two""#)
         .unwrap();
     let entry = dir.join("main.gaviero");
     fs::File::create(&entry)
@@ -1408,17 +1624,17 @@ fn compile_file_reports_duplicate_decl_across_files() {
             br#"
                 include "a.gaviero"
                 include "b.gaviero"
-                agent w { client base prompt "x" }
+                agent w { tier t prompt base }
                 workflow wf { steps [w] }
             "#,
         )
         .unwrap();
 
-    let err = gaviero_dsl::compile_file(&entry, None, None, &[], &[], &[]).unwrap_err();
+    let err = compile_file(&entry, None, None, &[], &[], &[]).unwrap_err();
     let msg = format!("{:?}", err);
     assert!(
-        msg.contains("duplicate client name `base`"),
-        "expected duplicate-client diagnostic, got: {}",
+        msg.contains("duplicate prompt name `base`"),
+        "expected duplicate-prompt diagnostic, got: {}",
         msg
     );
 }
@@ -1427,9 +1643,9 @@ fn compile_file_reports_duplicate_decl_across_files() {
 fn compile_rejects_inline_include_with_helpful_diagnostic() {
     let src = r#"
         include "lib.gaviero"
-        client c { tier cheap model "claude:sonnet" }
+        agent a { tier t }
     "#;
-    let err = gaviero_dsl::compile(src, "inline.gaviero", None, None).unwrap_err();
+    let err = compile(src, "inline.gaviero", None, None).unwrap_err();
     let msg = format!("{:?}", err);
     assert!(
         msg.contains("compile_file") || msg.contains("--script"),
@@ -1442,7 +1658,7 @@ fn compile_rejects_inline_include_with_helpful_diagnostic() {
 
 fn for_loops_plan(params: &[(String, String)]) -> gaviero_core::swarm::plan::CompiledPlan {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/for_loops.gaviero");
-    gaviero_dsl::compile_file(
+    compile_file(
         &path,
         Some("for-loops"),
         Some("the release"),
@@ -1535,16 +1751,15 @@ fn for_loops_parallel_inside_loop_becomes_loop_agents() {
 }
 
 const FOR_BASE_SRC: &str = r#"
-client c { model "claude:sonnet" effort low default }
-agent base {
+agent base { tier t
     scope { owned ["out/{{t.id}}-v*.md"] }
     prompt "baseline {{t.id}}"
 }
-agent rev {
+agent rev { tier t
     scope { owned ["out/{{t.id}}-v*.md"] }
     prompt "review {{t.id}} v{{ITER}}"
 }
-agent judge { prompt "VERDICT" }
+agent judge { tier t prompt "VERDICT" }
 workflow w {
     execution_mode document
     param topics [ { id "a" } { id "b" } { id "c" } ]
@@ -1562,7 +1777,7 @@ workflow w {
 #[test]
 fn for_loops_baseline_units_pair_a_for_step_with_its_loop() {
     let plan =
-        gaviero_dsl::compile_with_vars(FOR_BASE_SRC, "t.gaviero", Some("w"), None, &[], &[], &[])
+        compile_with_vars(FOR_BASE_SRC, "t.gaviero", Some("w"), None, &[], &[], &[])
             .expect("compiles");
     let lc = plan.loop_configs.first().expect("loop config");
     assert_eq!(lc.agent_ids, vec!["a-rev", "b-rev", "c-rev"]);
@@ -1589,34 +1804,32 @@ fn for_loops_param_list_literal_override() {
 fn for_error(steps: &str, agents: &str, params: &str, document: bool) -> String {
     let src = format!(
         r#"
-client c {{ model "claude:sonnet" effort low default }}
-agent judge {{ prompt "VERDICT" }}
+agent judge {{ tier t prompt "VERDICT" }}
 {agents}
 workflow w {{
     {mode}
     param topics [ {{ id "a" }} {{ id "b" }} ]
-    param judgeparam {{ model "claude:sonnet" }}
     {params}
     steps [ {steps} ]
 }}
 "#,
         mode = if document { "execution_mode document" } else { "" },
     );
-    match gaviero_dsl::compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[]) {
+    match compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[]) {
         Ok(_) => panic!("expected a compile error for:\n{src}"),
         Err(e) => format!("{e:?}"),
     }
 }
 
-const OK_AGENT: &str = r#"agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.id}}" }
-agent uses_judgeparam { client judgeparam prompt "j" }"#;
+const OK_AGENT: &str = r#"agent a { tier t scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.id}}" }
+agent uses_judgeparam { tier t prompt "j" }"#;
 
 #[test]
 fn for_error_parallel_body_must_write_per_item_files() {
     let msg = for_error(
         "for t in topics parallel { a } uses_judgeparam",
-        r#"agent a { scope { owned ["out/shared.md"] } prompt "x" }
-agent uses_judgeparam { client judgeparam prompt "j" }"#,
+        r#"agent a { tier t scope { owned ["out/shared.md"] } prompt "x" }
+agent uses_judgeparam { tier t prompt "j" }"#,
         "",
         true,
     );
@@ -1635,8 +1848,8 @@ fn for_error_sequential_needs_document_mode() {
 fn for_error_unknown_item_field() {
     let msg = for_error(
         "for t in topics parallel { a } uses_judgeparam",
-        r#"agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.nope}}" }
-agent uses_judgeparam { client judgeparam prompt "j" }"#,
+        r#"agent a { tier t scope { owned ["out/{{t.id}}.md"] } prompt "x {{t.nope}}" }
+agent uses_judgeparam { tier t prompt "j" }"#,
         "",
         true,
     );
@@ -1646,11 +1859,10 @@ agent uses_judgeparam { client judgeparam prompt "j" }"#,
 #[test]
 fn for_error_empty_list_from_cli() {
     let src = r#"
-client c { model "claude:sonnet" effort low default }
-agent a { scope { owned ["out/{{t.id}}.md"] } prompt "x" }
+agent a { tier t scope { owned ["out/{{t.id}}.md"] } prompt "x" }
 workflow w { param topics [ { id "a" } ] steps [ for t in topics parallel { a } ] }
 "#;
-    let err = gaviero_dsl::compile_with_vars(
+    let err = compile_with_vars(
         src,
         "t.gaviero",
         Some("w"),
@@ -1716,8 +1928,487 @@ fn for_error_sequential_inside_loop() {
     assert!(msg.contains("loop"), "{msg}");
 }
 
+// ── loop ordering and the one-loop rule ──────────────────────────────────
+
 #[test]
-fn for_error_over_a_client_param() {
-    let msg = for_error("for t in judgeparam parallel { a } uses_judgeparam", OK_AGENT, "", true);
-    assert!(msg.contains("not a list param"), "{msg}");
+fn loop_agent_ids_follow_intra_loop_depends_on() {
+    let src = r#"
+agent inv { tier t scope { owned ["out/inv-v*.md"] } prompt "investigate v{{ITER}}" }
+agent cur { tier t scope { owned ["out/cur-v*.md"] } depends_on [inv] prompt "curate v{{ITER}}" }
+agent judge { tier t prompt "VERDICT" }
+workflow w {
+    execution_mode document
+    steps [
+        loop {
+            agents [cur inv]
+            max_iterations 2
+            until agent judge
+        }
+    ]
+}
+"#;
+    let plan = compile_with_vars(src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .expect("compiles");
+    let lc = plan.loop_configs.first().expect("loop config");
+    assert_eq!(lc.agent_ids, vec!["inv", "cur"]);
+}
+
+#[test]
+fn error_two_loops_in_one_workflow() {
+    let src = r#"
+agent a { tier t scope { owned ["out/a-v*.md"] } prompt "a v{{ITER}}" }
+agent b { tier t scope { owned ["out/b-v*.md"] } prompt "b v{{ITER}}" }
+agent judge { tier t prompt "VERDICT" }
+workflow w {
+    execution_mode document
+    steps [
+        loop { agents [a] max_iterations 2 until agent judge }
+        loop { agents [b] max_iterations 2 until agent judge }
+    ]
+}
+"#;
+    let err = compile_with_vars(src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("a workflow may contain at most one `loop` block"),
+        "{msg}"
+    );
+}
+
+// ── `for … in json` (runtime lists) ──────────────────────────────────────
+
+const RUNTIME_FOR_AGENTS: &str = r#"
+agent worker { tier t
+    scope { owned ["out/{{q.id}}.md"] }
+    produces ["out/{{q.id}}.md"]
+    prompt "MARK-{{q.id}} focus={{q.focus}}"
+}
+agent summary { tier t depends_on [worker] prompt "summarise" }
+agent judge { tier t prompt "VERDICT" }
+"#;
+
+fn runtime_for_compile(
+    workflow_body: &str,
+) -> Result<gaviero_core::swarm::plan::CompiledPlan, String> {
+    let src = format!("{RUNTIME_FOR_AGENTS}\nworkflow w {{ {workflow_body} }}\n");
+    compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn runtime_for_error(workflow_body: &str) -> String {
+    runtime_for_compile(workflow_body).expect_err("expected a compile error")
+}
+
+#[test]
+fn runtime_for_top_level_emits_template_and_op() {
+    let plan = runtime_for_compile(
+        r#"execution_mode document
+           steps [ for q in json "out/items.json" parallel { worker } summary ]"#,
+    )
+    .expect("compiles");
+    let worker = unit(&plan, "worker");
+    assert_eq!(worker.produces, vec!["out/{{q.id}}.md"]);
+    assert!(worker.coordinator_instructions.contains("MARK-{{q.id}}"));
+    assert_eq!(plan.runtime_fors.len(), 1);
+    let op = &plan.runtime_fors[0];
+    assert_eq!(op.unit_id, "worker");
+    assert_eq!(op.var, "q");
+    assert_eq!(op.source, "out/items.json");
+    assert_eq!(op.max_items, gaviero_core::swarm::plan::DEFAULT_MAX_SPAWN);
+    assert!(unit(&plan, "summary").depends_on.contains(&"worker".to_string()));
+}
+
+#[test]
+fn runtime_for_inside_loop_joins_loop_agents() {
+    let plan = runtime_for_compile(
+        r#"execution_mode document
+           steps [ loop {
+               for q in json "out/items-v{{PREV_ITER}}.json" parallel max 6 { worker }
+               max_iterations 3
+               until agent judge
+           } ]"#,
+    )
+    .expect("compiles");
+    let lc = plan.loop_configs.first().expect("loop config");
+    assert_eq!(lc.agent_ids, vec!["worker"]);
+    assert_eq!(plan.runtime_fors[0].source, "out/items-v{{PREV_ITER}}.json");
+    assert_eq!(plan.runtime_fors[0].max_items, 6);
+}
+
+#[test]
+fn runtime_for_source_gets_compile_time_vars() {
+    let src = format!(
+        "{RUNTIME_FOR_AGENTS}\nvars {{ OUT_DIR \"research/x\" }}\nworkflow w {{ execution_mode document steps [ for q in json \"{{{{OUT_DIR}}}}/items.json\" parallel {{ worker }} ] }}\n"
+    );
+    let plan = compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .expect("compiles");
+    assert_eq!(plan.runtime_fors[0].source, "research/x/items.json");
+}
+
+#[test]
+fn tier_bindings_are_emitted() {
+    let plan = runtime_for_compile(
+        r#"execution_mode document
+           steps [ for q in json "out/items.json" parallel { worker } ]"#,
+    )
+    .expect("compiles");
+    // Every tier of the profile is emitted, so runtime items can name one.
+    let b = plan.tier_bindings.get("low").expect("tier low bound");
+    assert_eq!(b.model.as_deref(), Some("claude:haiku"));
+    assert_eq!(b.effort.as_deref(), Some("low"));
+}
+
+#[test]
+fn runtime_for_error_sequential() {
+    let msg = runtime_for_error(
+        r#"execution_mode document steps [ for q in json "out/i.json" sequential { worker } ]"#,
+    );
+    assert!(msg.contains("`for … in json` supports only `parallel`"), "{msg}");
+}
+
+#[test]
+fn runtime_for_error_max_without_json() {
+    let msg = runtime_for_error(
+        r#"execution_mode document param topics [ { id "a" } ]
+           steps [ for q in topics parallel max 2 { worker } ]"#,
+    );
+    assert!(msg.contains("`max` applies only to `for … in json`"), "{msg}");
+}
+
+#[test]
+fn runtime_for_error_max_zero() {
+    let msg = runtime_for_error(
+        r#"execution_mode document steps [ for q in json "out/i.json" parallel max 0 { worker } ]"#,
+    );
+    assert!(msg.contains("`max` must be at least 1"), "{msg}");
+}
+
+#[test]
+fn runtime_for_error_peer_template() {
+    let msg = runtime_for_error(
+        r#"execution_mode document steps [ for q in json "out/i.json" parallel { worker peer_template "x" } ]"#,
+    );
+    assert!(
+        msg.contains("`peer_template` is not available with `for … in json`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn runtime_for_error_two_body_agents() {
+    let msg = runtime_for_error(
+        r#"execution_mode document steps [ for q in json "out/i.json" parallel { worker summary } ]"#,
+    );
+    assert!(msg.contains("`for … in json` takes exactly one body agent"), "{msg}");
+}
+
+#[test]
+fn runtime_for_error_needs_document_mode() {
+    let msg = runtime_for_error(r#"steps [ for q in json "out/i.json" parallel { worker } ]"#);
+    assert!(
+        msg.contains("`for … in json` requires `execution_mode document`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn runtime_for_error_body_without_produces() {
+    let src = r#"
+agent bare { tier t scope { owned ["out/{{q.id}}.md"] } prompt "x" }
+workflow w { execution_mode document steps [ for q in json "out/i.json" parallel { bare } ] }
+"#;
+    let msg = format!(
+        "{:?}",
+        compile_with_vars(src, "t.gaviero", Some("w"), None, &[], &[], &[])
+            .unwrap_err()
+    );
+    assert!(
+        msg.contains("the body of `for … in json` must declare `produces`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn runtime_for_error_inside_stacked_loop() {
+    let msg = runtime_for_error(
+        r#"execution_mode document steps [ loop {
+               for q in json "out/i.json" parallel { worker }
+               branch_chain stacked
+               until agent judge
+           } ]"#,
+    );
+    assert!(
+        msg.contains("`for … in json` cannot run inside a `branch_chain stacked` loop"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn map_reduce_requires_document_mode() {
+    let src = r#"
+agent d { tier t prompt "discover" }
+agent r { tier t depends_on [d] prompt "reduce" }
+workflow w {
+    steps [d r]
+    pattern map_reduce { discover d reduce r max_spawn 4 }
+}
+"#;
+    let msg = format!(
+        "{:?}",
+        compile_with_vars(src, "t.gaviero", Some("w"), None, &[], &[], &[])
+            .unwrap_err()
+    );
+    assert!(
+        msg.contains("`pattern map_reduce` requires `execution_mode document`"),
+        "{msg}"
+    );
+}
+
+// ── budget { wall usd } ──────────────────────────────────────────────────
+
+fn budget_compile(block: &str) -> Result<gaviero_core::swarm::plan::CompiledPlan, String> {
+    let src = format!(
+        "agent a {{ tier t prompt \"x\" }}\nworkflow w {{ steps [a] {block} }}\n"
+    );
+    compile_with_vars(&src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[test]
+fn budget_block_compiles() {
+    let plan = budget_compile(r#"budget { wall "8h" usd 40 }"#).expect("compiles");
+    let b = plan.budget.expect("budget");
+    assert_eq!(b.wall_secs, Some(28800));
+    assert_eq!(b.usd, Some(40.0));
+}
+
+#[test]
+fn budget_usd_float() {
+    let plan = budget_compile(r#"budget { usd 12.5 }"#).expect("compiles");
+    let b = plan.budget.expect("budget");
+    assert_eq!(b.usd, Some(12.5));
+    assert_eq!(b.wall_secs, None);
+}
+
+#[test]
+fn budget_wall_units() {
+    let secs = |w: &str| {
+        budget_compile(&format!("budget {{ wall \"{w}\" }}"))
+            .expect("compiles")
+            .budget
+            .unwrap()
+            .wall_secs
+    };
+    assert_eq!(secs("90s"), Some(90));
+    assert_eq!(secs("30m"), Some(1800));
+    assert_eq!(secs("45"), Some(45));
+    assert!(budget_compile("").unwrap().budget.is_none());
+}
+
+#[test]
+fn budget_error_bad_duration() {
+    let msg = budget_compile(r#"budget { wall "eight hours" }"#).unwrap_err();
+    assert!(
+        msg.contains(r#"`wall` takes a duration like \"90s\", \"30m\" or \"8h\""#)
+            || msg.contains("`wall` takes a duration like"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn budget_error_usd_not_positive() {
+    let msg = budget_compile(r#"budget { usd 0 }"#).unwrap_err();
+    assert!(msg.contains("`usd` must be positive"), "{msg}");
+}
+
+#[test]
+fn budget_error_empty() {
+    let msg = budget_compile(r#"budget { }"#).unwrap_err();
+    assert!(msg.contains("`budget` needs `wall` or `usd`"), "{msg}");
+}
+
+// ── produces json ────────────────────────────────────────────────────────
+
+#[test]
+fn produces_json_compiles_into_both_lists() {
+    let src = r#"
+vars { OUT_DIR "research/x" }
+agent a { tier t
+    scope { owned ["{{OUT_DIR}}/*"] }
+    produces ["{{OUT_DIR}}/report.md"]
+    produces json ["{{OUT_DIR}}/frontier-v{{ITER}}.json"]
+    prompt "x"
+}
+workflow w { steps [a] }
+"#;
+    let plan = compile_with_vars(src, "t.gaviero", Some("w"), None, &[], &[], &[])
+        .expect("compiles");
+    let a = unit(&plan, "a");
+    assert_eq!(
+        a.produces,
+        vec!["research/x/report.md", "research/x/frontier-v{{ITER}}.json"]
+    );
+    assert_eq!(a.produces_json, vec!["research/x/frontier-v{{ITER}}.json"]);
+}
+
+// ── examples/deep_explore.gaviero ────────────────────────────────────────
+
+/// The `{{name}}` placeholders of a text, without the braces.
+fn regex_lite_placeholders() -> impl Fn(&str) -> Vec<String> {
+    |text: &str| {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            match after.find("}}") {
+                Some(end) => {
+                    out.push(after[..end].to_string());
+                    rest = &after[end + 2..];
+                }
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+#[test]
+fn example_deep_explore_compiles() {
+    // The script names no provider: models come from the profile, here the
+    // shipped `mixed` one (high = claude:opus, medium = codex terra), the way
+    // a run's implicit `default` profile fills its tiers.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let script = dir.join("deep_explore.gaviero");
+    let profile = gaviero_core::script_profiles::SelectedProfile {
+        name: "default".into(),
+        path: dir.join("profiles/mixed.gaviero"),
+        precedence: gaviero_core::script_profiles::ProfilePrecedence::FillsGaps,
+    };
+    let plan = gaviero_dsl::compile_file_with_profile(&script, Some(&profile), None, None, &[], &[], &[])
+        .unwrap_or_else(|e| panic!("compiling deep_explore.gaviero:\n{e:?}"));
+    // Without a profile no tier is bound: the script declares none of its own.
+    assert!(gaviero_dsl::compile_file(&script, None, None, &[], &[], &[]).is_err());
+
+    // The only input is the run prompt (SWARM form Prompt box / --prompt):
+    // no file var for the form to ask for.
+    let inspection = gaviero_dsl::inspect_file(&script).expect("inspect");
+    assert!(inspection.requires_prompt);
+    let vars: Vec<&str> = inspection.vars.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(vars, ["OUT_DIR", "COLLECTION", "ACADEMIC_SERVER", "FALSIFY_TIER"]);
+    // Every agent declares its tier; the form learns which ones the profile
+    // must define.
+    assert_eq!(inspection.tiers, ["high", "top", "medium"]);
+    let with_prompt = gaviero_dsl::compile_file_with_profile(
+        &script, Some(&profile), None, Some("Map the failure modes of X."), &[], &[], &[],
+    )
+    .expect("compile with a prompt");
+    let curator_prompt = &with_prompt
+        .work_units_unordered()
+        .into_iter()
+        .find(|u| u.id == "curator")
+        .expect("curator")
+        .coordinator_instructions;
+    assert!(curator_prompt.contains("Map the failure modes of X."), "{curator_prompt}");
+    // Every placeholder left after compiling is one the runtime fills:
+    // the loop pass or a runtime `for` item. A typo would reach the agent.
+    let runtime_placeholder = regex_lite_placeholders();
+    for u in with_prompt
+        .work_units_unordered()
+        .into_iter()
+        .chain(with_prompt.loop_judge_units.iter())
+    {
+        for found in runtime_placeholder(&u.coordinator_instructions) {
+            assert!(
+                found == "ITER" || found == "PREV_ITER" || found.starts_with("q."),
+                "unresolved {{{{{found}}}}} in {}",
+                u.id
+            );
+        }
+    }
+    assert!(curator_prompt.contains("`academic` MCP server"), "{curator_prompt}");
+
+    let model = |id: &str| -> String {
+        plan.work_units_unordered()
+            .into_iter()
+            .chain(plan.loop_judge_units.iter())
+            .find(|u| u.id == id)
+            .and_then(|u| u.model.clone())
+            .unwrap_or_else(|| panic!("no model for {id}"))
+    };
+    assert_eq!(model("scout"), "claude:opus", "tier high");
+    assert_eq!(model("curator"), "claude:fable", "tier top");
+    assert_eq!(model("investigator"), "claude:opus", "tier high");
+    assert_eq!(model("synthesize"), "claude:fable", "tier top");
+    // The auditors declare `tier medium`: another family than the
+    // investigators under this profile.
+    assert_eq!(model("verifier"), "codex:gpt-6.1-terra", "tier medium");
+    assert_eq!(model("citation_check"), "codex:gpt-6.1-terra", "tier medium");
+    assert!(plan.tier_bindings.contains_key("high"), "runtime items can name tier high");
+
+    // `--tier` moves one auditor for a run; the others keep their tier.
+    let moved = gaviero_dsl::compile_file_with_profile(
+        &script,
+        Some(&profile),
+        None,
+        None,
+        &[],
+        &[("verifier".to_string(), "top".to_string())],
+        &[],
+    )
+    .expect("compile with --tier verifier=top");
+    let verifier = moved
+        .work_units_unordered()
+        .into_iter()
+        .find(|u| u.id == "verifier")
+        .and_then(|u| u.model.clone());
+    assert_eq!(verifier.as_deref(), Some("claude:fable"));
+    assert_eq!(
+        moved.loop_judge_units[0].model.as_deref(),
+        Some("codex:gpt-6.1-terra")
+    );
+
+    assert_eq!(plan.runtime_fors.len(), 1);
+    let op = &plan.runtime_fors[0];
+    assert_eq!(op.unit_id, "investigator");
+    assert_eq!(op.source, "research/explore/assignments-v{{ITER}}.json");
+    assert_eq!(op.max_items, 6);
+
+    let lc = plan.loop_configs.first().expect("loop config");
+    // Dependency order inside every pass: curate → investigate → audit.
+    assert_eq!(lc.agent_ids, vec!["curator", "investigator", "verifier"]);
+
+    let budget = plan.budget.as_ref().expect("budget");
+    assert_eq!(budget.usd, Some(60.0));
+    assert_eq!(budget.wall_secs, Some(10 * 3600));
+    assert_eq!(
+        plan.execution_mode,
+        gaviero_core::swarm::plan::ExecutionMode::Document
+    );
+    // `tier medium`: a different family from the curator under this
+    // profile, and movable per run with --tier stop_judge=….
+    assert_eq!(model("stop_judge"), "codex:gpt-6.1-terra", "tier medium");
+
+    let curator = unit(&plan, "curator");
+    assert_eq!(curator.produces_json.len(), 2);
+    assert_eq!(
+        unit(&plan, "verifier").produces_json,
+        vec!["research/explore/audit-v{{ITER}}.json"]
+    );
+    assert_eq!(
+        unit(&plan, "scout").produces_json,
+        vec!["research/explore/landscape.json"]
+    );
+
+    // The shape the runtime launches: scope validation as `execute` runs it.
+    let units = plan.work_units_ordered().expect("toposort");
+    let groups = gaviero_core::swarm::validation::add_baseline_units_to_loop_groups(
+        gaviero_core::swarm::validation::expand_loop_groups_with_roster_init(
+            plan.loop_configs.iter().map(|lc| lc.agent_ids.clone()).collect(),
+            &units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        ),
+        &plan.loop_configs,
+    );
+    let errors = gaviero_core::swarm::validation::validate_scopes(&units, &groups);
+    assert!(errors.is_empty(), "{errors:?}");
 }

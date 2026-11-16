@@ -9,7 +9,6 @@ pub mod patterns;
 pub mod profile;
 pub mod resolver;
 pub mod reviewers;
-pub mod tiers;
 pub mod workflow_params;
 
 // Re-export `CompiledPlan` as the primary output type.
@@ -24,13 +23,16 @@ pub use inspect::{
     ParamInspection, ParamKindInfo, ScriptInspection, VarInspection, WorkflowInspection,
     inspect_file, profile_tier_names,
 };
-pub use tiers::load_tier_overrides;
 
-/// Compile a `.gaviero` DSL script into a [`CompiledPlan`].
+use gaviero_core::script_profiles::SelectedProfile;
+
+/// Compile an inline `.gaviero` script into a [`CompiledPlan`].
 ///
 /// # Parameters
 /// - `source`: The raw script text.
 /// - `filename`: Used in error messages to identify the file.
+/// - `profile`: The model profile that says which model each tier means.
+///   Every agent declares a tier, so a script with agents needs one.
 /// - `workflow`: Optional workflow name to select from the script.
 ///   - `None` and exactly one workflow declared → use it.
 ///   - `None` and no workflow declared → run all agents in declaration order.
@@ -46,30 +48,32 @@ pub use tiers::load_tier_overrides;
 pub fn compile(
     source: &str,
     filename: &str,
+    profile: Option<&SelectedProfile>,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, miette::Report> {
-    compile_with_vars(source, filename, workflow, runtime_prompt, &[], &[], &[])
+    compile_with_vars(source, filename, profile, workflow, runtime_prompt, &[], &[], &[])
 }
 
 /// Like [`compile`] but accepts variable / tier / param overrides.
 ///
 /// - `override_vars` — `--var KEY=VALUE` overrides. Beat script-level `vars {}`,
 ///   lose to agent-level vars.
-/// - `override_tiers` — `--tiers-file` bindings. Replace top-level `tier`
-///   declarations.
-/// - `override_params` — `--param NAME=VALUE` workflow-parameter overrides.
-///   Roster params: `id=provider:model[@effort],...`. Client params:
-///   `provider:model[@effort]`. Either model spec may instead be `tier:<name>`.
-///   Required params without an in-script default fail compilation when absent
-///   here.
+/// - `agent_tiers` — `--tier AGENT=TIER` overrides. Beat the selected
+///   workflow's `tiers { }` block, which beats the tier the agent declares.
+/// - `override_params` — `--param NAME=VALUE` list-param overrides:
+///   `id=tier,...`, bare ids `a,b`, or a DSL list literal `[{id "a" …}]`.
+///   Required params without an in-script default fail compilation when
+///   absent here.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_vars(
     source: &str,
     filename: &str,
+    profile: Option<&SelectedProfile>,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
-    override_tiers: &[(String, String)],
+    agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     use miette::NamedSource;
@@ -92,20 +96,23 @@ pub fn compile_with_vars(
     if !parse_errors.is_empty() {
         return Err(miette::Report::new(DslErrors::new(parse_errors)));
     }
-    let ast = match ast {
-        Some(a) => a,
-        None => return Err(miette::Report::msg("parsing produced no output")),
+    let Some(mut script) = ast else {
+        return Err(miette::Report::msg("parsing produced no output"));
     };
+    let mut sources = vec![(filename.to_string(), source.to_string())];
+    profile::reject_model_tables(&script, &sources).map_err(miette::Report::new)?;
+    if let Some(profile) = profile {
+        profile::apply_profile(&mut script, &mut sources, profile).map_err(miette::Report::new)?;
+    }
 
     // Phase 3: Compile
-    compiler::compile_ast_with_vars(
-        &ast,
-        source,
-        filename,
+    compiler::compile_ast_with_sources(
+        &script,
+        &sources,
         workflow,
         runtime_prompt,
         override_vars,
-        override_tiers,
+        agent_tiers,
         override_params,
     )
     .map_err(miette::Report::new)
@@ -113,7 +120,7 @@ pub fn compile_with_vars(
 
 /// Compile a `.gaviero` script from disk, resolving any `include "..."`
 /// statements transitively. This is the entry point you want for scripts
-/// that share `client {}` / `prompt {}` / `vars {}` across files.
+/// that share `prompt {}` / `agent {}` / `vars {}` across files.
 ///
 /// `entry_path` is the top-level script. `include` paths are resolved
 /// relative to the directory of the file containing the `include`. Cycles
@@ -127,7 +134,7 @@ pub fn compile_file(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
-    override_tiers: &[(String, String)],
+    agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     compile_file_with_profile(
@@ -136,7 +143,7 @@ pub fn compile_file(
         workflow,
         runtime_prompt,
         override_vars,
-        override_tiers,
+        agent_tiers,
         override_params,
     )
 }
@@ -144,18 +151,20 @@ pub fn compile_file(
 /// Like [`compile_file`], with the tiers bound by a model profile. Pick the
 /// profile with [`gaviero_core::script_profiles::ProfileCatalog::select`].
 ///
-/// Tier precedence: `override_tiers` > a chosen profile > the script's `tier`
-/// lines > the implicit `default` profile.
+/// A model is chosen in one way only: the profile says what each tier is,
+/// and an agent's tier is `agent_tiers` (`--tier`) > the workflow's
+/// `tiers { }` block > the agent's own `tier`. Scripts declare no clients.
 pub fn compile_file_with_profile(
     entry_path: &std::path::Path,
-    profile: Option<&gaviero_core::script_profiles::SelectedProfile>,
+    profile: Option<&SelectedProfile>,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
-    override_tiers: &[(String, String)],
+    agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     let (mut script, mut sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
+    profile::reject_model_tables(&script, &sources).map_err(miette::Report::new)?;
     if let Some(profile) = profile {
         profile::apply_profile(&mut script, &mut sources, profile).map_err(miette::Report::new)?;
     }
@@ -165,7 +174,7 @@ pub fn compile_file_with_profile(
         workflow,
         runtime_prompt,
         override_vars,
-        override_tiers,
+        agent_tiers,
         override_params,
     )
     .map_err(miette::Report::new)

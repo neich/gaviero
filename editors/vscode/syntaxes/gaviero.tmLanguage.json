@@ -52,7 +52,7 @@
       ]
     },
     "field-keywords": {
-      "match": "\\b(tier|model|privacy|scope|owned|read_only|depends_on|prompt|description|max_retries|steps|max_parallel)\\b",
+      "match": "\\b(tier|tiers|param|model|privacy|scope|owned|read_only|depends_on|prompt|description|max_retries|steps|max_parallel)\\b",
       "name": "keyword.other.field.gaviero"
     },
     "tier-values": {

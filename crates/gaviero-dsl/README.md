@@ -20,9 +20,8 @@ cargo clippy -p gaviero-dsl
 
 ```bash
 gaviero-cli --script path/to/workflow.gaviero
-gaviero-cli --script workflows/refactor.gaviero --var PLANS=output --param judge=claude:haiku@low
-gaviero-cli --script examples/update_docs.gaviero \
-    --tiers-file examples/profiles/doc-codex.gaviero
+gaviero-cli --script workflows/refactor.gaviero --var PLANS=output --tier judge=low
+gaviero-cli --script examples/update_docs.gaviero --profile codex
 ```
 
 ### From the TUI
@@ -43,19 +42,16 @@ gaviero-cli --script tmp/plan.gaviero
 ### Two-agent workflow
 
 ```gaviero
-client reasoning { tier expensive model "claude:sonnet" }
-client local_exec  { tier cheap     model "ollama:qwen2.5-coder:7b" privacy local_only }
-
 agent design {
     description "Plan the refactor"
-    client reasoning
+    tier high
     scope { read_only ["src/" "tests/" "docs/"] }
     prompt "Inspect the implementation and produce a concrete refactor plan."
 }
 
 agent implement {
     description "Apply the refactor"
-    client local_exec
+    tier medium
     depends_on [design]
     scope { owned ["src/" "tests/"] read_only ["docs/"] impact_scope true }
     context { callers_of ["src/auth/session.rs"]  tests_for ["src/auth/"]  depth 2 }
@@ -72,34 +68,33 @@ workflow refactor_auth {
 
 ### Shipped examples
 
-Eleven workflow scripts, three tier overrides and three model profiles live in `examples/`:
+Twelve workflow scripts and four model profiles live in `examples/`:
 
 | File | Demonstrates |
 |---|---|
-| `clients.gaviero` | Shared client pool |
-| `plan_refinement.gaviero` | Dual-model plan refinement with judge loop |
+| `plan_refinement.gaviero` | Multi-provider plan refinement with judge loop (roster items on provider tiers) |
 | `generic_consensus.gaviero` | N-reviewer consensus via roster expansion |
 | `phased_plan.gaviero` | Dynamic phase extraction |
 | `codebase_review.gaviero` | Per-module review loop (findings only) |
-| `update_docs.gaviero` | Parallel doc rewrite with `--tiers-file` |
+| `update_docs.gaviero` | Parallel doc rewrite; swap models with `--profile` |
 | `security_audit_memory.gaviero` | `memory {}` overrides, `read_ns`, staleness |
-| `tiered_review.gaviero` | Provider-agnostic script; models come from a profile |
+| `tiered_review.gaviero` | The three ways a tier is chosen: agent `tier`, workflow `tiers { }`, item `tier` |
+| `mcp_smoke_test.gaviero` | One probe per provider on provider-pinned tiers |
+| `pattern_map_reduce.gaviero` | `pattern map_reduce`; spawn-manifest workers name a `tier` |
+| `scientific_research.gaviero` | Literature-research consensus panel |
 | `for_loops.gaviero` | Explicit `for … parallel` / `for … sequential` over a list param |
+| `deep_explore.gaviero` | Autonomous literature explorer on the `academic` MCP server: scout → loop (curator → runtime `for … in json` investigators → cross-family verifier, stop judge) → report + citation check; `budget`, `produces json`; tiers from the profile |
 
-**Model profiles** (`examples/profiles/`, see [below](#model-profiles)): `claude.gaviero`, `codex.gaviero`, `mixed.gaviero`.
-
-**Tier overrides** (`examples/profiles/`, `tier <role> <client>` lines only, for `--tiers-file`): `doc-claude.gaviero`, `doc-codex.gaviero`, `doc-cursor.gaviero`.
+**Model profiles** (`examples/profiles/`, see [below](#model-profiles)): `default.gaviero` (generic `low`…`top` tiers plus `<level>-claude` / `-codex` / `-cursor` and `high-deepseek`; copy it to `.gaviero/dsl/profiles/default.gaviero`), `claude.gaviero`, `codex.gaviero`, `mixed.gaviero`. The examples' rosters use the provider-pinned tiers, so they need a profile that defines them, such as `default.gaviero`.
 
 ```bash
 gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
     --prompt "Add workspace settings cascade"
 ```
 
-Scripts that `include "clients.gaviero"` must be compiled via `compile_file` or `gaviero-cli --script` — inline `compile()` rejects includes.
-
 ### Model strings
 
-Canonical form is `provider:model`. Bare names are rejected at dispatch.
+Model strings appear only in model profiles (`client { model "…" }`). Canonical form is `provider:model`; bare names are rejected at dispatch.
 
 | Provider | Examples |
 |---|---|
@@ -117,8 +112,9 @@ The DSL has no runtime config — behaviour is declared in the script and adjust
 | Override | CLI flag | Precedence |
 |---|---|---|
 | Vars | `--var KEY=VALUE` | agent `vars {}` > CLI > script `vars {}` |
-| Tiers | `--profile` or `--tiers-file` | CLI > script/includes > implicit `default` profile |
-| Workflow params | `--param NAME=VALUE` | Required params without defaults must be supplied |
+| What each tier means | `--profile NAME\|PATH` | chosen profile, else the profile named `default` |
+| An agent's tier | `--tier AGENT=TIER` | CLI > workflow `tiers { }` > the agent's own `tier`; a list item's `tier` moves its clone |
+| Workflow list params | `--param NAME=VALUE` | Required params without defaults must be supplied |
 
 Provider resolution, memory namespaces, and verification execution are configured via `.gaviero/settings.json` on the `gaviero-core` side. See [gaviero-cli](../gaviero-cli/README.md#configuration).
 
@@ -139,21 +135,30 @@ A run is refused before it starts if a `file` var names nothing on disk. Use a p
 
 A `file` outside the run root is copied in, and an uncommitted one is copied into agent worktrees. `dir` has one effect only: the SWARM form completes the field with folders. At run time it is a string, so a folder need not exist and is never copied.
 
-In the TUI's SWARM form `file` and `dir` vars complete as you type: `file` from the same list as `@` in chat, `dir` from the workspace's folders. The popup shows eight rows and scrolls through every match (Up/Down, PageUp/PageDown, wheel). Roster and client `param` fields complete `tier:<name>` from the tiers the run would have: the profile selected on the form, then the script's own.
+In the TUI's SWARM form `file` and `dir` vars complete as you type: `file` from the same list as `@` in chat, `dir` from the workspace's folders. The popup shows eight rows and scrolls through every match (Up/Down, PageUp/PageDown, wheel). List `param` items complete the tier after `id=` from the profile selected on the form.
 
 ### Model profiles
 
-Write a script against tiers, not providers. Tier names are free-form; `low`, `medium`, `high` and `top` are the convention.
+A script chooses models in one way only: by tier. Tier names are free-form; `low`, `medium`, `high` and `top` are the convention.
+
+- **Every agent declares its default tier** with `tier <name>`. An agent without one is a compile error.
+- **A workflow may move agents** to other tiers in its `tiers { <agent> <tier> … }` block; agents it does not name keep their own.
+- **A run may move agents** with `--tier AGENT=TIER`, which overrides the block.
+- **A list item's `tier`** (`{ id "a" tier top }`, `--param panel=a=top`) moves that item's clones; items without one keep their body agent's tier.
 
 ```gaviero
 agent gather { tier low prompt "…" }
+agent judge  { tier low prompt "…" }
+agent review { tier high template true prompt "…" }
 
 workflow review {
-    param judge { model "tier:medium" }          // client param
-    param panel [ { id "a" model "tier:top" } ]  // roster
-    steps [ gather ]
+    tiers { judge medium }                        // this workflow's judge runs on medium
+    param panel [ { id "a" } { id "b" tier top } ] // b's clone runs on top
+    steps [ gather loop { reviewers panel template_refine review until agent judge } ]
 }
 ```
+
+A script never declares `client` blocks or `tier <name> <client>` lines, not even in an included file — the compiler rejects them. There are no model-valued params, and list items take no `model` or `effort`.
 
 A profile says what each tier means. It holds only `client` and `tier` declarations (`include` works, for a shared client pool), and tiers may mix providers:
 
@@ -171,22 +176,22 @@ Profiles are looked up by file name in each workspace folder's `.gaviero/dsl/pro
 ```bash
 gaviero-cli --script review.gaviero --profile mixed
 gaviero-cli --script review.gaviero --profile ./one-off.gaviero
-gaviero-cli --script review.gaviero --profile mixed --param judge=tier:high
+gaviero-cli --script review.gaviero --profile mixed --tier judge=high
 ```
 
 The TUI's SWARM form offers the same choice in a **Profile** selector.
 
 | Situation | Result |
 |---|---|
-| Profile chosen | Its tiers replace the script's bindings for those names |
-| No choice, a profile named `default` exists | It supplies only the tiers the script leaves unbound |
-| Agent says `client <name>` | Untouched — a concrete client is a deliberate pin |
-| A client in the profile is marked `default` | Used by agents that bind neither client nor tier |
-| A tier nothing binds | Compile error |
+| Profile chosen | It defines every tier of the run |
+| No choice, a profile named `default` exists | It defines every tier of the run |
+| No profile at all | Compile error naming `--profile` / the `default` profile |
+| An agent's tier the profile does not define | Compile error listing the tiers it does define |
+| A client in the profile is marked `default` | Compile error — every agent declares a tier |
 
 `effort` names are checked at compile time, so a misspelling is an error listing the valid names. A model + effort pair the model cannot run stops the run before any agent starts; `auto` and `off` suit every model. Each profile client sets both together, so changing profile keeps the pair valid. Cursor takes no `effort`: pick a model id that has the level in it (`cursor:grok-4.7-high`).
 
-A profile's clients are private to it, so they cannot clash with the script's, and a tier fixes model, effort and privacy together: `tier:high@low` is an error.
+A tier fixes model, effort, privacy and `extra` together, so nothing in a script can pair a tier with a different effort.
 
 ## API
 
@@ -194,36 +199,34 @@ A profile's clients are private to it, so they cannot clash with the script's, a
 
 ```rust
 use gaviero_dsl::{
-    compile, compile_with_vars, compile_file,
-    workflow_execution_mode, load_tier_overrides,
-    CompiledPlan, ExecutionMode,
+    compile, compile_with_vars, compile_file_with_profile,
+    workflow_execution_mode, CompiledPlan, ExecutionMode,
 };
 
-// Inline (no `include` statements)
-let plan = compile(source, filename, Some("workflow_name"), Some("runtime prompt"))?;
+// Inline (no `include` statements); `profile` says what each tier means
+let plan = compile(source, filename, Some(&profile), Some("workflow_name"), Some("runtime prompt"))?;
 
-// Inline + CLI overrides
+// Inline + CLI overrides (`--var`, `--tier AGENT=TIER`, `--param`)
 let plan = compile_with_vars(
-    source, filename, Some("workflow_name"), Some("runtime prompt"),
-    &override_vars, &override_tiers, &override_params,
+    source, filename, Some(&profile), Some("workflow_name"), Some("runtime prompt"),
+    &override_vars, &agent_tiers, &override_params,
 )?;
 
 // From disk — resolves `include` transitively
-let plan = compile_file(path, Some("workflow"), Some("prompt"), &[], &[], &[])?;
+let plan = compile_file_with_profile(path, Some(&profile), Some("workflow"), Some("prompt"), &[], &[], &[])?;
 
 let mode: ExecutionMode = workflow_execution_mode(path, Some("my-workflow"))?;
-let tiers = load_tier_overrides(path_to_profile)?;
 ```
 
-All compile functions return `Result<CompiledPlan, miette::Report>` with source diagnostics on failure.
+`profile` is a [`SelectedProfile`](../gaviero-core/src/script_profiles.rs), usually picked with `ProfileCatalog::select`. All compile functions return `Result<CompiledPlan, miette::Report>` with source diagnostics on failure.
 
-`CompiledPlan` is re-exported from `gaviero_core::swarm::plan`. Public modules: `ast`, `compiler`, `reviewers`, `workflow_params`, `error`, `lexer`, `parser`, `resolver`, `tiers`.
+`CompiledPlan` is re-exported from `gaviero_core::swarm::plan`. Public modules: `ast`, `compiler`, `reviewers`, `workflow_params`, `error`, `lexer`, `parser`, `resolver`, `profile`, `patterns`, `inspect`.
 
 ### Language surface (summary)
 
-- **Client** — model + tier + effort + optional `extra {}` provider pairs
-- **Agent** — scope, prompt, dependencies, `produces []`, `context {}`, `memory {}`, `tools []`
-- **Workflow** — steps, `verify {}`, iteration strategy, explicit `loop {}` blocks, `for … parallel|sequential` over list params
+- **Client** (model profiles only) — model + effort + privacy + optional `extra {}` provider pairs, bound to a tier with `tier <name> <client>`
+- **Agent** — `tier` (required), scope, prompt, dependencies, `produces []`, `context {}`, `memory {}`, `tools []`
+- **Workflow** — steps, `tiers {}`, `verify {}`, iteration strategy, explicit `loop {}` blocks, `for … parallel|sequential` over list params
 - **Include** — splice shared declarations; cycles rejected; requires `compile_file`
 - **Scope** — `owned`, `read_only`, `impact_scope` with glob patterns
 - **Produces** — exact artefact paths the agent must have written when its turn
@@ -240,7 +243,7 @@ workflow w {
     execution_mode document          // required by `for … sequential`
     param topics [
         { id "a" focus "storage" }
-        { id "b" focus "network" model "tier:high" }
+        { id "b" focus "network" tier high }
     ]
     steps [
         for t in topics parallel {
@@ -258,17 +261,17 @@ workflow w {
 ```
 
 - **List params** are the roster param kind with free fields: entries are
-  `{ id "…" [model "…"] [effort …] [<ident> "<string>"]* }`. `id` is required,
+  `{ id "…" [tier <name>] [<ident> "<string>"]* }`. `id` is required,
   unique, and matches `[A-Za-z0-9][A-Za-z0-9_.-]*`. Free-field names must not be
   DSL keywords; `index`, `count`, `peers`, `peer_count`, `prev` and `peer_block`
   are reserved.
 - **Clones** are named `<item-id>-<agent>` (`a-analyst`, `b-analyst`, …). With
-  `model` (a `provider:model` or `tier:<name>` spec) the clone binds to it as a
-  roster entry does; without it the clone keeps the body agent's own client.
+  `tier` the clone runs on that tier; without it the clone keeps the body
+  agent's tier (after the workflow's `tiers { }` and `--tier`).
   Body agents run only through their clones: listing one as a plain step, or in
   two `for` blocks, is an error. They need no `template true`.
-- **Item vars** inside a clone: `{{t.id}}`, `{{t.<field>}}`, `{{t.model}}` /
-  `{{t.effort}}` when set, `{{t.index}}` (1-based), `{{t.count}}`, `{{t.peers}}`
+- **Item vars** inside a clone: `{{t.id}}`, `{{t.<field>}}`, `{{t.tier}}`
+  when set, `{{t.index}}` (1-based), `{{t.count}}`, `{{t.peers}}`
   (other ids, comma-joined), `{{t.peer_count}}`, `{{t.prev}}` (sequential only;
   empty for the first item), and `{{t.peer_block}}` — the `peer_template`
   rendered once per peer with `{{peer}}` = the peer id, joined by newlines
@@ -290,9 +293,58 @@ workflow w {
   (`LoopConfig::baseline_units`): they may own the same paths as the loop
   agents, and a resumed run skips them.
 - **CLI:** `--param 'topics=[{id "a" focus "x"} {id "b"}]'` (a DSL list
-  literal) or the short form `--param topics=a,b` / `id=provider:model[@effort],…`.
+  literal) or the short form `--param topics=a,b` / `id=tier,…`.
+- **Inside a `loop`, `depends_on` between loop agents orders them within
+  every pass**: `curator { depends_on [investigator] }` runs after that pass's
+  investigators, on pass 1 and on every later pass.
 - **Not supported:** `for … sequential` inside a `loop`, `loop` inside `for`,
-  `for` inside `for`, lists produced at runtime (use `pattern map_reduce`).
+  `for` inside `for`, more than one `loop` per workflow. For lists only known
+  at run time see `for … in json` below.
+
+#### Runtime lists (`for … in json`)
+
+```
+for q in json "{{OUT_DIR}}/assignments-v{{ITER}}.json" parallel max 6 { investigator }
+```
+
+`for <var> in json "<path>" parallel [max <N>] { <agent> }` reads its list
+from a JSON file when the step runs instead of from a list param. Example:
+[`examples/deep_explore.gaviero`](examples/deep_explore.gaviero).
+
+- **Where:** a top-level step, or inside a loop that is not
+  `branch_chain stacked`. The workflow must declare `execution_mode document`.
+  Inside a loop the file is read again on every pass, with that pass's
+  `{{ITER}}` / `{{PREV_ITER}}` in the path; compile-time vars (`{{OUT_DIR}}`)
+  resolve when the script compiles. The path is relative to the workspace root.
+- **The file** is a JSON array of flat objects. `id` is required, a string
+  matching `[A-Za-z0-9][A-Za-z0-9_.-]*`, unique. `tier` (a tier of the run's
+  profile) is optional; `model` and `effort` keys are rejected. Every other key is
+  a field: strings as written, numbers and bools as text, arrays and objects
+  as compact JSON. Values are not var-substituted.
+- **Item vars:** `{{q.id}}`, `{{q.<field>}}`, `{{q.tier}}`,
+  `{{q.index}}` (1-based), `{{q.count}}`, `{{q.peers}}`, `{{q.peer_count}}`.
+  A `{{q.x}}` that some item has no value for stops the run before any clone
+  starts.
+- **Body:** exactly one agent. It must declare `produces`, and its `owned` and
+  `produces` paths must contain `{{q.id}}`. It may not also be a plain step or
+  the body of another `for`.
+- **`max`:** defaults to 16. A list longer than `max` stops the run with an
+  error. An empty list runs no clone, and dependents still run.
+- **Clones** are named `<agent>@<item-id>` and run in parallel under the
+  workflow's `max_parallel`.
+- **Fan-in is strict:** `depends_on [investigator]` waits for every clone of
+  the step; if any clone fails, the step fails and its dependents are skipped.
+- **Resume:** at top level every clone is checkpointed and `--resume` re-runs
+  only the unfinished ones. Inside a loop a crashed pass re-runs whole
+  (passes resume from their artefacts, as for every loop).
+- **Not supported:** `sequential`, more than one body agent, `peer_template`,
+  `execution_mode repo`.
+
+`pattern map_reduce { discover … reduce … max_spawn N }` runs on the same
+machinery: it requires `execution_mode document`; the workers listed in the
+discover agent's `spawn_manifest.json` run in parallel and are checkpointed
+one by one; a missing manifest or one over `max_spawn` stops the run; and a
+failed worker skips `reduce`.
 
 The `loop { reviewers … template_init … template_refine … }` roster sugar
 remains and keeps its `<id>-init` / `<id>-refine` names and `REVIEWER_ID` /
@@ -328,6 +380,33 @@ Two checks enforce it, neither of which costs a model call:
 
 Agents that declare no `produces` fall back to a weaker check: the loop
 verifies that *something* the agent owns changed during the pass.
+
+`produces json ["…"]` declares outputs that must also **parse as JSON**: the
+paths join `produces`, and a file that exists but does not parse counts as
+missing — same corrective retry, same per-pass delivery gate. Use it for files
+another step reads, such as the list of a `for … in json`. Schemas stay in a
+`until command "…"` check.
+
+### Budgets (`budget`)
+
+```
+workflow w {
+    budget { wall "8h" usd 40 }
+}
+```
+
+- `wall` is `<digits>[s|m|h]` (no suffix = seconds). With
+  `gaviero-cli --run-timeout`, the smaller of the two applies; the TUI, which
+  passes no run timeout, gets the script's `wall`.
+- `usd` caps the cost providers report. Only `claude:` and `deepseek:` report
+  cost; `codex:`, `cursor:`, `ollama:` and `dsh:` report none, and a run with
+  a `usd` budget names the units whose spend it cannot see when it starts.
+  Spend includes every retry and every `best_of_N` attempt, and judges.
+- Both are checked before every dispatch — each agent, clone, worker, loop
+  pass and judge. A spent budget stops the run like `--run-timeout` does (no
+  error; the phase reads `run budget exhausted: …`). Spend is known only when a
+  dispatch returns, so agents already running in parallel can carry the total
+  past `usd`.
 
 ### Composed exit conditions (`until … and …`)
 
@@ -374,14 +453,14 @@ explicit `"verdict": "irreconcilable"` from the judge stops the loop and writes
 `blockers` array. Repeat detection fingerprints the blockers' agent/criterion
 pairing rather than the prose, so a judge rephrasing itself does not reset the
 count. `0` disables it.
-- **Params** — typed `param` on workflows; roster / list `id=provider:model[@effort],…`, bare ids `a,b`, or a DSL list literal `[{id "a" …}]`
+- **Params** — list `param`s on workflows: `id=tier,…`, bare ids `a,b`, or a DSL list literal `[{id "a" …}]`
 
 Full language reference: see the prior detailed blocks in [ARCHITECTURE.md](ARCHITECTURE.md) or browse `examples/`.
 
 ## See Also
 
 - [gaviero-core](../gaviero-core/README.md) — execution runtime
-- [gaviero-cli](../gaviero-cli/README.md) — `--script`, `--var`, `--param`, `--tiers-file`
+- [gaviero-cli](../gaviero-cli/README.md) — `--script`, `--var`, `--param`, `--tier`, `--profile`
 - [Root ARCHITECTURE.md](../../ARCHITECTURE.md) — compilation pipeline
 
 ## License

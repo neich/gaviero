@@ -34,7 +34,7 @@ use gaviero_core::tree_sitter::{Language, Parser, Query};
 
 ## Examples
 
-Grammar surface includes `client`, `agent`, `workflow` declarations; `scope`, `memory`, `context`, `verify` blocks; explicit `loop {}` and `until` clauses; `include` directives; strings and comments.
+Grammar surface includes `agent`, `workflow` and `prompt` declarations; `client` and `tier <alias> <client>` lines (model profiles); `scope`, `memory`, `context`, `verify`, `tiers` blocks; explicit `loop {}`, `for` and `until` clauses; `include` directives; strings and comments.
 
 The grammar accepts anything that should produce a meaningful downstream diagnostic — semantic errors are `gaviero-dsl`'s job.
 

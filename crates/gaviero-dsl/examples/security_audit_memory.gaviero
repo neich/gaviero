@@ -14,18 +14,19 @@
 
 // ── Clients ──────────────────────────────────────────────────────────────────
 //
-// Pulls in the shared client library. The privacy-interaction bullet at
-// the top of this file refers to a `privacy local_only` client; if you
-// want to demonstrate that, add one locally:
-//   client local { privacy local_only }
-// and bind the relevant agent to it.
-include "clients.gaviero"
+// Agents name tiers; the model profile maps them to clients. The
+// privacy-interaction bullet at the top of this file refers to a
+// `privacy local_only` client; to demonstrate it, give the run a profile
+// with a local tier, e.g.
+//   client local { model "ollama:qwen" privacy local_only }
+//   tier local local
+// and move the relevant agent onto it: `--tier verify=local`.
 
 // ── Agents ───────────────────────────────────────────────────────────────────
 
 agent scan {
     description "Scan codebase for security vulnerabilities"
-    client opus
+    tier high
     scope {
         owned    ["docs/security_findings.md"]
         read_only ["src/" "Cargo.toml" "Cargo.lock"]
@@ -55,7 +56,7 @@ Use memory context for any prior audit results.
 
 agent fix {
     description "Fix identified vulnerabilities"
-    client sonnet
+    tier medium
     depends_on [scan]
     scope {
         owned    ["src/"]
@@ -78,7 +79,7 @@ primary reference. Apply minimal, targeted fixes without refactoring.
 
 agent write_tests {
     description "Write security regression tests"
-    client sonnet
+    tier medium
     depends_on [fix]
     scope {
         owned    ["tests/security/"]
@@ -98,7 +99,7 @@ Each test should verify that the specific vulnerability no longer exists.
 
 agent verify {
     description "Verify all fixes and tests pass"
-    client sonnet
+    tier medium
     depends_on [write_tests]
     scope {
         read_only ["src/" "tests/" "docs/security_findings.md"]

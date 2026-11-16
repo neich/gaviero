@@ -120,6 +120,7 @@ mod tests {
             id: id.into(),
             description: id.into(),
             scope: FileScope::default(),
+            produces_json: vec![],
             produces: vec![],
             depends_on: vec![],
             backend: Default::default(),

@@ -99,10 +99,10 @@ parse Cli
   ├─ plan input:
   │     --task            → synthetic WorkUnit (owned=["."])
   │     --work-units      → Vec<WorkUnit> JSON
-  │     --script          → gaviero_dsl::compile_file(..., override_vars,
-  │                          override_tiers, override_params)
+  │     --script          → gaviero_dsl::compile_file_with_profile(..., profile,
+  │                          override_vars, agent_tiers, override_params)
   │                        + --workflow / --prompt / --prompt-file
-  │                        + --var / --param / --tiers-file
+  │                        + --var / --param / --tier / --profile
   │
   ├─ iteration overlays (--max-retries, --attempts, --test-first, --no-iterate)
   ├─ --coordinated? → plan_coordinated → write .gaviero → exit
@@ -151,7 +151,7 @@ Binary only — no library API. Public surface is the CLI:
 --repo / --workspace
 --task | --work-units | --script
 --workflow --prompt --prompt-file
---var KEY=VALUE --param NAME=VALUE --tiers-file
+--var KEY=VALUE --param NAME=VALUE --tier AGENT=TIER --profile NAME|PATH
 --model --coordinator-model --ollama-base-url
 --auto-accept --resume --fresh --isolated --max-parallel
 --max-retries --attempts --test-first --no-iterate

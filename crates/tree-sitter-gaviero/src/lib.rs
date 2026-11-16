@@ -88,7 +88,7 @@ mod tests {
         parser.set_language(&lang).unwrap();
         let src = r#"
             client c { tier execution model "sonnet" }
-            agent a { client c description "task" }
+            agent a { tier c description "task" }
             workflow w { steps [a] max_parallel 2 }
         "#;
         let tree = parser.parse(src, None).unwrap();
@@ -399,11 +399,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_for_over_a_json_file() {
+        let sexp = parse_ok(
+            "workflow w { execution_mode document steps [ for q in json \"out/i.json\" parallel max 3 { worker } ] }",
+        );
+        assert_eq!(sexp.matches("(for_block").count(), 1, "{sexp}");
+        assert_eq!(sexp.matches("(for_json_source").count(), 1, "{sexp}");
+    }
+
+    #[test]
+    fn parse_workflow_budget_block() {
+        let sexp = parse_ok("workflow w { steps [ a ] budget { wall \"8h\" usd 40 } }");
+        assert_eq!(sexp.matches("(budget_block").count(), 1, "{sexp}");
+        assert_eq!(sexp.matches("(budget_field").count(), 2, "{sexp}");
+        parse_ok("workflow w { budget { usd 12.5 } steps [ a ] }");
+    }
+
+    #[test]
+    fn parse_agent_produces_json() {
+        let sexp = parse_ok(
+            "agent a { produces [\"out/r.md\"] produces json [\"out/f.json\"] prompt \"x\" }",
+        );
+        assert!(!sexp.contains("ERROR"), "{sexp}");
+    }
+
+    #[test]
     fn parse_list_entry_with_free_field() {
         let sexp = parse_ok(
-            "workflow w { param topics [ { id \"a\" focus \"storage\" } { id \"b\" model \"tier:high\" } ] steps [ x ] }",
+            "workflow w { param topics [ { id \"a\" focus \"storage\" } { id \"b\" tier high-codex } ] steps [ x ] }",
         );
         assert_eq!(sexp.matches("(reviewer_entry").count(), 2, "{sexp}");
+        assert!(sexp.contains("(tier_alias_name"), "{sexp}");
+    }
+
+    #[test]
+    fn parse_workflow_tiers_block() {
+        let sexp = parse_ok(
+            "agent a { tier low } workflow w { tiers { a medium-codex } steps [ a ] }",
+        );
+        assert!(sexp.contains("(tiers_block (agent_tier"), "{sexp}");
+    }
+
+    /// Every case of `test/corpus/*.txt` parses to its expected tree — the
+    /// check `tree-sitter test` makes, run through `cargo test` so it needs
+    /// no CLI.
+    #[test]
+    fn corpus_cases_parse_to_their_expected_trees() {
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace(" )", ")")
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test/corpus");
+        let mut cases = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            let mut parts = text.split("=====\n").skip(1);
+            while let (Some(name), Some(body)) = (parts.next(), parts.next()) {
+                let (source, expected) = body.split_once("\n-----\n").expect("case has -----");
+                let mut parser = tree_sitter::Parser::new();
+                let lang: tree_sitter::Language = LANGUAGE.into();
+                parser.set_language(&lang).unwrap();
+                let tree = parser.parse(source, None).unwrap();
+                assert_eq!(
+                    squash(&tree.root_node().to_sexp()),
+                    squash(expected),
+                    "corpus case `{}`",
+                    name.trim()
+                );
+                cases += 1;
+            }
+        }
+        assert!(cases > 10, "found {cases} corpus cases");
+    }
+
+    /// A model is chosen by tier only: no `client` on an agent, no
+    /// model-valued param. (`model "…"` in a list item reads as a free
+    /// field here; gaviero-dsl rejects it with a diagnostic.)
+    #[test]
+    fn model_forms_outside_profiles_are_syntax_errors() {
+        for src in [
+            "agent a { client c }",
+            "workflow w { param j { model \"claude:opus\" } steps [ a ] }",
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            let lang: tree_sitter::Language = LANGUAGE.into();
+            parser.set_language(&lang).unwrap();
+            let tree = parser.parse(src, None).unwrap();
+            assert!(tree.root_node().has_error(), "{src} should not parse");
+        }
     }
 
     #[test]

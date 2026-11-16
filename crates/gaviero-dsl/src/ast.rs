@@ -13,6 +13,8 @@ pub struct Script {
 /// A top-level declaration in a `.gaviero` file.
 #[derive(Debug, Clone)]
 pub enum Item {
+    /// A `client { … }` declaration. Only model profiles may declare one;
+    /// the public compile entry points reject it in scripts.
     Client(ClientDecl),
     Agent(AgentDecl),
     Workflow(WorkflowDecl),
@@ -21,7 +23,8 @@ pub enum Item {
     /// Keys defined here are substituted compile-time across all agents.
     Vars(Vec<VarDecl>),
     /// A top-level `tier <name> <client>` alias — a named routing label
-    /// that resolves to a concrete client profile. See [`TierAlias`].
+    /// that resolves to a concrete client. See [`TierAlias`]. Profile-only,
+    /// like [`Item::Client`].
     TierAlias(TierAlias),
     /// `include "path"` — splices the items of another `.gaviero` file into
     /// the current script's top-level. Resolved by `compile_file` before
@@ -33,7 +36,7 @@ pub enum Item {
 /// A top-level `include "path"` declaration.
 ///
 /// ```text
-/// include "lib/clients.gaviero"
+/// include "lib/prompts.gaviero"
 /// include "../shared/prompts.gaviero"
 /// ```
 ///
@@ -81,18 +84,17 @@ pub struct VarDecl {
     pub default: Option<String>,
 }
 
-/// Top-level `tier <name> <client-ref>` declaration.
+/// Top-level `tier <name> <client-ref>` declaration of a model profile.
 ///
 /// ```text
-/// client opus_deep { model "claude:opus" effort xhigh }
-/// client codex_fast { model "codex:gpt-5.5" effort medium }
-/// tier expensive opus_deep
-/// tier cheap codex_fast
+/// client opus  { model "claude:opus" effort high }
+/// client terra { model "codex:gpt-6.1-terra" effort medium }
+/// tier high   opus
+/// tier medium terra
 /// ```
 ///
-/// An agent can then say `agent worker { tier cheap ... }` instead of binding
-/// to a concrete client. The alias layer is meant for swapping concrete
-/// bindings at the CLI (step 4) without touching agent definitions.
+/// Scripts never bind a client: an agent says `tier high`, and the run's
+/// profile says which model `high` is.
 #[derive(Debug, Clone)]
 pub struct TierAlias {
     /// Alias name. Accepts any identifier-shaped name — conventional values
@@ -203,7 +205,7 @@ pub struct ExtraPair {
 /// ```text
 /// agent researcher {
 ///     description "Research the codebase"
-///     client claude_opus
+///     tier high
 ///     scope { owned ["docs/"] read_only ["src/**"] }
 ///     prompt #" ... "#
 ///     depends_on [other_agent]
@@ -215,10 +217,10 @@ pub struct AgentDecl {
     pub name: String,
     pub name_span: Span,
     pub description: Option<(String, Span)>,
-    /// References a `ClientDecl` by name.
-    pub client: Option<(String, Span)>,
-    /// References a top-level `tier <name> <client>` alias by name.
-    /// Mutually exclusive with `client` — enforced at compile time.
+    /// The agent's default `tier <name>`, a tier of the run's model profile.
+    /// Required: the compiler rejects an agent without one. A workflow's
+    /// `tiers { }` block, `--tier`, or a list item's `tier` replace it before
+    /// compilation.
     pub tier_ref: Option<(String, Span)>,
     pub scope: Option<ScopeBlock>,
     pub depends_on: Option<(Vec<(String, Span)>, Span)>,
@@ -232,6 +234,9 @@ pub struct AgentDecl {
     /// Empty means no contract, and the runtime falls back to detecting
     /// whether the agent's owned files changed at all.
     pub produces: Vec<String>,
+    /// Paths declared with `produces json [...]` (also in `produces`): the
+    /// runtime additionally requires them to parse as JSON.
+    pub produces_json: Vec<String>,
     pub prompt: Option<(PromptSource, Span)>,
     pub max_retries: Option<(u8, Span)>,
     /// Wall-clock budget for one dispatch of this agent, in seconds.
@@ -268,26 +273,15 @@ pub struct AgentDecl {
     pub file_id: u32,
 }
 
-/// One reviewer in a `reviewers [ { id "…" model "provider:model" effort <val> } … ]`
-/// roster. The roster carries the model spec directly — no `client {}`
-/// indirection — so reviewers can be supplied 100% externally via a workflow
-/// `param`. `effort` is optional and overrides whatever the backend default
-/// would be; backends that don't accept effort ignore it.
+/// One item of a list param or `reviewers [ { id "…" tier <name> } … ]`
+/// roster.
 #[derive(Debug, Clone)]
 pub struct ReviewerEntry {
     pub id: String,
     pub id_span: Span,
-    /// Canonical `provider:model` spec (validated downstream by
-    /// `gaviero_core::swarm::backend::shared::validate_model_spec`), or
-    /// `tier:<name>` to bind this reviewer to a tier instead. `None` for a
-    /// plain list entry (`for` keeps the body agent's own client); the
-    /// `reviewers` roster requires it.
-    pub model: Option<String>,
-    /// Span of the `model` field when present, else the entry span.
-    pub model_span: Span,
-    /// Optional effort override (`off | auto | low | medium | high | xhigh | max`).
-    /// When `None`, the backend's default kicks in.
-    pub effort: Option<(String, Span)>,
+    /// `tier <name>`: the clone made for this item runs on that tier instead
+    /// of its body agent's. `None` keeps the body agent's tier.
+    pub tier: Option<(String, Span)>,
     /// Free `<ident> "<string>"` fields, in source order (list params used by
     /// `for`; exposed as `{{<var>.<name>}}`).
     pub fields: Vec<(String, String, Span)>,
@@ -313,51 +307,44 @@ impl ReviewerSource {
     }
 }
 
-/// Explicit shape of a workflow `param` when the author uses `[...]` or `{...}`.
+/// Explicit shape of a workflow `param` when the author writes a default.
 #[derive(Debug, Clone)]
 pub enum ParamShape {
-    /// `param <name> [ { id "a" model "claude:opus" ... } ]`
+    /// `param <name> [ { id "a" tier high ... } ]`
     Roster(Vec<ReviewerEntry>),
-    /// `param <name> { model "provider:model" effort ... privacy ... extra { } }`
-    Client(ClientParamSpec),
 }
 
-/// In-script default for a client workflow param (before CLI `--param` override).
-#[derive(Debug, Clone, Default)]
-pub struct ClientParamSpec {
-    pub model: Option<(String, Span)>,
-    pub effort: Option<(String, Span)>,
-    pub privacy: Option<(PrivacyLit, Span)>,
-    pub extra: Vec<ExtraPair>,
-    pub span: Span,
-}
-
-/// Resolved kind after inferring bare `param <name>` declarations from usage.
+/// A param's resolved kind. Params are lists; models are chosen by tiers
+/// alone, so there is no model-valued param.
 #[derive(Debug, Clone)]
 pub enum ParamKind {
+    /// The in-script default, if any.
     Roster(Option<Vec<ReviewerEntry>>),
-    Client(ClientParamSpec),
 }
 
-/// A workflow-level parameter declaration.
+/// A workflow-level list parameter, iterated by `for` or `reviewers`.
 ///
 /// ```text
-/// param roster [ { id "a" model "claude:opus" } ]   // roster param
-/// param judge { model "claude:sonnet" effort medium } // client param
-/// param gate { model "tier:high" }                    // client param bound to a tier
-/// param roster                                        // required roster (CLI)
-/// param gate { }                                      // required client (CLI)
+/// param roster [ { id "a" tier high } { id "b" tier high-codex } ]
+/// param roster                                   // required (CLI --param)
 /// ```
-///
-/// Bare `param <name>` (no `[...]` or `{...}`) infers kind from usage:
-/// `reviewers <name>` → roster; `client <name>` on an agent → client.
 #[derive(Debug, Clone)]
 pub struct ParamDecl {
     pub name: String,
     pub name_span: Span,
-    /// When `None`, kind is inferred from `reviewers` / `client` references.
+    /// `None` for a bare `param <name>`, whose value comes from `--param`.
     pub shape: Option<ParamShape>,
     pub span: Span,
+}
+
+/// One line of a workflow's `tiers { <agent> <tier> … }` block: run `agent`
+/// on `tier` instead of the tier it declares.
+#[derive(Debug, Clone)]
+pub struct AgentTier {
+    pub agent: String,
+    pub agent_span: Span,
+    pub tier: String,
+    pub tier_span: Span,
 }
 
 /// How a consensus loop treats judge verdicts and whether a judge runs at all.
@@ -509,6 +496,14 @@ pub struct ForBlock {
     pub mode_span: Span,
     pub agents: Vec<(String, Span)>,
     pub peer_template: Option<(String, Span)>,
+    /// `for <var> in json "<path>" …` — the list is read from this JSON file
+    /// at run time instead of a list param. When set, `list` holds the
+    /// literal `"json"`. The block is not cloned at compile time: its single
+    /// body agent compiles as a template and the runtime materialises one
+    /// clone per item (`gaviero_core::swarm::plan::RuntimeForOp`).
+    pub json_source: Option<(String, Span)>,
+    /// `max <N>` after the mode: cap on runtime items (json source only).
+    pub max_items: Option<(u32, Span)>,
     pub span: Span,
 }
 
@@ -690,12 +685,50 @@ pub struct WorkflowDecl {
     /// Workflow-level parameter declarations. Resolved at compile time via
     /// CLI `--param NAME=VALUE` overrides; required when no default present.
     pub params: Vec<ParamDecl>,
+    /// `tiers { <agent> <tier> … }` — agents that run on another tier than
+    /// the one they declare in this workflow. `--tier agent=tier` overrides
+    /// entries of this block.
+    pub tiers: Vec<AgentTier>,
     /// Optional pattern sugar (`pattern map_reduce { ... }`). Expanded into
     /// `CompiledPlan.fanout_ops` at compile time.
     pub pattern: Option<PatternDecl>,
+    /// `for … in json` blocks, recorded by `for` expansion (which replaces
+    /// each with a plain step / loop agent naming its body agent). Always
+    /// empty straight out of the parser. Emitted as
+    /// `CompiledPlan::runtime_fors`.
+    pub runtime_fors: Vec<RuntimeForDecl>,
+    /// `budget { wall "<dur>" usd <n> }` — run limits (see [`BudgetBlock`]).
+    pub budget: Option<BudgetBlock>,
     pub span: Span,
     #[doc(hidden)]
     pub file_id: u32,
+}
+
+/// The workflow-level `budget { wall "8h" usd 40 }` block.
+///
+/// Values are kept as written; the compiler validates them (a duration is
+/// `<digits>[s|m|h]`, `usd` must be positive, at least one field is set) so
+/// the diagnostics carry their own text and span. A repeated field keeps its
+/// first value, like every other workflow field.
+#[derive(Debug, Clone)]
+pub struct BudgetBlock {
+    pub wall: Option<(String, Span)>,
+    pub usd: Option<(f64, Span)>,
+    pub span: Span,
+}
+
+/// One `for <var> in json "<path>" parallel [max <N>] { <agent> }` block
+/// after expansion: the body agent compiles as a template unit and the
+/// runtime clones it once per item of the JSON list.
+#[derive(Debug, Clone)]
+pub struct RuntimeForDecl {
+    pub var: String,
+    pub agent: String,
+    /// Path as written (compile-time vars are substituted by the compiler;
+    /// `{{ITER}}` / `{{PREV_ITER}}` survive to the runtime).
+    pub source: String,
+    pub max_items: Option<u32>,
+    pub span: Span,
 }
 
 // ── value literals ────────────────────────────────────────────────────────

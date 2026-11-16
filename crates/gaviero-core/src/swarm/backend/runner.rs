@@ -370,6 +370,9 @@ async fn run_backend_inner(
     let mut all_modified: std::collections::HashSet<std::path::PathBuf> = Default::default();
     // Corrective suffix appended to the base prompt on retries
     let mut corrective: Option<String> = None;
+    // Spend across every attempt: a corrective retry is paid for too, so each
+    // manifest below reports the total, not just its last turn.
+    let mut turn_cost_usd = 0.0_f64;
 
     for attempt in 0..max_attempts {
         let prompt = match &corrective {
@@ -431,7 +434,7 @@ async fn run_backend_inner(
                     branch: None,
                     summary: Some(format!("Backend error: {}", e)),
                     output: None,
-                    cost_usd: 0.0,
+                    cost_usd: turn_cost_usd,
                 });
             }
         };
@@ -443,7 +446,6 @@ async fn run_backend_inner(
         let mut error_msg = String::new();
         let mut in_thinking = false;
         let mut read_count: usize = 0;
-        let mut turn_cost_usd = 0.0_f64;
 
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
@@ -797,7 +799,7 @@ async fn run_backend_inner(
         branch: None,
         summary: Some("completed".into()),
         output: None,
-        cost_usd: 0.0,
+        cost_usd: turn_cost_usd,
     })
 }
 
@@ -1007,6 +1009,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces_json: vec![],
             produces: vec![],
             depends_on: vec![],
             backend: Default::default(),
@@ -1399,6 +1402,122 @@ mod tests {
             AgentStatus::Failed(msg) => assert!(msg.contains("src/report.md"), "got: {msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// `produces json`: a declared file that exists but does not parse as
+    /// JSON gets the corrective retry, then fails the agent.
+    #[tokio::test]
+    async fn invalid_json_produces_fails_after_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::TextDelta(
+                "<file path=\"src/report.json\">
+{not json
+</file>
+".into(),
+            ),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.max_retries = 1;
+        unit.produces = vec!["src/report.json".into()];
+        unit.produces_json = vec!["src/report.json".into()];
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            workspace.join("src/report.json").exists(),
+            "the in-band block is applied, so the failure is about JSON, not absence"
+        );
+        match &manifest.status {
+            AgentStatus::Failed(msg) => assert!(msg.contains("invalid JSON"), "got: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A corrective retry is paid for too: the manifest reports the cost of
+    /// every attempt, not just the last turn.
+    #[tokio::test]
+    async fn cost_accumulates_across_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::TextDelta("Both files written.".into()),
+            UnifiedStreamEvent::Usage(crate::swarm::backend::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cost_usd: Some(0.5),
+                duration_ms: None,
+            }),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.max_retries = 1; // two attempts: the first, then one corrective retry
+        unit.produces = vec!["src/report.md".into()];
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(manifest.status, AgentStatus::Failed(_)));
+        assert!(
+            (manifest.cost_usd - 1.0).abs() < 1e-9,
+            "two attempts at $0.50 each, got {}",
+            manifest.cost_usd
+        );
     }
 
     #[tokio::test]

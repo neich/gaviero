@@ -1,0 +1,53 @@
+// Model profile: what each tier means when a run chooses no other.
+//
+// Scripts never name a model. Every agent declares a tier (`tier high`); a
+// workflow may move an agent to another tier (`tiers { judge medium }`), and
+// so may a run (`--tier judge=medium-codex`). This file is the one place a
+// tier becomes a model.
+//
+// The generic tiers (low, medium, high, top) are on Claude. The
+// <level>-<provider> tiers pin a step to that level of one provider — use
+// them to put a critic or a judge on another model family than the agents
+// it checks.
+//
+// Copy this file to .gaviero/dsl/profiles/default.gaviero (workspace) or
+// $GAVIERO_ROOT/.gaviero/dsl/profiles/default.gaviero (global) and edit it.
+
+client haiku    { model "claude:haiku"         privacy public effort low }
+client sonnet   { model "claude:sonnet"        privacy public effort medium }
+client opus     { model "claude:opus"          privacy public effort high }
+client fable    { model "claude:fable"         privacy public effort max }
+
+client luna     { model "codex:gpt-6-luna"     privacy public effort low }
+client terra    { model "codex:gpt-6.1-terra"  privacy public effort medium }
+client sol      { model "codex:gpt-6.1-sol"    privacy public effort high }
+client astra    { model "codex:gpt-6-astra"    privacy public effort high }
+
+client composer { model "cursor:composer-2.5"  privacy public }
+// The Cursor CLI id carries the effort (`agent --list-models`).
+client grok     { model "cursor:grok-4.7-high" privacy public }
+
+// DeepSeek through `dsh --profile acp`; accepts low, high and max effort.
+client flash    { model "dsh:deepseek-flash"   privacy public effort high }
+
+tier low             haiku
+tier medium          sonnet
+tier high            opus
+tier top             fable
+
+tier low-claude      haiku
+tier medium-claude   sonnet
+tier high-claude     opus
+tier top-claude      fable
+
+tier low-codex       luna
+tier medium-codex    terra
+tier high-codex      sol
+tier top-codex       astra
+
+tier low-cursor      composer
+tier medium-cursor   composer
+tier high-cursor     composer
+tier top-cursor      grok
+
+tier high-deepseek   flash

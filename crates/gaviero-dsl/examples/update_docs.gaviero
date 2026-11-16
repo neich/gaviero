@@ -14,14 +14,11 @@
 // Usage:
 //   gaviero-cli --script crates/gaviero-dsl/examples/update_docs.gaviero
 //
-// Swap model combinations via a tiers profile (semantic role → client):
-//   gaviero-cli --script .../update_docs.gaviero \
-//     --tiers-file .../profiles/doc-codex.gaviero
-
-// Client pool + default tier bindings (override with --tiers-file).
-include "clients.gaviero"
-// include "profiles/doc-claude.gaviero"
-include "profiles/doc-cursor.gaviero"
+// Models: inventory and the deep writers run on tier `top`, the standard
+// writer and the recorder on `medium`. Swap every model at once with a
+// model profile, or move one agent:
+//   gaviero-cli --script .../update_docs.gaviero --profile codex
+//   gaviero-cli --script .../update_docs.gaviero --tier write_readme_md=high
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
@@ -76,7 +73,7 @@ prompt doc_write_body #"
 
 agent inventory {
     description "Inventory all crates and their documentation state"
-    tier inventory
+    tier top
     scope {
         read_only [
             "src/" "crates/" "Cargo.toml"
@@ -118,7 +115,7 @@ The fixed context injected into every AI prompt. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    tier writer_deep
+    tier top
     depends_on [inventory]
     scope {
         owned     [
@@ -158,7 +155,7 @@ The user-facing description of each crate/project. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    tier writer_standard
+    tier medium
     depends_on [inventory]
     scope {
         owned     [
@@ -199,7 +196,7 @@ The deep technical description of a crate/project. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    tier writer_deep
+    tier top
     depends_on [inventory]
     scope {
         owned     [
@@ -224,7 +221,7 @@ agent record_docs_update {
         REVIEW_SCOPE "CLAUDE.md (AI context), README.md (user guide), ARCHITECTURE.md (technical design)"
     }
     description "Record documentation update to memory: {{PROMPT}}"
-    tier recorder
+    tier medium
     depends_on [write_claude_md write_readme_md write_architecture_md]
     scope {
         read_only ["CLAUDE.md" "README.md" "ARCHITECTURE.md" "crates/"]

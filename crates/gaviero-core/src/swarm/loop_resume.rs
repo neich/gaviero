@@ -126,13 +126,26 @@ pub fn detect(
 
     // Owned globs per loop agent. An agent with no owned paths cannot be
     // validated, so the whole loop opts out rather than resuming blind.
-    let mut owned: BTreeMap<&str, &[String]> = BTreeMap::new();
+    //
+    // A runtime `for` template (`for q in json …`) still carries its item
+    // placeholders (`out/{{q.id}}-v*.md`); each placeholder matches any
+    // segment. Such an agent writes as many files per pass as that pass had
+    // items, so it only has to show at least one artefact per version — it
+    // takes no part in the "every reviewer produced the same set" rule.
+    let mut owned: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut dynamic: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for agent_id in &loop_config.agent_ids {
         let unit = unit_map.get(agent_id.as_str())?;
         if unit.scope.owned_paths.is_empty() {
             return None;
         }
-        owned.insert(agent_id.as_str(), unit.scope.owned_paths.as_slice());
+        if unit.scope.owned_paths.iter().any(|g| g.contains("{{")) {
+            dynamic.insert(agent_id.as_str());
+        }
+        owned.insert(
+            agent_id.as_str(),
+            unit.scope.owned_paths.iter().map(|g| wildcard_placeholders(g)).collect(),
+        );
     }
 
     let mut notes: Vec<String> = Vec::new();
@@ -194,8 +207,20 @@ pub fn detect(
             ));
             continue;
         }
-        let mut vectors = per_agent.values().map(|c| &c.counts);
+        if per_agent
+            .iter()
+            .any(|(id, c)| dynamic.contains(id) && c.total() == 0)
+        {
+            notes.push(format!("v{version} incomplete — a runtime `for` wrote nothing"));
+            continue;
+        }
+        let mut vectors = per_agent
+            .iter()
+            .filter(|(id, _)| !dynamic.contains(*id))
+            .map(|(_, c)| &c.counts);
         let Some(first) = vectors.next() else {
+            // Only runtime `for` members, each with at least one artefact.
+            last_complete = Some(*version);
             continue;
         };
         if first.iter().sum::<usize>() == 0 {
@@ -280,6 +305,27 @@ pub fn detect(
         satisfied_init_units,
         notes,
     })
+}
+
+/// Replace every `{{…}}` placeholder in a glob with `*`.
+fn wildcard_placeholders(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len());
+    let mut rest = glob;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("}}") {
+            Some(end) => {
+                out.push('*');
+                rest = &rest[start + end + 2..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse the trailing `-v<N>` marker from a path's file name.
@@ -631,5 +677,37 @@ mod tests {
         assert_eq!(parse_version("plans/v2/claude-conclusion-v11.md"), Some(11));
         assert_eq!(parse_version("plans/x/plan_log.md"), None);
         assert_eq!(parse_version("plans/x/claude-v2-notes.md"), None);
+    }
+
+    /// A runtime `for` member (`out/{{q.id}}-finding-v*.md`) writes a
+    /// different number of files each pass; a pass counts once it wrote any
+    /// and every other loop agent completed it.
+    #[test]
+    fn detect_handles_runtime_for_owned_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "out/a-finding-v1.md", "x");
+        write(root, "out/b-finding-v1.md", "x");
+        write(root, "out/frontier-v1.json", "{}");
+        write(root, "out/c-finding-v2.md", "x");
+        write(root, "out/frontier-v2.json", "{}");
+        // Pass 3 crashed: an investigator wrote, the curator never ran.
+        write(root, "out/a-finding-v3.md", "x");
+
+        let worker = unit("worker", &["out/{{q.id}}-finding-v*.md"]);
+        let curator = unit("curator", &["out/frontier-v*.json"]);
+        let map: HashMap<&str, &WorkUnit> =
+            [("worker", &worker), ("curator", &curator)].into_iter().collect();
+        let resume = detect(root, &loop_config(&["worker", "curator"], "out", 1), &map)
+            .expect("passes 1 and 2 are complete");
+        assert_eq!(resume.last_complete_iter, 2);
+        assert_eq!(resume.resume_iter_start, 3);
+    }
+
+    #[test]
+    fn placeholders_become_wildcards() {
+        assert_eq!(wildcard_placeholders("out/{{q.id}}-v*.md"), "out/*-v*.md");
+        assert_eq!(wildcard_placeholders("a/{{x}}/{{y}}.md"), "a/*/*.md");
+        assert_eq!(wildcard_placeholders("plain/v*.md"), "plain/v*.md");
     }
 }

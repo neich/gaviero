@@ -39,7 +39,7 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 - **stdout = results, stderr = telemetry.** Observers always log to stderr.
 - **Model spec:** `provider:model` required. Accepted prefixes include `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)). Default: workspace `agent.model`, then `claude:sonnet`.
 - **`--repo` vs `--workspace`:** `execution repo` vs `execution document` ([`workflow_execution_mode`](../gaviero-dsl/src/lib.rs)). Conflicts with each other; `--workspace` defaults to the plan file's directory when `--var PLAN_FILE=...` is set.
-- **DSL precedence.** Tiers: `--tiers-file` or `--profile` (mutually exclusive) > script/includes > the implicit `default` profile. Vars: agent-level > `--var` > script-level. Params: `--param` (see [`workflow_params`](../gaviero-dsl/src/workflow_params.rs)).
+- **DSL precedence.** Models: `--profile` (else the profile named `default`) says what each tier means; an agent's tier is `--tier AGENT=TIER` > the workflow's `tiers { }` > its own `tier`. Vars: agent-level > `--var` > script-level. Params: `--param` (see [`workflow_params`](../gaviero-dsl/src/workflow_params.rs)).
 - **State follows the TUI.** [`state::discover`](src/state.rs) walks the run root and its parents for `.gaviero/settings.json` or `.gaviero/memory.db` (never `$HOME`) and honours a `*.gaviero-workspace` listing that folder. Runs share that workspace's memory (`MemoryStores::open` at its state root, configured embedder, repo scope = the member folder containing the run root). `--isolated`, or no workspace found, means throwaway memory/graph/telemetry in a temp dir; settings are still read, skills are off, and synthesized agent configs are restored at exit. Admin commands require a discovered workspace; `--history` / `--mcp-stats` fall back to the run root.
 - **Never build a code graph for one root into another root's DB.** A build deletes every file it did not scan. A run from a workspace folder uses the graph the TUI keeps for that folder; subfolder runs use `<state_root>/.gaviero/graphs/<hash>/` (`RunState::graph_db`).
 - **Memory ops open the same `MemoryServices`** as the TUI; never bypass the writer task.
@@ -49,7 +49,7 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 
 - **Never add a flag without adding the field on `Cli` first.** Docs trail the struct.
 - **Never write directly to a file.** Synthetic-task mode still goes through the Write Gate (`AutoAccept` when `--auto-accept`).
-- **Tier overrides only contain `tier` lines.** [`load_tier_overrides`](../gaviero-dsl/src/tiers.rs) rejects other items.
+- **Models come from tiers only.** There is no `--tiers-file` and no model-valued `--param`; do not add one. `--param` values are list items (`id=tier`).
 - **Always validate the model spec via core** — do not re-parse prefixes in CLI code.
 - **Never document `--no-memory`.** It does not exist on `Cli`.
 

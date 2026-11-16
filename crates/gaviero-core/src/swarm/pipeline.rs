@@ -108,32 +108,71 @@ pub fn preflight_plan_models(
     Ok(())
 }
 
-/// Wall-clock budget for a whole swarm run.
+/// Run limits: the wall clock (`--run-timeout` and the workflow's
+/// `budget { wall }`, the smaller non-zero one) and the workflow's
+/// `budget { usd }`.
 ///
-/// Checked cooperatively rather than by wrapping `execute` in a timeout: a
-/// hard cancel would throw away every manifest collected so far, and the
-/// artefacts on disk are the point of a document workflow. Because every
-/// dispatch is bounded by `WorkUnit::timeout_secs`, the gap between two checks
-/// is bounded too, so cooperative checking cannot be starved.
-struct RunDeadline {
+/// Checked cooperatively before every dispatch rather than by wrapping
+/// `execute` in a timeout: a hard cancel would throw away every manifest
+/// collected so far, and the artefacts on disk are the point of a document
+/// workflow. Because every dispatch is bounded by `WorkUnit::timeout_secs`,
+/// the gap between two checks is bounded too. Spend is only known once a
+/// dispatch returns, so agents already running in a parallel tier can carry
+/// the total past `usd`.
+struct RunLimits {
     start: std::time::Instant,
-    budget: Option<std::time::Duration>,
+    wall: Option<std::time::Duration>,
+    usd: Option<f64>,
 }
 
-impl RunDeadline {
-    fn new(secs: u64) -> Self {
+impl RunLimits {
+    fn new(run_timeout_secs: u64, budget: Option<&crate::swarm::plan::RunBudget>) -> Self {
+        let plan_wall = budget.and_then(|b| b.wall_secs).filter(|s| *s > 0);
+        let cli_wall = (run_timeout_secs > 0).then_some(run_timeout_secs);
+        let wall_secs = match (plan_wall, cli_wall) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         Self {
             start: std::time::Instant::now(),
-            budget: (secs > 0).then_some(std::time::Duration::from_secs(secs)),
+            wall: wall_secs.map(std::time::Duration::from_secs),
+            usd: budget.and_then(|b| b.usd),
         }
     }
 
-    /// `Some(elapsed_secs)` once the budget is spent.
-    fn expired(&self) -> Option<u64> {
-        let budget = self.budget?;
-        let elapsed = self.start.elapsed();
-        (elapsed >= budget).then_some(elapsed.as_secs())
+    /// Why no further agent may start, if a limit is spent.
+    fn exhausted(&self, spent_usd: f64) -> Option<String> {
+        if let Some(wall) = self.wall
+            && self.start.elapsed() >= wall
+        {
+            return Some(format!("wall budget of {}s spent", wall.as_secs()));
+        }
+        if let Some(usd) = self.usd
+            && spent_usd >= usd
+        {
+            return Some(format!("usd budget of ${usd:.2} spent (${spent_usd:.2})"));
+        }
+        None
     }
+}
+
+/// Reported spend so far: every manifest's `cost_usd` (agents, clones,
+/// workers and judges). Providers that report no cost contribute nothing.
+fn spent_usd(all_manifests: &[AgentManifest]) -> f64 {
+    all_manifests.iter().map(|m| m.cost_usd).sum()
+}
+
+/// Record a manifest and tell the observer the run's spend so far.
+fn push_manifest(
+    all_manifests: &mut Vec<AgentManifest>,
+    manifest: AgentManifest,
+    observer: &dyn SwarmObserver,
+) {
+    all_manifests.push(manifest);
+    observer.on_cost_update(&crate::swarm::verify::CostEstimate {
+        estimated_usd: spent_usd(all_manifests),
+        ..Default::default()
+    });
 }
 
 /// A spawned agent task that dies with the run awaiting it.
@@ -305,12 +344,72 @@ fn workspace_bash_inherited(
 /// Pending/Blocked/HardFailure all count as unmet. Tiers are supposed to
 /// have already run those deps; if they have not, dispatching the child is
 /// the bug that let `review_module` start after `inventory` Failed.
+///
+/// A dependency on a `pattern map_reduce` discover agent also covers every
+/// worker its wave recorded (`<discover>::<worker>` in `spawned_ids`): a
+/// failed worker leaves the reduce agent unmet.
 fn unmet_dependency_ids(unit: &WorkUnit, exec_state: &ExecutionState) -> Vec<String> {
-    unit.depends_on
+    let mut unmet: Vec<String> = unit
+        .depends_on
         .iter()
         .filter(|d| !exec_state.status(d).is_success())
         .cloned()
+        .collect();
+    for dep in &unit.depends_on {
+        let prefix = format!("{dep}::");
+        for key in &exec_state.spawned_ids {
+            if let Some(worker) = key.strip_prefix(&prefix)
+                && !exec_state.status(worker).is_success()
+                && !unmet.iter().any(|u| u == worker)
+            {
+                unmet.push(worker.to_string());
+            }
+        }
+    }
+    unmet
+}
+
+/// The loop agents `unit` depends on that have not completed this pass.
+fn intra_loop_unmet(
+    unit: &WorkUnit,
+    loop_agent_ids: &[String],
+    pass_completed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    unit.depends_on
+        .iter()
+        .filter(|d| loop_agent_ids.contains(d) && **d != unit.id)
+        .filter(|d| !pass_completed.contains(*d))
+        .cloned()
         .collect()
+}
+
+/// Dispatch tiers for one loop pass: `depends_on` between the loop's own
+/// agents, in Kahn order, each tier listed in the loop's written order.
+/// Dependencies outside the loop are already satisfied before the loop runs.
+fn loop_pass_tiers(
+    loop_agent_ids: &[String],
+    unit_map: &std::collections::HashMap<&str, &WorkUnit>,
+) -> Vec<Vec<String>> {
+    let members: Vec<WorkUnit> = loop_agent_ids
+        .iter()
+        .filter_map(|id| unit_map.get(id.as_str()))
+        .map(|u| {
+            let mut u = (*u).clone();
+            u.depends_on.retain(|d| loop_agent_ids.contains(d) && *d != u.id);
+            u
+        })
+        .collect();
+    let position = |id: &str| loop_agent_ids.iter().position(|a| a == id).unwrap_or(usize::MAX);
+    match validation::dependency_tiers(&members) {
+        Ok(mut tiers) => {
+            for tier in &mut tiers {
+                tier.sort_by_key(|id| position(id));
+            }
+            tiers
+        }
+        // Cycles are rejected at compile time; fall back to one tier.
+        Err(_) => vec![loop_agent_ids.to_vec()],
+    }
 }
 
 fn skipped_for_unmet_deps(unit_id: &str, deps: &[String]) -> AgentManifest {
@@ -351,7 +450,7 @@ fn record_unmet_dependency_skip(
         manifest.summary.as_deref().unwrap_or(""),
     );
     exec_state.record_result(unit_id, manifest.clone());
-    all_manifests.push(manifest);
+    push_manifest(all_manifests, manifest, observer);
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -523,7 +622,11 @@ pub async fn execute(
     // ── Single-agent fast path ────────────────────────────────────────────────
     // One work unit → bypass worktrees, bus, and merge; run directly through
     // the IterationEngine so strategy / retry / model-escalation all apply.
-    if work_units.len() == 1 && plan.loop_configs.is_empty() {
+    if work_units.len() == 1
+        && plan.loop_configs.is_empty()
+        && plan.runtime_fors.is_empty()
+        && plan.fanout_ops.is_empty()
+    {
         let unit = work_units.into_iter().next().unwrap();
 
         // Resume support: skip if already completed.
@@ -764,6 +867,37 @@ pub async fn execute(
         }
     }
 
+    // `for … in json` templates, and the clones each one ran most recently
+    // inside a loop (the delivery checks judge those, not the template).
+    let runtime_for_map: std::collections::HashMap<&str, &crate::swarm::plan::RuntimeForOp> = plan
+        .runtime_fors
+        .iter()
+        .map(|op| (op.unit_id.as_str(), op))
+        .collect();
+    let mut dynamic_clones: std::collections::HashMap<String, Vec<WorkUnit>> =
+        std::collections::HashMap::new();
+    let limits = RunLimits::new(config.run_timeout_secs, plan.budget.as_ref());
+    warn_unreported_budget_costs(plan, observer);
+    let dyn_ctx = DynamicCtx {
+        config,
+        limits: &limits,
+        semaphore: semaphore.clone(),
+        memory: memory.clone(),
+        memory_writer: &memory_writer,
+        observer,
+        validation: validation_pipeline.clone(),
+        board: shared_board.clone(),
+        analysis: &analysis,
+        pre_fetched_memory: pre_fetched_memory.clone(),
+        tier_router: &tier_router,
+        iteration_config: &plan.iteration_config,
+        bus: &bus,
+        run_id: &run_id,
+        plan_hash: &plan_hash,
+        static_units: &work_units,
+        loop_groups: &loop_groups,
+    };
+
     observer.on_phase_changed("running");
 
     // Build a map from loop-agent id → iter_start for first-pass {{ITER}} substitution.
@@ -802,6 +936,10 @@ pub async fn execute(
     // execute_module's loop iterations 2..N actually run, so test_audit sees
     // an empty workspace state. The deferral makes "depends on a loop body
     // agent" mean "depends on the loop body having fully iterated".
+    //
+    // A loop body agent is never a post-loop unit, even when it depends on
+    // another agent of its loop (`curator depends_on [investigator]`): the
+    // loop itself orders those agents inside every pass.
     let loop_body_agents: std::collections::HashSet<String> = effective_loop_configs
         .iter()
         .flat_map(|lc| lc.agent_ids.iter().cloned())
@@ -825,6 +963,7 @@ pub async fn execute(
                 }
             }
         }
+        out.retain(|id| !loop_body_agents.contains(id));
         out
     };
 
@@ -848,19 +987,16 @@ pub async fn execute(
         ));
     }
 
-    let deadline = RunDeadline::new(config.run_timeout_secs);
 
     // 3. Execute tiers
     for (tier_idx, tier) in tiers.iter().enumerate() {
-        if let Some(elapsed) = deadline.expired() {
+        if let Some(reason) = limits.exhausted(spent_usd(&all_manifests)) {
             tracing::error!(
-                "Run budget of {}s exhausted after {}s — stopping before tier {}/{}",
-                config.run_timeout_secs,
-                elapsed,
+                "Run budget exhausted ({reason}) — stopping before tier {}/{}",
                 tier_idx + 1,
                 tiers.len()
             );
-            observer.on_phase_changed("run budget exhausted");
+            observer.on_phase_changed(&format!("run budget exhausted: {reason}"));
             break;
         }
         observer.on_tier_started(tier_idx + 1, tiers.len());
@@ -868,9 +1004,26 @@ pub async fn execute(
         if effective_max_parallel <= 1 || tier.len() <= 1 {
             // Sequential execution
             for unit_id in tier {
-                // Skip if already completed (resume support)
+                if let Some(reason) = limits.exhausted(spent_usd(&all_manifests)) {
+                    tracing::error!("Run budget exhausted ({reason}) — not starting '{unit_id}'");
+                    observer.on_phase_changed(&format!("run budget exhausted: {reason}"));
+                    break;
+                }
+                // Skip if already completed (resume support) — but finish a
+                // fan-out wave the checkpoint shows as incomplete.
                 if exec_state.status(unit_id) == NodeStatus::Completed {
                     tracing::info!("Skipping completed node '{}' (resume)", unit_id);
+                    if fanout_wave_pending(plan, unit_id, &exec_state) {
+                        run_fanout_wave_if_needed(
+                            unit_id,
+                            plan,
+                            &dyn_ctx,
+                            &mut exec_state,
+                            &mut all_manifests,
+                            &make_observer,
+                        )
+                        .await?;
+                    }
                     continue;
                 }
                 // Stacked-mode loop body agents: tier dispatch hands them
@@ -896,6 +1049,44 @@ pub async fn execute(
                         &mut exec_state,
                         &mut all_manifests,
                     );
+                    continue;
+                }
+
+                // A `for … in json` template: clone it per item and run the
+                // clones; the template's own record is the barrier.
+                if let Some(op) = runtime_for_map.get(unit_id.as_str()) {
+                    let pass = loop_agent_first_iter
+                        .get(unit_id.as_str())
+                        .map(|&is| (is, None));
+                    exec_state.set_status(unit_id, NodeStatus::Running);
+                    let (manifest, clones) = run_runtime_for_step(
+                        unit,
+                        op,
+                        pass,
+                        &plan.tier_bindings,
+                        &dyn_ctx,
+                        &mut exec_state,
+                        &mut all_manifests,
+                        &make_observer,
+                    )
+                    .await?;
+                    if pass.is_some() {
+                        dynamic_clones.insert(unit_id.clone(), clones);
+                    }
+                    let failed = !matches!(manifest.status, AgentStatus::Completed);
+                    observer.on_agent_state_changed(
+                        unit_id,
+                        &manifest.status,
+                        manifest.summary.as_deref().unwrap_or(""),
+                    );
+                    exec_state.record_result(unit_id, manifest.clone());
+                    if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
+                        tracing::warn!("Failed to save execution state checkpoint: {}", e);
+                    }
+                    push_manifest(&mut all_manifests, manifest, observer);
+                    if failed {
+                        break;
+                    }
                     continue;
                 }
 
@@ -965,44 +1156,36 @@ pub async fn execute(
                 if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
                     tracing::warn!("Failed to save execution state checkpoint: {}", e);
                 }
-                all_manifests.push(manifest);
+                push_manifest(&mut all_manifests, manifest, observer);
                 if failed {
                     break;
                 }
 
                 // Runtime fan-out: materialize + run SpawnManifest workers
-                if !failed
-                    && let Err(e) = run_fanout_wave_if_needed(
-                        unit_id,
-                        plan,
-                        config,
-                        &context_files,
-                        &memory,
-                        &memory_writer,
-                        observer,
-                        git_coordinator.clone(),
-                        validation_pipeline.clone(),
-                        shared_board.clone(),
-                        &analysis,
-                        pre_fetched_memory.clone(),
-                        &tier_router,
-                        &plan.iteration_config,
-                        &bus,
-                        &mut all_manifests,
-                        &mut exec_state,
-                        &run_id,
-                        &plan_hash,
-                        worktree_mgr.as_mut(),
-                        &make_observer,
-                    )
-                    .await
-                {
-                    tracing::warn!("fan-out after '{unit_id}' failed: {e:#}");
-                }
+                run_fanout_wave_if_needed(
+                    unit_id,
+                    plan,
+                    &dyn_ctx,
+                    &mut exec_state,
+                    &mut all_manifests,
+                    &make_observer,
+                )
+                .await?;
             }
         } else {
             // Parallel execution within tier
             let mut handles = Vec::new();
+            // Ids in the same order as `handles`: skipped and deferred units
+            // are never spawned, so `tier[handle_idx]` would name the wrong
+            // unit when reporting a task error.
+            let mut spawned_ids: Vec<String> = Vec::new();
+            // `for … in json` templates of this tier. They fan out under the
+            // same semaphore, so they run after the tier's other agents are
+            // collected — never while a permit-holding task waits on them.
+            let mut deferred_runtime_fors: Vec<String> = Vec::new();
+            // Discover agents of this tier whose `pattern map_reduce` wave
+            // runs once the tier is collected (same reason as above).
+            let mut deferred_fanouts: Vec<String> = Vec::new();
 
             // Register all agents as Pending before spawning. Skip stacked
             // loop body agents (handled by the loop block) and post-loop
@@ -1016,6 +1199,14 @@ pub async fn execute(
 
             for unit_id in tier {
                 if stacked_loop_agents.contains(unit_id) || post_loop_units.contains(unit_id) {
+                    continue;
+                }
+                // Skip if already completed (resume support)
+                if exec_state.status(unit_id) == NodeStatus::Completed {
+                    tracing::info!("Skipping completed node '{}' (resume)", unit_id);
+                    if fanout_wave_pending(plan, unit_id, &exec_state) {
+                        deferred_fanouts.push(unit_id.clone());
+                    }
                     continue;
                 }
                 let unit = (*unit_map
@@ -1033,6 +1224,15 @@ pub async fn execute(
                         &mut all_manifests,
                     );
                     continue;
+                }
+                if runtime_for_map.contains_key(unit_id.as_str()) {
+                    deferred_runtime_fors.push(unit_id.clone());
+                    continue;
+                }
+                if let Some(reason) = limits.exhausted(spent_usd(&all_manifests)) {
+                    tracing::error!("Run budget exhausted ({reason}) — not starting '{unit_id}'");
+                    observer.on_phase_changed(&format!("run budget exhausted: {reason}"));
+                    break;
                 }
 
                 // Apply {{ITER}}/{{PREV_ITER}} for first pass of loop agents
@@ -1138,9 +1338,13 @@ pub async fn execute(
 
                     Ok::<_, anyhow::Error>(manifest)
                 })));
+                spawned_ids.push(unit_id.clone());
             }
 
-            // Collect results
+            // Collect results. Every manifest is recorded in the execution
+            // state, exactly like the sequential branch: later tiers check
+            // their `depends_on` against it, loops check their first pass
+            // against it, and `--resume` reads it back from the checkpoint.
             for (handle_idx, handle) in handles.into_iter().enumerate() {
                 match handle.await {
                     Ok(Ok(manifest)) => {
@@ -1173,18 +1377,27 @@ pub async fn execute(
                                 .await;
                             }
                         }
-                        all_manifests.push(manifest);
+                        if matches!(manifest.status, AgentStatus::Completed)
+                            && plan
+                                .fanout_ops
+                                .iter()
+                                .any(|op| op.after_unit == manifest.work_unit_id)
+                        {
+                            deferred_fanouts.push(manifest.work_unit_id.clone());
+                        }
+                        exec_state.record_result(&manifest.work_unit_id, manifest.clone());
+                        push_manifest(&mut all_manifests, manifest, observer);
                     }
                     Ok(Err(e)) => {
                         let err_msg = format!("{:#}", e);
                         tracing::error!("Agent task error: {}", err_msg);
-                        if let Some(unit_id) = tier.get(handle_idx) {
+                        if let Some(unit_id) = spawned_ids.get(handle_idx) {
                             observer.on_agent_state_changed(
                                 unit_id,
                                 &AgentStatus::Failed(err_msg.clone()),
                                 &err_msg,
                             );
-                            all_manifests.push(AgentManifest {
+                            let manifest = AgentManifest {
                                 work_unit_id: unit_id.clone(),
                                 status: AgentStatus::Failed(err_msg),
                                 modified_files: vec![],
@@ -1192,19 +1405,21 @@ pub async fn execute(
                                 summary: Some("Agent task error".into()),
                                 output: None,
                                 cost_usd: 0.0,
-                            });
+                            };
+                            exec_state.record_result(unit_id, manifest.clone());
+                            push_manifest(&mut all_manifests, manifest, observer);
                         }
                     }
                     Err(e) => {
                         let err_msg = format!("task panicked: {}", e);
                         tracing::error!("{}", err_msg);
-                        if let Some(unit_id) = tier.get(handle_idx) {
+                        if let Some(unit_id) = spawned_ids.get(handle_idx) {
                             observer.on_agent_state_changed(
                                 unit_id,
                                 &AgentStatus::Failed(err_msg.clone()),
                                 &err_msg,
                             );
-                            all_manifests.push(AgentManifest {
+                            let manifest = AgentManifest {
                                 work_unit_id: unit_id.clone(),
                                 status: AgentStatus::Failed(err_msg),
                                 modified_files: vec![],
@@ -1212,10 +1427,64 @@ pub async fn execute(
                                 summary: Some("Agent task panicked".into()),
                                 output: None,
                                 cost_usd: 0.0,
-                            });
+                            };
+                            exec_state.record_result(unit_id, manifest.clone());
+                            push_manifest(&mut all_manifests, manifest, observer);
                         }
                     }
                 }
+            }
+            if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
+                tracing::warn!("Failed to save execution state checkpoint: {}", e);
+            }
+
+            for unit_id in &deferred_fanouts {
+                run_fanout_wave_if_needed(
+                    unit_id,
+                    plan,
+                    &dyn_ctx,
+                    &mut exec_state,
+                    &mut all_manifests,
+                    &make_observer,
+                )
+                .await?;
+            }
+
+            for unit_id in &deferred_runtime_fors {
+                let (Some(op), Some(template)) = (
+                    runtime_for_map.get(unit_id.as_str()),
+                    unit_map.get(unit_id.as_str()),
+                ) else {
+                    continue;
+                };
+                let pass = loop_agent_first_iter
+                    .get(unit_id.as_str())
+                    .map(|&is| (is, None));
+                exec_state.set_status(unit_id, NodeStatus::Running);
+                let (manifest, clones) = run_runtime_for_step(
+                    template,
+                    op,
+                    pass,
+                    &plan.tier_bindings,
+                    &dyn_ctx,
+                    &mut exec_state,
+                    &mut all_manifests,
+                    &make_observer,
+                )
+                .await?;
+                if pass.is_some() {
+                    dynamic_clones.insert(unit_id.clone(), clones);
+                }
+                observer.on_agent_state_changed(
+                    unit_id,
+                    &manifest.status,
+                    manifest.summary.as_deref().unwrap_or(""),
+                );
+                exec_state.record_result(unit_id, manifest.clone());
+                if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
+                    tracing::warn!("Failed to save execution state checkpoint: {}", e);
+                }
+                push_manifest(&mut all_manifests, manifest, observer);
             }
         }
     }
@@ -1483,21 +1752,19 @@ pub async fn execute(
                     }
                 }
                 exec_state.record_result(agent_id, manifest.clone());
-                all_manifests.push(manifest);
+                push_manifest(&mut all_manifests, manifest, observer);
             }
         }
 
         for iteration in 1..loop_config.max_iterations {
             let current_iter_abs = loop_config.iter_start + iteration - 1;
 
-            if let Some(elapsed) = deadline.expired() {
+            if let Some(reason) = limits.exhausted(spent_usd(&all_manifests)) {
                 tracing::error!(
-                    "Run budget of {}s exhausted after {}s — stopping the loop at iteration {}",
-                    config.run_timeout_secs,
-                    elapsed,
+                    "Run budget exhausted ({reason}) — stopping the loop at iteration {}",
                     current_iter_abs
                 );
-                observer.on_phase_changed("run budget exhausted");
+                observer.on_phase_changed(&format!("run budget exhausted: {reason}"));
                 loop_terminated = true;
                 break;
             }
@@ -1516,24 +1783,27 @@ pub async fn execute(
             // judge turn.
             // Snapshot the pass now; the delivery gate itself runs only
             // if a judge is about to be dispatched (D-7).
+            // A runtime `for` member is judged through the clones it ran.
+            let (member_ids, member_map) =
+                expand_loop_members(&loop_config.agent_ids, &unit_map, &dynamic_clones);
             let delivery_after =
-                snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
+                snapshot_loop_agents(&member_ids, &member_map, &config.workspace_root);
 
             // A panel that delivers nothing at all, pass after pass, is
             // stuck. Deterministic conditions never reach the delivery
             // gate, so without this they would iterate to the budget.
             {
                 let silent = loop_agents_without_delivery(DeliveryCheck {
-                    agent_ids: &loop_config.agent_ids,
-                    unit_map: &unit_map,
+                    agent_ids: &member_ids,
+                    unit_map: &member_map,
                     all_manifests: &all_manifests,
                     before: &loop_output_baseline,
                     after: &delivery_after,
                     workspace_root: &config.workspace_root,
                     iter_abs: current_iter_abs,
                 });
-                let whole_panel_silent = !loop_config.agent_ids.is_empty()
-                    && silent.len() == loop_config.agent_ids.len();
+                let whole_panel_silent =
+                    !member_ids.is_empty() && silent.len() == member_ids.len();
                 silent_streak = if whole_panel_silent {
                     silent_streak.saturating_add(1)
                 } else {
@@ -1574,15 +1844,16 @@ pub async fn execute(
                     make_observer: &make_observer,
                     strict_judge: loop_config.strict_judge,
                     judge_timeout_secs: loop_config.judge_timeout_secs,
-                    loop_agent_ids: &loop_config.agent_ids,
+                    loop_agent_ids: &member_ids,
                     consensus_mode: loop_config.consensus_mode,
                     verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
                     probe_dedup: &mut probe_dedup,
                     delivery: DeliveryInputs {
-                        unit_map: &unit_map,
+                        unit_map: &member_map,
                         before: &loop_output_baseline,
                         after: &delivery_after,
                     },
+                    limits: &limits,
                 };
                 evaluate_loop_condition(&loop_config.until, current_iter_abs, &mut loop_ctx).await?
             };
@@ -1724,13 +1995,38 @@ pub async fn execute(
                     observer.on_agent_state_changed(agent_id, &AgentStatus::Pending, "queued");
                 }
 
+                // `depends_on` between agents of this loop orders them inside
+                // the pass: each tier starts once the previous one finished.
+                let pass_tiers = loop_pass_tiers(&loop_config.agent_ids, &unit_map);
+                let mut pass_completed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for pass_tier in &pass_tiers {
                 let mut prepared: Vec<(String, WorkUnit, PathBuf, Option<BranchOverride>)> =
                     Vec::new();
-                for agent_id in &loop_config.agent_ids {
+                // Runtime `for` members of this tier fan out after the tier's
+                // other agents are collected (they share the semaphore).
+                let mut tier_runtime_fors: Vec<String> = Vec::new();
+                for agent_id in pass_tier {
                     let unit_template = match unit_map.get(agent_id.as_str()) {
                         Some(u) => u,
                         None => continue,
                     };
+                    let unmet =
+                        intra_loop_unmet(unit_template, &loop_config.agent_ids, &pass_completed);
+                    if !unmet.is_empty() {
+                        record_unmet_dependency_skip(
+                            agent_id,
+                            &unmet,
+                            observer,
+                            &mut exec_state,
+                            &mut all_manifests,
+                        );
+                        continue;
+                    }
+                    if runtime_for_map.contains_key(agent_id.as_str()) {
+                        tier_runtime_fors.push(agent_id.clone());
+                        continue;
+                    }
                     let unit = apply_iter_vars_with_gate_feedback(
                         unit_template,
                         iter_abs,
@@ -1902,6 +2198,7 @@ pub async fn execute(
                         manifest.summary.as_deref().unwrap_or(""),
                     );
                     if matches!(manifest.status, AgentStatus::Completed) {
+                        pass_completed.insert(agent_id.clone());
                         let b = bus.lock().await;
                         b.broadcast(
                             &manifest.work_unit_id,
@@ -1921,15 +2218,87 @@ pub async fn execute(
                         .await;
                     }
                     exec_state.record_result(&agent_id, manifest.clone());
-                    all_manifests.push(manifest);
+                    push_manifest(&mut all_manifests, manifest, observer);
+                }
+                for agent_id in &tier_runtime_fors {
+                    let (Some(op), Some(template)) = (
+                        runtime_for_map.get(agent_id.as_str()),
+                        unit_map.get(agent_id.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    let (manifest, clones) = run_runtime_for_step(
+                        template,
+                        op,
+                        Some((iter_abs, last_gate_failure.as_ref())),
+                        &plan.tier_bindings,
+                        &dyn_ctx,
+                        &mut exec_state,
+                        &mut all_manifests,
+                        &make_observer,
+                    )
+                    .await?;
+                    dynamic_clones.insert(agent_id.clone(), clones);
+                    observer.on_agent_state_changed(
+                        agent_id,
+                        &manifest.status,
+                        manifest.summary.as_deref().unwrap_or(""),
+                    );
+                    if matches!(manifest.status, AgentStatus::Completed) {
+                        pass_completed.insert(agent_id.clone());
+                    }
+                    exec_state.record_result(agent_id, manifest.clone());
+                    push_manifest(&mut all_manifests, manifest, observer);
+                }
                 }
             } else {
                 // Sequential fallback (max_parallel == 1 or a single loop agent).
+                // `agent_ids` is in dependency order (the compiler sorts it),
+                // so an agent runs only after the loop agents it depends on.
+                let mut pass_completed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for agent_id in &loop_config.agent_ids {
                     let unit_template = match unit_map.get(agent_id.as_str()) {
                         Some(u) => u,
                         None => continue,
                     };
+                    let unmet =
+                        intra_loop_unmet(unit_template, &loop_config.agent_ids, &pass_completed);
+                    if !unmet.is_empty() {
+                        record_unmet_dependency_skip(
+                            agent_id,
+                            &unmet,
+                            observer,
+                            &mut exec_state,
+                            &mut all_manifests,
+                        );
+                        continue;
+                    }
+                    if let Some(op) = runtime_for_map.get(agent_id.as_str()) {
+                        let (manifest, clones) = run_runtime_for_step(
+                            unit_template,
+                            op,
+                            Some((iter_abs, last_gate_failure.as_ref())),
+                            &plan.tier_bindings,
+                            &dyn_ctx,
+                            &mut exec_state,
+                            &mut all_manifests,
+                            &make_observer,
+                        )
+                        .await?;
+                        dynamic_clones.insert(agent_id.clone(), clones);
+                        observer.on_agent_state_changed(
+                            agent_id,
+                            &manifest.status,
+                            manifest.summary.as_deref().unwrap_or(""),
+                        );
+                        if matches!(manifest.status, AgentStatus::Completed) {
+                            pass_completed.insert(agent_id.clone());
+                        }
+                        exec_state.record_result(agent_id, manifest.clone());
+                        push_manifest(&mut all_manifests, manifest, observer);
+                        continue;
+                    }
 
                     let iter_unit = apply_iter_vars_with_gate_feedback(
                         unit_template,
@@ -1986,6 +2355,7 @@ pub async fn execute(
                     };
 
                     if matches!(manifest.status, AgentStatus::Completed) {
+                        pass_completed.insert(agent_id.clone());
                         let b = bus.lock().await;
                         b.broadcast(
                             &manifest.work_unit_id,
@@ -2012,7 +2382,7 @@ pub async fn execute(
                         }
                     }
                     exec_state.record_result(agent_id, manifest.clone());
-                    all_manifests.push(manifest);
+                    push_manifest(&mut all_manifests, manifest, observer);
                 }
             }
         }
@@ -2024,8 +2394,11 @@ pub async fn execute(
                 loop_config.iter_start + loop_config.max_iterations.saturating_sub(1);
             // Snapshot the pass now; the delivery gate itself runs only
             // if a judge is about to be dispatched (D-7).
+            // A runtime `for` member is judged through the clones it ran.
+            let (member_ids, member_map) =
+                expand_loop_members(&loop_config.agent_ids, &unit_map, &dynamic_clones);
             let delivery_after =
-                snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
+                snapshot_loop_agents(&member_ids, &member_map, &config.workspace_root);
             let final_outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
@@ -2048,15 +2421,16 @@ pub async fn execute(
                     make_observer: &make_observer,
                     strict_judge: loop_config.strict_judge,
                     judge_timeout_secs: loop_config.judge_timeout_secs,
-                    loop_agent_ids: &loop_config.agent_ids,
+                    loop_agent_ids: &member_ids,
                     consensus_mode: loop_config.consensus_mode,
                     verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
                     probe_dedup: &mut probe_dedup,
                     delivery: DeliveryInputs {
-                        unit_map: &unit_map,
+                        unit_map: &member_map,
                         before: &loop_output_baseline,
                         after: &delivery_after,
                     },
+                    limits: &limits,
                 };
                 evaluate_loop_condition(&loop_config.until, final_iter_abs, &mut loop_ctx).await?
             };
@@ -2193,7 +2567,7 @@ pub async fn execute(
                 if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
                     tracing::warn!("Failed to save execution state checkpoint: {}", e);
                 }
-                all_manifests.push(manifest);
+                push_manifest(&mut all_manifests, manifest, observer);
                 if failed {
                     // A post-loop failure aborts further post-loop dispatch
                     // (e.g. final_verify shouldn't run if test_audit failed)
@@ -2640,6 +3014,8 @@ struct LoopConditionContext<'a> {
     /// Inputs for the delivery gate, consulted only if a judge is about
     /// to be dispatched.
     delivery: DeliveryInputs<'a>,
+    /// Run limits: a spent budget dispatches no judge.
+    limits: &'a RunLimits,
 }
 
 /// What the delivery gate needs to decide whether the panel is intact.
@@ -2854,6 +3230,14 @@ fn apply_iter_vars_full(
         // every iteration.
         produces: unit
             .produces
+            .iter()
+            .map(|p| {
+                p.replace("{{ITER}}", &iter_str)
+                    .replace("{{PREV_ITER}}", &prev_str)
+            })
+            .collect(),
+        produces_json: unit
+            .produces_json
             .iter()
             .map(|p| {
                 p.replace("{{ITER}}", &iter_str)
@@ -3915,35 +4299,378 @@ fn force_stage_owned_ignored(
     Ok(())
 }
 
-/// Store an agent's execution result to memory (best-effort, never fails the pipeline).
+/// With a `budget { usd }`, name the units whose provider reports no cost:
+/// their spend never counts toward the limit.
+fn warn_unreported_budget_costs(plan: &CompiledPlan, observer: &dyn SwarmObserver) {
+    if plan.budget.as_ref().and_then(|b| b.usd).is_none() {
+        return;
+    }
+    let reports_cost = |model: Option<&str>| {
+        model.is_some_and(|m| m.starts_with("claude:") || m.starts_with("deepseek:"))
+    };
+    let mut ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .chain(plan.loop_judge_units.iter())
+        .filter(|u| !reports_cost(u.model.as_deref()))
+        .map(|u| u.id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return;
+    }
+    let msg = format!(
+        "budget: cost is not reported for: {} — usd counts claude: and deepseek: only",
+        ids.join(", ")
+    );
+    tracing::warn!("{msg}");
+    observer.on_phase_changed(&msg);
+}
+
+/// Everything a dynamically materialised unit needs to run, borrowed from
+/// `execute`. Dynamic units — runtime `for` clones and `pattern map_reduce`
+/// workers — are not plan nodes, so they run outside the tier loop, in the
+/// shared workspace (both forms require `execution_mode document`).
+struct DynamicCtx<'a> {
+    config: &'a SwarmConfig,
+    limits: &'a RunLimits,
+    semaphore: Arc<Semaphore>,
+    memory: Option<Arc<MemoryStores>>,
+    memory_writer: &'a Option<WriterHandle>,
+    observer: &'a dyn SwarmObserver,
+    validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
+    board: Arc<SharedBoard>,
+    analysis: &'a WorkspaceAnalysis,
+    pre_fetched_memory: Arc<Option<String>>,
+    tier_router: &'a TierRouter,
+    iteration_config: &'a crate::iteration::IterationConfig,
+    bus: &'a Arc<tokio::sync::Mutex<AgentBus>>,
+    run_id: &'a str,
+    plan_hash: &'a str,
+    /// Static plan units, for scope validation of the dynamic ones.
+    static_units: &'a [WorkUnit],
+    /// Loop scope groups (see `validation::validate_scopes`).
+    loop_groups: &'a [Vec<String>],
+}
+
+/// Validate, then run `units` concurrently under the run's `max_parallel`
+/// semaphore and record every result. The caller must not hold a permit.
 ///
-/// Writes one aggregate entry for the agent's run, plus one sentinel entry per
-/// `staleness_source` path recording the current file hash. On the next run,
-/// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
+/// With `resume_skip`, units already `Completed` in the checkpoint are not
+/// run again. `template` names the plan node the units were cloned from (it
+/// is left out of scope validation and their clones join its loop group).
+async fn run_dynamic_units<F>(
+    units: Vec<WorkUnit>,
+    resume_skip: bool,
+    template: Option<&str>,
+    ctx: &DynamicCtx<'_>,
+    exec_state: &mut ExecutionState,
+    all_manifests: &mut Vec<AgentManifest>,
+    make_observer: &F,
+) -> Result<Vec<AgentManifest>>
+where
+    F: Fn(&str) -> Box<dyn AcpObserver>,
+{
+    // Clones must not collide with each other or with any static unit. A
+    // clone shares its template's loop group, like every loop member.
+    let dynamic_ids: Vec<String> = units.iter().map(|u| u.id.clone()).collect();
+    let mut groups: Vec<Vec<String>> = ctx.loop_groups.to_vec();
+    if let Some(template) = template {
+        for group in groups.iter_mut() {
+            if group.iter().any(|id| id == template) {
+                group.extend(dynamic_ids.iter().cloned());
+            }
+        }
+    }
+    let mut checked: Vec<WorkUnit> = ctx
+        .static_units
+        .iter()
+        .filter(|u| Some(u.id.as_str()) != template)
+        .cloned()
+        .collect();
+    checked.extend(units.iter().cloned());
+    let scope_errors = validation::validate_scopes(&checked, &groups);
+    let scope_errors: Vec<String> = scope_errors
+        .iter()
+        .map(|e| e.to_string())
+        .filter(|e| dynamic_ids.iter().any(|id| e.contains(id.as_str())))
+        .collect();
+    if !scope_errors.is_empty() {
+        bail!("dynamic unit scope validation failed: {}", scope_errors.join("; "));
+    }
+
+    {
+        let mut b = ctx.bus.lock().await;
+        for unit in &units {
+            b.register(&unit.id);
+        }
+    }
+
+    let mut handles: Vec<(String, WorkUnit, AbortOnDrop<AgentManifest>)> = Vec::new();
+    for unit in units {
+        if let Some(reason) = ctx.limits.exhausted(spent_usd(all_manifests)) {
+            tracing::error!("Run budget exhausted ({reason}) — not starting '{}'", unit.id);
+            ctx.observer
+                .on_phase_changed(&format!("run budget exhausted: {reason}"));
+            break;
+        }
+        if resume_skip && exec_state.status(&unit.id) == NodeStatus::Completed {
+            tracing::info!("Skipping completed dynamic unit '{}' (resume)", unit.id);
+            continue;
+        }
+        if ctx.config.execution_mode == ExecutionMode::Repo {
+            tracing::warn!(
+                "dynamic unit '{}' runs in the shared workspace (no worktree)",
+                unit.id
+            );
+        }
+        exec_state.set_status(&unit.id, NodeStatus::Running);
+        ctx.observer
+            .on_agent_state_changed(&unit.id, &AgentStatus::Pending, "queued");
+
+        let sem = ctx.semaphore.clone();
+        let root = ctx.config.workspace_root.clone();
+        let mem = ctx.memory.clone();
+        let ns: Vec<String> = unit
+            .read_namespaces
+            .as_deref()
+            .unwrap_or(ctx.config.read_namespaces.as_slice())
+            .to_vec();
+        let obs = make_observer(&unit.id);
+        let val_pipeline = ctx.validation.clone();
+        let board_ref = Some(ctx.board.clone());
+        let rm = ctx.analysis.repo_map.clone();
+        let agent_impact = ctx.analysis.impact_texts.get(&unit.id).cloned();
+        let router = ctx.tier_router.clone();
+        let iteration_config = ctx.iteration_config.clone();
+        let pfm = ctx.pre_fetched_memory.clone();
+        let swarm_extras = ctx.config.swarm_extra_tools.clone();
+        let tool_policy = ctx.config.tool_policy.clone();
+        let exposed_tools = ctx.config.exposed_tools.clone();
+        let skip_repo_context = ctx.config.execution_mode == ExecutionMode::Document;
+        let skill_catalog = ctx.config.skill_catalog.clone();
+        let task_unit = unit.clone();
+        let handle = AbortOnDrop(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            invalidate_stale_sources(&mem, &task_unit, &root).await;
+            let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+                WriteMode::AutoAccept,
+                Box::new(NoopWriteGateObserver),
+            )));
+            let engine = crate::iteration::IterationEngine::new(iteration_config.clone());
+            engine
+                .run_with_backend_factory(
+                    task_unit.clone(),
+                    write_gate,
+                    &root,
+                    mem.as_ref(),
+                    &ns,
+                    obs.as_ref(),
+                    val_pipeline.as_deref(),
+                    board_ref.as_deref(),
+                    (*rm).as_ref(),
+                    agent_impact.as_deref(),
+                    (*pfm).as_deref(),
+                    &swarm_extras,
+                    tool_policy.as_ref(),
+                    exposed_tools.as_deref(),
+                    skip_repo_context,
+                    skill_catalog.as_deref(),
+                    |candidate| resolve_backend_for_unit(&router, candidate),
+                )
+                .await
+                .manifest
+        }));
+        handles.push((unit.id.clone(), unit, handle));
+    }
+
+    let mut manifests = Vec::with_capacity(handles.len());
+    for (unit_id, unit, handle) in handles {
+        let manifest = match handle.await {
+            Ok(m) => m,
+            Err(e) => {
+                let err_msg = format!("task panicked: {e}");
+                tracing::error!("dynamic unit {unit_id}: {err_msg}");
+                AgentManifest {
+                    work_unit_id: unit_id.clone(),
+                    status: AgentStatus::Failed(err_msg),
+                    modified_files: vec![],
+                    branch: None,
+                    summary: Some("Agent task panicked".into()),
+                    output: None,
+                    cost_usd: 0.0,
+                }
+            }
+        };
+        ctx.observer.on_agent_state_changed(
+            &manifest.work_unit_id,
+            &manifest.status,
+            manifest.summary.as_deref().unwrap_or(""),
+        );
+        if matches!(manifest.status, AgentStatus::Completed) {
+            let b = ctx.bus.lock().await;
+            b.broadcast(
+                &manifest.work_unit_id,
+                &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+            );
+            drop(b);
+            let effective_write_ns = effective_write_namespace(&unit, ctx.config);
+            store_agent_result(
+                &ctx.memory,
+                ctx.memory_writer,
+                effective_write_ns,
+                &manifest,
+                &unit,
+                ctx.run_id,
+                ctx.config,
+            )
+            .await;
+        }
+        exec_state.record_result(&unit_id, manifest.clone());
+        push_manifest(all_manifests, manifest.clone(), ctx.observer);
+        manifests.push(manifest);
+    }
+    if let Err(e) = exec_state.save(&ctx.config.workspace_root, ctx.plan_hash) {
+        tracing::warn!("Failed to save execution state checkpoint: {}", e);
+    }
+    Ok(manifests)
+}
+
+/// The record of a runtime `for` template: `Completed` once every clone is,
+/// `Failed` (naming the failed items) otherwise. Clone costs stay on the
+/// clones' own manifests.
+fn barrier_manifest(unit_id: &str, clone_ids: &[String], exec_state: &ExecutionState) -> AgentManifest {
+    let failed: Vec<&str> = clone_ids
+        .iter()
+        .filter(|id| !exec_state.status(id).is_success())
+        .map(String::as_str)
+        .collect();
+    let (status, summary) = if clone_ids.is_empty() {
+        (AgentStatus::Completed, "no items".to_string())
+    } else if failed.is_empty() {
+        (AgentStatus::Completed, format!("{} item(s)", clone_ids.len()))
+    } else {
+        let msg = format!(
+            "runtime for: {} of {} item(s) failed: {}",
+            failed.len(),
+            clone_ids.len(),
+            failed.join(", ")
+        );
+        (AgentStatus::Failed(msg.clone()), msg)
+    };
+    AgentManifest {
+        work_unit_id: unit_id.to_string(),
+        status,
+        modified_files: vec![],
+        branch: None,
+        summary: Some(summary),
+        output: None,
+        cost_usd: 0.0,
+    }
+}
+
+/// Run one `for … in json` step: read the list, clone the template per item,
+/// dispatch the clones, and return the barrier manifest (not yet recorded).
+///
+/// `pass` is `Some((iter_abs, gate_feedback))` inside a loop: the list path
+/// and every clone get that pass's `{{ITER}}` / `{{PREV_ITER}}`, and nothing
+/// is skipped for resume (loops resume per pass, from their artefacts).
+/// Returns the clones (with `{{ITER}}` still unsubstituted) alongside, for the
+/// loop's delivery checks.
 #[allow(clippy::too_many_arguments)]
-async fn run_fanout_wave_if_needed(
+async fn run_runtime_for_step<F>(
+    template: &WorkUnit,
+    op: &crate::swarm::plan::RuntimeForOp,
+    pass: Option<(u32, Option<&GateFailure>)>,
+    tier_bindings: &std::collections::HashMap<String, crate::swarm::plan::TierBinding>,
+    ctx: &DynamicCtx<'_>,
+    exec_state: &mut ExecutionState,
+    all_manifests: &mut Vec<AgentManifest>,
+    make_observer: &F,
+) -> Result<(AgentManifest, Vec<WorkUnit>)>
+where
+    F: Fn(&str) -> Box<dyn AcpObserver>,
+{
+    let source = match pass {
+        Some((iter_abs, _)) => op
+            .source
+            .replace("{{ITER}}", &iter_abs.to_string())
+            .replace("{{PREV_ITER}}", &iter_abs.saturating_sub(1).to_string()),
+        None => op.source.clone(),
+    };
+    let items = crate::swarm::runtime_for::load_items(&ctx.config.workspace_root, &source)?;
+    let clones = crate::swarm::runtime_for::materialize(template, op, &items, tier_bindings)?;
+    tracing::info!(
+        "runtime for `{}`: {} item(s) from {}",
+        op.unit_id,
+        clones.len(),
+        source
+    );
+    let clone_ids: Vec<String> = clones.iter().map(|c| c.id.clone()).collect();
+    let dispatched: Vec<WorkUnit> = match pass {
+        Some((iter_abs, gate)) => clones
+            .iter()
+            .map(|c| apply_iter_vars_with_gate_feedback(c, iter_abs, gate))
+            .collect(),
+        None => clones.clone(),
+    };
+    run_dynamic_units(
+        dispatched,
+        pass.is_none(),
+        Some(&op.unit_id),
+        ctx,
+        exec_state,
+        all_manifests,
+        make_observer,
+    )
+    .await?;
+    Ok((barrier_manifest(&op.unit_id, &clone_ids, exec_state), clones))
+}
+
+/// Loop members as the delivery checks see them: a runtime `for` template is
+/// replaced by its latest clones.
+fn expand_loop_members<'a>(
+    agent_ids: &[String],
+    unit_map: &std::collections::HashMap<&'a str, &'a WorkUnit>,
+    dynamic: &'a std::collections::HashMap<String, Vec<WorkUnit>>,
+) -> (Vec<String>, std::collections::HashMap<&'a str, &'a WorkUnit>) {
+    let mut ids = Vec::with_capacity(agent_ids.len());
+    let mut map = unit_map.clone();
+    for id in agent_ids {
+        match dynamic.get(id) {
+            Some(clones) => {
+                for clone in clones {
+                    ids.push(clone.id.clone());
+                    map.insert(clone.id.as_str(), clone);
+                }
+            }
+            None => ids.push(id.clone()),
+        }
+    }
+    (ids, map)
+}
+
+/// `pattern map_reduce`: after `completed_unit_id` (a discover agent)
+/// completes, load its spawn manifest and run the workers it lists.
+///
+/// Workers run concurrently through the same dispatcher as runtime `for`
+/// clones, each is checkpointed, and a resumed run re-runs only the workers
+/// not yet `Completed`. A missing manifest or one over `max_spawn` aborts the
+/// run. Units that `depends_on` the discover agent count every recorded
+/// worker as a dependency (see `unmet_dependency_ids`).
+#[allow(clippy::too_many_arguments)]
+async fn run_fanout_wave_if_needed<F>(
     completed_unit_id: &str,
     plan: &CompiledPlan,
-    config: &SwarmConfig,
-    context_files: &[(String, String)],
-    memory: &Option<Arc<MemoryStores>>,
-    memory_writer: &Option<WriterHandle>,
-    observer: &dyn SwarmObserver,
-    git_coordinator: Arc<GitCoordinator>,
-    validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
-    shared_board: Arc<SharedBoard>,
-    analysis: &WorkspaceAnalysis,
-    pre_fetched_memory: Arc<Option<String>>,
-    tier_router: &TierRouter,
-    iteration_config: &crate::iteration::IterationConfig,
-    bus: &Arc<tokio::sync::Mutex<AgentBus>>,
-    all_manifests: &mut Vec<AgentManifest>,
+    ctx: &DynamicCtx<'_>,
     exec_state: &mut ExecutionState,
-    run_id: &str,
-    plan_hash: &str,
-    mut worktree_mgr: Option<&mut WorktreeManager>,
-    make_observer: &impl Fn(&str) -> Box<dyn AcpObserver>,
-) -> Result<()> {
+    all_manifests: &mut Vec<AgentManifest>,
+    make_observer: &F,
+) -> Result<()>
+where
+    F: Fn(&str) -> Box<dyn AcpObserver>,
+{
     let Some(op) = plan
         .fanout_ops
         .iter()
@@ -3951,21 +4678,10 @@ async fn run_fanout_wave_if_needed(
     else {
         return Ok(());
     };
+    let config = ctx.config;
 
-    // Resume: skip if we already spawned for this after_unit
-    if exec_state
-        .spawned_ids
-        .iter()
-        .any(|id| id.starts_with(&format!("{}::", op.after_unit)))
-    {
-        tracing::info!(
-            "fan-out after '{}' already materialized (resume); skipping",
-            op.after_unit
-        );
-        return Ok(());
-    }
-
-    let manifest_path = shared_board
+    let manifest_path = ctx
+        .board
         .spawn_manifest_path(completed_unit_id)
         .await
         .or_else(|| {
@@ -3979,7 +4695,7 @@ async fn run_fanout_wave_if_needed(
                     .workspace_root
                     .join(".gaviero")
                     .join("runs")
-                    .join(plan_hash)
+                    .join(ctx.plan_hash)
                     .join("artifacts")
                     .join("spawn_manifest")
                     .join(format!("from-{completed_unit_id}.json")),
@@ -3988,35 +4704,12 @@ async fn run_fanout_wave_if_needed(
         });
 
     let Some(path) = manifest_path else {
-        tracing::warn!(
-            "FanoutOp after '{}' but no spawn_manifest found on blackboard",
-            completed_unit_id
-        );
-        return Ok(());
+        bail!("pattern map_reduce: discover '{completed_unit_id}' wrote no spawn manifest");
     };
 
     let parsed = crate::swarm::spawn::load_manifest_file(&path)?;
-    let workers = crate::swarm::spawn::materialize_from_manifest(&parsed, op)?;
-
-    let fanout_group: Vec<Vec<String>> = vec![workers.iter().map(|w| w.id.clone()).collect()];
-    let scope_errors = validation::validate_scopes(&workers, &fanout_group);
-    if !scope_errors.is_empty() {
-        anyhow::bail!(
-            "fan-out scope validation failed: {}",
-            scope_errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-    }
-
-    {
-        let mut b = bus.lock().await;
-        for w in &workers {
-            b.register(&w.id);
-        }
-    }
+    let workers =
+        crate::swarm::spawn::materialize_from_manifest(&parsed, op, &plan.tier_bindings)?;
 
     tracing::info!(
         "fan-out after '{}': materializing {} workers from {}",
@@ -4024,57 +4717,23 @@ async fn run_fanout_wave_if_needed(
         workers.len(),
         path.display()
     );
-
-    for unit in &workers {
-        if exec_state.status(&unit.id) == NodeStatus::Completed {
-            continue;
+    for w in &workers {
+        let key = format!("{}::{}", op.after_unit, w.id);
+        if !exec_state.spawned_ids.contains(&key) {
+            exec_state.spawned_ids.push(key);
         }
-        exec_state.set_status(&unit.id, NodeStatus::Running);
-        observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, &unit.description);
-
-        let effective_read_ns = effective_read_namespaces(unit, config, memory);
-        let agent_ctx = AgentRunContext::for_run(
-            config,
-            context_files,
-            &effective_read_ns,
-            observer,
-            memory.clone(),
-            git_coordinator.clone(),
-            validation.clone(),
-            Some(shared_board.clone()),
-            analysis,
-            pre_fetched_memory.clone(),
-        );
-        let manifest = run_single_agent(
-            unit,
-            worktree_mgr.as_deref_mut(),
-            &agent_ctx,
-            tier_router,
-            iteration_config,
-            make_observer(&unit.id),
-        )
-        .await?;
-
-        if matches!(manifest.status, AgentStatus::Completed) {
-            let effective_write_ns = effective_write_namespace(unit, config);
-            store_agent_result(
-                memory,
-                memory_writer,
-                effective_write_ns,
-                &manifest,
-                unit,
-                run_id,
-                config,
-            )
-            .await;
-        }
-        exec_state
-            .spawned_ids
-            .push(format!("{}::{}", op.after_unit, unit.id));
-        exec_state.record_result(&unit.id, manifest.clone());
-        let _ = exec_state.save(&config.workspace_root, plan_hash);
-        all_manifests.push(manifest);
     }
+
+    run_dynamic_units(
+        workers,
+        true,
+        None,
+        ctx,
+        exec_state,
+        all_manifests,
+        make_observer,
+    )
+    .await?;
 
     // Refresh knowledge impact texts after a mutating fan-out wave
     if config.execution_mode == ExecutionMode::Repo {
@@ -4099,6 +4758,29 @@ async fn run_fanout_wave_if_needed(
     Ok(())
 }
 
+/// Whether the fan-out wave after `discover` still has work: no worker was
+/// ever recorded, or one is not `Completed`.
+fn fanout_wave_pending(plan: &CompiledPlan, discover: &str, exec_state: &ExecutionState) -> bool {
+    if !plan.fanout_ops.iter().any(|op| op.after_unit == discover) {
+        return false;
+    }
+    let prefix = format!("{discover}::");
+    let mut recorded = exec_state
+        .spawned_ids
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .peekable();
+    if recorded.peek().is_none() {
+        return true;
+    }
+    recorded.any(|worker| exec_state.status(worker) != NodeStatus::Completed)
+}
+
+/// Store an agent's execution result to memory (best-effort, never fails the pipeline).
+///
+/// Writes one aggregate entry for the agent's run, plus one sentinel entry per
+/// `staleness_source` path recording the current file hash. On the next run,
+/// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
 async fn store_agent_result(
     memory: &Option<Arc<MemoryStores>>,
     writer: &Option<WriterHandle>,
@@ -4449,6 +5131,33 @@ mod tests {
     use crate::types::{FileScope, ModelTier, PrivacyLevel};
     use std::collections::HashMap;
 
+    #[test]
+    fn run_limits_usd_exhaustion() {
+        let budget = crate::swarm::plan::RunBudget {
+            wall_secs: None,
+            usd: Some(1.0),
+        };
+        let limits = RunLimits::new(0, Some(&budget));
+        assert!(limits.exhausted(0.5).is_none());
+        let reason = limits.exhausted(1.2).expect("over the usd budget");
+        assert!(reason.contains("usd budget of $1.00"), "{reason}");
+
+        // No budget and no --run-timeout: nothing ever runs out.
+        assert!(RunLimits::new(0, None).exhausted(1e9).is_none());
+    }
+
+    #[test]
+    fn run_limits_take_the_smaller_wall() {
+        let budget = crate::swarm::plan::RunBudget {
+            wall_secs: Some(3600),
+            usd: None,
+        };
+        let limits = RunLimits::new(60, Some(&budget));
+        assert_eq!(limits.wall, Some(std::time::Duration::from_secs(60)));
+        let limits = RunLimits::new(0, Some(&budget));
+        assert_eq!(limits.wall, Some(std::time::Duration::from_secs(3600)));
+    }
+
     /// Abandoning a run must take its parallel agents with it.
     #[tokio::test]
     async fn dropping_an_agent_handle_aborts_the_task() {
@@ -4494,6 +5203,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces_json: vec![],
             produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]
@@ -6155,6 +6865,13 @@ async fn evaluate_agent_condition(
         iter_abs: current_iter_abs,
     })?;
 
+    if let Some(reason) = ctx.limits.exhausted(spent_usd(ctx.all_manifests)) {
+        tracing::error!("Run budget exhausted ({reason}) — not dispatching judge '{agent_id}'");
+        ctx.observer
+            .on_phase_changed(&format!("run budget exhausted: {reason}"));
+        return Ok(LoopConditionOutcome::Continue(JudgeReport::default()));
+    }
+
     let agent_id = &agent_id.to_string();
     let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
         tracing::warn!(
@@ -6345,7 +7062,7 @@ async fn evaluate_agent_condition(
         _ => LoopConditionOutcome::Continue(report),
     };
 
-    ctx.all_manifests.push(manifest);
+    push_manifest(ctx.all_manifests, manifest, ctx.observer);
     Ok(outcome)
 }
 

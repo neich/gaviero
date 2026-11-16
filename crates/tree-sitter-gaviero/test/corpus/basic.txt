@@ -52,7 +52,7 @@ Agent with memory block
 
 agent scan {
     description "Scan codebase"
-    client opus
+    tier high
     memory {
         read_ns ["shared" "audit"]
         write_ns "findings"
@@ -72,7 +72,8 @@ agent scan {
     (agent_field
       (string))
     (agent_field
-      (identifier))
+      (tier_alias_name
+        (identifier)))
     (agent_field
       (memory_block
         (memory_field
@@ -99,7 +100,7 @@ Agent with context block
 
 agent fix {
     description "Fix the bug"
-    client opus
+    tier high
     context {
         callers_of ["src/auth.rs"]
         tests_for ["src/auth/"]
@@ -115,7 +116,8 @@ agent fix {
     (agent_field
       (string))
     (agent_field
-      (identifier))
+      (tier_alias_name
+        (identifier)))
     (agent_field
       (context_block
         (context_field
@@ -389,13 +391,13 @@ client c { tier cheap }
       (tier_value))))
 
 =====
-Workflow param — client shape
+Workflow tiers block
 =====
 
 workflow w {
-    param judge {
-        model "claude:sonnet"
-        effort medium
+    tiers {
+        judge medium
+        critic high-codex
     }
     steps [a]
 }
@@ -406,12 +408,14 @@ workflow w {
   (workflow_declaration
     (identifier)
     (workflow_field
-      (param_declaration
-        (identifier)
-        (param_client_block
-          (client_field
-            (string))
-          (client_field
+      (tiers_block
+        (agent_tier
+          (identifier)
+          (tier_alias_name
+            (identifier)))
+        (agent_tier
+          (identifier)
+          (tier_alias_name
             (identifier)))))
     (workflow_field
       (step_list
@@ -423,8 +427,8 @@ Workflow param — roster shape
 
 workflow w {
     param roster [
-        { id "claude" model "claude:opus" effort max }
-        { id "codex"  model "codex:gpt-5.5" effort high }
+        { id "claude" tier top-claude }
+        { id "codex"  tier high-codex }
     ]
     steps [a]
 }
@@ -442,16 +446,14 @@ workflow w {
             (reviewer_field
               (string))
             (reviewer_field
-              (string))
-            (reviewer_field
-              (identifier)))
+              (tier_alias_name
+                (identifier))))
           (reviewer_entry
             (reviewer_field
               (string))
             (reviewer_field
-              (string))
-            (reviewer_field
-              (identifier))))))
+              (tier_alias_name
+                (identifier)))))))
     (workflow_field
       (step_list
         (identifier)))))

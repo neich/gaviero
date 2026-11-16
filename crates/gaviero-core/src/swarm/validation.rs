@@ -275,6 +275,7 @@ mod tests {
             id: id.to_string(),
             description: format!("Task {}", id),
             scope: scope(owned),
+            produces_json: vec![],
             produces: vec![],
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),

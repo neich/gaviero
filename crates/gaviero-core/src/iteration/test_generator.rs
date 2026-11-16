@@ -73,6 +73,7 @@ impl TestGenerator {
             id: "test-generator".into(),
             description: format!("Generate tests for: {}", &task[..task.len().min(80)]),
             scope: scope.clone(),
+            produces_json: vec![],
             produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]

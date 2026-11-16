@@ -38,16 +38,14 @@
 //   never wrote is Failed, not Completed. {{ITER}} in produces is
 //   substituted per pass.
 //
-// Models: two workflow params — `reviewer` (expensive) and `judge`
-// (cheap: inventory, halt_judge, synthesize). Pass a model spec on the
-// CLI; no tiers file required. `@effort` is optional.
+// Models: review_module runs on tier `high`, the other three on `medium`;
+// the model profile says which models those are. Move one agent per run
+// with `--tier`:
 //
 //   gaviero-cli --script crates/gaviero-dsl/examples/codebase_review.gaviero \
 //     --var OUT_DIR=reviews/opus
 //   gaviero-cli --script crates/gaviero-dsl/examples/codebase_review.gaviero \
-//     --param reviewer=codex:gpt-5.6-sol@high --var OUT_DIR=reviews/gpt-5.6-sol
-
-include "clients.gaviero"
+//     --tier review_module=high-codex --var OUT_DIR=reviews/codex
 
 vars {
     OUT_DIR "reviews/latest"
@@ -257,7 +255,7 @@ prompt synthesize-body #"
 // they arrive through synthesized `.mcp.json`, not `--tools`.
 agent inventory {
     description "Inventory modules in leaf-to-root order"
-    client judge
+    tier medium
     tools ["WebSearch" "WebFetch"]
     scope {
         owned     ["{{OUT_DIR}}/inventory.md"]
@@ -276,7 +274,7 @@ agent inventory {
 
 agent review_module {
     description "Review module {{ITER}} — findings only, no edits"
-    client reviewer
+    tier high
     tools ["WebSearch" "WebFetch"]
     depends_on [inventory]
     scope {
@@ -290,7 +288,7 @@ agent review_module {
 
 agent halt_judge {
     description "Exit the review loop when MODULE_COUNT is covered or inventory STOP"
-    client judge
+    tier medium
     tools ["WebSearch" "WebFetch"]
     scope {
         read_only ["{{OUT_DIR}}/"]
@@ -300,7 +298,7 @@ agent halt_judge {
 
 agent synthesize {
     description "Roll up per-module reviews into one summary"
-    client judge
+    tier medium
     tools ["WebSearch" "WebFetch"]
     // depends_on a loop body agent — post-loop dispatch waits until the
     // loop has finished every iteration, so synthesize sees every
@@ -334,14 +332,6 @@ agent synthesize {
 // No compile/clippy/test verify — this workflow writes markdown only.
 
 workflow codebase_review {
-    param reviewer {
-        model "claude:opus"
-        effort max
-    }
-    param judge {
-        model "claude:sonnet"
-        effort medium
-    }
     steps [
         inventory
         loop {

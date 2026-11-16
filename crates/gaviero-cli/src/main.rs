@@ -233,39 +233,29 @@ struct Cli {
     #[arg(long = "var", requires = "script")]
     vars: Vec<String>,
 
-    /// Supply a workflow `param <name>` declared in a DSL script. Format:
-    /// `NAME=VALUE`. For roster params, the value is a comma-separated list
-    /// of `id=provider:model[@effort]` entries
-    /// (e.g. `--param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high`).
-    /// List / roster params (`for t in <list>`) also accept a DSL list literal
-    /// (`--param 'topics=[{id "a" focus "x"} {id "b"}]'`) or bare ids (`a,b`).
-    /// `tier:<name>` may stand in for any model spec (e.g. `--param judge=tier:high`).
+    /// Supply a workflow list `param <name>` declared in a DSL script.
+    /// Format: `NAME=VALUE`, where the value is a comma-separated list of
+    /// `id=tier` entries (e.g. `--param roster=claude=top-claude,codex=top-codex`),
+    /// bare ids (`a,b`), or a DSL list literal
+    /// (`--param 'topics=[{id "a" focus "x"} {id "b" tier high}]'`).
     /// Required params without a default fail compilation when absent.
     /// Can be specified multiple times. Only valid with `--script`.
     #[arg(long = "param", requires = "script")]
     params: Vec<String>,
 
-    /// Tier profile for a DSL script: a `.gaviero` file containing only
-    /// `tier <role> <client>` bindings. Overrides tier lines from the script
-    /// and its `include`s (e.g. `profiles/doc-default.gaviero`). Agents must
-    /// `include "clients.gaviero"` (or equivalent) so named clients exist.
-    /// Only valid with `--script`.
-    #[arg(long = "tiers-file", requires = "script")]
-    tiers_file: Option<PathBuf>,
+    /// Run one agent of a DSL script on another tier. Format: `AGENT=TIER`
+    /// (e.g. `--tier verifier=medium-codex`). Overrides the workflow's
+    /// `tiers { }` entry for that agent, which overrides the tier the agent
+    /// declares. Can be specified multiple times. Only valid with `--script`.
+    #[arg(long = "tier", value_name = "AGENT=TIER", requires = "script")]
+    agent_tiers: Vec<String>,
 
     /// Model profile for a DSL script: the name of a
     /// `.gaviero/dsl/profiles/<name>.gaviero` file (workspace folders first, then
     /// the workspace layer, then `$GAVIERO_ROOT`), or a path to a `.gaviero`
-    /// file. It binds the script's `tier` names to its own clients and
-    /// replaces the script's bindings for those tiers. Without this flag a
-    /// profile named `default`, if any, supplies only the tiers the script
-    /// leaves unbound. Only valid with `--script`.
-    #[arg(
-        long = "profile",
-        value_name = "NAME|PATH",
-        requires = "script",
-        conflicts_with = "tiers_file"
-    )]
+    /// file. It is the only place a tier gets its model. Without this flag
+    /// the profile named `default` is used. Only valid with `--script`.
+    #[arg(long = "profile", value_name = "NAME|PATH", requires = "script")]
     profile: Option<String>,
 
     /// Print the N most recent retrieval manifests (Tier S / S4) and exit.
@@ -1397,6 +1387,20 @@ fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
                 .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("--param `{}`: expected NAME=VALUE format", s))?;
             Ok((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// `--tier AGENT=TIER` pairs.
+fn parse_agent_tiers(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|s| {
+            let (agent, tier) = s
+                .split_once('=')
+                .map(|(a, t)| (a.trim(), t.trim()))
+                .filter(|(a, t)| !a.is_empty() && !t.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--tier `{s}`: expected AGENT=TIER"))?;
+            Ok((agent.to_string(), tier.to_string()))
         })
         .collect()
 }
@@ -4470,27 +4474,7 @@ async fn main() -> Result<()> {
             cli.prompt_file.as_deref(),
         );
         let override_params = parse_param_overrides(&cli.params)?;
-        let override_tiers = if let Some(ref tiers_path) = cli.tiers_file {
-            let tiers_path = if tiers_path.is_absolute() {
-                tiers_path.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(tiers_path)
-            };
-            let bindings = gaviero_dsl::load_tier_overrides(&tiers_path).map_err(|report| {
-                eprintln!("{:?}", report);
-                anyhow::anyhow!("tiers profile failed: {}", tiers_path.display())
-            })?;
-            eprintln!(
-                "[tiers] profile {} ({} binding(s))",
-                tiers_path.display(),
-                bindings.len()
-            );
-            bindings
-        } else {
-            Vec::new()
-        };
+        let agent_tiers = parse_agent_tiers(&cli.agent_tiers)?;
         let profile = ProfileCatalog::scan(&workspace, &ScriptCatalog::global_scripts_dir())
             .select(
                 cli.profile.as_deref(),
@@ -4509,7 +4493,7 @@ async fn main() -> Result<()> {
             cli.workflow.as_deref(),
             runtime_prompt.as_deref(),
             &override_vars,
-            &override_tiers,
+            &agent_tiers,
             &override_params,
         )
         .map_err(|report| {
@@ -4525,6 +4509,7 @@ async fn main() -> Result<()> {
                 read_only_paths: Vec::new(),
                 interface_contracts: std::collections::HashMap::new(),
             },
+            produces_json: vec![],
             produces: vec![],
             depends_on: Vec::new(),
             #[allow(deprecated)]
@@ -4814,8 +4799,13 @@ async fn main() -> Result<()> {
         std::fs::write(&plan_path, &dsl_text).context("writing plan file")?;
 
         // Validate immediately so the user gets early feedback on syntax errors.
+        // The plan's agents name tiers, so it compiles against the profile a
+        // `--script` run of it would use: the `default` one.
         let plan_filename = plan_path.display().to_string();
-        match gaviero_dsl::compile(&dsl_text, &plan_filename, None, None) {
+        let profile = ProfileCatalog::scan(&workspace, &ScriptCatalog::global_scripts_dir())
+            .select(None, Some(&gaviero_core::memory::scope::hash_path(&repo)), &cwd)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        match gaviero_dsl::compile(&dsl_text, &plan_filename, profile.as_ref(), None, None) {
             Ok(compiled) => {
                 let agent_count = compiled.graph.node_count();
                 let units = compiled.work_units_ordered().unwrap_or_default();

@@ -46,11 +46,9 @@
 // Both prompts and scope paths substitute {{OUT_DIR}} at compile time, so
 // a single --var override relocates every output the script produces.
 
-// Shared client library. Agents bind to concrete clients (`client opus`
-// for the deep-reasoning steps, `client sonnet` for the cheap gate /
-// judge). Swap to a different profile by editing the `client` field on
-// each agent below.
-include "clients.gaviero"
+// Models: the deep-reasoning steps run on tier `high`, the cheap gate and
+// judge on `medium`. The model profile (`--profile`) says which models
+// those are; `--tier <agent>=<tier>` moves one agent for a run.
 
 vars {
     OUT_DIR "plans/log"
@@ -228,7 +226,7 @@ prompt audit-body #"
 
 agent analyse_plan {
     description "Extract phases from plan: {{PROMPT}}"
-    client opus
+    tier high
     scope {
         owned     ["{{OUT_DIR}}/00-briefing.md"]
         read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
@@ -249,7 +247,7 @@ agent analyse_plan {
 // because phase_executor and phase_gate share the same loop group.
 agent phase_executor {
     description "Execute phase {{ITER}} from briefing"
-    client opus
+    tier high
     depends_on [analyse_plan]
     scope {
         owned     ["src/" "tests/" "{{OUT_DIR}}/phase-*.md"]
@@ -261,7 +259,7 @@ agent phase_executor {
 
 agent phase_gate {
     description "Gate verdict after phase {{ITER}}"
-    client sonnet
+    tier medium
     depends_on [phase_executor]
     scope {
         owned     ["{{OUT_DIR}}/gate-*.md"]
@@ -273,7 +271,7 @@ agent phase_gate {
 
 agent phase_judge {
     description "Judge whether all briefing phases are done"
-    client sonnet
+    tier medium
     scope {
         read_only ["{{OUT_DIR}}/"]
     }
@@ -282,7 +280,7 @@ agent phase_judge {
 
 agent final_audit {
     description "Final integration audit: {{PROMPT}}"
-    client opus
+    tier high
     depends_on [phase_gate]
     scope {
         owned     ["{{OUT_DIR}}/99-audit.md"]

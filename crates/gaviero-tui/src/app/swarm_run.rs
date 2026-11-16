@@ -862,18 +862,14 @@ fn active_tiers(app: &App) -> Vec<String> {
     let root = &form.folders[form.selected_folder()].1;
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
     let repo = gaviero_core::memory::scope::hash_path(&canonical);
-    let mut tiers = ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
+    // Only the profile defines tiers; the script merely names them, so a
+    // name the profile lacks would not compile and is not offered.
+    ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
         .select(form.selected_profile().as_deref(), Some(&repo), root)
         .ok()
         .flatten()
         .and_then(|profile| gaviero_dsl::profile_tier_names(&profile.path).ok())
-        .unwrap_or_default();
-    for tier in &form.inspection.tiers {
-        if !tiers.contains(tier) {
-            tiers.push(tier.clone());
-        }
-    }
-    tiers
+        .unwrap_or_default()
 }
 
 /// Bring the focused field's popup up to date after its text changed.
@@ -1409,14 +1405,9 @@ mod tests {
     use std::time::Duration;
 
     const SCRIPT: &str = r#"// description: Write one report
-client local {
-    model "ollama:qwen"
-    privacy public
-}
-
 agent writer {
     description "write the report"
-    client local
+    tier local
     scope { owned ["{{OUT_DIR}}/report.md"] }
     produces ["{{OUT_DIR}}/report.md"]
     prompt "Write the report about {{PROMPT}}."
@@ -1512,6 +1503,18 @@ workflow run {
         let script_dir = dir.join(".gaviero/dsl/report");
         std::fs::create_dir_all(&script_dir).unwrap();
         std::fs::write(script_dir.join("report.gaviero"), source).unwrap();
+        // Scripts name tiers only; the workspace's `default` profile says
+        // `local` is the fake Ollama. A test that writes its own profiles
+        // keeps them alone.
+        let profiles = dir.join(".gaviero/dsl/profiles");
+        if !profiles.exists() {
+            std::fs::create_dir_all(&profiles).unwrap();
+            std::fs::write(
+                profiles.join("default.gaviero"),
+                "client local { model \"ollama:qwen\" privacy public }\ntier local local\n",
+            )
+            .unwrap();
+        }
         std::fs::write(
             dir.join(".gaviero/settings.json"),
             serde_json::json!({
@@ -1659,7 +1662,7 @@ workflow run {
         open_filled_form(&mut app);
         std::fs::write(
             root.join(".gaviero/dsl/report/report.gaviero"),
-            "agent writer { client missing prompt \"x\" }\n",
+            "agent writer { tier missing prompt \"x\" }\n",
         )
         .unwrap();
         press_run(&mut app);
@@ -1747,13 +1750,8 @@ workflow run {
         assert_eq!(app.swarm_dashboard.view, SwarmView::Run, "the last run can be reopened");
     }
 
-    const FILE_SCRIPT: &str = r#"client local {
-    model "ollama:qwen"
-    privacy public
-}
-
-agent writer {
-    client local
+    const FILE_SCRIPT: &str = r#"agent writer {
+    tier local
     scope { owned ["report.md"] }
     produces ["report.md"]
     prompt "Summarize {{BRIEF}}."
@@ -1769,14 +1767,10 @@ workflow run {
 }
 "#;
 
-    const ROSTER_SCRIPT: &str = r#"client c {
-    model "ollama:qwen"
-    privacy public
-}
-agent worker { client c prompt "w" }
-agent judge { client c prompt "j" }
+    const ROSTER_SCRIPT: &str = r#"agent worker { tier local prompt "w" }
+agent judge { tier local prompt "j" }
 workflow run {
-    param panel [ { id "a" model "tier:low" } ]
+    param panel [ { id "a" tier low } ]
     steps [ loop { agents [worker] reviewers panel until agent judge } judge ]
 }
 "#;
@@ -2029,7 +2023,9 @@ workflow run {
         open_panel(&mut app);
         handle_action(&mut app, Action::Enter);
 
-        // Profile selector first: auto -> fast.
+        // The form opens on the first input; go up to the Profile
+        // selector: auto -> fast.
+        app.swarm_dashboard.form.as_mut().unwrap().focus_field("Profile");
         handle_action(&mut app, Action::CursorRight);
         handle_action(&mut app, Action::Tab);
         for _ in 0.."low".len() {
@@ -2037,12 +2033,12 @@ workflow run {
         }
         assert_eq!(
             completion_matches(&app),
-            vec!["tier:quick".to_string(), "tier:deep".to_string()]
+            vec!["quick".to_string(), "deep".to_string()]
         );
 
         handle_action(&mut app, Action::CursorDown);
         handle_action(&mut app, Action::Enter);
-        assert_eq!(field_text(&app, "panel"), "a=tier:deep");
+        assert_eq!(field_text(&app, "panel"), "a=deep");
 
         // Same field, the other profile.
         handle_action(&mut app, Action::CursorUp);
@@ -2051,7 +2047,7 @@ workflow run {
         for _ in 0.."deep".len() {
             handle_action(&mut app, Action::Backspace);
         }
-        assert_eq!(completion_matches(&app), vec!["tier:glacial".to_string()]);
+        assert_eq!(completion_matches(&app), vec!["glacial".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2062,19 +2058,19 @@ workflow run {
         open_panel(&mut app);
         handle_action(&mut app, Action::Enter);
         app.swarm_dashboard.form.as_mut().unwrap().focus_field("panel");
-        assert_eq!(field_text(&app, "panel"), "a=tier:low");
+        assert_eq!(field_text(&app, "panel"), "a=low");
 
         // Alt+Enter: a new item below; typing fills it.
         handle_action(&mut app, Action::AltEnter);
-        type_text(&mut app, "b=ollama:x");
-        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:x");
+        type_text(&mut app, "b=mid");
+        assert_eq!(field_text(&app, "panel"), "a=low,b=mid");
 
         // Backspace on an emptied item removes it and returns to the one above.
         handle_action(&mut app, Action::AltEnter);
         handle_action(&mut app, Action::Backspace);
-        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:x");
+        assert_eq!(field_text(&app, "panel"), "a=low,b=mid");
         type_text(&mut app, "y");
-        assert_eq!(field_text(&app, "panel"), "a=tier:low,b=ollama:xy");
+        assert_eq!(field_text(&app, "panel"), "a=low,b=midy");
 
         // Mouse: `x` removes the first item, `+` appends an empty one.
         let area = ratatui::layout::Rect::new(0, 0, 60, 20);
@@ -2091,12 +2087,12 @@ workflow run {
                 .unwrap_or_else(|| panic!("{needle} not drawn:\n{}", screen.join("\n")))
         };
         let (plus_x, plus_y) = at("(list) +");
-        let (x_x, x_y) = at("x a=tier:low");
+        let (x_x, x_y) = at("x a=low");
         click(&mut app, x_x, x_y);
-        assert_eq!(field_text(&app, "panel"), "b=ollama:xy");
+        assert_eq!(field_text(&app, "panel"), "b=midy");
         click(&mut app, plus_x + "(list) ".len() as u16, plus_y);
         type_text(&mut app, "c");
-        assert_eq!(field_text(&app, "panel"), "b=ollama:xy,c");
+        assert_eq!(field_text(&app, "panel"), "b=midy,c");
     }
 
     /// Open the form with a repo skill named `lint` available.

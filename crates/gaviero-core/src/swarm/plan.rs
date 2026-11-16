@@ -130,12 +130,16 @@ pub enum ConsensusMode {
 pub const DEFAULT_MAX_SPAWN: u32 = 16;
 
 /// One worker entry inside a spawn manifest (dynamic fan-out).
+///
+/// A worker names a `tier` of the run's model profile, never a model: the
+/// manifest is agent-written, and models are chosen by tier only. Without a
+/// tier it takes the op's `default_model`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnWorkerSpec {
     pub id: String,
-    pub model: String,
     #[serde(default)]
-    pub effort: Option<String>,
+    pub tier: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -170,7 +174,8 @@ pub struct FanoutOp {
     /// Max workers to spawn (default [`DEFAULT_MAX_SPAWN`]).
     #[serde(default = "default_max_spawn")]
     pub max_spawn: u32,
-    /// Optional default model when a worker omits `model`.
+    /// Model for workers that name no `tier`. Set by core-built plans only;
+    /// DSL `pattern map_reduce` leaves it empty, so its workers need a tier.
     #[serde(default)]
     pub default_model: Option<String>,
     /// Optional synthetic barrier id that reduce agents `depends_on`.
@@ -181,6 +186,39 @@ pub struct FanoutOp {
 
 fn default_max_spawn() -> u32 {
     DEFAULT_MAX_SPAWN
+}
+
+/// A `for <var> in json "<path>" parallel max <N> { <agent> }` step. The body
+/// agent is the plan node `unit_id` (a template whose `{{<var>.*}}`
+/// placeholders survive compile); the runtime materialises one clone per item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeForOp {
+    pub unit_id: String,
+    pub var: String,
+    /// Workspace-relative path; may contain `{{ITER}}` / `{{PREV_ITER}}`.
+    pub source: String,
+    pub max_items: u32,
+}
+
+/// What a profile tier resolves to, captured at compile time so
+/// runtime-materialised units (`for … in json` items, spawn-manifest
+/// workers) can bind to tiers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierBinding {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub extra: Vec<(String, String)>,
+    pub privacy: crate::types::PrivacyLevel,
+    pub tier: crate::types::ModelTier,
+}
+
+/// A workflow's `budget { wall "<dur>" usd <n> }`: limits checked before every
+/// dispatch. `usd` counts the cost providers report (`claude:`, `deepseek:`);
+/// the wall clock merges with `--run-timeout` (the smaller non-zero wins).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunBudget {
+    pub wall_secs: Option<u64>,
+    pub usd: Option<f64>,
 }
 
 /// Configuration for an explicit `loop { ... }` block in a workflow.
@@ -302,6 +340,15 @@ pub struct CompiledPlan {
     /// Runtime fan-out ops: after `after_unit` completes, load a SpawnManifest
     /// from the blackboard and materialize additional work units (capped).
     pub fanout_ops: Vec<FanoutOp>,
+    /// `for … in json` steps: each names a template node in `graph` that the
+    /// runtime replaces with one clone per item of a JSON list.
+    pub runtime_fors: Vec<RuntimeForOp>,
+    /// Every tier of the run's model profile, resolved to its client's
+    /// model settings, so runtime items (`for … in json`, spawn-manifest
+    /// workers) can name a `tier`.
+    pub tier_bindings: HashMap<String, TierBinding>,
+    /// The workflow's `budget { … }`, when declared.
+    pub budget: Option<RunBudget>,
 }
 
 impl CompiledPlan {
@@ -403,6 +450,9 @@ impl CompiledPlan {
             loop_judge_units: Vec::new(),
             execution_mode: ExecutionMode::default(),
             fanout_ops: Vec::new(),
+            runtime_fors: Vec::new(),
+            tier_bindings: HashMap::new(),
+            budget: None,
         }
     }
 

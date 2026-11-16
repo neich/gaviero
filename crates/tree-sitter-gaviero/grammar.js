@@ -30,6 +30,9 @@ module.exports = grammar({
     comment: (_) => token(seq("//", /.*/)),
 
     // ── Client ───────────────────────────────────────────────────
+    // Model profiles only (`.gaviero/dsl/profiles/*.gaviero`); gaviero-dsl
+    // rejects a client in a script. Parsed everywhere so profiles highlight
+    // and the compiler, not the grammar, explains the rule.
     client_declaration: ($) =>
       seq("client", $.identifier, "{", repeat($.client_field), "}"),
 
@@ -68,6 +71,7 @@ module.exports = grammar({
     var_type: ($) => choice("file", "dir"),
 
     // ── Top-level tier alias: `tier <name> <client-ref>` ─────────
+    // A model profile's tier → client mapping (profile-only, like `client`).
     tier_alias_declaration: ($) =>
       seq("tier", $.tier_alias_name, $.identifier),
 
@@ -93,11 +97,11 @@ module.exports = grammar({
     agent_field: ($) =>
       choice(
         seq("description", $._string_value),
-        seq("client", $.identifier),
+        // The agent's default tier; a profile says which model it is.
         seq("tier", $.tier_alias_name),
         $.scope_block,
         seq("depends_on", $.identifier_list),
-        seq("produces", $.string_list),
+        seq("produces", optional("json"), $.string_list),
         seq("prompt", choice($._string_value, $.identifier)),
         seq("max_retries", $.integer),
         seq("timeout", $.integer),
@@ -191,27 +195,31 @@ module.exports = grammar({
     reviewer_field: ($) =>
       choice(
         seq("id", $._string_value),
-        seq("model", $._string_value),
-        seq("effort", $._effort_value),
+        // The tier this item's clone runs on instead of its agent's.
+        seq("tier", $.tier_alias_name),
         // Free `<ident> "<string>"` field of a list param (`{{t.<ident>}}`).
         seq($.identifier, $._string_value),
       ),
 
     // ── For block ────────────────────────────────────────────────
     // `for <var> in <list-param> parallel|sequential { <agent>+ [peer_template "…"] }`
+    // `for <var> in json "<path>" parallel [max <n>] { <agent> }` — runtime list.
     for_block: ($) =>
       seq(
         "for",
         $.identifier,
         "in",
-        $.identifier,
+        choice($.identifier, $.for_json_source),
         $.for_mode,
+        optional(seq("max", $.integer)),
         "{",
         repeat1(choice($.identifier, $.peer_template)),
         "}",
       ),
 
     for_mode: (_) => choice("parallel", "sequential"),
+
+    for_json_source: ($) => seq("json", $._string_value),
 
     peer_template: ($) => seq("peer_template", $._string_value),
 
@@ -251,7 +259,24 @@ module.exports = grammar({
         seq("escalate_after", $.integer),
         $.verify_block,
         $.param_declaration,
+        $.tiers_block,
         $.pattern_block,
+        $.budget_block,
+      ),
+
+    // `tiers { <agent> <tier> … }` — agents that run on another tier than
+    // the one they declare, in this workflow.
+    tiers_block: ($) => seq("tiers", "{", repeat($.agent_tier), "}"),
+
+    agent_tier: ($) => seq($.identifier, $.tier_alias_name),
+
+    // `budget { wall "8h" usd 40 }`
+    budget_block: ($) => seq("budget", "{", repeat($.budget_field), "}"),
+
+    budget_field: ($) =>
+      choice(
+        seq("wall", $._string_value),
+        seq("usd", choice($.float, $.integer)),
       ),
 
     // `pattern map_reduce { discover <agent> reduce <agent> max_spawn <n> }`
@@ -265,19 +290,10 @@ module.exports = grammar({
         seq("max_spawn", $.integer),
       ),
 
-    // `param <name>`                                — bare; kind inferred from usage
-    // `param <name> [ <reviewer_entry>* ]`          — roster default
-    // `param <name> { <client_field>* }`            — client default (model / effort / privacy / extra)
-    // When the default is omitted, the CLI must supply `--param <name>=...`.
+    // `param <name> [ <reviewer_entry>* ]` — a list param with its default.
+    // `param <name>`                      — the CLI supplies `--param <name>=...`.
     param_declaration: ($) =>
-      seq(
-        "param",
-        $.identifier,
-        optional(choice($.reviewer_list, $.param_client_block)),
-      ),
-
-    param_client_block: ($) =>
-      seq("{", repeat($.client_field), "}"),
+      seq("param", $.identifier, optional($.reviewer_list)),
 
     // ── Step list (identifiers + loop blocks + for blocks) ───────
     step_list: ($) =>
