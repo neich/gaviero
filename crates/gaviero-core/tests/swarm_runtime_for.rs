@@ -113,6 +113,44 @@ impl SwarmObserver for QuietObserver {
     fn on_completed(&self, _result: &SwarmResult) {}
 }
 
+/// Records every agent status change as `(id, "pending" | "running" | …)`.
+#[derive(Default)]
+struct RecordingObserver {
+    states: std::sync::Mutex<Vec<(String, &'static str)>>,
+}
+
+impl RecordingObserver {
+    /// The statuses `id` went through, in order.
+    fn of(&self, id: &str) -> Vec<&'static str> {
+        self.states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(agent, _)| agent == id)
+            .map(|(_, status)| *status)
+            .collect()
+    }
+}
+
+impl SwarmObserver for RecordingObserver {
+    fn on_phase_changed(&self, _phase: &str) {}
+    fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, _detail: &str) {
+        let label = match status {
+            AgentStatus::Pending => "pending",
+            AgentStatus::Running => "running",
+            AgentStatus::Completed => "completed",
+            AgentStatus::Failed(_) => "failed",
+        };
+        self.states
+            .lock()
+            .unwrap()
+            .push((work_unit_id.to_string(), label));
+    }
+    fn on_tier_started(&self, _current: usize, _total: usize) {}
+    fn on_merge_conflict(&self, _branch: &str, _files: &[String]) {}
+    fn on_completed(&self, _result: &SwarmResult) {}
+}
+
 struct NoopAcpObserver;
 impl AcpObserver for NoopAcpObserver {
     fn on_stream_chunk(&self, _text: &str) {}
@@ -308,6 +346,39 @@ async fn top_level_runtime_for_runs_every_item_then_the_dependent() {
     for id in ["worker@a", "worker@b", "worker@c", "worker"] {
         assert_eq!(state.status(id), NodeStatus::Completed, "{id}");
     }
+}
+
+#[tokio::test]
+async fn runtime_for_clones_and_their_template_are_reported_running() {
+    let tmp = workspace_with(&[("out/items.json", THREE_ITEMS)]);
+    let server = standard_server().await;
+    let plan = top_level_plan(16);
+    let observer = RecordingObserver::default();
+
+    // Three clones, two slots: one clone waits for a slot.
+    execute(
+        &plan,
+        &config_for(tmp.path(), &server.uri(), 2),
+        None,
+        None,
+        &observer,
+        make_obs,
+    )
+    .await
+    .expect("run succeeds");
+
+    for id in ["worker@a", "worker@b", "worker@c"] {
+        assert_eq!(
+            observer.of(id),
+            vec!["pending", "running", "completed"],
+            "{id}: queued, then running, then completed"
+        );
+    }
+    assert_eq!(
+        observer.of("worker"),
+        vec!["pending", "running", "completed"],
+        "the template runs while its clones do"
+    );
 }
 
 #[tokio::test]
