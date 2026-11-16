@@ -119,22 +119,15 @@
 //
 //   The reviewer panel is a workflow parameter — supplied via
 //   `--param roster=...`. The in-script default below runs a
-//   three-provider frontier panel at maximum research depth:
-//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.6. Each roster
-//   entry is `id=provider:model[@effort]`; the id becomes the filename
-//   prefix and the model + effort bind the cloned reviewer agent to an
-//   anonymous client. Use distinct ids per reviewer.
+//   three-provider frontier panel: the top Claude, Codex and Cursor
+//   tiers of the run's model profile. Each roster entry is `id=tier`;
+//   the id becomes the filename prefix and the tier sets the cloned
+//   reviewer's model. Use distinct ids per reviewer.
 //
-//   Cursor note: the Cursor backend does not forward `effort`;
-//   reasoning depth rides on the model id itself.
-//   `cursor:grok-4.7-high` is the canonical id (see
-//   clients.gaviero) — check variants with `agent --list-models`
-//   before inventing suffixes.
-//
-//   The judge stays on `claude:sonnet` at `medium` — it only
-//   classifies summaries against a fixed rubric and runs once per
-//   iteration, so raising its effort multiplies cost without
-//   improving the verdict.
+//   The judge runs on tier `medium` — it only classifies summaries
+//   against a fixed rubric and runs once per iteration, so a larger
+//   model multiplies cost without improving the verdict. Move it for
+//   one run with `--tier convergence-judge=<tier>`.
 //
 // Files written per iteration N (N=1 for init, N=2..11 for refinement):
 //
@@ -299,7 +292,7 @@
 //       --workflow scientific-research-consensus \
 //       --workspace /path/to/research-workspace \
 //       --prompt "Short topic title for logs" \
-//       --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh
+//       --param roster=claude=top-claude,codex=top-codex
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
@@ -886,12 +879,12 @@ prompt judge-body #"
 //
 // Two reviewer templates (init and refine) plus a fixed convergence
 // judge. The init / refine templates are cloned per roster entry by
-// the loop expansion in crates/gaviero-dsl/src/reviewers.rs:
+// the loop expansion in crates/gaviero-dsl/src/workflow_params.rs:
 //
 //   - {{REVIEWER_ID}} is substituted with each entry's id in the
 //     description, scope paths, and prompt body.
-//   - Each clone is bound to an anonymous client carrying that entry's
-//     model + effort.
+//   - Each clone runs on that entry's tier (the template's own `tier`
+//     when the entry names none).
 //   - Refine clones additionally get {{PEER_IDS}}, {{PEER_COUNT}}, and
 //     {{PEER_READ_BLOCK}} substituted for cross-reviewer prompting.
 //
@@ -905,6 +898,7 @@ prompt judge-body #"
 
 agent reviewer-init {
     template true
+    tier top
     description "Initial scientific research analysis ({{REVIEWER_ID}}): {{PROMPT}}"
     tools ["WebSearch" "WebFetch"]
     scope {
@@ -931,6 +925,7 @@ agent reviewer-init {
 
 agent reviewer-refine {
     template true
+    tier top
     description "Refine scientific research conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
     tools ["WebSearch" "WebFetch"]
     scope {
@@ -963,7 +958,7 @@ agent reviewer-refine {
 
 agent convergence-judge {
     description "Judge consensus across reviewer panel: {{PROMPT}}"
-    client judge
+    tier medium
     scope {
         read_only ["{{OUT_DIR}}/" "{{PLAN_FILE}}"]
     }
@@ -976,12 +971,10 @@ agent convergence-judge {
 // The `roster` workflow parameter binds the loop's `reviewers` slot to
 // a list of provider entries. Override entirely from the CLI:
 //
-//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.7-high
+//   --param roster=claude=top-claude,codex=top-codex,cursor=top-cursor
 //
 // The in-script default below runs that same three-provider frontier
-// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.7) so the
-// example works with no flag. The Cursor entry's `effort` is a no-op —
-// the Cursor backend does not forward it (see header roster note).
+// panel so the example works with no flag.
 //
 // `execution_mode document` (see header) is declared on this workflow:
 // refine agents must read peer artefacts under {{OUT_DIR}}/, which
@@ -1027,14 +1020,10 @@ agent convergence-judge {
 
 workflow scientific-research-consensus {
     execution_mode document
-    param judge {
-        model "claude:sonnet"
-        effort medium
-    }
     param roster [
-        { id "claude" model "claude:opus"       effort xhigh }
-        { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
-        { id "cursor" model "cursor:grok-4.7-high" }
+        { id "claude" tier top-claude }
+        { id "codex"  tier top-codex }
+        { id "cursor" tier top-cursor }
     ]
 
     steps [
