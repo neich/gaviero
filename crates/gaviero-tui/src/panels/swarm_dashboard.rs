@@ -204,7 +204,7 @@ pub enum ListTarget {
 }
 
 /// A list param's value split into items, each in `--param` syntax:
-/// `id=provider:model[@effort]`, `id`, or `{id "a" focus "x"}` when the entry
+/// `id=tier`, `id`, or `{id "a" focus "x"}` when the entry
 /// has free fields.
 pub fn split_list_value(value: &str) -> Vec<String> {
     let value = value.trim();
@@ -226,11 +226,8 @@ fn list_item_text(entry: &ReviewerEntry) -> String {
     if !entry.fields.is_empty() {
         return list_literal_entry(entry);
     }
-    match &entry.model {
-        Some(model) => match &entry.effort {
-            Some((effort, _)) => format!("{}={model}@{effort}", entry.id),
-            None => format!("{}={model}", entry.id),
-        },
+    match &entry.tier {
+        Some((tier, _)) => format!("{}={tier}", entry.id),
         None => entry.id.clone(),
     }
 }
@@ -313,7 +310,6 @@ impl FormField {
         }
         let kind = match self.role {
             FieldRole::Param(ParamKindInfo::Roster) => " (list)",
-            FieldRole::Param(ParamKindInfo::Client) => " (model)",
             FieldRole::File => " (file)",
             FieldRole::Dir => " (folder)",
             _ => "",
@@ -328,9 +324,8 @@ impl FormField {
             FieldRole::Profile => "Which models the script's tiers use. ←/→ to change",
             FieldRole::Prompt => "Alt+Enter new line  Alt+↑↓ resize  $skill  @file",
             FieldRole::Param(ParamKindInfo::Roster) => {
-                "id=provider:model[@effort] · id · {id \"…\" key \"…\"}  Alt+Enter/+ add  x or ⌫ on empty removes"
+                "id=tier · id · {id \"…\" key \"…\"}  Alt+Enter/+ add  x or ⌫ on empty removes"
             }
-            FieldRole::Param(ParamKindInfo::Client) => "provider:model[@effort] or tier:<name>",
             FieldRole::Var => "Script variable. Empty leaves it unset",
             FieldRole::File => "An existing file. Type to search, as with @ in chat",
             FieldRole::Dir => "A folder. Type to search the workspace",
@@ -442,6 +437,7 @@ impl SwarmForm {
             list_hits: Vec::new(),
         };
         form.fields = form.build_fields(selected_folder, 0, 0);
+        form.focus = form.first_input_field();
         form
     }
 
@@ -449,7 +445,19 @@ impl SwarmForm {
     pub fn with_profiles(mut self, profiles: Vec<String>) -> Self {
         self.profiles = profiles;
         self.fields = self.build_fields(self.selected_folder(), self.selected_workflow(), 0);
+        self.focus = self.first_input_field();
         self
+    }
+
+    /// The first field to type into. The Folder / Workflow / Profile
+    /// selectors above it start on a usable choice, and every script run
+    /// needs a profile, so the form opens on the Prompt (or first input)
+    /// rather than on a selector.
+    fn first_input_field(&self) -> usize {
+        self.fields
+            .iter()
+            .position(|f| !matches!(f.value, FieldValue::Choice { .. }))
+            .unwrap_or(0)
     }
 
     fn build_fields(&self, folder: usize, workflow: usize, profile: usize) -> Vec<FormField> {
@@ -502,11 +510,7 @@ impl SwarmForm {
         }
         if let Some(wf) = self.inspection.workflows.get(workflow) {
             for param in &wf.params {
-                let build = match param.kind {
-                    ParamKindInfo::Roster => FormField::list_field,
-                    ParamKindInfo::Client => FormField::text_field,
-                };
-                fields.push(build(
+                fields.push(FormField::list_field(
                     &param.name,
                     FieldRole::Param(param.kind),
                     param.default.clone(),
@@ -796,12 +800,8 @@ impl SwarmForm {
             (FieldRole::File | FieldRole::Dir, Some(input)) => {
                 prompt_input::update_path_autocomplete(input, &mut self.completion);
             }
-            (FieldRole::Param(kind), Some(input)) => {
-                prompt_input::update_tier_autocomplete(
-                    input,
-                    &mut self.completion,
-                    kind == ParamKindInfo::Roster,
-                );
+            (FieldRole::Param(_), Some(input)) => {
+                prompt_input::update_tier_autocomplete(input, &mut self.completion);
             }
             _ => self.completion.reset(),
         }
@@ -2369,7 +2369,7 @@ mod tests {
     fn param(name: &str, default: Option<&str>) -> ParamInspection {
         ParamInspection {
             name: name.into(),
-            kind: ParamKindInfo::Client,
+            kind: ParamKindInfo::Roster,
             default: default.map(str::to_string),
         }
     }
@@ -2414,7 +2414,7 @@ mod tests {
     fn untouched_defaults_are_not_passed_as_overrides() {
         let mut form = SwarmForm::new(
             row(),
-            inspection(vec![workflow("w", vec![param("judge", Some("claude:opus"))])]),
+            inspection(vec![workflow("w", vec![param("judge", Some("a=high"))])]),
             folders(),
             1,
         );
@@ -2432,16 +2432,16 @@ mod tests {
     fn edited_values_are_passed_and_empty_undeclared_vars_are_not() {
         let mut form = SwarmForm::new(
             row(),
-            inspection(vec![workflow("w", vec![param("judge", Some("claude:opus"))])]),
+            inspection(vec![workflow("w", vec![param("judge", Some("a=high"))])]),
             folders(),
             0,
         );
         type_into(&mut form, "Prompt", "p");
-        type_into(&mut form, "judge", "codex:x@low");
+        type_into(&mut form, "judge", "a=low-codex");
         type_into(&mut form, "OUT_DIR", "elsewhere");
 
         let values = form.collect().unwrap();
-        assert_eq!(values.params, vec![("judge".to_string(), "codex:x@low".to_string())]);
+        assert_eq!(values.params, vec![("judge".to_string(), "a=low-codex".to_string())]);
         assert_eq!(values.vars, vec![("OUT_DIR".to_string(), "elsewhere".to_string())]);
     }
 
@@ -2464,8 +2464,8 @@ mod tests {
         let mut form = SwarmForm::new(
             row(),
             inspection(vec![
-                workflow("one", vec![param("only_one", Some("a:b"))]),
-                workflow("two", vec![param("only_two", Some("c:d"))]),
+                workflow("one", vec![param("only_one", Some("a=low"))]),
+                workflow("two", vec![param("only_two", Some("b=high"))]),
             ]),
             folders(),
             0,
@@ -2871,7 +2871,7 @@ mod tests {
         let screen = render_rows(&mut dash, 60, 24).join("\n");
         assert!(screen.contains("audit"), "{screen}");
         assert!(screen.contains("Prompt *"), "{screen}");
-        assert!(screen.contains("gate (model) *"), "{screen}");
+        assert!(screen.contains("gate * (list)"), "{screen}");
         assert!(screen.contains("OUT_DIR"), "{screen}");
         assert!(screen.contains("Run"), "{screen}");
         assert!(screen.contains("gate is required"), "{screen}");
@@ -2917,23 +2917,23 @@ mod tests {
 
     #[test]
     fn list_values_split_into_items_and_join_back() {
-        assert_eq!(split_list_value("a=claude:opus@high, b ,c"), ["a=claude:opus@high", "b", "c"]);
+        assert_eq!(split_list_value("a=high-claude, b ,c"), ["a=high-claude", "b", "c"]);
         assert_eq!(
             split_list_value(TOPICS),
             [r#"{id "a" focus "storage"}"#, r#"{id "b" focus "network"}"#]
         );
         assert_eq!(
-            split_list_value(r#"[{id "a" model "codex:x" effort low}]"#),
-            ["a=codex:x@low"],
+            split_list_value(r#"[{id "a" tier low-codex}]"#),
+            ["a=low-codex"],
             "an entry without free fields reads in the short form"
         );
         assert!(split_list_value("").is_empty());
 
-        assert_eq!(join_list_items(&["a=codex:x", "", " b "]), "a=codex:x,b");
-        let mixed = join_list_items(&[r#"{id "a" focus "x"}"#, "b=codex:y@low"]);
-        assert_eq!(mixed, r#"[{id "a" focus "x"} {id "b" model "codex:y" effort "low"}]"#);
+        assert_eq!(join_list_items(&["a=high", "", " b "]), "a=high,b");
+        let mixed = join_list_items(&[r#"{id "a" focus "x"}"#, "b=low-codex"]);
+        assert_eq!(mixed, r#"[{id "a" focus "x"} {id "b" tier low-codex}]"#);
         let back = parse_reviewers_override(&mixed).unwrap();
-        assert_eq!(back[1].effort.as_ref().unwrap().0, "low");
+        assert_eq!(back[1].tier.as_ref().unwrap().0, "low-codex");
     }
 
     #[test]

@@ -15,14 +15,9 @@ fn gaviero_cli() -> PathBuf {
 }
 
 const SCRIPT: &str = r#"
-client local {
-    model "ollama:qwen"
-    privacy public
-}
-
 agent writer {
     description "write the report"
-    client local
+    tier local
     scope { owned ["out/report.md"] }
     produces ["out/report.md"]
     prompt "Write the report."
@@ -97,6 +92,18 @@ fn fake_ollama() -> String {
     format!("http://{addr}")
 }
 
+/// The model profile every run here uses (`--profile`, beside the script):
+/// the script names tier `local`, and this says it is the fake Ollama.
+const PROFILE: &str = "client local { model \"ollama:qwen\" privacy public }
+tier local local
+";
+
+fn profile_beside(script: &Path) -> PathBuf {
+    let path = script.with_file_name("local-profile.gaviero");
+    std::fs::write(&path, PROFILE).unwrap();
+    path
+}
+
 fn write_script(dir: &Path) -> PathBuf {
     let path = dir.join("wf.gaviero");
     std::fs::write(&path, SCRIPT).unwrap();
@@ -112,6 +119,8 @@ fn run(script: &Path, workspace: &Path, extra: &[&str]) -> Output {
     Command::new(gaviero_cli())
         .arg("--script")
         .arg(script)
+        .arg("--profile")
+        .arg(profile_beside(script))
         .arg("--workspace")
         .arg(workspace)
         .arg("--ollama-base-url")
@@ -156,6 +165,8 @@ fn run_from(cwd: &Path, script: &Path) -> Output {
         .current_dir(cwd)
         .arg("--script")
         .arg(script)
+        .arg("--profile")
+        .arg(profile_beside(script))
         .arg("--ollama-base-url")
         .arg(fake_ollama())
         .args(["--model", "ollama:qwen", "--no-mcp"])

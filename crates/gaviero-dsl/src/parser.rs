@@ -21,11 +21,11 @@ enum ClientField {
 #[derive(Debug)]
 enum AgentField {
     Description(String, Span),
-    Client(String, Span),
     TierRef(String, Span),
     Scope(ScopeBlock),
     DependsOn(Vec<(String, Span)>, Span),
-    Produces(Vec<String>),
+    /// `produces [...]` or `produces json [...]` (the bool).
+    Produces(Vec<String>, bool),
     Prompt(PromptSource, Span),
     MaxRetries(u8, Span),
     Timeout(u64, Span),
@@ -63,7 +63,15 @@ enum WorkflowField {
     EscalateAfter(u32, Span),
     Verify(VerifyBlock),
     Param(ParamDecl),
+    Tiers(Vec<AgentTier>),
     Pattern(PatternDecl),
+    Budget(BudgetBlock),
+}
+
+#[derive(Debug)]
+enum BudgetField {
+    Wall(String, Span),
+    Usd(f64, Span),
 }
 
 #[derive(Debug)]
@@ -96,7 +104,7 @@ enum LoopField {
     TemplateInit(String, Span),
     TemplateRefine(String, Span),
     ConsensusMode(ConsensusModeLit),
-    For(ForBlock),
+    For(Box<ForBlock>),
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +116,7 @@ enum ForItem {
 #[derive(Debug)]
 enum ReviewerField {
     Id(String, Span),
-    Model(String, Span),
-    Effort(String, Span),
+    Tier(String, Span),
     /// Free `<ident> "<string>"` field of a list-param entry.
     Free(String, String, Span),
 }
@@ -127,7 +134,7 @@ enum MemoryField {
 
 // ── Parser builder ─────────────────────────────────────────────────────────
 
-/// `[ { id "…" [model "…"] [effort …] [<ident> "<string>"]* } … ]` — the
+/// `[ { id "…" [tier <name>] [<ident> "<string>"]* } … ]` — the
 /// list-param / roster literal. Shared by the script parser and
 /// [`parse_list_literal`] (the `--param NAME=[…]` CLI form).
 fn list_entries_parser<'src, I>()
@@ -140,22 +147,23 @@ where
         Token::RawStr(s) => s,
     };
     let kw_id = select! { Token::Ident(s) if s == "id" => () };
-    // `effort` accepts the same shape as `client { effort <value> }` — either
-    // an identifier (e.g. `high`) or a quoted string (e.g. `"max"`).
-    let effort_value = choice((
-        select! { Token::Ident(s) => s },
-        select! { Token::Str(s) => s },
-    ));
+    // A tier name, as after an agent's `tier`.
+    let tier_name = select! {
+        Token::Ident(s)        => s,
+        Token::TierCheap       => "cheap".to_owned(),
+        Token::TierExpensive   => "expensive".to_owned(),
+        Token::TierCoordinator => "coordinator".to_owned(),
+        Token::TierReasoning   => "reasoning".to_owned(),
+        Token::TierExecution   => "execution".to_owned(),
+        Token::TierMechanical  => "mechanical".to_owned(),
+    };
     let reviewer_field = choice((
         kw_id
             .ignore_then(string.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| ReviewerField::Id(v, s)),
-        just(Token::KwModel)
-            .ignore_then(string.map_with(|v, e| (v, e.span())))
-            .map(|(v, s)| ReviewerField::Model(v, s)),
-        just(Token::KwEffort)
-            .ignore_then(effort_value.map_with(|v, e| (v, e.span())))
-            .map(|(v, s)| ReviewerField::Effort(v, s)),
+        just(Token::KwTier)
+            .ignore_then(tier_name.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Tier(v, s)),
         // Free fields come last so `id` keeps its own meaning. Duplicates are
         // kept (in order) for the `for` expansion to report.
         select! { Token::Ident(s) => s }
@@ -169,40 +177,29 @@ where
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
         .map_with(|fields, e| {
             let mut id: Option<(String, Span)> = None;
-            let mut model: Option<(String, Span)> = None;
-            let mut effort: Option<(String, Span)> = None;
+            let mut tier: Option<(String, Span)> = None;
             let mut free: Vec<(String, String, Span)> = Vec::new();
             for f in fields {
                 match f {
-                    // A repeated `id` / `model` / `effort` keeps the first
-                    // value and lands in `fields` under its own name, so the
-                    // `for` expansion can report it as a duplicate field.
+                    // A repeated `id` / `tier` keeps the first value and
+                    // lands in `fields` under its own name, so the `for`
+                    // expansion can report it as a duplicate field.
                     ReviewerField::Id(v, s) => match id {
                         None => id = Some((v, s)),
                         Some(_) => free.push(("id".to_string(), v, s)),
                     },
-                    ReviewerField::Model(v, s) => match model {
-                        None => model = Some((v, s)),
-                        Some(_) => free.push(("model".to_string(), v, s)),
-                    },
-                    ReviewerField::Effort(v, s) => match effort {
-                        None => effort = Some((v, s)),
-                        Some(_) => free.push(("effort".to_string(), v, s)),
+                    ReviewerField::Tier(v, s) => match tier {
+                        None => tier = Some((v, s)),
+                        Some(_) => free.push(("tier".to_string(), v, s)),
                     },
                     ReviewerField::Free(k, v, s) => free.push((k, v, s)),
                 }
             }
             let (id_value, id_span) = id.unwrap_or_else(|| (String::new(), e.span()));
-            let (model_value, model_span) = match model {
-                Some((v, s)) => (Some(v), s),
-                None => (None, e.span()),
-            };
             ReviewerEntry {
                 id: id_value,
                 id_span,
-                model: model_value,
-                model_span,
-                effort,
+                tier,
                 fields: free,
                 span: e.span(),
             }
@@ -711,11 +708,7 @@ where
         just(Token::KwDescription)
             .ignore_then(string.map_with(|s, e| (s, e.span())))
             .map(|(v, s)| AgentField::Description(v, s)),
-        just(Token::KwClient)
-            .ignore_then(ident.map_with(|s, e| (s, e.span())))
-            .map(|(v, s)| AgentField::Client(v, s)),
-        // `tier <name>` — references a top-level tier alias. Mutually
-        // exclusive with `client`; the compiler rejects agents that set both.
+        // `tier <name>` — the agent's default tier, bound by the profile.
         just(Token::KwTier)
             .ignore_then(tier_name.map_with(|s, e| (s, e.span())))
             .map(|(v, s)| AgentField::TierRef(v, s)),
@@ -724,8 +717,9 @@ where
             .ignore_then(ident_list.clone().map_with(|v, e| (v, e.span())))
             .map(|(v, s)| AgentField::DependsOn(v, s)),
         just(Token::KwProduces)
-            .ignore_then(str_list.clone())
-            .map(AgentField::Produces),
+            .ignore_then(select! { Token::Ident(s) if s == "json" => () }.or_not())
+            .then(str_list.clone())
+            .map(|(json, paths)| AgentField::Produces(paths, json.is_some())),
         just(Token::KwPrompt)
             .ignore_then(choice((
                 string.map_with(|s, e| (PromptSource::Inline(s), e.span())),
@@ -759,7 +753,6 @@ where
         )
         .map_with(|((name, name_span), fields), e| {
             let mut description = None;
-            let mut client = None;
             let mut tier_ref = None;
             let mut scope = None;
             let mut depends_on = None;
@@ -771,14 +764,12 @@ where
             let mut vars: Vec<(String, String)> = Vec::new();
             let mut tools: Vec<String> = Vec::new();
             let mut produces: Vec<String> = Vec::new();
+            let mut produces_json: Vec<String> = Vec::new();
             let mut template = false;
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
                         description.get_or_insert((v, s));
-                    }
-                    AgentField::Client(v, s) => {
-                        client.get_or_insert((v, s));
                     }
                     AgentField::TierRef(v, s) => {
                         tier_ref.get_or_insert((v, s));
@@ -789,7 +780,10 @@ where
                     AgentField::DependsOn(v, s) => {
                         depends_on.get_or_insert((v, s));
                     }
-                    AgentField::Produces(paths) => {
+                    AgentField::Produces(paths, json) => {
+                        if json {
+                            produces_json.extend(paths.iter().cloned());
+                        }
                         produces.extend(paths);
                     }
                     AgentField::Prompt(v, s) => {
@@ -822,11 +816,11 @@ where
                 name,
                 name_span,
                 description,
-                client,
                 tier_ref,
                 scope,
                 depends_on,
                 produces,
+                produces_json,
                 prompt,
                 max_retries,
                 timeout_secs,
@@ -953,18 +947,43 @@ where
             .map(|(v, s)| ForItem::PeerTemplate(v, s)),
         ident.map_with(|n, e| ForItem::Agent(n, e.span())),
     ));
+    // `in json "<path>"` (runtime list) or `in <list-param>`. The json form
+    // is tried first, so a list param that happens to be named `json` still
+    // parses: it is followed by a mode word, not a string.
+    let kw_json = select! { Token::Ident(s) if s == "json" => () };
+    let kw_max = select! { Token::Ident(s) if s == "max" => () };
+    let for_list = choice((
+        kw_json
+            .map_with(|_, e| e.span())
+            .then(string.map_with(|v, e| (v, e.span())))
+            .map(|(json_span, (path, path_span))| {
+                (("json".to_string(), json_span), Some((path, path_span)))
+            }),
+        ident.map_with(|s, e| ((s, e.span()), None)),
+    ));
+    // Range checks (`max 0`, `max` without a json source, …) are semantic and
+    // live in `for_loops`, where the diagnostic text survives backtracking.
+    let for_max = kw_max.ignore_then(integer.map_with(|n, e| {
+        (u32::try_from(n).unwrap_or(u32::MAX), e.span())
+    }));
     let for_block = kw_for
         .ignore_then(ident.map_with(|s, e| (s, e.span())))
         .then_ignore(kw_in)
-        .then(ident.map_with(|s, e| (s, e.span())))
+        .then(for_list)
         .then(for_mode.map_with(|m, e| (m, e.span())))
+        .then(for_max.or_not())
         .then(
             for_item
                 .repeated()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
         )
-        .try_map(|((((var, var_span), (list, list_span)), (mode, mode_span)), items), span| {
+        .try_map(
+            |(
+                ((((var, var_span), ((list, list_span), json_source)), (mode, mode_span)), max_items),
+                items,
+            ),
+             span| {
             let mut agents = Vec::new();
             let mut peer_template: Option<(String, Span)> = None;
             for item in items {
@@ -996,12 +1015,15 @@ where
                 mode_span,
                 agents,
                 peer_template,
+                json_source,
+                max_items,
                 span,
             })
-        });
+        },
+        );
 
     let loop_field = choice((
-        for_block.clone().map(LoopField::For),
+        for_block.clone().map(|fb| LoopField::For(Box::new(fb))),
         just(Token::KwReviewers)
             .ignore_then(reviewers_source)
             .map(LoopField::Reviewers),
@@ -1075,7 +1097,7 @@ where
             let mut fors: Vec<ForBlock> = Vec::new();
             for f in fields {
                 match f {
-                    LoopField::For(fb) => fors.push(fb),
+                    LoopField::For(fb) => fors.push(*fb),
                     LoopField::Reviewers(v) => reviewers = v,
                     LoopField::Agents(v) => agents = v,
                     LoopField::Until(c) => {
@@ -1152,43 +1174,15 @@ where
 
     // ── workflow declaration ──────────────────────────────────────
 
-    // `param <name> [ <reviewer-list> ]` | `param <name> { model ... }`
-    // Bare `param <name>` infers roster vs client from usage at compile time.
-    let param_client_block = client_field
-        .clone()
-        .repeated()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LBrace), just(Token::RBrace));
-    let param_body = choice((
-        reviewer_literal_list.clone().map(ParamShape::Roster),
-        param_client_block.map_with(|fields, e| {
-            let mut spec = ClientParamSpec {
-                span: e.span(),
-                ..Default::default()
-            };
-            for f in fields {
-                match f {
-                    ClientField::Model(v, s) => {
-                        spec.model.get_or_insert((v, s));
-                    }
-                    ClientField::Effort(v, s) => {
-                        spec.effort.get_or_insert((v, s));
-                    }
-                    ClientField::Privacy(v, s) => {
-                        spec.privacy.get_or_insert((v, s));
-                    }
-                    ClientField::Extra(pairs) => {
-                        spec.extra.extend(pairs);
-                    }
-                    ClientField::Tier(_, _) | ClientField::Default => {}
-                }
-            }
-            ParamShape::Client(spec)
-        }),
-    ));
+    // `param <name> [ <list> ]`, or bare `param <name>` (value from `--param`).
     let param_decl = just(Token::KwParam)
         .ignore_then(ident.map_with(|n, e| (n, e.span())))
-        .then(param_body.or_not())
+        .then(
+            reviewer_literal_list
+                .clone()
+                .map(ParamShape::Roster)
+                .or_not(),
+        )
         .map_with(|((name, name_span), shape), e| {
             WorkflowField::Param(ParamDecl {
                 name,
@@ -1249,8 +1243,71 @@ where
             })
         });
 
+    // `budget { wall "<dur>" usd <n> }` — contextual keywords; values are
+    // validated by the compiler.
+    let kw_budget = select! { Token::Ident(s) if s == "budget" => () };
+    let kw_wall = select! { Token::Ident(s) if s == "wall" => () };
+    let kw_usd = select! { Token::Ident(s) if s == "usd" => () };
+    let usd_value = select! {
+        Token::Int(n) => n as f64,
+        Token::Float(v) => v as f64,
+    };
+    let budget_field = choice((
+        kw_wall
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| BudgetField::Wall(v, s)),
+        kw_usd
+            .ignore_then(usd_value.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| BudgetField::Usd(v, s)),
+    ));
+    let budget_block = kw_budget
+        .ignore_then(
+            budget_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut block = BudgetBlock {
+                wall: None,
+                usd: None,
+                span: e.span(),
+            };
+            for field in fields {
+                match field {
+                    BudgetField::Wall(v, s) => {
+                        block.wall.get_or_insert((v, s));
+                    }
+                    BudgetField::Usd(v, s) => {
+                        block.usd.get_or_insert((v, s));
+                    }
+                }
+            }
+            block
+        });
+
+    // `tiers { <agent> <tier> … }` — `tiers` is contextual, so an agent may
+    // still be named `tiers`.
+    let kw_tiers = select! { Token::Ident(s) if s == "tiers" => () };
+    let agent_tier = ident
+        .map_with(|n, e| (n, e.span()))
+        .then(tier_name.map_with(|t, e| (t, e.span())))
+        .map(|((agent, agent_span), (tier, tier_span))| AgentTier {
+            agent,
+            agent_span,
+            tier,
+            tier_span,
+        });
+    let tiers_block = kw_tiers.ignore_then(
+        agent_tier
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+    );
+
     let workflow_field = choice((
         param_decl,
+        tiers_block.map(WorkflowField::Tiers),
         just(Token::KwSteps)
             .ignore_then(step_list.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| WorkflowField::Steps(v, s)),
@@ -1283,6 +1340,7 @@ where
             .map(|(n, s)| WorkflowField::EscalateAfter(n as u32, s)),
         verify_block.map(WorkflowField::Verify),
         pattern_block.map(WorkflowField::Pattern),
+        budget_block.map(WorkflowField::Budget),
     ));
 
     let workflow_decl = just(Token::KwWorkflow)
@@ -1305,9 +1363,14 @@ where
             let mut escalate_after = None;
             let mut verify = None;
             let mut params: Vec<ParamDecl> = Vec::new();
+            let mut tiers: Vec<AgentTier> = Vec::new();
             let mut pattern = None;
+            let mut budget = None;
             for f in fields {
                 match f {
+                    WorkflowField::Tiers(entries) => {
+                        tiers.extend(entries);
+                    }
                     WorkflowField::Steps(v, s) => {
                         steps.get_or_insert((v, s));
                     }
@@ -1344,6 +1407,9 @@ where
                     WorkflowField::Pattern(p) => {
                         pattern.get_or_insert(p);
                     }
+                    WorkflowField::Budget(b) => {
+                        budget.get_or_insert(b);
+                    }
                 }
             }
             WorkflowDecl {
@@ -1360,7 +1426,10 @@ where
                 escalate_after,
                 verify,
                 params,
+                tiers,
                 pattern,
+                runtime_fors: Vec::new(),
+                budget,
                 span: e.span(),
                 file_id: 0,
             }
@@ -1634,7 +1703,6 @@ mod tests {
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
         if let Item::Agent(a) = &ast.unwrap().items[2] {
             assert!(matches!(&a.tier_ref, Some((n, _)) if n == "expensive"));
-            assert!(a.client.is_none());
         } else {
             panic!("expected Agent item");
         }
@@ -1729,12 +1797,42 @@ mod tests {
     fn full_example_three_items() {
         let src = r#"
             client c { tier execution model "sonnet" }
-            agent a { client c description "task" }
+            agent a { tier c description "task" }
             workflow w { steps [a] }
         "#;
         let (ast, errs) = parse_str(src);
         assert!(errs.is_empty(), "{:?}", errs);
         assert_eq!(ast.unwrap().items.len(), 3);
+    }
+
+    /// `client` is no longer an agent field: an agent names a tier.
+    #[test]
+    fn agent_client_field_is_a_parse_error() {
+        let (_, errs) = parse_str(r#"agent a { client c }"#);
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn workflow_tiers_block_parses() {
+        let src = r#"
+            agent a { tier t }
+            agent b { tier t }
+            workflow w {
+                tiers { a high b medium-codex }
+                steps [a b]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let Item::Workflow(w) = &ast.unwrap().items[2] else {
+            panic!("expected workflow");
+        };
+        let pairs: Vec<(&str, &str)> = w
+            .tiers
+            .iter()
+            .map(|t| (t.agent.as_str(), t.tier.as_str()))
+            .collect();
+        assert_eq!(pairs, [("a", "high"), ("b", "medium-codex")]);
     }
 
     #[test]
@@ -2382,7 +2480,7 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "a");
-        assert!(entries[0].model.is_none());
+        assert!(entries[0].tier.is_none());
         assert_eq!(entries[0].fields.len(), 1);
         assert_eq!(entries[0].fields[0].0, "focus");
         assert_eq!(entries[0].fields[0].1, "x");
@@ -2393,7 +2491,7 @@ mod tests {
         let src = r#"
             agent a { description "a" }
             workflow w {
-                param p [ { id "a" id "b" model "claude:opus" } ]
+                param p [ { id "a" id "b" tier high } ]
                 steps [a]
             }
         "#;
@@ -2406,7 +2504,7 @@ mod tests {
             panic!("expected list param");
         };
         assert_eq!(entries[0].id, "a");
-        assert_eq!(entries[0].model.as_deref(), Some("claude:opus"));
+        assert_eq!(entries[0].tier.as_ref().map(|(t, _)| t.as_str()), Some("high"));
         assert!(entries[0].fields.iter().any(|(k, v, _)| k == "id" && v == "b"));
     }
 
@@ -2513,6 +2611,60 @@ mod tests {
     }
 
     #[test]
+    fn for_block_over_a_json_file_parses() {
+        let steps = workflow_steps(
+            r#"
+            agent worker { description "w" }
+            workflow w { steps [ for q in json "out/items.json" parallel max 4 { worker } ] }
+        "#,
+        );
+        let StepItem::For(fb) = &steps[0] else {
+            panic!("expected For step");
+        };
+        assert_eq!(fb.var, "q");
+        assert_eq!(fb.list, "json");
+        assert_eq!(
+            fb.json_source.as_ref().map(|(p, _)| p.as_str()),
+            Some("out/items.json")
+        );
+        assert_eq!(fb.max_items.map(|(n, _)| n), Some(4));
+        assert_eq!(fb.mode, ForMode::Parallel);
+    }
+
+    #[test]
+    fn for_block_over_a_json_file_without_max_parses() {
+        let steps = workflow_steps(
+            r#"
+            agent worker { description "w" }
+            workflow w { steps [ loop { for q in json "out/i-v{{PREV_ITER}}.json" parallel { worker } until agent worker } ] }
+        "#,
+        );
+        let StepItem::Loop(lb) = &steps[0] else {
+            panic!("expected Loop step");
+        };
+        assert_eq!(
+            lb.fors[0].json_source.as_ref().map(|(p, _)| p.as_str()),
+            Some("out/i-v{{PREV_ITER}}.json")
+        );
+        assert!(lb.fors[0].max_items.is_none());
+    }
+
+    #[test]
+    fn a_list_param_named_json_is_still_a_list_param() {
+        let steps = workflow_steps(
+            r#"
+            agent a { description "a" }
+            workflow w { steps [ for t in json parallel { a } ] }
+        "#,
+        );
+        let StepItem::For(fb) = &steps[0] else {
+            panic!("expected For step");
+        };
+        assert_eq!(fb.list, "json");
+        assert!(fb.json_source.is_none());
+    }
+
+    #[test]
     fn agent_named_parallel_still_works_as_a_step() {
         let steps = workflow_steps(
             r#"
@@ -2526,12 +2678,14 @@ mod tests {
     }
 
     #[test]
-    fn list_literal_parses_free_fields_and_models() {
+    fn list_literal_parses_free_fields_and_tiers() {
         let entries =
-            parse_list_literal(r#"[{id "a" focus "x"} {id "b" model "claude:opus"}]"#).unwrap();
+            parse_list_literal(r#"[{id "a" focus "x"} {id "b" tier high-codex}]"#).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].fields[0].0, "focus");
-        assert_eq!(entries[1].model.as_deref(), Some("claude:opus"));
+        assert_eq!(entries[1].tier.as_ref().map(|(t, _)| t.as_str()), Some("high-codex"));
+        // A model is never an item field: models live in the profile.
+        assert!(parse_list_literal(r#"[{id "b" model "claude:opus"}]"#).is_err());
     }
 
     #[test]

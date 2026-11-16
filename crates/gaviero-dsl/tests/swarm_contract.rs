@@ -14,28 +14,42 @@
 //! `crates/gaviero-core/tests/swarm_execute_validation.rs`. The two
 //! files together pin the symmetry from both directions.
 
+use gaviero_core::script_profiles::{ProfilePrecedence, SelectedProfile};
 use gaviero_core::swarm::validation;
+
+/// The profile shipped with the examples: generic tiers low / medium /
+/// high / top, as a `--coordinated` plan finds in a `default` profile.
+fn profile() -> SelectedProfile {
+    SelectedProfile {
+        name: "default".into(),
+        path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/profiles/default.gaviero"),
+        precedence: ProfilePrecedence::FillsGaps,
+    }
+}
+
+fn compile(src: &str, filename: &str) -> Result<gaviero_dsl::CompiledPlan, miette::Report> {
+    gaviero_dsl::compile(src, filename, Some(&profile()), None, None)
+}
 
 #[test]
 fn dsl_compiled_plan_passes_swarm_validate_scopes() {
     let src = r#"
-        client base { tier cheap model "claude:sonnet" }
         agent reader {
             description "read"
-            client base
+            tier medium
             scope { owned ["docs/"] read_only ["src/"] }
         }
         agent writer {
             description "write"
-            client base
+            tier medium
             depends_on [reader]
             scope { owned ["src/feature/"] read_only ["docs/"] }
         }
         workflow w { steps [reader writer] }
     "#;
 
-    let plan = gaviero_dsl::compile(src, "t4.gaviero", None, None)
-        .expect("DSL should compile this two-agent workflow");
+    let plan = compile(src, "t4.gaviero").expect("DSL should compile this two-agent workflow");
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 2);
 
@@ -57,8 +71,9 @@ fn dsl_compiled_plan_passes_swarm_validate_scopes() {
 fn scientific_research_roster_passes_swarm_scope_validation() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/scientific_research.gaviero");
-    let plan = gaviero_dsl::compile_file(
+    let plan = gaviero_dsl::compile_file_with_profile(
         &path,
+        Some(&profile()),
         Some("scientific-research-consensus"),
         Some("test topic"),
         &[],
@@ -92,22 +107,21 @@ fn dsl_does_not_catch_scope_overlap_swarm_validator_does() {
     // If a future change moves the check into the DSL, flip this test
     // to expect a compile-time error and update CLAUDE.md to match.
     let src = r#"
-        client base { tier cheap model "claude:sonnet" }
         agent a {
             description "a"
-            client base
+            tier medium
             scope { owned ["src/"] }
         }
         agent b {
             description "b"
-            client base
+            tier medium
             scope { owned ["src/"] }
         }
         workflow w { steps [a b] }
     "#;
 
     // DSL accepts the source.
-    let plan = gaviero_dsl::compile(src, "t4-overlap.gaviero", None, None)
+    let plan = compile(src, "t4-overlap.gaviero")
         .expect("DSL accepts overlap today (validation lives in swarm runtime)");
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 2);
@@ -133,40 +147,27 @@ fn dsl_does_not_catch_scope_overlap_swarm_validator_does() {
 /// T5 — Coordinator-emitted DSL shape compiles cleanly through the DSL
 /// pipeline. `swarm::coordinator::build_coordinator_dsl_prompt` instructs
 /// the model to produce a `.gaviero` workflow with this exact structure
-/// (clients with `tier <kw>` + `model`, `agent { description, client, scope,
-/// depends_on, prompt #"..."# }` blocks, `workflow main { steps [...] }`).
-/// If the prompt template ever drifts past what `gaviero_dsl::compile`
-/// accepts, this test catches it at the DSL crate boundary instead of at
-/// coordinator runtime.
+/// (`agent { description, tier <low|medium|high>, scope, depends_on,
+/// produces, timeout, prompt #"..."#, max_retries }` blocks, no clients,
+/// `workflow main { steps [...] }`). If the prompt template ever drifts past
+/// what `gaviero_dsl::compile` accepts, this test catches it at the DSL
+/// crate boundary instead of at coordinator runtime.
 ///
-/// The verified contract: compile → topo-sort → swarm scope/dependency
-/// validation must all succeed for a representative coordinator output.
-///
-/// Client names are free identifiers; the coordinator's "use `reasoning`,
-/// `execution`, `mechanical` as client names" instruction is broken
-/// against the lexer (those are reserved tier-value keywords). See the
-/// `coordinator_prompt_uses_reserved_tier_words_as_client_names` test
-/// below for the regression that pins that contract bug.
+/// The verified contract: compile (against the run's profile) → topo-sort →
+/// swarm scope/dependency validation must all succeed for a representative
+/// coordinator output.
 #[test]
 fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
-    // Mirror the structural shape `build_coordinator_dsl_prompt` instructs
-    // the model to emit:
-    //   - one client per tier
-    //   - agents with description, client, scope { owned, read_only },
-    //     depends_on, prompt #" "#, max_retries
-    //   - workflow main { steps [...] max_parallel <n> }
     let src = r##"
-        client opus    { tier expensive model "claude:opus" }
-        client sonnet  { tier cheap     model "claude:sonnet" }
-        client haiku   { tier cheap     model "claude:haiku" }
-
         agent designer {
             description "Design the new module structure"
-            client opus
+            tier high
             scope {
                 owned    ["docs/design.md"]
                 read_only ["src/"]
             }
+            produces ["docs/design.md"]
+            timeout 1800
             prompt #"
                 Read the existing code under src/ and produce a one-page
                 design doc describing the new module layout.
@@ -176,7 +177,7 @@ fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
 
         agent implementer {
             description "Implement the module per the design"
-            client sonnet
+            tier medium
             depends_on [designer]
             scope {
                 owned    ["src/feature/"]
@@ -190,7 +191,7 @@ fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
 
         agent renamer {
             description "Update call sites for the rename"
-            client haiku
+            tier low
             depends_on [implementer]
             scope {
                 owned    ["src/api/"]
@@ -208,12 +209,14 @@ fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
         }
     "##;
 
-    let plan = gaviero_dsl::compile(src, "coordinator-template.gaviero", None, None)
+    let plan = compile(src, "coordinator-template.gaviero")
         .expect("DSL must accept the coordinator's emit shape");
 
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 3, "expected 3 work units");
     assert_eq!(plan.max_parallel, Some(2));
+    assert_eq!(units[0].model.as_deref(), Some("claude:opus"), "tier high");
+    assert_eq!(units[2].model.as_deref(), Some("claude:haiku"), "tier low");
 
     // Scope validation matches what `pipeline::execute` runs.
     let loop_groups = validation::expand_loop_groups_with_roster_init(
@@ -245,21 +248,19 @@ fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
 #[test]
 fn coordinator_dsl_independent_agents_collapse_to_one_tier() {
     let src = r##"
-        client sonnet { tier cheap model "claude:sonnet" }
-
         agent a {
             description "a"
-            client sonnet
+            tier medium
             scope { owned ["src/a/"] }
         }
         agent b {
             description "b"
-            client sonnet
+            tier medium
             scope { owned ["src/b/"] }
         }
         agent c {
             description "c"
-            client sonnet
+            tier medium
             scope { owned ["src/c/"] }
         }
 
@@ -269,8 +270,7 @@ fn coordinator_dsl_independent_agents_collapse_to_one_tier() {
         }
     "##;
 
-    let plan =
-        gaviero_dsl::compile(src, "coordinator-parallel.gaviero", None, None).expect("DSL compile");
+    let plan = compile(src, "coordinator-parallel.gaviero").expect("DSL compile");
     let units = plan.work_units_ordered().expect("toposort");
     let tiers = validation::dependency_tiers(&units).expect("tiers");
     assert_eq!(
@@ -281,39 +281,26 @@ fn coordinator_dsl_independent_agents_collapse_to_one_tier() {
     assert_eq!(tiers[0].len(), 3);
 }
 
-/// Regression: pins the contract bug between
-/// `swarm::coordinator::build_coordinator_dsl_prompt` and the DSL lexer.
-///
-/// The coordinator's prompt template tells the model:
-///   ```
-///   CLIENT NAMES to use:
-///   - `reasoning` for reasoning-tier agents
-///   - `execution` for execution-tier agents
-///   - `mechanical` for mechanical-tier agents
-///   ```
-/// but the DSL lexer reserves `reasoning`, `execution`, and `mechanical`
-/// as tier-value keywords, so a model that follows the instructions
-/// produces DSL the parser rejects. Until the prompt is fixed, swarm
-/// `--coordinated` runs that obey the prompt are doomed to a parse error.
-///
-/// This test asserts the failure today (the DSL rejects `client reasoning`)
-/// so a future fix to the prompt → grammar contract surfaces here as a
-/// failure-to-failure (the test would pass — flipping the assertion is
-/// the signal to also delete this regression).
+/// The plan the coordinator emits never declares clients: a plan that does
+/// fails to compile, so the template must keep teaching `tier` only.
 #[test]
-fn coordinator_prompt_uses_reserved_tier_words_as_client_names() {
+fn a_coordinator_plan_with_clients_does_not_compile() {
     let src = r#"
-        client reasoning { tier expensive model "claude:opus" }
+        client deep { model "claude:opus" }
         agent a {
             description "a"
-            client reasoning
-            scope { owned ["src/a/"] }
+            tier high
+            scope { owned ["out/"] }
+            produces ["out/a.md"]
+            timeout 600
         }
     "#;
-    let result = gaviero_dsl::compile(src, "regression.gaviero", None, None);
-    assert!(
-        result.is_err(),
-        "DSL still rejects `client reasoning` — if this test starts to pass, \
-         the lexer or prompt has been fixed; remove this regression."
-    );
+    let err = compile(src, "coordinator-names.gaviero").unwrap_err();
+    assert!(format!("{err:?}").contains("cannot declare `client deep`"), "{err:?}");
+
+    let plan = compile(&src.replace(r#"client deep { model "claude:opus" }"#, ""), "c.gaviero")
+        .expect("the same plan without the client compiles");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units[0].produces, vec!["out/a.md".to_string()]);
+    assert_eq!(units[0].timeout_secs, 600);
 }

@@ -1,14 +1,15 @@
-//! Merge a named model profile into a resolved script.
+//! Model profiles: the one place a tier gets its model.
 //!
 //! A profile is a `.gaviero` file of `client` and `tier` declarations (plus
 //! `include`s of the same). It is self-contained: its tiers may only point at
-//! its own clients, and those clients are renamed on merge, so a profile never
-//! collides with what the script declares and a script cannot depend on it by
-//! client name. Scripts reach a profile through `tier <name>` alone.
+//! its own clients, and those clients are renamed on merge, so a script
+//! cannot depend on them by name. Scripts declare neither clients nor tier
+//! lines ([`reject_model_tables`]); they reach a profile through
+//! `tier <name>` alone.
 
 use std::collections::HashSet;
 
-use gaviero_core::script_profiles::{ProfilePrecedence, SelectedProfile};
+use gaviero_core::script_profiles::SelectedProfile;
 use miette::NamedSource;
 
 use crate::ast::{ClientDecl, Item, Script, Span, TierAlias};
@@ -20,6 +21,41 @@ pub fn profile_client_name(client: &str) -> String {
     format!("__profile_{client}")
 }
 
+/// Reject `client { }` and `tier <alias> <client>` in a script (or a file it
+/// includes): what a tier means belongs to the model profile, never to the
+/// script.
+pub(crate) fn reject_model_tables(
+    script: &Script,
+    sources: &[(String, String)],
+) -> Result<(), DslErrors> {
+    const WHY: &str = "models are chosen in one place: a model profile \
+                       (.gaviero/dsl/profiles/<name>.gaviero) maps tiers to clients, \
+                       and agents pick a tier with `tier <name>`";
+    let mut errors = Vec::new();
+    for item in &script.items {
+        let (file_id, span, what) = match item {
+            Item::Client(c) => (c.file_id, c.span, format!("`client {}`", c.name)),
+            Item::TierAlias(t) => (
+                t.file_id,
+                t.span,
+                format!("`tier {} {}`", t.name, t.client_ref),
+            ),
+            _ => continue,
+        };
+        let (filename, content) = &sources[file_id as usize];
+        errors.push(DslError::Compile {
+            src: NamedSource::new(filename, content.clone()),
+            span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+            reason: format!("a script cannot declare {what} — {WHY}"),
+        });
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DslErrors::new(errors))
+    }
+}
+
 /// Merge `selected` into `script`. Diagnostics for the profile point at the
 /// profile's own files, which are appended to `sources`.
 pub(crate) fn apply_profile(
@@ -28,43 +64,7 @@ pub(crate) fn apply_profile(
     selected: &SelectedProfile,
 ) -> Result<(), DslErrors> {
     let (profile, profile_sources) = resolver::resolve(&selected.path)?;
-    let (mut clients, mut tiers) = split_profile(profile, &profile_sources)?;
-
-    match selected.precedence {
-        ProfilePrecedence::OverridesScript => {
-            let bound: HashSet<&str> = tiers.iter().map(|t| t.name.as_str()).collect();
-            script
-                .items
-                .retain(|i| !matches!(i, Item::TierAlias(t) if bound.contains(t.name.as_str())));
-            if clients.iter().any(|c| c.is_default) {
-                for item in &mut script.items {
-                    if let Item::Client(c) = item {
-                        c.is_default = false;
-                    }
-                }
-            }
-        }
-        ProfilePrecedence::FillsGaps => {
-            let bound: HashSet<String> = script
-                .items
-                .iter()
-                .filter_map(|i| match i {
-                    Item::TierAlias(t) => Some(t.name.clone()),
-                    _ => None,
-                })
-                .collect();
-            tiers.retain(|t| !bound.contains(&t.name));
-            let script_has_default = script
-                .items
-                .iter()
-                .any(|i| matches!(i, Item::Client(c) if c.is_default));
-            if script_has_default {
-                for client in &mut clients {
-                    client.is_default = false;
-                }
-            }
-        }
-    }
+    let (clients, tiers) = split_profile(profile, &profile_sources)?;
 
     let offset = sources.len() as u32;
     sources.extend(profile_sources);
@@ -121,6 +121,17 @@ fn split_profile(
 
     let mut declared = HashSet::new();
     for client in &clients {
+        if client.is_default {
+            errors.push(error_at(
+                client.file_id,
+                client.name_span,
+                format!(
+                    "client `{}` is marked `default`, which no longer means anything — \
+                     every agent declares a tier; remove `default`",
+                    client.name
+                ),
+            ));
+        }
         if !declared.insert(client.name.as_str()) {
             errors.push(error_at(
                 client.file_id,

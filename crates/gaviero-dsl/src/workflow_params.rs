@@ -1,99 +1,108 @@
-//! Workflow parameter materialization: client params and roster expansion.
-//!
-//! Client params (`param judge { model "claude:sonnet" ... }` or bare `param judge`
-//! when an agent says `client judge`) synthesize `__param_<name>` clients and
-//! rewrite agent bindings before compilation.
+//! Workflow parameter materialization: list params and roster expansion,
+//! plus the workflow `tiers { }` block.
 //!
 //! Roster params expand `loop { reviewers ... }` into per-reviewer agents.
+//! A model is chosen by tier only: an agent declares `tier <name>`, the
+//! workflow's `tiers { agent tier }` block and `--tier agent=tier` replace it,
+//! and a list item's `tier` replaces it for that item's clone.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::{DslError, DslErrors};
 
-/// Synthesized client name for a workflow client param.
-pub fn param_client_name(param: &str) -> String {
-    format!("__param_{param}")
-}
+/// Apply the selected workflow's `tiers { }` block, then the `--tier`
+/// overrides, to the agents' declared tiers. Runs before any cloning, so
+/// `for` and roster clones inherit the result; an item's own `tier` still
+/// wins for its clone.
+pub(crate) fn apply_agent_tiers(
+    script: &mut Script,
+    workflow_name: Option<&str>,
+    cli_tiers: &[(String, String)],
+) -> Result<(), DslErrors> {
+    let block: Vec<AgentTier> = script
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Workflow(wf) if workflow_name.is_none_or(|n| wf.name == n) => {
+                Some(wf.tiers.clone())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let agents: HashSet<String> = script
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Agent(a) => Some(a.name.clone()),
+            _ => None,
+        })
+        .collect();
 
-/// The tier named by a `tier:<name>` model spec, if `model` is one. A param or
-/// roster entry written this way binds its agent to the tier, leaving the
-/// choice of model to the profile.
-pub fn tier_of_model_spec(model: &str) -> Option<&str> {
-    model.strip_prefix("tier:").map(str::trim)
-}
+    let mut errors = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut chosen: HashMap<String, (String, Span)> = HashMap::new();
+    for entry in &block {
+        let span = entry.agent_span;
+        let at = (span.start, span.end.saturating_sub(span.start).max(1));
+        if !agents.contains(&entry.agent) {
+            errors.push(DslError::Compile {
+                src: miette::NamedSource::new("script", String::new()),
+                span: at.into(),
+                reason: format!("`tiers` names `{}`, which is not a defined agent", entry.agent),
+            });
+        } else if !seen.insert(entry.agent.as_str()) {
+            errors.push(DslError::Compile {
+                src: miette::NamedSource::new("script", String::new()),
+                span: at.into(),
+                reason: format!("`tiers` sets agent `{}` twice", entry.agent),
+            });
+        }
+        chosen.insert(entry.agent.clone(), (entry.tier.clone(), entry.tier_span));
+    }
+    for (agent, tier) in cli_tiers {
+        if !agents.contains(agent) {
+            errors.push(DslError::Compile {
+                src: miette::NamedSource::new("<cli>", String::new()),
+                span: (0, 1).into(),
+                reason: format!("--tier {agent}={tier}: `{agent}` is not a defined agent"),
+            });
+            continue;
+        }
+        // A CLI tier has no place in the source; keep the agent's own span so
+        // an unknown tier is reported on the agent.
+        let span = chosen
+            .get(agent)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| (0..0).into());
+        chosen.insert(agent.clone(), (tier.clone(), span));
+    }
+    if !errors.is_empty() {
+        return Err(DslErrors::new(errors));
+    }
 
-/// The tier a client param resolves to. A tier fixes model, effort and
-/// privacy together, so a spec that also sets those is contradictory.
-fn client_spec_tier(spec: &ClientParamSpec) -> Result<Option<String>, String> {
-    let Some(tier) = spec.model.as_ref().and_then(|(m, _)| tier_of_model_spec(m)) else {
-        return Ok(None);
-    };
-    if tier.is_empty() {
-        return Err("`tier:` needs a tier name, e.g. `tier:high`".into());
+    for item in &mut script.items {
+        let Item::Agent(agent) = item else { continue };
+        if let Some((tier, span)) = chosen.get(&agent.name) {
+            let span = if span.start == span.end {
+                agent.tier_ref.as_ref().map(|(_, s)| *s).unwrap_or(agent.name_span)
+            } else {
+                *span
+            };
+            agent.tier_ref = Some((tier.clone(), span));
+        }
     }
-    if spec.effort.is_some() || spec.privacy.is_some() || !spec.extra.is_empty() {
-        return Err(format!(
-            "`tier:{tier}` cannot be combined with effort, privacy or extra — \
-             the tier's client sets those"
-        ));
-    }
-    Ok(Some(tier.to_string()))
-}
-
-/// The tier a roster entry resolves to; see [`client_spec_tier`].
-pub(crate) fn roster_entry_tier(entry: &ReviewerEntry) -> Result<Option<&str>, String> {
-    let Some(tier) = entry.model.as_deref().and_then(tier_of_model_spec) else {
-        return Ok(None);
-    };
-    if tier.is_empty() {
-        return Err(format!(
-            "roster entry `{}`: `tier:` needs a tier name, e.g. `tier:high`",
-            entry.id
-        ));
-    }
-    if entry.effort.is_some() {
-        return Err(format!(
-            "roster entry `{}`: `tier:{tier}` cannot be combined with effort — \
-             the tier's client sets it",
-            entry.id
-        ));
-    }
-    Ok(Some(tier))
-}
-
-/// Parse `--param NAME=provider:model[@effort]` for a client param.
-pub fn parse_client_override(value: &str) -> Result<ClientParamSpec, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("client param override is empty".into());
-    }
-    let (model_spec, effort) = match value.split_once('@') {
-        Some((m, e)) => (m.trim().to_string(), Some(e.trim().to_string())),
-        None => (value.to_string(), None),
-    };
-    if model_spec.is_empty() || !model_spec.contains(':') {
-        return Err(format!(
-            "client param override must be `provider:model` or `provider:model@effort`, got `{value}`"
-        ));
-    }
-    let span: chumsky::span::SimpleSpan = (0..0).into();
-    Ok(ClientParamSpec {
-        model: Some((model_spec, span)),
-        effort: effort.map(|e| (e, span)),
-        privacy: None,
-        extra: Vec::new(),
-        span,
-    })
+    Ok(())
 }
 
 /// Parse a `--param NAME=...` value string into a roster / list param.
 ///
 /// Forms:
-/// - a DSL list literal: `[{id "a" focus "x"} {id "b" model "claude:opus"}]`
+/// - a DSL list literal: `[{id "a" focus "x"} {id "b" tier high}]`
 ///   (any value whose trimmed form starts with `[`);
-/// - the short form `id=provider:model[@effort](,id=provider:model[@effort])*`,
-///   where a part without `=` is an id-only entry (`a,b,c`).
+/// - the short form `id=tier(,id=tier)*`, where a part without `=` is an
+///   id-only entry (`a,b,c`).
 pub fn parse_reviewers_override(value: &str) -> Result<Vec<ReviewerEntry>, String> {
     if value.trim_start().starts_with('[') {
         return crate::parser::parse_list_literal(value);
@@ -104,39 +113,26 @@ pub fn parse_reviewers_override(value: &str) -> Result<Vec<ReviewerEntry>, Strin
         if part.is_empty() {
             continue;
         }
-        let Some((id, rest)) = part.split_once('=') else {
-            let span: chumsky::span::SimpleSpan = (0..0).into();
-            out.push(ReviewerEntry {
-                id: part.to_string(),
-                id_span: span,
-                model: None,
-                model_span: span,
-                effort: None,
-                fields: Vec::new(),
-                span,
-            });
-            continue;
+        let span: chumsky::span::SimpleSpan = (0..0).into();
+        let (id, tier) = match part.split_once('=') {
+            Some((id, tier)) => (id.trim(), Some(tier.trim())),
+            None => (part, None),
         };
-        let id = id.trim();
         if id.is_empty() {
             return Err(format!("invalid roster entry `{part}` (empty id)"));
         }
-        let (model_spec, effort) = match rest.split_once('@') {
-            Some((m, e)) => (m.trim().to_string(), Some(e.trim().to_string())),
-            None => (rest.trim().to_string(), None),
-        };
-        if model_spec.is_empty() || !model_spec.contains(':') {
+        if let Some(tier) = tier
+            && (tier.is_empty() || tier.contains([':', '@', ' ']))
+        {
             return Err(format!(
-                "invalid roster entry `{part}` (model must be `provider:model`)"
+                "invalid roster entry `{part}` (expected `id=<tier>`, e.g. `claude=top-claude`; \
+                 models are chosen by the profile's tiers)"
             ));
         }
-        let span: chumsky::span::SimpleSpan = (0..0).into();
         out.push(ReviewerEntry {
             id: id.to_string(),
             id_span: span,
-            model: Some(model_spec),
-            model_span: span,
-            effort: effort.map(|e| (e, span)),
+            tier: tier.map(|t| (t.to_string(), span)),
             fields: Vec::new(),
             span,
         });
@@ -166,62 +162,40 @@ pub(crate) fn describe_workflow_params(
         .collect();
     let usage = param_usage_for_workflow(wf, &agent_by_name);
 
-    let with_effort = |model: &str, effort: Option<&str>| match effort {
-        Some(e) => format!("{model}@{e}"),
-        None => model.to_string(),
-    };
-
     wf.params
         .iter()
         .filter_map(|decl| {
             let mut ignored = Vec::new();
-            let kind = resolve_param_kind(&decl.name, decl, &usage, &mut ignored)?;
-            Some(match kind {
-                ParamKind::Roster(entries) => ParamInspection {
-                    name: decl.name.clone(),
-                    kind: ParamKindInfo::Roster,
-                    default: entries.filter(|e| !e.is_empty()).map(|entries| {
-                        // Free fields only survive in the literal form.
-                        if entries.iter().any(|r| !r.fields.is_empty()) {
-                            let items: Vec<String> =
-                                entries.iter().map(list_literal_entry).collect();
-                            return format!("[{}]", items.join(" "));
-                        }
-                        entries
-                            .iter()
-                            .map(|r| {
-                                let effort = r.effort.as_ref().map(|(e, _)| e.as_str());
-                                match &r.model {
-                                    Some(model) => {
-                                        format!("{}={}", r.id, with_effort(model, effort))
-                                    }
-                                    None => r.id.clone(),
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    }),
-                },
-                ParamKind::Client(spec) => ParamInspection {
-                    name: decl.name.clone(),
-                    kind: ParamKindInfo::Client,
-                    default: spec.model.as_ref().map(|(model, _)| {
-                        with_effort(model, spec.effort.as_ref().map(|(e, _)| e.as_str()))
-                    }),
-                },
+            let ParamKind::Roster(entries) =
+                resolve_param_kind(&decl.name, decl, &usage, &mut ignored)?;
+            Some(ParamInspection {
+                name: decl.name.clone(),
+                kind: ParamKindInfo::Roster,
+                default: entries.filter(|e| !e.is_empty()).map(|entries| {
+                    // Free fields only survive in the literal form.
+                    if entries.iter().any(|r| !r.fields.is_empty()) {
+                        let items: Vec<String> = entries.iter().map(list_literal_entry).collect();
+                        return format!("[{}]", items.join(" "));
+                    }
+                    entries
+                        .iter()
+                        .map(|r| match &r.tier {
+                            Some((tier, _)) => format!("{}={tier}", r.id),
+                            None => r.id.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
             })
         })
         .collect()
 }
 
-/// One entry in list-literal syntax: `{id "a" model "m" effort high focus "x"}`.
+/// One entry in list-literal syntax: `{id "a" tier high focus "x"}`.
 pub fn list_literal_entry(entry: &ReviewerEntry) -> String {
     let mut out = format!("{{id {}", quote_literal(&entry.id));
-    if let Some(model) = &entry.model {
-        out.push_str(&format!(" model {}", quote_literal(model)));
-    }
-    if let Some((effort, _)) = &entry.effort {
-        out.push_str(&format!(" effort {}", quote_literal(effort)));
+    if let Some((tier, _)) = &entry.tier {
+        out.push_str(&format!(" tier {tier}"));
     }
     for (name, value, _) in &entry.fields {
         out.push_str(&format!(" {name} {}", quote_literal(value)));
@@ -239,27 +213,14 @@ fn quote_literal(value: &str) -> String {
     }
 }
 
-/// Materialize client params and expand reviewer rosters for the selected workflow.
+/// Resolve list params and expand reviewer rosters for the selected workflow.
 pub fn expand_workflow_params_in_script(
     script: &mut Script,
     workflow_name: Option<&str>,
     override_params: &[(String, String)],
 ) -> Result<(), DslErrors> {
     let mut errors = Vec::new();
-    let mut new_clients: Vec<ClientDecl> = Vec::new();
     let mut new_agents: Vec<AgentDecl> = Vec::new();
-
-    let static_client_names: HashSet<String> = script
-        .items
-        .iter()
-        .filter_map(|i| {
-            if let Item::Client(c) = i {
-                Some(c.name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
 
     let agent_by_name: HashMap<String, AgentDecl> = script
         .items
@@ -275,10 +236,8 @@ pub fn expand_workflow_params_in_script(
 
     // Per-workflow resolved param kinds (used by roster pass).
     let mut kinds_by_workflow: HashMap<String, HashMap<String, ParamKind>> = HashMap::new();
-    let mut client_rewrites: Vec<(String, String)> = Vec::new();
-    let mut tier_rewrites: Vec<(String, String)> = Vec::new();
 
-    // Pass 1 — materialize client params (immutable workflow borrow).
+    // Pass 1 — resolve param kinds (immutable workflow borrow).
     for item in &script.items {
         let Item::Workflow(wf) = item else { continue };
         if let Some(name) = workflow_name
@@ -305,77 +264,7 @@ pub fn expand_workflow_params_in_script(
             continue;
         }
 
-        kinds_by_workflow.insert(wf.name.clone(), resolved_kinds.clone());
-
-        for (param_name, kind) in &resolved_kinds {
-            let ParamKind::Client(spec) = kind else {
-                continue;
-            };
-            if static_client_names.contains(param_name) {
-                errors.push(DslError::Compile {
-                    src: miette::NamedSource::new("script", String::new()),
-                    span: (
-                        params_by_name[param_name].name_span.start,
-                        params_by_name[param_name]
-                            .name_span
-                            .end
-                            .saturating_sub(params_by_name[param_name].name_span.start)
-                            .max(1),
-                    )
-                        .into(),
-                    reason: format!(
-                        "workflow param `{param_name}` conflicts with top-level `client {param_name}` — \
-                         use a different param or client name"
-                    ),
-                });
-                continue;
-            }
-
-            let resolved = match resolve_client_spec(
-                param_name,
-                spec,
-                &params_by_name[param_name],
-                override_params,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    errors.push(e);
-                    continue;
-                }
-            };
-
-            match client_spec_tier(&resolved) {
-                Ok(Some(tier)) => {
-                    tier_rewrites.push((param_name.clone(), tier));
-                    continue;
-                }
-                Ok(None) => {}
-                Err(reason) => {
-                    let name_span = params_by_name[param_name].name_span;
-                    errors.push(DslError::Compile {
-                        src: miette::NamedSource::new("script", String::new()),
-                        span: (
-                            name_span.start,
-                            name_span.end.saturating_sub(name_span.start).max(1),
-                        )
-                            .into(),
-                        reason: format!("workflow param `{param_name}`: {reason}"),
-                    });
-                    continue;
-                }
-            }
-
-            let synth_name = param_client_name(param_name);
-            new_clients.push(synth_client_from_spec(&synth_name, &resolved));
-            client_rewrites.push((param_name.clone(), synth_name));
-        }
-    }
-
-    for (param_name, synth_name) in &client_rewrites {
-        rewrite_agent_client_param(script, param_name, synth_name);
-    }
-    for (param_name, tier) in &tier_rewrites {
-        rewrite_agent_tier_param(script, param_name, tier);
+        kinds_by_workflow.insert(wf.name.clone(), resolved_kinds);
     }
 
     if !errors.is_empty() {
@@ -421,32 +310,6 @@ pub fn expand_workflow_params_in_script(
                             continue;
                         }
                     };
-
-                    let tier_problems: Vec<DslError> = roster
-                        .iter()
-                        .filter_map(|entry| {
-                            let reason = if entry.model.is_none() {
-                                format!("roster entry `{}` needs `model`", entry.id)
-                            } else {
-                                roster_entry_tier(entry).err()?
-                            };
-                            Some(DslError::Compile {
-                                src: miette::NamedSource::new("script", String::new()),
-                                span: (
-                                    entry.span.start,
-                                    entry.span.end.saturating_sub(entry.span.start).max(1),
-                                )
-                                    .into(),
-                                reason,
-                            })
-                        })
-                        .collect();
-                    if !tier_problems.is_empty() {
-                        errors.extend(tier_problems);
-                        lb.reviewers = ReviewerSource::None;
-                        expanded_steps.push(StepItem::Loop(lb));
-                        continue;
-                    }
 
                     let init_template = lb.template_init.as_ref().map(|(name, span)| {
                         match agent_by_name.get(name) {
@@ -508,31 +371,11 @@ pub fn expand_workflow_params_in_script(
                         Vec::new();
 
                     for entry in &roster {
-                        let refine_client_name = if init_template.is_some() {
-                            format!("__roster_{}_refine", entry.id)
-                        } else {
-                            format!("__roster_{}", entry.id)
-                        };
-                        // A tier entry binds through the tier; it has no client of its own.
-                        let needs_client = entry
-                            .model
-                            .as_deref()
-                            .and_then(tier_of_model_spec)
-                            .is_none();
-                        if needs_client {
-                            new_clients.push(synth_client_from_entry(&refine_client_name, entry));
-                        }
-
                         if let Some((init_tpl, _, _)) = &init_template {
-                            let init_client_name = format!("__roster_{}_init", entry.id);
-                            if needs_client {
-                                new_clients.push(synth_client_from_entry(&init_client_name, entry));
-                            }
                             let init_agent = clone_reviewer_agent(
                                 init_tpl,
                                 &format!("{}-init", entry.id),
                                 entry,
-                                &init_client_name,
                             );
                             new_agents.push(init_agent.clone());
                             expanded_steps.push(StepItem::Agent(
@@ -545,7 +388,6 @@ pub fn expand_workflow_params_in_script(
                             refine_tpl,
                             &format!("{}-refine", entry.id),
                             entry,
-                            &refine_client_name,
                         );
                         let refine_agent = inject_peer_vars(refine_agent, &entry.id, &peer_ids);
                         refine_agent_names
@@ -563,9 +405,6 @@ pub fn expand_workflow_params_in_script(
         *steps = expanded_steps;
     }
 
-    for client in new_clients {
-        script.items.push(Item::Client(client));
-    }
     for agent in new_agents {
         script.items.push(Item::Agent(agent));
     }
@@ -599,14 +438,12 @@ pub fn expand_reviewers_in_script(
 #[derive(Clone, Default)]
 struct ParamUsage {
     roster: bool,
-    client: bool,
 }
 
 fn param_usage_for_workflow(
     wf: &WorkflowDecl,
-    agent_by_name: &HashMap<String, AgentDecl>,
+    _agent_by_name: &HashMap<String, AgentDecl>,
 ) -> HashMap<String, ParamUsage> {
-    let param_names: HashSet<String> = wf.params.iter().map(|p| p.name.clone()).collect();
     let mut usage: HashMap<String, ParamUsage> = HashMap::new();
     let Some((steps, _)) = &wf.steps else {
         return usage;
@@ -617,39 +454,20 @@ fn param_usage_for_workflow(
                 if let ReviewerSource::ParamRef(name, _) = &lb.reviewers {
                     usage.entry(name.clone()).or_default().roster = true;
                 }
-                for fb in &lb.fors {
+                for fb in lb.fors.iter().filter(|fb| fb.json_source.is_none()) {
                     usage.entry(fb.list.clone()).or_default().roster = true;
                 }
-                if let UntilCondition::Agent(judge, _) = &lb.until {
-                    record_client_param_usage(&mut usage, judge, &param_names, agent_by_name);
-                }
             }
-            StepItem::Agent(name, _) => {
-                record_client_param_usage(&mut usage, name, &param_names, agent_by_name);
-            }
+            StepItem::Agent(..) => {}
             // A `for` iterates a list param, which is the roster kind.
-            StepItem::For(fb) => {
+            // (`for … in json` reads a file at run time and uses no param.)
+            StepItem::For(fb) if fb.json_source.is_none() => {
                 usage.entry(fb.list.clone()).or_default().roster = true;
             }
+            StepItem::For(_) => {}
         }
     }
     usage
-}
-
-fn record_client_param_usage(
-    usage: &mut HashMap<String, ParamUsage>,
-    agent_name: &str,
-    param_names: &HashSet<String>,
-    agent_by_name: &HashMap<String, AgentDecl>,
-) {
-    let Some(agent) = agent_by_name.get(agent_name) else {
-        return;
-    };
-    if let Some((client_name, _)) = &agent.client
-        && param_names.contains(client_name)
-    {
-        usage.entry(client_name.clone()).or_default().client = true;
-    }
 }
 
 fn resolve_param_kind(
@@ -658,79 +476,13 @@ fn resolve_param_kind(
     usage: &HashMap<String, ParamUsage>,
     errors: &mut Vec<DslError>,
 ) -> Option<ParamKind> {
-    if let Some(shape) = &decl.shape {
-        return Some(match shape {
-            ParamShape::Roster(list) => ParamKind::Roster(Some(list.clone())),
-            ParamShape::Client(spec) => ParamKind::Client(spec.clone()),
-        });
+    if let Some(ParamShape::Roster(list)) = &decl.shape {
+        return Some(ParamKind::Roster(Some(list.clone())));
     }
-
-    let u = usage.get(name).cloned().unwrap_or_default();
-    match (u.roster, u.client) {
-        (true, true) => {
-            errors.push(DslError::Compile {
-                src: miette::NamedSource::new("script", String::new()),
-                span: (
-                    decl.name_span.start,
-                    decl.name_span
-                        .end
-                        .saturating_sub(decl.name_span.start)
-                        .max(1),
-                )
-                    .into(),
-                reason: format!(
-                    "workflow param `{name}` is used as both a roster (`reviewers {name}`) \
-                     and a client (`client {name}`) — use distinct param names or add \
-                     explicit `[...]` / `{{...}}` syntax"
-                ),
-            });
-            None
-        }
-        (true, false) => Some(ParamKind::Roster(None)),
-        (false, true) => Some(ParamKind::Client(ClientParamSpec {
-            span: decl.span,
-            ..Default::default()
-        })),
-        (false, false) => {
-            errors.push(DslError::Compile {
-                src: miette::NamedSource::new("script", String::new()),
-                span: (
-                    decl.name_span.start,
-                    decl.name_span
-                        .end
-                        .saturating_sub(decl.name_span.start)
-                        .max(1),
-                )
-                    .into(),
-                reason: format!(
-                    "workflow param `{name}` is never referenced — use `reviewers {name}`, \
-                     `client {name}` on an agent, or remove the declaration"
-                ),
-            });
-            None
-        }
+    if usage.get(name).is_some_and(|u| u.roster) {
+        return Some(ParamKind::Roster(None));
     }
-}
-
-fn resolve_client_spec(
-    name: &str,
-    spec: &ClientParamSpec,
-    decl: &ParamDecl,
-    override_params: &[(String, String)],
-) -> Result<ClientParamSpec, DslError> {
-    if let Some((_, v)) = override_params.iter().find(|(k, _)| k == name) {
-        return parse_client_override(v).map_err(|e| DslError::Compile {
-            src: miette::NamedSource::new("<cli>", String::new()),
-            span: (0, 1).into(),
-            reason: format!("--param {name}: {e}"),
-        });
-    }
-
-    if spec.model.is_some() {
-        return Ok(spec.clone());
-    }
-
-    Err(DslError::Compile {
+    errors.push(DslError::Compile {
         src: miette::NamedSource::new("script", String::new()),
         span: (
             decl.name_span.start,
@@ -741,10 +493,12 @@ fn resolve_client_spec(
         )
             .into(),
         reason: format!(
-            "workflow client param `{name}` has no `model` default and was not \
-             supplied on the CLI — pass `--param {name}=provider:model[@effort]`"
+            "workflow param `{name}` is never referenced — iterate it with \
+             `for x in {name}` or `reviewers {name}`, or remove the declaration \
+             (params are lists; an agent's model comes from its `tier`)"
         ),
-    })
+    });
+    None
 }
 
 pub(crate) fn resolve_roster(
@@ -772,16 +526,7 @@ pub(crate) fn resolve_roster(
                 reason: format!("workflow param `{name}` is not a roster param"),
             })?;
 
-            let ParamKind::Roster(default) = kind else {
-                return Err(DslError::Compile {
-                    src: miette::NamedSource::new("script", String::new()),
-                    span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
-                    reason: format!(
-                        "`reviewers {name}` requires a roster param (`param {name} [ ... ]` \
-                         or bare `param {name}` used only in `reviewers`)"
-                    ),
-                });
-            };
+            let ParamKind::Roster(default) = kind;
 
             if let Some((_, v)) = override_params.iter().find(|(k, _)| k == name) {
                 return parse_reviewers_override(v).map_err(|e| DslError::Compile {
@@ -805,7 +550,7 @@ pub(crate) fn resolve_roster(
                         .into(),
                     reason: format!(
                         "workflow roster param `{name}` has no default and was not \
-                         supplied on the CLI — pass `--param {name}=id=provider:model[@effort],...`"
+                         supplied on the CLI — pass `--param {name}=id=<tier>,...`"
                     ),
                 }),
             }
@@ -813,43 +558,7 @@ pub(crate) fn resolve_roster(
     }
 }
 
-fn synth_client_from_spec(name: &str, spec: &ClientParamSpec) -> ClientDecl {
-    let span = spec.span;
-    ClientDecl {
-        name: name.to_string(),
-        name_span: span,
-        tier: None,
-        model: spec.model.clone(),
-        effort: spec.effort.clone(),
-        extra: spec.extra.clone(),
-        privacy: spec.privacy.or(Some((PrivacyLit::Public, span))),
-        is_default: false,
-        span,
-        file_id: 0,
-    }
-}
-
-pub(crate) fn synth_client_from_entry(name: &str, entry: &ReviewerEntry) -> ClientDecl {
-    ClientDecl {
-        name: name.to_string(),
-        name_span: entry.span,
-        tier: None,
-        model: entry.model.clone().map(|m| (m, entry.model_span)),
-        effort: entry.effort.clone(),
-        extra: Vec::new(),
-        privacy: Some((PrivacyLit::Public, entry.span)),
-        is_default: false,
-        span: entry.span,
-        file_id: 0,
-    }
-}
-
-fn clone_reviewer_agent(
-    template: &AgentDecl,
-    name: &str,
-    entry: &ReviewerEntry,
-    client_name: &str,
-) -> AgentDecl {
+fn clone_reviewer_agent(template: &AgentDecl, name: &str, entry: &ReviewerEntry) -> AgentDecl {
     let mut vars = template.vars.clone();
     vars.retain(|(k, _)| k != "REVIEWER_ID");
     vars.push(("REVIEWER_ID".into(), entry.id.clone()));
@@ -858,16 +567,11 @@ fn clone_reviewer_agent(
         name: name.to_string(),
         name_span: template.name_span,
         description: template.description.clone(),
-        client: Some((client_name.to_string(), entry.span)),
-        tier_ref: None,
+        tier_ref: entry.tier.clone().or_else(|| template.tier_ref.clone()),
         vars,
         template: false,
         ..clone_agent_shell(template)
     };
-    if let Some(tier) = entry.model.as_deref().and_then(tier_of_model_spec) {
-        agent.client = None;
-        agent.tier_ref = Some((tier.to_string(), template.name_span));
-    }
     if let Some(scope) = agent.scope.as_mut() {
         for path in scope.owned.iter_mut().chain(scope.read_only.iter_mut()) {
             *path = path.replace("{{REVIEWER_ID}}", &entry.id);
@@ -875,7 +579,7 @@ fn clone_reviewer_agent(
     }
     // The output contract is per-reviewer for the same reason the owned globs
     // are: without the id prefix every clone would claim the same artefacts.
-    for path in agent.produces.iter_mut() {
+    for path in agent.produces.iter_mut().chain(agent.produces_json.iter_mut()) {
         *path = path.replace("{{REVIEWER_ID}}", &entry.id);
     }
     agent
@@ -886,11 +590,11 @@ fn clone_agent_shell(template: &AgentDecl) -> AgentDecl {
         name: String::new(),
         name_span: template.name_span,
         description: None,
-        client: None,
-        tier_ref: None,
+        tier_ref: template.tier_ref.clone(),
         scope: template.scope.clone(),
         depends_on: template.depends_on.clone(),
         produces: template.produces.clone(),
+        produces_json: template.produces_json.clone(),
         prompt: template.prompt.clone(),
         max_retries: template.max_retries,
         timeout_secs: template.timeout_secs,
@@ -902,30 +606,6 @@ fn clone_agent_shell(template: &AgentDecl) -> AgentDecl {
         template: false,
         span: template.span,
         file_id: template.file_id,
-    }
-}
-
-fn rewrite_agent_client_param(script: &mut Script, param_name: &str, synth_name: &str) {
-    for item in &mut script.items {
-        let Item::Agent(agent) = item else { continue };
-        if agent.client.as_ref().is_some_and(|(n, _)| n == param_name) {
-            let span = agent.client.as_ref().unwrap().1;
-            agent.client = Some((synth_name.to_string(), span));
-        }
-    }
-}
-
-/// Turn every `client <param>` binding into `tier <name>`. The span stays on
-/// the agent's own `client` line, so a missing tier is reported in its file.
-fn rewrite_agent_tier_param(script: &mut Script, param_name: &str, tier: &str) {
-    for item in &mut script.items {
-        let Item::Agent(agent) = item else { continue };
-        if let Some((name, span)) = &agent.client
-            && name == param_name
-        {
-            agent.tier_ref = Some((tier.to_string(), *span));
-            agent.client = None;
-        }
     }
 }
 
@@ -977,44 +657,26 @@ fn build_peer_read_block(peers: &[&str]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_client_override_with_effort() {
-        let spec = parse_client_override("claude:sonnet@medium").unwrap();
-        assert_eq!(spec.model.as_ref().unwrap().0, "claude:sonnet");
-        assert_eq!(spec.effort.as_ref().unwrap().0, "medium");
-    }
-
-    #[test]
-    fn parse_client_override_rejects_bare_model() {
-        let err = parse_client_override("opus").unwrap_err();
-        assert!(err.contains("provider:model"), "got: {err}");
+    fn tier_of(entry: &ReviewerEntry) -> Option<&str> {
+        entry.tier.as_ref().map(|(t, _)| t.as_str())
     }
 
     #[test]
     fn parse_simple_two_reviewers() {
-        let entries = parse_reviewers_override("claude=claude:opus,codex=codex:gpt-5.5").unwrap();
+        let entries = parse_reviewers_override("claude=top-claude,codex=top-codex").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "claude");
-        assert_eq!(entries[0].model.as_deref(), Some("claude:opus"));
-    }
-
-    #[test]
-    fn parse_with_effort() {
-        let entries =
-            parse_reviewers_override("claude=claude:opus@max,codex=codex:gpt-5.5@high").unwrap();
-        assert_eq!(entries[0].effort.as_ref().unwrap().0, "max");
-        assert_eq!(entries[1].effort.as_ref().unwrap().0, "high");
+        assert_eq!(tier_of(&entries[0]), Some("top-claude"));
+        assert_eq!(tier_of(&entries[1]), Some("top-codex"));
     }
 
     #[test]
     fn parse_list_literal_override() {
-        let entries = parse_reviewers_override(
-            r#"[{id "a" focus "x"} {id "b" model "claude:opus"}]"#,
-        )
-        .unwrap();
+        let entries =
+            parse_reviewers_override(r#"[{id "a" focus "x"} {id "b" tier high}]"#).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].fields[0].1, "x");
-        assert_eq!(entries[1].model.as_deref(), Some("claude:opus"));
+        assert_eq!(tier_of(&entries[1]), Some("high"));
     }
 
     #[test]
@@ -1022,14 +684,24 @@ mod tests {
         let entries = parse_reviewers_override("a,b").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "a");
-        assert!(entries[0].model.is_none());
+        assert!(entries[0].tier.is_none());
         assert_eq!(entries[1].id, "b");
     }
 
+    /// Models are a profile's business: a roster entry names a tier, never
+    /// a `provider:model`, an effort or a `tier:` spec.
     #[test]
-    fn parse_rejects_missing_provider() {
-        let err = parse_reviewers_override("claude=opus").unwrap_err();
-        assert!(err.contains("provider:model"), "got: {err}");
+    fn parse_rejects_model_specs() {
+        for value in ["claude=claude:opus", "claude=opus@max", "claude=tier:high"] {
+            let err = parse_reviewers_override(value).unwrap_err();
+            assert!(err.contains("id=<tier>"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_list_literal_rejects_model_and_effort() {
+        assert!(parse_reviewers_override(r#"[{id "a" model "claude:opus"}]"#).is_err());
+        assert!(parse_reviewers_override(r#"[{id "a" effort high}]"#).is_err());
     }
 
     /// The block is substituted like any other prompt text, so its

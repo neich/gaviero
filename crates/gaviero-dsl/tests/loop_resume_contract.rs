@@ -33,18 +33,28 @@ fn unit_map<'a>(units: &[&'a WorkUnit]) -> HashMap<&'a str, &'a WorkUnit> {
     units.iter().map(|u| (u.id.as_str(), *u)).collect()
 }
 
+/// The model profile shipped with the examples.
+fn profile() -> gaviero_core::script_profiles::SelectedProfile {
+    gaviero_core::script_profiles::SelectedProfile {
+        name: "default".into(),
+        path: example("profiles/default.gaviero"),
+        precedence: gaviero_core::script_profiles::ProfilePrecedence::FillsGaps,
+    }
+}
+
 /// Compile `plan_refinement.gaviero` the way the operator's CLI invocation
 /// did, with a three-provider roster and a relocated `OUT_DIR`.
 fn compile_plan_refinement(out_dir: &str) -> gaviero_core::swarm::plan::CompiledPlan {
-    gaviero_dsl::compile_file(
+    gaviero_dsl::compile_file_with_profile(
         &example("plan_refinement.gaviero"),
+        Some(&profile()),
         Some("feature-plan-refinement"),
         Some("feature brief"),
         &[("OUT_DIR".to_string(), out_dir.to_string())],
         &[],
         &[(
             "roster".to_string(),
-            "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@high"
+            "claude=top-claude,codex=high-codex,cursor=high-cursor"
                 .to_string(),
         )],
     )
@@ -199,8 +209,9 @@ fn scientific_research_resume_suppresses_the_init_round() {
     }
     write(tmp.path(), &format!("{out_dir}/problem.md"), "# problem");
 
-    let plan = gaviero_dsl::compile_file(
+    let plan = gaviero_dsl::compile_file_with_profile(
         &example("scientific_research.gaviero"),
+        Some(&profile()),
         Some("scientific-research-consensus"),
         Some("research topic"),
         &[
@@ -210,7 +221,7 @@ fn scientific_research_resume_suppresses_the_init_round() {
         &[],
         &[(
             "roster".to_string(),
-            "claude=claude:opus@max,codex=codex:gpt-5.5@high".to_string(),
+            "claude=top-claude,codex=high-codex".to_string(),
         )],
     )
     .expect("scientific_research.gaviero compiles");

@@ -57,7 +57,7 @@ pub fn compile_ast_with_vars(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
-    override_tiers: &[(String, String)],
+    agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let sources = vec![(filename.to_string(), source.to_string())];
@@ -67,7 +67,7 @@ pub fn compile_ast_with_vars(
         workflow,
         runtime_prompt,
         override_vars,
-        override_tiers,
+        agent_tiers,
         override_params,
     )
 }
@@ -85,10 +85,11 @@ pub fn compile_ast_with_sources(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
-    override_tiers: &[(String, String)],
+    agent_tiers: &[(String, String)],
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let mut script = script.clone();
+    crate::workflow_params::apply_agent_tiers(&mut script, workflow, agent_tiers)?;
     expand_workflow_params_in_script(&mut script, workflow, override_params)?;
 
     if sources.is_empty() {
@@ -115,7 +116,6 @@ pub fn compile_ast_with_sources(
     let mut prompt_map: HashMap<&str, &str> = HashMap::new();
     let mut tier_alias_map: HashMap<&str, &TierAlias> = HashMap::new();
     let mut script_vars: Vec<(String, String)> = Vec::new();
-    let mut default_client: Option<&ClientDecl> = None;
     let mut errors: Vec<DslError> = Vec::new();
 
     for item in &script.items {
@@ -165,22 +165,6 @@ pub fn compile_ast_with_sources(
                             .into(),
                         reason: format!("duplicate client name `{}`", c.name),
                     });
-                }
-                // Track default client — only one is allowed
-                if c.is_default {
-                    if default_client.is_some() {
-                        errors.push(DslError::Compile {
-                            src: src_for(c.file_id),
-                            span: (
-                                c.name_span.start,
-                                c.name_span.end.saturating_sub(c.name_span.start),
-                            )
-                                .into(),
-                            reason: "only one client can be declared `default`".into(),
-                        });
-                    } else {
-                        default_client = Some(c);
-                    }
                 }
             }
             Item::Agent(a) => {
@@ -258,16 +242,11 @@ pub fn compile_ast_with_sources(
         }
     }
 
-    // ── Effective tier bindings (script/profile + CLI `--tiers-file`) ──
-    //
-    // CLI overrides win over `tier` lines from the script and its includes.
-    let mut effective_tier_bindings: HashMap<String, String> = tier_alias_map
+    // ── Tier bindings: the profile's `tier` lines ──
+    let effective_tier_bindings: HashMap<String, String> = tier_alias_map
         .values()
         .map(|ta| (ta.name.clone(), ta.client_ref.clone()))
         .collect();
-    for (alias, client_ref) in override_tiers {
-        effective_tier_bindings.insert(alias.clone(), client_ref.clone());
-    }
 
     // Validate every binding resolves to a declared client.
     for (alias, client_ref) in &effective_tier_bindings {
@@ -372,7 +351,6 @@ pub fn compile_ast_with_sources(
             decl,
             &client_map,
             &effective_tier_bindings,
-            default_client,
             &prompt_map,
             &script_vars,
             override_vars,
@@ -390,7 +368,6 @@ pub fn compile_ast_with_sources(
             decl,
             &client_map,
             &effective_tier_bindings,
-            default_client,
             &prompt_map,
             &script_vars,
             override_vars,
@@ -445,6 +422,32 @@ pub fn compile_ast_with_sources(
             src: src_for(cycle_fid),
             span: span.into(),
             reason: format!("dependency cycle detected: {}", cycle.join(" -> ")),
+        }));
+    }
+
+    // ── Phase 5b: at most one loop per workflow ───────────────────
+    //
+    // The runtime defers every dependent of a loop body to after the loops
+    // block, and Phase 6 makes a second loop depend on the first — so a
+    // second loop would run its agents once and never iterate.
+    if let Some(wf) = selected_workflow
+        && let Some((steps, _)) = &wf.steps
+        && let Some(second) = steps
+            .iter()
+            .filter_map(|s| match s {
+                StepItem::Loop(lb) => Some(lb),
+                _ => None,
+            })
+            .nth(1)
+    {
+        return Err(DslErrors::single(DslError::Compile {
+            src: src_for(wf.file_id),
+            span: (
+                second.span.start,
+                second.span.end.saturating_sub(second.span.start).max(1),
+            )
+                .into(),
+            reason: "a workflow may contain at most one `loop` block".to_string(),
         }));
     }
 
@@ -506,7 +509,10 @@ pub fn compile_ast_with_sources(
 
     // ── Phase 8: extract LoopConfigs from workflow steps ────────
 
-    let loop_configs = extract_loop_configs(selected_workflow, &script_vars, override_vars);
+    let mut loop_configs = extract_loop_configs(selected_workflow, &script_vars, override_vars);
+    for lc in &mut loop_configs {
+        lc.agent_ids = order_loop_agents(&lc.agent_ids, &work_units);
+    }
 
     let workflow_execution = if let Some(wf) = selected_workflow {
         if let Some((mode, _span)) = &wf.execution {
@@ -524,6 +530,96 @@ pub fn compile_ast_with_sources(
     plan.loop_configs = loop_configs;
     plan.loop_judge_units = loop_judge_units;
     plan.execution_mode = workflow_execution;
+
+    // `for … in json` steps. Compile-time vars resolve in the path now;
+    // `{{ITER}}` / `{{PREV_ITER}}` are left for the runtime pass.
+    if let Some(wf) = selected_workflow {
+        plan.runtime_fors = wf
+            .runtime_fors
+            .iter()
+            .map(|rf| gaviero_core::swarm::plan::RuntimeForOp {
+                unit_id: rf.agent.clone(),
+                var: rf.var.clone(),
+                source: apply_vars(
+                    &rf.source,
+                    &script_vars,
+                    override_vars,
+                    &[],
+                    &[],
+                    &rf.agent,
+                    runtime_prompt,
+                ),
+                max_items: rf
+                    .max_items
+                    .unwrap_or(gaviero_core::swarm::plan::DEFAULT_MAX_SPAWN),
+            })
+            .collect();
+    }
+
+    // `budget { wall "<dur>" usd <n> }`.
+    if let Some(wf) = selected_workflow
+        && let Some(bb) = &wf.budget
+    {
+        let at = |span: &Span| (span.start, span.end.saturating_sub(span.start).max(1));
+        let mut budget = gaviero_core::swarm::plan::RunBudget::default();
+        if bb.wall.is_none() && bb.usd.is_none() {
+            errors.push(DslError::Compile {
+                src: src_for(wf.file_id),
+                span: at(&bb.span).into(),
+                reason: "`budget` needs `wall` or `usd`".to_string(),
+            });
+        }
+        if let Some((wall, span)) = &bb.wall {
+            match parse_duration_secs(wall) {
+                Some(secs) => budget.wall_secs = Some(secs),
+                None => errors.push(DslError::Compile {
+                    src: src_for(wf.file_id),
+                    span: at(span).into(),
+                    reason: "`wall` takes a duration like \"90s\", \"30m\" or \"8h\"".to_string(),
+                }),
+            }
+        }
+        if let Some((usd, span)) = &bb.usd {
+            if *usd > 0.0 {
+                budget.usd = Some(*usd);
+            } else {
+                errors.push(DslError::Compile {
+                    src: src_for(wf.file_id),
+                    span: at(span).into(),
+                    reason: "`usd` must be positive".to_string(),
+                });
+            }
+        }
+        plan.budget = Some(budget);
+    }
+
+    // Tier bindings, resolved the way `compile_agent` resolves `tier <alias>`,
+    // so runtime items can name a `tier`.
+    for (alias, client_ref) in &effective_tier_bindings {
+        let Some(cd) = client_map.get(client_ref.as_str()) else {
+            continue;
+        };
+        let extra = compile_extra(&cd.extra, &cd.name, sources, cd.file_id)
+            .map_err(DslErrors::single)?;
+        plan.tier_bindings.insert(
+            alias.clone(),
+            gaviero_core::swarm::plan::TierBinding {
+                model: cd.model.as_ref().map(|(m, _)| m.clone()),
+                effort: cd.effort.as_ref().map(|(e, _)| e.clone()),
+                extra,
+                privacy: cd
+                    .privacy
+                    .as_ref()
+                    .map(|(p, _)| map_privacy(*p))
+                    .unwrap_or_default(),
+                tier: cd
+                    .tier
+                    .as_ref()
+                    .map(|(t, _)| map_tier(*t))
+                    .unwrap_or_default(),
+            },
+        );
+    }
 
     // Pattern sugar → fanout_ops (map_reduce only in v1).
     if let Some(wf) = selected_workflow
@@ -549,6 +645,22 @@ pub fn compile_ast_with_sources(
                 }
                 match pattern {
                     PatternDecl::MapReduce(mr) => {
+                        // Workers are materialised at run time and share the
+                        // run root; repo-mode worktrees would need a per-worker
+                        // provision + merge the runtime does not do.
+                        if workflow_execution != gaviero_core::swarm::plan::ExecutionMode::Document
+                        {
+                            errors.push(DslError::Compile {
+                                src: src_for(wf.file_id),
+                                span: (
+                                    mr.span.start,
+                                    mr.span.end.saturating_sub(mr.span.start).max(1),
+                                )
+                                    .into(),
+                                reason: "`pattern map_reduce` requires `execution_mode document`"
+                                    .to_string(),
+                            });
+                        }
                         if !mr.reduce.0.is_empty() && !agent_map.contains_key(mr.reduce.0.as_str())
                         {
                             errors.push(DslError::Compile {
@@ -907,7 +1019,6 @@ fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
     effective_tier_bindings: &HashMap<String, String>,
-    default_client: Option<&ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
     script_vars: &[(String, String)],
     override_vars: &[(String, String)],
@@ -920,111 +1031,77 @@ fn compile_agent(
         NamedSource::new(filename, content.clone())
     };
 
-    // ── Reject mutually-exclusive client + tier ──────────────────
+    // ── The agent's tier → the profile's client ──────────────────
     //
-    // An agent may reference a concrete client OR a tier alias, but not both.
-    // Point the diagnostic at the tier field so the author sees the conflict
-    // on the newer surface syntax.
-    if let (Some((cn, _)), Some((tn, ts))) = (&decl.client, &decl.tier_ref) {
+    // `tier_ref` already carries the workflow's `tiers { }` block, `--tier`
+    // and a list item's `tier` (applied before cloning). It is the only way
+    // an agent gets a model.
+    let Some((tier_name, tier_span)) = &decl.tier_ref else {
+        let span = decl.name_span;
         return Err(DslError::Compile {
             src: src(),
-            span: (ts.start, ts.end.saturating_sub(ts.start).max(1)).into(),
+            span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
             reason: format!(
-                "agent `{}` declares both `client {}` and `tier {}` — pick one",
-                decl.name, cn, tn
+                "agent `{}` declares no tier — add `tier <name>` (e.g. `tier high`); \
+                 the run's model profile says which model each tier uses",
+                decl.name
             ),
         });
-    }
-
-    // Resolve the effective `ClientDecl` for this agent, if any.
-    //
-    // Order of precedence:
-    //   1. `client <name>` — explicit concrete binding.
-    //   2. `tier <name>`   — resolve through tier alias → `ClientDecl`.
-    //   3. top-level `default` client.
-    //   4. no client — fall through to defaults + warning.
-    let resolved_client: Option<&ClientDecl> =
-        if let Some((client_name, client_span)) = &decl.client {
-            let cd = client_map
-                .get(client_name.as_str())
-                .copied()
-                .ok_or_else(|| DslError::Compile {
-                    src: src(),
-                    span: (
-                        client_span.start,
-                        client_span.end.saturating_sub(client_span.start).max(1),
-                    )
-                        .into(),
-                    reason: format!("undefined client `{}`", client_name),
-                })?;
-            Some(cd)
-        } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
-            let client_ref = effective_tier_bindings
-                .get(tier_name.as_str())
-                .ok_or_else(|| DslError::Compile {
-                    src: src(),
-                    span: (
-                        tier_span.start,
-                        tier_span.end.saturating_sub(tier_span.start).max(1),
-                    )
-                        .into(),
-                    reason: format!(
-                        "agent `{}` references undefined tier alias `{}` — choose a profile \
-                         that binds it, or declare `tier {} <client>` in the script",
-                        decl.name, tier_name, tier_name
-                    ),
-                })?;
-            let cd = client_map
-                .get(client_ref.as_str())
-                .ok_or_else(|| DslError::Compile {
-                    src: src(),
-                    span: (
-                        tier_span.start,
-                        tier_span.end.saturating_sub(tier_span.start).max(1),
-                    )
-                        .into(),
-                    reason: format!(
-                        "tier alias `{}` references undefined client `{}`",
-                        tier_name, client_ref
-                    ),
-                })?;
-            Some(*cd)
-        } else {
-            default_client
-        };
-
-    let (tier, model, effort, extra, privacy) = if let Some(cd) = resolved_client {
-        let tier = cd
-            .tier
-            .as_ref()
-            .map(|(t, _)| map_tier(*t))
-            .unwrap_or_default();
-        let model = cd.model.as_ref().map(|(m, _)| m.clone());
-        let effort = cd.effort.as_ref().map(|(e, _)| e.clone());
-        let extra = compile_extra(&cd.extra, &cd.name, sources, cd.file_id)?;
-        let privacy = cd
-            .privacy
-            .as_ref()
-            .map(|(p, _)| map_privacy(*p))
-            .unwrap_or_default();
-        (tier, model, effort, extra, privacy)
-    } else {
-        // No explicit client, no tier alias, no default — warn if any
-        // clients are declared, then fall back to defaults.
-        if !client_map.is_empty() {
-            tracing::warn!(
-                agent = %decl.name,
-                "no client declared and no default client set; falling back to tier=Cheap/model=None. Declare a default client with `default` in the client block."
-            );
-        }
-        (
-            ModelTier::default(),
-            None,
-            None,
-            Vec::new(),
-            PrivacyLevel::default(),
-        )
     };
+    let at_tier = (
+        tier_span.start,
+        tier_span.end.saturating_sub(tier_span.start).max(1),
+    );
+    let client_ref = effective_tier_bindings
+        .get(tier_name.as_str())
+        .ok_or_else(|| {
+            let mut known: Vec<&str> = effective_tier_bindings.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            DslError::Compile {
+                src: src(),
+                span: at_tier.into(),
+                reason: if known.is_empty() {
+                    format!(
+                        "agent `{}` uses tier `{}`, but no model profile is bound — choose \
+                         one with `--profile`, or add a `default` profile under \
+                         .gaviero/dsl/profiles/",
+                        decl.name, tier_name
+                    )
+                } else {
+                    format!(
+                        "agent `{}` uses tier `{}`, which the run's model profile does not \
+                         define (it defines: {})",
+                        decl.name,
+                        tier_name,
+                        known.join(", ")
+                    )
+                },
+            }
+        })?;
+    let cd = client_map
+        .get(client_ref.as_str())
+        .ok_or_else(|| DslError::Compile {
+            src: src(),
+            span: at_tier.into(),
+            reason: format!(
+                "tier alias `{}` references undefined client `{}`",
+                tier_name, client_ref
+            ),
+        })?;
+
+    let tier = cd
+        .tier
+        .as_ref()
+        .map(|(t, _)| map_tier(*t))
+        .unwrap_or_default();
+    let model = cd.model.as_ref().map(|(m, _)| m.clone());
+    let effort = cd.effort.as_ref().map(|(e, _)| e.clone());
+    let extra = compile_extra(&cd.extra, &cd.name, sources, cd.file_id)?;
+    let privacy = cd
+        .privacy
+        .as_ref()
+        .map(|(p, _)| map_privacy(*p))
+        .unwrap_or_default();
 
     // Build scope. Paths get the same compile-time var substitution as
     // prompts/descriptions so scripts can drive output roots via --var
@@ -1059,6 +1136,7 @@ fn compile_agent(
     // {{ITER}} / {{PREV_ITER}} deliberately survive — the loop substitutes
     // them per pass so one declaration covers every iteration.
     let produces: Vec<String> = decl.produces.iter().map(|p| sub(p)).collect();
+    let produces_json: Vec<String> = decl.produces_json.iter().map(|p| sub(p)).collect();
 
     let depends_on = decl
         .depends_on
@@ -1238,6 +1316,7 @@ fn compile_agent(
         description,
         scope,
         produces,
+        produces_json,
         depends_on,
         backend: AgentBackend::default(),
         model,
@@ -1409,6 +1488,66 @@ fn extract_loop_configs(
         .collect()
 }
 
+/// `<digits>[s|m|h]` → seconds (no suffix means seconds). `None` for any
+/// other shape, for zero, and on overflow.
+fn parse_duration_secs(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (digits, unit) = match text.char_indices().last()? {
+        (i, 's') => (&text[..i], 1),
+        (i, 'm') => (&text[..i], 60),
+        (i, 'h') => (&text[..i], 3600),
+        _ => (text, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs = digits.parse::<u64>().ok()?.checked_mul(unit)?;
+    (secs > 0).then_some(secs)
+}
+
+/// Order a loop's agents so each comes after the loop agents it
+/// `depends_on`. Stable: agents with no ordering constraint between them
+/// keep their written order (`agents [...]` first, then `for` clones).
+/// Dependencies on agents outside the loop play no part here — the loop as
+/// a whole already runs after them.
+///
+/// The sequential and stacked loop passes walk `agent_ids` in order, so this
+/// is what makes `curator { depends_on [investigator] }` run after the
+/// investigators in every pass.
+fn order_loop_agents(agent_ids: &[String], work_units: &[WorkUnit]) -> Vec<String> {
+    let members: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
+    let deps_of = |id: &str| -> Vec<&str> {
+        work_units
+            .iter()
+            .find(|u| u.id == id)
+            .map(|u| {
+                u.depends_on
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|d| members.contains(d) && *d != id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut placed: Vec<String> = Vec::with_capacity(agent_ids.len());
+    let mut remaining: Vec<&String> = agent_ids.iter().collect();
+    while !remaining.is_empty() {
+        let next = remaining.iter().position(|id| {
+            deps_of(id)
+                .iter()
+                .all(|d| placed.iter().any(|p| p.as_str() == *d))
+        });
+        // Cycles are rejected before this runs; keep the rest as written
+        // rather than loop forever if one ever slips through.
+        let Some(idx) = next else {
+            placed.extend(remaining.into_iter().cloned());
+            break;
+        };
+        placed.push(remaining.remove(idx).clone());
+    }
+    placed
+}
+
 fn resolve_var(
     key: &str,
     script_vars: &[(String, String)],
@@ -1465,21 +1604,55 @@ mod tests {
     use crate::{lexer, parser};
     use gaviero_core::types::ModelTier;
 
+    /// Bind tier `t` (most fixtures' agents use it) to a tier with no
+    /// model, the way a profile would. Fixtures that declare their own
+    /// clients and tier lines stand for an already-merged profile.
+    fn with_test_tier(mut script: Script) -> Script {
+        let bound = script
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::TierAlias(t) if t.name == "t"));
+        if !bound {
+            let span: Span = (0..0).into();
+            script.items.push(Item::Client(ClientDecl {
+                name: "__test_t".into(),
+                name_span: span,
+                tier: None,
+                model: None,
+                effort: None,
+                extra: Vec::new(),
+                privacy: None,
+                is_default: false,
+                span,
+                file_id: 0,
+            }));
+            script.items.push(Item::TierAlias(TierAlias {
+                name: "t".into(),
+                name_span: span,
+                client_ref: "__test_t".into(),
+                client_ref_span: span,
+                span,
+                file_id: 0,
+            }));
+        }
+        script
+    }
+
     fn compile_str(src: &str) -> Result<Vec<WorkUnit>, DslErrors> {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None)
+        compile_ast(&with_test_tier(ast.unwrap()), src, "test.gaviero", None, None)
             .map(|c| c.work_units_ordered().expect("toposort in tests"))
     }
 
     const FULL_EXAMPLE: &str = r##"
-        client opus   { tier coordinator model "claude-opus-4-7" }
-        client sonnet { tier execution   model "claude-sonnet-4-6" }
+        client opus   { tier coordinator model "claude-opus-4-7" } tier opus opus
+        client sonnet { tier execution   model "claude-sonnet-4-6" } tier sonnet sonnet
 
         agent researcher {
             description "Research the codebase"
-            client opus
+            tier opus
             scope { owned ["docs/architecture.md"] read_only ["src/**"] }
             prompt #"Analyze the codebase and write a comprehensive architecture document."#
             max_retries 2
@@ -1487,7 +1660,7 @@ mod tests {
 
         agent implementer {
             description "Implement the feature"
-            client sonnet
+            tier sonnet
             depends_on [researcher]
             scope { owned ["src/feature/"] read_only ["docs/architecture.md"] }
             prompt #"Based on the architecture document, implement the feature."#
@@ -1503,9 +1676,9 @@ mod tests {
     fn produces_substitutes_vars_but_defers_iter() {
         let src = r##"
             vars { OUT_DIR "plans/out" }
-            client sonnet { tier execution model "claude:sonnet" }
+            client sonnet { tier execution model "claude:sonnet" } tier sonnet sonnet
             agent writer {
-                client sonnet
+                tier sonnet
                 scope { owned ["{{OUT_DIR}}/report-v*.md"] }
                 produces [
                     "{{OUT_DIR}}/report-v{{ITER}}.md"
@@ -1546,9 +1719,9 @@ mod tests {
     #[test]
     fn agent_timeout_is_declarable_and_zero_means_unbounded() {
         let src = r##"
-            client sonnet { tier execution model "claude:sonnet" }
-            agent quick  { client sonnet timeout 90 prompt #"go"# }
-            agent unbounded { client sonnet timeout 0 prompt #"go"# }
+            client sonnet { tier execution model "claude:sonnet" } tier sonnet sonnet
+            agent quick  { tier sonnet timeout 90 prompt #"go"# }
+            agent unbounded { tier sonnet timeout 0 prompt #"go"# }
             workflow w { steps [quick unbounded] }
         "##;
         let units = compile_str(src).expect("should compile");
@@ -1560,9 +1733,9 @@ mod tests {
     #[test]
     fn loop_irreconcilable_after_is_declarable_and_defaults_to_two() {
         let base = r##"
-            client sonnet { tier execution model "claude:sonnet" }
-            agent worker { client sonnet scope { owned ["a/"] } prompt #"go"# }
-            agent judge  { client sonnet prompt #"judge"# }
+            client sonnet { tier execution model "claude:sonnet" } tier sonnet sonnet
+            agent worker { tier sonnet scope { owned ["a/"] } prompt #"go"# }
+            agent judge  { tier sonnet prompt #"judge"# }
         "##;
         let plan = |extra: &str| {
             let src = format!(
@@ -1571,7 +1744,7 @@ mod tests {
             let (tokens, _) = lexer::lex(&src);
             let (ast, errs) = parser::parse(&tokens, &src, "test.gaviero");
             assert!(errs.is_empty(), "parse errors: {errs:?}");
-            compile_ast(&ast.unwrap(), &src, "test.gaviero", None, None).expect("compiles")
+            compile_ast(&with_test_tier(ast.unwrap()), &src, "test.gaviero", None, None).expect("compiles")
         };
         assert_eq!(plan("").loop_configs[0].irreconcilable_after, 2);
         assert_eq!(
@@ -1613,7 +1786,7 @@ mod tests {
 
     #[test]
     fn undefined_client_ref() {
-        let src = r#"agent x { client nonexistent }"#;
+        let src = r#"agent x { tier nonexistent }"#;
         let result = compile_str(src);
         assert!(result.is_err());
         let errs = result.unwrap_err();
@@ -1623,14 +1796,14 @@ mod tests {
 
     #[test]
     fn duplicate_agent_name() {
-        let src = r#"agent x { } agent x { }"#;
+        let src = r#"agent x { tier t } agent x { tier t }"#;
         let result = compile_str(src);
         assert!(result.is_err());
     }
 
     #[test]
     fn agent_no_client_uses_defaults() {
-        let src = r#"agent simple { description "task" }"#;
+        let src = r#"agent simple { tier t description "task" }"#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].tier, ModelTier::Cheap); // Cheap is now the default
         assert_eq!(units[0].model, None);
@@ -1640,8 +1813,8 @@ mod tests {
     #[test]
     fn client_effort_flows_to_work_unit() {
         let src = r#"
-            client deep { model "opus" effort high }
-            agent a { client deep description "task" }
+            client deep { model "opus" effort high } tier deep deep
+            agent a { tier deep description "task" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].effort.as_deref(), Some("high"));
@@ -1649,21 +1822,11 @@ mod tests {
     }
 
     #[test]
-    fn default_client_effort_flows_to_work_unit() {
+    fn a_default_marker_does_not_choose_the_model() {
         let src = r#"
-            client deep { model "opus" effort xhigh default }
-            agent a { description "uses default" }
-        "#;
-        let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].effort.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
-    fn explicit_client_effort_overrides_default() {
-        let src = r#"
-            client fast { model "haiku" effort low default }
-            client deep { model "opus" effort high }
-            agent a { client deep description "task" }
+            client fast { model "haiku" effort low default } tier fast fast
+            client deep { model "opus" effort high } tier deep deep
+            agent a { tier deep description "task" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].effort.as_deref(), Some("high"));
@@ -1678,28 +1841,13 @@ mod tests {
                     thinking_budget "8000"
                     max_tokens      "32768"
                 }
-            }
-            agent a { client deep description "task" }
+            } tier deep deep
+            agent a { tier deep description "task" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].extra.len(), 2);
         assert_eq!(units[0].extra[0], ("thinking_budget".into(), "8000".into()));
         assert_eq!(units[0].extra[1], ("max_tokens".into(), "32768".into()));
-    }
-
-    #[test]
-    fn default_client_extras_flow_to_work_unit() {
-        let src = r#"
-            client deep {
-                model "opus"
-                default
-                extra { thinking_budget "4000" }
-            }
-            agent a { description "uses default" }
-        "#;
-        let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].extra.len(), 1);
-        assert_eq!(units[0].extra[0].0, "thinking_budget");
     }
 
     #[test]
@@ -1711,8 +1859,8 @@ mod tests {
                     thinking_budget "8000"
                     thinking_budget "9000"
                 }
-            }
-            agent a { client deep description "task" }
+            } tier deep deep
+            agent a { tier deep description "task" }
         "#;
         let err = compile_str(src).expect_err("duplicate extra key should fail");
         let msg = format!("{:?}", err);
@@ -1728,7 +1876,7 @@ mod tests {
     #[test]
     fn tier_alias_resolves_to_client_fields() {
         let src = r#"
-            client deep { model "opus" effort xhigh }
+            client deep { model "opus" effort xhigh } tier deep deep
             tier expensive deep
             agent a { tier expensive description "task" }
         "#;
@@ -1739,11 +1887,12 @@ mod tests {
 
     #[test]
     fn a_misspelled_effort_is_a_compile_error() {
+        // A profile's client with a misspelled effort fails the compile.
         let src = r#"
-            client deep { model "claude:opus" effort hgih default }
-            agent a { prompt "p" }
+            client deep { model "claude:opus" effort hgih } tier deep deep
+            agent a { tier deep prompt "p" }
         "#;
-        let error = format!("{:?}", crate::compile(src, "t.gaviero", None, None).unwrap_err());
+        let error = format!("{:?}", compile_str(src).unwrap_err());
         assert!(error.contains("unknown effort `hgih`"), "{error}");
         assert!(error.contains("xhigh"), "lists the valid names: {error}");
     }
@@ -1751,10 +1900,10 @@ mod tests {
     #[test]
     fn a_real_level_the_model_lacks_still_compiles() {
         let src = r#"
-            client fast { model "dsh:deepseek-flash" effort xhigh default }
-            agent a { prompt "p" }
+            client fast { model "dsh:deepseek-flash" effort xhigh } tier fast fast
+            agent a { tier fast prompt "p" }
         "#;
-        crate::compile(src, "t.gaviero", None, None).unwrap();
+        compile_str(src).unwrap();
     }
 
     #[test]
@@ -1763,7 +1912,7 @@ mod tests {
             client deep {
                 model "opus"
                 extra { thinking_budget "8000" }
-            }
+            } tier deep deep
             tier expensive deep
             agent a { tier expensive description "task" }
         "#;
@@ -1775,13 +1924,13 @@ mod tests {
     #[test]
     fn undefined_tier_alias_is_compile_error() {
         let src = r#"
-            client deep { model "opus" }
+            client deep { model "opus" } tier deep deep
             agent a { tier ghost description "task" }
         "#;
         let err = compile_str(src).expect_err("undefined alias should fail");
         let msg = format!("{:?}", err);
         assert!(
-            msg.contains("undefined tier alias") && msg.contains("ghost"),
+            msg.contains("uses tier `ghost`") && msg.contains("it defines: deep, t"),
             "unexpected error: {}",
             msg
         );
@@ -1793,7 +1942,7 @@ mod tests {
             tier expensive ghost_client
             agent a { tier expensive description "task" }
         "#;
-        let err = compile_str(src).expect_err("alias→ghost client should fail");
+        let err = compile_str(src).expect_err("alias→ghost tier should fail");
         let msg = format!("{:?}", err);
         assert!(
             msg.contains("tier alias") && msg.contains("ghost_client"),
@@ -1805,8 +1954,8 @@ mod tests {
     #[test]
     fn duplicate_tier_alias_is_compile_error() {
         let src = r#"
-            client a { model "opus" }
-            client b { model "haiku" }
+            client a { model "opus" } tier a a
+            client b { model "haiku" } tier b b
             tier cheap a
             tier cheap b
         "#;
@@ -1820,25 +1969,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_cannot_declare_both_client_and_tier() {
-        let src = r#"
-            client deep { model "opus" }
-            tier expensive deep
-            agent a { client deep tier expensive description "task" }
-        "#;
-        let err = compile_str(src).expect_err("both client+tier should fail");
-        let msg = format!("{:?}", err);
-        assert!(
-            msg.contains("both") && msg.contains("client") && msg.contains("tier"),
-            "unexpected error: {}",
-            msg
-        );
-    }
-
-    #[test]
     fn tier_alias_with_custom_name_resolves() {
         let src = r#"
-            client c { model "haiku" effort low }
+            client c { model "haiku" effort low } tier c c
             tier blazingly_fast c
             agent a { tier blazingly_fast description "task" }
         "#;
@@ -1848,10 +1981,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_client_takes_precedence_over_default() {
+    fn the_agent_tier_alone_chooses_the_client() {
         let src = r#"
-            client fast { model "haiku" default }
-            client deep { model "opus" }
+            client fast { model "haiku" default } tier fast fast
+            client deep { model "opus" } tier deep deep
             tier expensive deep
             agent a { tier expensive description "task" }
         "#;
@@ -1862,30 +1995,19 @@ mod tests {
     #[test]
     fn extras_empty_when_no_extra_block() {
         let src = r#"
-            client deep { model "opus" }
-            agent a { client deep description "task" }
+            client deep { model "opus" } tier deep deep
+            agent a { tier deep description "task" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert!(units[0].extra.is_empty());
     }
 
     #[test]
-    fn agent_no_client_uses_default_client() {
+    fn the_agent_tier_alone_chooses_the_client_and_its_tier_lit() {
         let src = r#"
-            client sonnet { tier cheap model "claude-sonnet-4-6" default }
-            agent a { description "uses default" }
-        "#;
-        let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].tier, ModelTier::Cheap);
-        assert_eq!(units[0].model, Some("claude-sonnet-4-6".to_string()));
-    }
-
-    #[test]
-    fn explicit_client_overrides_default() {
-        let src = r#"
-            client sonnet { tier cheap model "claude-sonnet-4-6" default }
-            client opus { tier expensive model "claude-opus-4-7" }
-            agent a { description "explicit opus" client opus }
+            client sonnet { tier cheap model "claude-sonnet-4-6" default } tier sonnet sonnet
+            client opus { tier expensive model "claude-opus-4-7" } tier opus opus
+            agent a { description "explicit opus" tier opus }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].tier, ModelTier::Expensive);
@@ -1893,25 +2015,8 @@ mod tests {
     }
 
     #[test]
-    fn multiple_defaults_is_compile_error() {
-        let src = r#"
-            client sonnet { tier cheap model "claude-sonnet-4-6" default }
-            client opus { tier expensive model "claude-opus-4-7" default }
-            agent a { description "test" }
-        "#;
-        let result = compile_str(src);
-        assert!(result.is_err(), "multiple defaults should error");
-        let msg = format!("{:?}", result.unwrap_err());
-        assert!(
-            msg.contains("default"),
-            "error should mention default: {}",
-            msg
-        );
-    }
-
-    #[test]
     fn agent_no_scope_gets_dot_scope() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str(src).expect("compile");
         assert_eq!(units[0].scope.owned_paths, vec!["."]);
     }
@@ -1919,13 +2024,13 @@ mod tests {
     #[test]
     fn workflow_filter() {
         let src = r#"
-            agent a { description "a" }
-            agent b { description "b" }
+            agent a { tier t description "a" }
+            agent b { tier t description "b" }
             workflow only_a { steps [a] }
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let compiled = compile_ast(&ast.unwrap(), src, "t", Some("only_a"), None).unwrap();
+        let compiled = compile_ast(&with_test_tier(ast.unwrap()), src, "t", Some("only_a"), None).unwrap();
         let units = compiled.work_units_ordered().expect("toposort in tests");
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].id, "a");
@@ -1933,10 +2038,10 @@ mod tests {
 
     #[test]
     fn undefined_workflow_step_errors() {
-        let src = r#"agent a { } workflow w { steps [a ghost] }"#;
+        let src = r#"agent a { tier t } workflow w { steps [a ghost] }"#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let result = compile_ast(&ast.unwrap(), src, "t", None, None);
+        let result = compile_ast(&with_test_tier(ast.unwrap()), src, "t", None, None);
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("ghost"), "{}", msg);
@@ -1945,8 +2050,8 @@ mod tests {
     #[test]
     fn cycle_detection_simple() {
         let src = r#"
-            agent a { depends_on [b] }
-            agent b { depends_on [a] }
+            agent a { tier t depends_on [b] }
+            agent b { tier t depends_on [a] }
         "#;
         let result = compile_str(src);
         assert!(result.is_err());
@@ -1957,9 +2062,9 @@ mod tests {
     #[test]
     fn cycle_detection_three_nodes() {
         let src = r#"
-            agent a { depends_on [c] }
-            agent b { depends_on [a] }
-            agent c { depends_on [b] }
+            agent a { tier t depends_on [c] }
+            agent b { tier t depends_on [a] }
+            agent c { tier t depends_on [b] }
         "#;
         let result = compile_str(src);
         assert!(result.is_err());
@@ -1970,9 +2075,9 @@ mod tests {
     #[test]
     fn no_cycle_linear_chain() {
         let src = r#"
-            agent a { description "first" }
-            agent b { depends_on [a] description "second" }
-            agent c { depends_on [b] description "third" }
+            agent a { tier t description "first" }
+            agent b { tier t depends_on [a] description "second" }
+            agent c { tier t depends_on [b] description "third" }
         "#;
         let result = compile_str(src);
         assert!(result.is_ok(), "linear chain should not be a cycle");
@@ -1980,7 +2085,7 @@ mod tests {
 
     #[test]
     fn self_dependency_is_cycle() {
-        let src = r#"agent self_ref { depends_on [self_ref] }"#;
+        let src = r#"agent self_ref { tier t depends_on [self_ref] }"#;
         let result = compile_str(src);
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
@@ -1990,19 +2095,19 @@ mod tests {
     #[test]
     fn workflow_max_parallel_propagated() {
         let src = r#"
-            agent a { description "first" }
+            agent a { tier t description "first" }
             workflow w { steps [a] max_parallel 3 }
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let compiled = compile_ast(&ast.unwrap(), src, "t", None, None).unwrap();
+        let compiled = compile_ast(&with_test_tier(ast.unwrap()), src, "t", None, None).unwrap();
         assert_eq!(compiled.max_parallel, Some(3));
     }
 
     #[test]
     fn memory_merge_additive_read_ns() {
         let src = r#"
-            agent a {
+            agent a { tier t
                 memory {
                     read_ns ["agent-ns"]
                     write_ns "agent-out"
@@ -2028,7 +2133,7 @@ mod tests {
     #[test]
     fn memory_merge_workflow_write_ns_fallback() {
         let src = r#"
-            agent a { description "t" }
+            agent a { tier t description "t" }
             workflow w {
                 steps [a]
                 memory { write_ns "wf-default" }
@@ -2041,7 +2146,7 @@ mod tests {
     #[test]
     fn memory_importance_and_staleness() {
         let src = r#"
-            agent scan {
+            agent scan { tier t
                 memory {
                     importance 0.8
                     staleness_sources ["src/" "Cargo.toml"]
@@ -2055,7 +2160,7 @@ mod tests {
 
     #[test]
     fn memory_none_when_not_declared() {
-        let src = r#"agent a { description "task" }"#;
+        let src = r#"agent a { tier t description "task" }"#;
         let units = compile_str(src).unwrap();
         assert!(units[0].read_namespaces.is_none());
         assert!(units[0].write_namespace.is_none());
@@ -2065,7 +2170,7 @@ mod tests {
 
     #[test]
     fn undefined_depends_on_has_span() {
-        let src = r#"agent a { depends_on [nonexistent] }"#;
+        let src = r#"agent a { tier t depends_on [nonexistent] }"#;
         let result = compile_str(src);
         assert!(result.is_err());
         let err = &result.unwrap_err().errors[0];
@@ -2086,20 +2191,20 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None, runtime_prompt)
+        compile_ast(&with_test_tier(ast.unwrap()), src, "test.gaviero", None, runtime_prompt)
             .map(|c| c.work_units_ordered().expect("toposort in tests"))
     }
 
     #[test]
     fn runtime_prompt_substituted_in_coordinator_instructions() {
-        let src = r##"agent x { prompt #"Task: {{PROMPT}}"# }"##;
+        let src = r##"agent x { tier t prompt #"Task: {{PROMPT}}"# }"##;
         let units = compile_str_with_prompt(src, Some("implement login")).unwrap();
         assert_eq!(units[0].coordinator_instructions, "Task: implement login");
     }
 
     #[test]
     fn runtime_prompt_fixed_prompt_unchanged() {
-        let src = r##"agent x { prompt #"Fixed task: do the thing"# }"##;
+        let src = r##"agent x { tier t prompt #"Fixed task: do the thing"# }"##;
         let units = compile_str_with_prompt(src, Some("ignored")).unwrap();
         assert_eq!(
             units[0].coordinator_instructions,
@@ -2109,28 +2214,28 @@ mod tests {
 
     #[test]
     fn runtime_prompt_fallback_no_prompt_field() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str_with_prompt(src, Some("do the thing")).unwrap();
         assert_eq!(units[0].coordinator_instructions, "do the thing");
     }
 
     #[test]
     fn runtime_prompt_none_no_prompt_field_empty() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str_with_prompt(src, None).unwrap();
         assert_eq!(units[0].coordinator_instructions, "");
     }
 
     #[test]
     fn runtime_prompt_substituted_in_description() {
-        let src = r#"agent x { description "Process {{PROMPT}}" }"#;
+        let src = r#"agent x { tier t description "Process {{PROMPT}}" }"#;
         let units = compile_str_with_prompt(src, Some("files")).unwrap();
         assert_eq!(units[0].description, "Process files");
     }
 
     #[test]
     fn runtime_prompt_multiple_placeholder_occurrences() {
-        let src = r##"agent x { prompt #"{{PROMPT}} and also {{PROMPT}}"# }"##;
+        let src = r##"agent x { tier t prompt #"{{PROMPT}} and also {{PROMPT}}"# }"##;
         let units = compile_str_with_prompt(src, Some("X")).unwrap();
         assert_eq!(units[0].coordinator_instructions, "X and also X");
     }
@@ -2138,7 +2243,7 @@ mod tests {
     #[test]
     fn memory_read_query_and_limit_compiled() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 memory {
                     read_query "custom search query"
                     read_limit 10
@@ -2156,7 +2261,7 @@ mod tests {
     #[test]
     fn memory_write_content_compiled() {
         let src = r##"
-            agent x {
+            agent x { tier t
                 memory {
                     write_ns "output"
                     write_content #"Findings: {{SUMMARY}}"#
@@ -2174,7 +2279,7 @@ mod tests {
     #[test]
     fn memory_read_query_prompt_substitution() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 memory {
                     read_query "find results for {{PROMPT}}"
                 }
@@ -2189,7 +2294,7 @@ mod tests {
 
     #[test]
     fn memory_fields_none_when_not_declared() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str(src).unwrap();
         assert!(units[0].memory_read_query.is_none());
         assert!(units[0].memory_read_limit.is_none());
@@ -2202,14 +2307,14 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None)
+        compile_ast(&with_test_tier(ast.unwrap()), src, "test.gaviero", None, None)
     }
 
     #[test]
     fn loop_config_extracted_verify() {
         let src = r#"
-            agent a { description "impl" }
-            agent b { description "test" }
+            agent a { tier t description "impl" }
+            agent b { tier t description "test" }
             workflow w {
                 steps [
                     loop {
@@ -2233,7 +2338,7 @@ mod tests {
     #[test]
     fn loop_config_extracted_command() {
         let src = r#"
-            agent fixer { description "fix" }
+            agent fixer { tier t description "fix" }
             workflow w {
                 steps [
                     loop {
@@ -2254,8 +2359,8 @@ mod tests {
     #[test]
     fn loop_config_extracted_agent() {
         let src = r#"
-            agent impl_agent { description "implement" }
-            agent judge { description "evaluate quality" }
+            agent impl_agent { tier t description "implement" }
+            agent judge { tier t description "evaluate quality" }
             workflow w {
                 steps [
                     loop {
@@ -2278,7 +2383,7 @@ mod tests {
     #[test]
     fn undefined_loop_judge_is_compile_error() {
         let src = r#"
-            agent impl_agent { description "implement" }
+            agent impl_agent { tier t description "implement" }
             workflow w {
                 steps [
                     loop {
@@ -2303,8 +2408,8 @@ mod tests {
     fn loop_stability_judge_timeout_strict_judge_defaults_and_overrides() {
         // Defaults when no judge-control fields are present.
         let src = r#"
-            agent impl_agent { description "implement" }
-            agent judge { description "judge" }
+            agent impl_agent { tier t description "implement" }
+            agent judge { tier t description "judge" }
             workflow w {
                 steps [
                     loop {
@@ -2323,8 +2428,8 @@ mod tests {
 
         // Explicit overrides.
         let src = r#"
-            agent impl_agent { description "implement" }
-            agent judge { description "judge" }
+            agent impl_agent { tier t description "implement" }
+            agent judge { tier t description "judge" }
             workflow w {
                 steps [
                     loop {
@@ -2350,25 +2455,28 @@ mod tests {
         let src = concat!(
             "prompt p #\"init {{REVIEWER_ID}}\"#\n",
             "prompt r #\"refine {{REVIEWER_ID}}\"#\n",
-            "client c { model \"claude:sonnet\" }\n",
-            "agent tinit { template true prompt p scope { owned [\"out/x-*\"] } }\n",
-            "agent tref { template true prompt r scope { owned [\"out/y-*\"] } }\n",
-            "agent judge { client c prompt \"judge\" }\n",
+            "client c { model \"claude:sonnet\" } tier c c\n",
+            "agent tinit { tier t template true prompt p scope { owned [\"out/x-*\"] } }\n",
+            "agent tref { tier t template true prompt r scope { owned [\"out/y-*\"] } }\n",
+            "agent judge { tier c prompt \"judge\" }\n",
             "workflow w { steps [ loop {\n",
-            "  reviewers [ { id \"a\" model \"claude:sonnet\" } { id \"b\" model \"claude:sonnet\" } ]\n",
+            "  reviewers [ { id \"a\" tier c } { id \"b\" } ]\n",
             "  template_init tinit template_refine tref max_iterations 3 until agent judge\n",
             "} ] }\n",
         );
         let plan = compile_plan(src).unwrap();
-        let ids: Vec<_> = plan
-            .work_units_unordered()
-            .into_iter()
-            .map(|u| u.id.as_str())
-            .collect();
+        let units = plan.work_units_unordered();
+        let ids: Vec<_> = units.iter().map(|u| u.id.as_str()).collect();
         assert!(ids.contains(&"a-init"));
         assert!(ids.contains(&"b-init"));
         assert!(ids.contains(&"a-refine"));
         assert!(ids.contains(&"b-refine"));
+        // An entry's `tier` moves both of its clones; without one they keep
+        // the template's tier.
+        let model = |id: &str| units.iter().find(|u| u.id == id).unwrap().model.clone();
+        assert_eq!(model("a-init").as_deref(), Some("claude:sonnet"));
+        assert_eq!(model("a-refine").as_deref(), Some("claude:sonnet"));
+        assert_eq!(model("b-refine"), None, "tier t has no model");
         assert_eq!(
             plan.loop_configs[0].agent_ids,
             ["a-refine".to_string(), "b-refine".to_string()]
@@ -2381,7 +2489,7 @@ mod tests {
         // Using an agent's name as `until agent <name>` is ambiguous at runtime
         // (shadowing the workflow unit_map). The compiler must reject it.
         let src = r#"
-            agent impl_agent { description "implement" }
+            agent impl_agent { tier t description "implement" }
             workflow w {
                 steps [
                     loop {
@@ -2405,7 +2513,7 @@ mod tests {
     #[test]
     fn no_loop_configs_when_no_loops() {
         let src = r#"
-            agent a { description "t" }
+            agent a { tier t description "t" }
             workflow w { steps [a] }
         "#;
         let plan = compile_plan(src).unwrap();
@@ -2415,9 +2523,9 @@ mod tests {
     #[test]
     fn loop_agents_included_in_work_units() {
         let src = r#"
-            agent pre { description "pre-step" }
-            agent looped { description "in loop" }
-            agent post { description "post-step" }
+            agent pre { tier t description "pre-step" }
+            agent looped { tier t description "in loop" }
+            agent post { tier t description "post-step" }
             workflow w {
                 steps [
                     pre
@@ -2441,10 +2549,10 @@ mod tests {
     #[test]
     fn loop_agents_depend_on_preceding_steps() {
         let src = r#"
-            agent init-a  { description "first init" }
-            agent init-b  { description "second init" }
-            agent refine  { description "refine" }
-            agent judge   { description "judge" }
+            agent init-a  { tier t description "first init" }
+            agent init-b  { tier t description "second init" }
+            agent refine  { tier t description "refine" }
+            agent judge   { tier t description "judge" }
             workflow w {
                 steps [
                     init-a
@@ -2475,7 +2583,7 @@ mod tests {
     #[test]
     fn impact_scope_compiled() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 scope {
                     owned ["src/"]
                     impact_scope true
@@ -2488,7 +2596,7 @@ mod tests {
 
     #[test]
     fn impact_scope_false_by_default() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str(src).unwrap();
         assert!(!units[0].impact_scope);
     }
@@ -2496,7 +2604,7 @@ mod tests {
     #[test]
     fn context_block_compiled() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 context {
                     callers_of ["src/auth.rs"]
                     tests_for  ["src/auth/"]
@@ -2512,7 +2620,7 @@ mod tests {
 
     #[test]
     fn context_defaults_when_not_declared() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str(src).unwrap();
         assert!(units[0].context_callers_of.is_empty());
         assert!(units[0].context_tests_for.is_empty());
@@ -2522,7 +2630,7 @@ mod tests {
     #[test]
     fn tools_field_propagates_to_work_unit() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 description "runs cargo"
                 tools ["Bash" "WebFetch"]
             }
@@ -2533,7 +2641,7 @@ mod tests {
 
     #[test]
     fn tools_defaults_to_empty_when_absent() {
-        let src = r#"agent x { description "t" }"#;
+        let src = r#"agent x { tier t description "t" }"#;
         let units = compile_str(src).unwrap();
         assert!(units[0].extra_allowed_tools.is_empty());
     }
@@ -2541,7 +2649,7 @@ mod tests {
     #[test]
     fn impact_tests_in_verify() {
         let src = r#"
-            agent a { description "t" }
+            agent a { tier t description "t" }
             workflow w {
                 steps [a]
                 verify { compile true impact_tests true }
@@ -2556,7 +2664,7 @@ mod tests {
     #[test]
     fn impact_tests_in_loop_until() {
         let src = r#"
-            agent a { description "impl" }
+            agent a { tier t description "impl" }
             workflow w {
                 steps [
                     loop {
@@ -2583,9 +2691,9 @@ mod tests {
     fn loop_script(until_body: &str) -> String {
         format!(
             r#"
-            agent a {{ description "impl" }}
-            agent judge {{ description "evaluate" }}
-            agent judge2 {{ description "also evaluate" }}
+            agent a {{ tier t description "impl" }}
+            agent judge {{ tier t description "evaluate" }}
+            agent judge2 {{ tier t description "also evaluate" }}
             workflow w {{
                 steps [
                     loop {{
@@ -2653,8 +2761,8 @@ mod tests {
     fn until_and_substitutes_vars_in_every_command() {
         let src = r#"
             vars { OUT_DIR "reports" }
-            agent a { description "impl" }
-            agent judge { description "evaluate" }
+            agent a { tier t description "impl" }
+            agent judge { tier t description "evaluate" }
             workflow w {
                 steps [
                     loop {
@@ -2700,7 +2808,7 @@ mod tests {
     fn named_prompt_resolves() {
         let src = r#"
             prompt my-prompt "do the thing"
-            agent x { prompt my-prompt }
+            agent x { tier t prompt my-prompt }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "do the thing");
@@ -2710,13 +2818,13 @@ mod tests {
     fn named_prompt_with_runtime_prompt_substitution() {
         let src = r#"
             prompt body "task: {{PROMPT}}"
-            agent x { prompt body }
+            agent x { tier t prompt body }
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
         let units = compile_ast(
-            &ast.unwrap(),
+            &with_test_tier(ast.unwrap()),
             src,
             "test.gaviero",
             None,
@@ -2731,8 +2839,8 @@ mod tests {
     fn named_prompt_agent_substitution() {
         let src = r#"
             prompt body "write to {{AGENT}}-output.md"
-            agent alpha { prompt body }
-            agent beta  { prompt body }
+            agent alpha { tier t prompt body }
+            agent beta  { tier t prompt body }
         "#;
         let units = compile_str(src).expect("should compile");
         let alpha = units.iter().find(|u| u.id == "alpha").unwrap();
@@ -2743,7 +2851,7 @@ mod tests {
 
     #[test]
     fn named_prompt_undefined_ref_errors() {
-        let src = r#"agent x { prompt missing-prompt }"#;
+        let src = r#"agent x { tier t prompt missing-prompt }"#;
         let result = compile_str(src);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err().errors[0]);
@@ -2755,7 +2863,7 @@ mod tests {
         let src = r#"
             prompt foo "first"
             prompt foo "second"
-            agent x { prompt foo }
+            agent x { tier t prompt foo }
         "#;
         let result = compile_str(src);
         assert!(result.is_err());
@@ -2765,14 +2873,14 @@ mod tests {
 
     #[test]
     fn inline_prompt_still_works() {
-        let src = r#"agent x { prompt "inline text" }"#;
+        let src = r#"agent x { tier t prompt "inline text" }"#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "inline text");
     }
 
     #[test]
     fn inline_prompt_agent_substitution() {
-        let src = r#"agent my-agent { prompt "hello {{AGENT}}" }"#;
+        let src = r#"agent my-agent { tier t prompt "hello {{AGENT}}" }"#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "hello my-agent");
     }
@@ -2783,7 +2891,7 @@ mod tests {
     fn script_vars_substituted_in_prompt() {
         let src = r#"
             vars { PLANS "plans" }
-            agent x { prompt "write to {{PLANS}}/out.md" }
+            agent x { tier t prompt "write to {{PLANS}}/out.md" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "write to plans/out.md");
@@ -2792,7 +2900,7 @@ mod tests {
     #[test]
     fn agent_vars_substituted_in_prompt() {
         let src = r#"
-            agent x {
+            agent x { tier t
                 vars { MODEL "claude" }
                 prompt "write to {{MODEL}}-output.md"
             }
@@ -2808,7 +2916,7 @@ mod tests {
     fn agent_vars_override_script_vars() {
         let src = r#"
             vars { MODEL "default" }
-            agent x {
+            agent x { tier t
                 vars { MODEL "claude" }
                 prompt "model: {{MODEL}}"
             }
@@ -2821,8 +2929,8 @@ mod tests {
     fn script_vars_used_when_no_agent_vars() {
         let src = r#"
             vars { PLANS "plans" }
-            agent x { prompt "path: {{PLANS}}/file.md" }
-            agent y { prompt "also: {{PLANS}}/other.md" }
+            agent x { tier t prompt "path: {{PLANS}}/file.md" }
+            agent y { tier t prompt "also: {{PLANS}}/other.md" }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "path: plans/file.md");
@@ -2836,7 +2944,7 @@ mod tests {
         // touching the file.
         let src = r#"
             vars { OUT_DIR "plans/log" }
-            agent x {
+            agent x { tier t
                 scope {
                     owned     ["{{OUT_DIR}}/out.md" "src/{{AGENT}}/"]
                     read_only ["{{OUT_DIR}}/" "src/"]
@@ -2862,7 +2970,7 @@ mod tests {
         // {{ITER}} and {{PREV_ITER}} must NOT be substituted at compile time —
         // they are reserved for the runtime loop executor.
         let src = r##"
-            agent x { prompt #"read v{{PREV_ITER}} write v{{ITER}}"# }
+            agent x { tier t prompt #"read v{{PREV_ITER}} write v{{ITER}}"# }
         "##;
         let units = compile_str(src).expect("should compile");
         assert_eq!(
@@ -2874,7 +2982,7 @@ mod tests {
     #[test]
     fn iter_start_parsed_and_propagated() {
         let src = r#"
-            agent a { description "refine" }
+            agent a { tier t description "refine" }
             workflow w {
                 steps [
                     loop {
@@ -2895,7 +3003,7 @@ mod tests {
     #[test]
     fn iter_start_defaults_to_1() {
         let src = r#"
-            agent a { description "t" }
+            agent a { tier t description "t" }
             workflow w {
                 steps [
                     loop {
@@ -2915,7 +3023,7 @@ mod tests {
         // All three types of substitution should work together.
         let src = r#"
             vars { DIR "plans" }
-            agent claude {
+            agent claude { tier t
                 vars { MODEL "claude" }
                 prompt "Read {{DIR}}/codex-plan-v1.md write {{DIR}}/{{MODEL}}-plan-v2.md by {{AGENT}}"
             }
@@ -2931,18 +3039,18 @@ mod tests {
     fn template_plan_refinement_example() {
         // Smoke-test the full plan_refinement.gaviero example structure
         let src = r##"
-            client opus  { tier expensive model "claude-opus-4-7" privacy public }
-            client codex { tier expensive model "codex:gpt-5.4"   privacy public }
+            client opus  { tier expensive model "claude-opus-4-7" privacy public } tier opus opus
+            client codex { tier expensive model "codex:gpt-5.4"   privacy public } tier codex codex
 
             vars { PLANS "plans" }
 
             prompt init-body   #"Write to {{PLANS}}/{{MODEL_NAME}}-plan-v1.md"#
             prompt refine-body #"Read {{PLANS}}/claude-plan-v{{PREV_ITER}}.md write {{PLANS}}/{{MODEL_NAME}}-plan-v{{ITER}}.md"#
 
-            agent claude-init  { vars { MODEL_NAME "claude" } client opus  prompt init-body }
-            agent codex-init   { vars { MODEL_NAME "codex"  } client codex prompt init-body }
-            agent claude-refine { vars { MODEL_NAME "claude" } client opus  prompt refine-body }
-            agent codex-refine  { vars { MODEL_NAME "codex"  } client codex prompt refine-body }
+            agent claude-init  { vars { MODEL_NAME "claude" } tier opus  prompt init-body }
+            agent codex-init   { vars { MODEL_NAME "codex"  } tier codex prompt init-body }
+            agent claude-refine { vars { MODEL_NAME "claude" } tier opus  prompt refine-body }
+            agent codex-refine  { vars { MODEL_NAME "codex"  } tier codex prompt refine-body }
 
             workflow feature-plan-refinement {
                 steps [
@@ -3004,12 +3112,13 @@ mod tests {
     #[test]
     fn map_reduce_pattern_emits_fanout_ops() {
         let src = r#"
-            agent discover { description "write spawn_manifest.json" }
-            agent reduce {
+            agent discover { tier t description "write spawn_manifest.json" }
+            agent reduce { tier t
                 description "aggregate"
                 depends_on [discover]
             }
             workflow map-reduce {
+                execution_mode document
                 pattern map_reduce {
                     discover discover
                     reduce reduce
@@ -3027,9 +3136,10 @@ mod tests {
     #[test]
     fn map_reduce_pattern_defaults_max_spawn() {
         let src = r#"
-            agent discover { description "d" }
-            agent reduce { description "r" depends_on [discover] }
+            agent discover { tier t description "d" }
+            agent reduce { tier t description "r" depends_on [discover] }
             workflow w {
+                execution_mode document
                 pattern map_reduce {
                     discover discover
                     reduce reduce

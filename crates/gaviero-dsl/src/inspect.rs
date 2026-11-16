@@ -39,7 +39,8 @@ pub struct ScriptInspection {
     pub accepts_prompt: bool,
     /// Execution mode when the script declares no workflow.
     pub default_execution: ExecutionMode,
-    /// Tiers the script binds itself, in declaration order.
+    /// Tiers the script asks for (agents, `tiers { }` blocks, list items),
+    /// in order of appearance. The profile must define each of them.
     pub tiers: Vec<String>,
 }
 
@@ -95,10 +96,8 @@ pub struct VarInspection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamKindInfo {
-    /// `id=provider:model[@effort],…`
+    /// A list: `id=tier,…`, bare ids `a,b`, or a list literal `[{id "a" …}]`.
     Roster,
-    /// `provider:model[@effort]`
-    Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +121,40 @@ fn tier_names(script: &Script) -> Vec<String> {
             && !names.contains(&tier.name)
         {
             names.push(tier.name.clone());
+        }
+    }
+    names
+}
+
+/// The tiers a script asks for, in order of appearance: every agent's
+/// `tier`, every workflow `tiers { }` entry and every list item's `tier`.
+fn used_tier_names(script: &Script) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: &str| {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    };
+    for item in &script.items {
+        match item {
+            Item::Agent(agent) => {
+                if let Some((tier, _)) = &agent.tier_ref {
+                    add(tier);
+                }
+            }
+            Item::Workflow(wf) => {
+                for entry in &wf.tiers {
+                    add(&entry.tier);
+                }
+                for param in &wf.params {
+                    if let Some(crate::ast::ParamShape::Roster(entries)) = &param.shape {
+                        for (tier, _) in entries.iter().filter_map(|e| e.tier.as_ref()) {
+                            add(tier);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     names
@@ -196,7 +229,7 @@ fn inspect_script(script: &Script, sources: &[(String, String)]) -> ScriptInspec
         requires_prompt,
         accepts_prompt: requires_prompt || agent_without_prompt,
         default_execution: peek_workflow_execution_mode(script, None),
-        tiers: tier_names(script),
+        tiers: used_tier_names(script),
     }
 }
 
@@ -242,7 +275,7 @@ mod tests {
     fn declared_vars_keep_their_defaults_and_unknown_placeholders_are_listed() {
         let info = inspect(concat!(
             "vars { OUT_DIR \"plans/out\" }\n",
-            "agent a {\n",
+            "agent a { tier t\n",
             "  scope { owned [\"{{OUT_DIR}}/{{TARGET}}.md\"] }\n",
             "  prompt #\"work on {{TARGET}}\"#\n",
             "}\n",
@@ -270,7 +303,7 @@ mod tests {
     fn reserved_commented_and_agent_level_placeholders_are_not_inputs() {
         let info = inspect(concat!(
             "// mentions {{IN_A_COMMENT}}\n",
-            "agent a {\n",
+            "agent a { tier t\n",
             "  vars { LOCAL \"x\" }\n",
             "  prompt #\"{{PROMPT}} {{ITER}} {{AGENT}} {{LOCAL}}\"#\n",
             "}\n",
@@ -289,7 +322,7 @@ mod tests {
             "  NEEDED file\n",
             "  AFTER \"y\"\n",
             "}\n",
-            "agent a { prompt #\"{{INPUT}} {{NEEDED}}\"# }\n",
+            "agent a { tier t prompt #\"{{INPUT}} {{NEEDED}}\"# }\n",
         ));
         let names: Vec<&str> = info.vars.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, ["PLAIN", "INPUT", "NEEDED", "AFTER"]);
@@ -311,18 +344,30 @@ mod tests {
 
     const NEEDS_FILE: &str = concat!(
         "vars { NEEDED file\n PLAIN \"p\" }\n",
-        "client c { model \"claude:opus\" privacy public }\n",
-        "agent a { client c scope { owned [\"o.md\"] } prompt #\"read {{NEEDED}} {{PLAIN}}\"# }\n",
+        "agent a { tier t scope { owned [\"o.md\"] } prompt #\"read {{NEEDED}} {{PLAIN}}\"# }\n",
         "workflow w { steps [a] }\n",
     );
 
+    /// `crate::compile_with_vars` against `tests/fixtures/test-profile.gaviero`.
+    fn compile_with_vars(
+        src: &str,
+        vars: &[(String, String)],
+    ) -> Result<gaviero_core::swarm::plan::CompiledPlan, miette::Report> {
+        let profile = gaviero_core::script_profiles::SelectedProfile {
+            name: "test".into(),
+            path: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-profile.gaviero"),
+            precedence: gaviero_core::script_profiles::ProfilePrecedence::OverridesScript,
+        };
+        crate::compile_with_vars(src, "t", Some(&profile), None, None, vars, &[], &[])
+    }
+
     #[test]
     fn a_file_var_without_a_default_must_be_supplied() {
-        let err = crate::compile_with_vars(NEEDS_FILE, "t", None, None, &[], &[], &[]).unwrap_err();
+        let err = compile_with_vars(NEEDS_FILE, &[]).unwrap_err();
         assert!(format!("{err:?}").contains("file var `NEEDED`"), "{err:?}");
 
         let vars = vec![("NEEDED".to_string(), "docs/a.md".to_string())];
-        let plan = crate::compile_with_vars(NEEDS_FILE, "t", None, None, &vars, &[], &[]).unwrap();
+        let plan = compile_with_vars(NEEDS_FILE, &vars).unwrap();
         let shown = format!("{plan:?}");
         assert!(shown.contains("read docs/a.md p"), "{shown}");
     }
@@ -331,7 +376,7 @@ mod tests {
     fn dir_vars_are_listed_apart_from_files_and_can_be_required() {
         let info = inspect(concat!(
             "vars {\n  SRC dir \"src\"\n  DATA dir\n  IN file \"a.md\"\n}\n",
-            "agent a { prompt #\"{{SRC}} {{DATA}} {{IN}}\"# }\n",
+            "agent a { tier t prompt #\"{{SRC}} {{DATA}} {{IN}}\"# }\n",
         ));
         assert_eq!(info.dir_var_names(), ["SRC", "DATA"]);
         assert_eq!(info.file_var_names(), ["IN"]);
@@ -342,28 +387,25 @@ mod tests {
         );
 
         let src = NEEDS_FILE.replace("NEEDED file\n", "NEEDED dir\n");
-        let err = crate::compile_with_vars(&src, "t", None, None, &[], &[], &[]).unwrap_err();
+        let err = compile_with_vars(&src, &[]).unwrap_err();
         assert!(format!("{err:?}").contains("dir var `NEEDED`"), "{err:?}");
     }
 
     #[test]
     fn untyped_vars_compile_exactly_as_before() {
         let src = NEEDS_FILE.replace("NEEDED file\n", "NEEDED \"x.md\"\n");
-        let plan = crate::compile_with_vars(&src, "t", None, None, &[], &[], &[]).unwrap();
+        let plan = compile_with_vars(&src, &[]).unwrap();
         assert!(format!("{plan:?}").contains("read x.md p"));
     }
 
     #[test]
     fn agent_level_vars_take_no_type() {
-        let src = concat!(
-            "client c { model \"claude:opus\" privacy public }\n",
-            "agent a { client c vars { X file \"y\" } prompt #\"{{X}}\"# }\n",
-        );
-        assert!(crate::compile_with_vars(src, "t", None, None, &[], &[], &[]).is_err());
+        let src = "agent a { tier t vars { X file \"y\" } prompt #\"{{X}}\"# }\n";
+        assert!(compile_with_vars(src, &[]).is_err());
     }
 
     #[test]
-    fn script_and_profile_tiers_are_listed_in_order() {
+    fn used_and_profile_tiers_are_listed_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("p.gaviero");
         std::fs::write(
@@ -373,17 +415,23 @@ mod tests {
         .unwrap();
         assert_eq!(profile_tier_names(&profile).unwrap(), ["top", "low"]);
 
+        // A script lists the tiers it asks for: agents, then the workflow's
+        // `tiers { }` block and list items, deduplicated.
         let info = inspect(concat!(
-            "client c { model \"claude:opus\" privacy public }\n",
-            "tier mine c\n",
             "agent a { tier mine prompt #\"x\"# }\n",
+            "agent b { tier low prompt #\"x\"# }\n",
+            "workflow w {\n",
+            "  tiers { a top }\n",
+            "  param l [ { id \"x\" tier mine } { id \"y\" tier high } ]\n",
+            "  steps [ a b ]\n",
+            "}\n",
         ));
-        assert_eq!(info.tiers, ["mine"]);
+        assert_eq!(info.tiers, ["mine", "low", "top", "high"]);
     }
 
     #[test]
     fn agent_without_a_prompt_accepts_one_without_requiring_it() {
-        let info = inspect("agent a { description \"do it\" }\n");
+        let info = inspect("agent a { tier t description \"do it\" }\n");
         assert!(info.accepts_prompt);
         assert!(!info.requires_prompt);
     }
@@ -391,31 +439,19 @@ mod tests {
     #[test]
     fn params_report_kind_and_default_in_override_syntax() {
         let info = inspect(concat!(
-            "agent worker { prompt #\"w\"# }\n",
-            "agent judge { client gate prompt #\"j\"# }\n",
+            "agent worker { tier t prompt #\"w\"# }\n",
+            "agent judge { tier t prompt #\"j\"# }\n",
             "workflow w {\n",
-            "  param gate { model \"claude:sonnet\" effort high }\n",
-            "  param panel [ { id \"a\" model \"claude:opus\" } { id \"b\" model \"codex:x\" effort low } ]\n",
+            "  param panel [ { id \"a\" tier high } { id \"b\" } ]\n",
             "  param bare\n",
-            "  steps [ loop { agents [worker] reviewers bare until agent judge } judge ]\n",
+            "  steps [ loop { agents [worker] reviewers bare until agent judge } for x in panel parallel { judge } ]\n",
             "}\n",
         ));
         let params = &info.workflows[0].params;
+        assert_eq!(params[0].default.as_deref(), Some("a=high,b"));
+        assert_eq!(params[0].kind, ParamKindInfo::Roster);
         assert_eq!(
-            params[0],
-            ParamInspection {
-                name: "gate".into(),
-                kind: ParamKindInfo::Client,
-                default: Some("claude:sonnet@high".into()),
-            }
-        );
-        assert_eq!(
-            params[1].default.as_deref(),
-            Some("a=claude:opus,b=codex:x@low")
-        );
-        assert_eq!(params[1].kind, ParamKindInfo::Roster);
-        assert_eq!(
-            params[2],
+            params[1],
             ParamInspection {
                 name: "bare".into(),
                 kind: ParamKindInfo::Roster,
@@ -433,7 +469,7 @@ mod tests {
         let default = topics.default.as_deref().unwrap();
         assert_eq!(
             default,
-            r#"[{id "a" focus "storage"} {id "b" focus "network"} {id "c" focus "ui"}]"#
+            r#"[{id "a" focus "storage"} {id "b" focus "network"} {id "c" tier high focus "ui"}]"#
         );
         let entries = crate::workflow_params::parse_reviewers_override(default).unwrap();
         assert_eq!(entries.len(), 3);
@@ -441,17 +477,17 @@ mod tests {
 
         let mut odd = entries[0].clone();
         odd.fields[0].1 = "say \"hi\"".into();
-        odd.model = Some("claude:opus".into());
+        odd.tier = Some(("high-codex".into(), (0..0).into()));
         let literal = crate::workflow_params::list_literal_entry(&odd);
         let back = crate::workflow_params::parse_reviewers_override(&format!("[{literal}]")).unwrap();
         assert_eq!(back[0].fields[0].1, "say \"hi\"");
-        assert_eq!(back[0].model.as_deref(), Some("claude:opus"));
+        assert_eq!(back[0].tier.as_ref().map(|(t, _)| t.as_str()), Some("high-codex"));
     }
 
     #[test]
     fn each_workflow_reports_its_execution_mode() {
         let info = inspect(concat!(
-            "agent a { prompt #\"x\"# }\n",
+            "agent a { tier t prompt #\"x\"# }\n",
             "workflow one { steps [a] }\n",
             "workflow two { execution_mode document steps [a] }\n",
         ));
@@ -478,7 +514,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("lib.gaviero"),
-            "agent b { prompt #\"{{SHARED}}\"# }\n",
+            "agent b { tier t prompt #\"{{SHARED}}\"# }\n",
         )
         .unwrap();
         let path = dir.path().join("script.gaviero");

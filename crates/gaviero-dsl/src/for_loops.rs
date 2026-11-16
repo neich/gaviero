@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::DslError;
-use crate::workflow_params::{resolve_roster, roster_entry_tier, synth_client_from_entry};
+use crate::workflow_params::resolve_roster;
 
 /// Free-field names that would shadow a derived item var.
 const RESERVED_FIELDS: &[&str] = &["index", "count", "peers", "peer_count", "prev", "peer_block"];
@@ -83,7 +83,6 @@ pub(crate) fn expand_for_blocks(
         })
         .collect();
 
-    let mut new_clients: Vec<ClientDecl> = Vec::new();
     let mut new_agents: Vec<AgentDecl> = Vec::new();
     // body agent name → every clone of it (for fan-in rewriting).
     let mut clones_of: HashMap<String, Vec<String>> = HashMap::new();
@@ -110,10 +109,14 @@ pub(crate) fn expand_for_blocks(
         // ── collect the blocks ────────────────────────────────────────
         let mut blocks: Vec<(ForBlock, Placement)> = Vec::new();
         let mut plain_steps: HashSet<String> = HashSet::new();
+        let mut stacked_loops: HashSet<usize> = HashSet::new();
         for (i, step) in steps.iter().enumerate() {
             match step {
                 StepItem::For(fb) => blocks.push((fb.clone(), Placement::Step(i))),
                 StepItem::Loop(lb) => {
+                    if lb.branch_chain == BranchChainLit::Stacked {
+                        stacked_loops.insert(i);
+                    }
                     for fb in &lb.fors {
                         blocks.push((fb.clone(), Placement::InLoop(i)));
                     }
@@ -130,10 +133,26 @@ pub(crate) fn expand_for_blocks(
 
         // ── validate blocks and resolve their lists ───────────────────
         let mut resolved: Vec<ResolvedFor> = Vec::new();
+        // `for … in json` blocks: validated here, lowered (not cloned) below.
+        let mut runtime: Vec<(ForBlock, Placement)> = Vec::new();
         let mut body_owner: HashMap<String, usize> = HashMap::new();
         for (idx, (fb, placement)) in blocks.into_iter().enumerate() {
             let mut ok = true;
-            if fb.mode == ForMode::Sequential {
+            if fb.json_source.is_some() {
+                let in_stacked_loop =
+                    matches!(placement, Placement::InLoop(i) if stacked_loops.contains(&i));
+                ok &= validate_json_for(
+                    &fb,
+                    in_stacked_loop,
+                    execution_document,
+                    &agent_by_name,
+                    errors,
+                );
+            } else if let Some((_, span)) = fb.max_items {
+                errors.push(compile_err(span, "`max` applies only to `for … in json`".into()));
+                ok = false;
+            }
+            if fb.json_source.is_none() && fb.mode == ForMode::Sequential {
                 if matches!(placement, Placement::InLoop(_)) {
                     errors.push(compile_err(
                         fb.mode_span,
@@ -196,6 +215,13 @@ pub(crate) fn expand_for_blocks(
                         ok = false;
                     }
                 }
+            }
+
+            if fb.json_source.is_some() {
+                if ok {
+                    runtime.push((fb, placement));
+                }
+                continue;
             }
 
             // Resolve the list param.
@@ -263,20 +289,8 @@ pub(crate) fn expand_for_blocks(
                     clone.name = clone_name.clone();
                     clone.template = false;
                     clone.item_vars = item_vars.clone();
-                    if entry.model.is_some() {
-                        match roster_entry_tier(entry) {
-                            Err(reason) => errors.push(compile_err(entry.span, reason)),
-                            Ok(Some(tier)) => {
-                                clone.client = None;
-                                clone.tier_ref = Some((tier.to_string(), template.name_span));
-                            }
-                            Ok(None) => {
-                                let client_name = format!("__for_{}_{}", entry.id, agent);
-                                new_clients.push(synth_client_from_entry(&client_name, entry));
-                                clone.client = Some((client_name, entry.span));
-                                clone.tier_ref = None;
-                            }
-                        }
+                    if let Some(tier) = &entry.tier {
+                        clone.tier_ref = Some(tier.clone());
                     }
                     // depends_on: same-item siblings, then the sequential chain.
                     let mut deps: Vec<(String, Span)> = Vec::new();
@@ -321,6 +335,27 @@ pub(crate) fn expand_for_blocks(
             let (Placement::Step(i) | Placement::InLoop(i)) = rf.placement;
             by_step.entry(i).or_default().push(bi);
         }
+        // A runtime `for` becomes its body agent: a plain step at top level,
+        // a loop agent inside a loop. The runtime clones it per JSON item.
+        let mut runtime_by_step: HashMap<usize, Vec<&ForBlock>> = HashMap::new();
+        for (fb, placement) in &runtime {
+            let (Placement::Step(i) | Placement::InLoop(i)) = *placement;
+            runtime_by_step.entry(i).or_default().push(fb);
+        }
+        let runtime_decls: Vec<RuntimeForDecl> = runtime
+            .iter()
+            .map(|(fb, _)| RuntimeForDecl {
+                var: fb.var.clone(),
+                agent: fb.agents[0].0.clone(),
+                source: fb
+                    .json_source
+                    .as_ref()
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or_default(),
+                max_items: fb.max_items.map(|(n, _)| n),
+                span: fb.span,
+            })
+            .collect();
         let old_steps = std::mem::take(steps);
         let mut new_steps: Vec<StepItem> = Vec::new();
         // The baseline of a loop is the top-level `for` step *immediately*
@@ -330,6 +365,12 @@ pub(crate) fn expand_for_blocks(
         let mut previous_for: Option<(String, Vec<String>)> = None;
         for (i, step) in old_steps.into_iter().enumerate() {
             match step {
+                StepItem::For(_) if runtime_by_step.contains_key(&i) => {
+                    for fb in &runtime_by_step[&i] {
+                        new_steps.push(StepItem::Agent(fb.agents[0].0.clone(), fb.span));
+                    }
+                    previous_for = None;
+                }
                 StepItem::For(_) => {
                     for &bi in by_step.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
                         let rf = &resolved[bi];
@@ -340,6 +381,9 @@ pub(crate) fn expand_for_blocks(
                     }
                 }
                 StepItem::Loop(mut lb) => {
+                    for fb in runtime_by_step.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
+                        lb.agents.push((fb.agents[0].0.clone(), fb.span));
+                    }
                     for &bi in by_step.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
                         let rf = &resolved[bi];
                         for name in &block_clones[bi] {
@@ -366,6 +410,7 @@ pub(crate) fn expand_for_blocks(
             }
         }
         *steps = new_steps;
+        wf.runtime_fors = runtime_decls;
     }
 
     if !errors.is_empty() || clones_of.is_empty() {
@@ -406,12 +451,72 @@ pub(crate) fn expand_for_blocks(
         }
     }
 
-    for client in new_clients {
-        script.items.push(Item::Client(client));
-    }
     for agent in new_agents {
         script.items.push(Item::Agent(agent));
     }
+}
+
+/// Rules specific to `for <var> in json "<path>" parallel [max <N>] { <agent> }`.
+/// The agent checks shared with list `for` blocks (defined, not a plain step,
+/// one block only, `{{<var>.id}}` in every owned / produces path) run in the
+/// caller. Returns `false` on any error.
+fn validate_json_for(
+    fb: &ForBlock,
+    in_stacked_loop: bool,
+    execution_document: bool,
+    agent_by_name: &HashMap<String, AgentDecl>,
+    errors: &mut Vec<DslError>,
+) -> bool {
+    let before = errors.len();
+    let json_span = fb
+        .json_source
+        .as_ref()
+        .map(|(_, s)| *s)
+        .unwrap_or(fb.list_span);
+    if fb.mode == ForMode::Sequential {
+        errors.push(compile_err(
+            fb.mode_span,
+            "`for … in json` supports only `parallel`".into(),
+        ));
+    }
+    if let Some((_, span)) = &fb.peer_template {
+        errors.push(compile_err(
+            *span,
+            "`peer_template` is not available with `for … in json`".into(),
+        ));
+    }
+    if fb.agents.len() != 1 {
+        errors.push(compile_err(
+            fb.span,
+            "`for … in json` takes exactly one body agent".into(),
+        ));
+    }
+    if let Some((0, span)) = fb.max_items {
+        errors.push(compile_err(span, "`max` must be at least 1".into()));
+    }
+    if !execution_document {
+        errors.push(compile_err(
+            json_span,
+            "`for … in json` requires `execution_mode document`".into(),
+        ));
+    }
+    if in_stacked_loop {
+        errors.push(compile_err(
+            fb.span,
+            "`for … in json` cannot run inside a `branch_chain stacked` loop".into(),
+        ));
+    }
+    for (agent, span) in &fb.agents {
+        if let Some(decl) = agent_by_name.get(agent)
+            && decl.produces.is_empty()
+        {
+            errors.push(compile_err(
+                *span,
+                "the body of `for … in json` must declare `produces`".into(),
+            ));
+        }
+    }
+    errors.len() == before
 }
 
 /// Check ids and fields of a resolved list. Returns `false` on any error.
@@ -455,7 +560,7 @@ fn validate_items(fb: &ForBlock, items: &[ReviewerEntry], errors: &mut Vec<DslEr
                         fb.list, fb.var
                     ),
                 ));
-            } else if matches!(name.as_str(), "id" | "model" | "effort") || !names.insert(name) {
+            } else if matches!(name.as_str(), "id" | "tier") || !names.insert(name) {
                 errors.push(compile_err(
                     *span,
                     format!(
@@ -484,11 +589,8 @@ fn item_vars_for(fb: &ForBlock, items: &[ReviewerEntry], k: usize) -> Vec<(Strin
     for (name, value, _) in &entry.fields {
         vars.push((key(name), value.clone()));
     }
-    if let Some(model) = &entry.model {
-        vars.push((key("model"), model.clone()));
-    }
-    if let Some((effort, _)) = &entry.effort {
-        vars.push((key("effort"), effort.clone()));
+    if let Some((tier, _)) = &entry.tier {
+        vars.push((key("tier"), tier.clone()));
     }
     vars.push((key("index"), (k + 1).to_string()));
     vars.push((key("count"), items.len().to_string()));

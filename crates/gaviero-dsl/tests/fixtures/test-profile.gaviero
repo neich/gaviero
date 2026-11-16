@@ -1,0 +1,18 @@
+// Model profile for the DSL tests. Scripts name tiers only; this file says
+// what each tier means.
+//
+// `t` maps to a client with no model: the unit compiles with `model = None`
+// and runs on the workspace default model, the case most tests do not care
+// about.
+
+client blank  { }
+client opus   { tier coordinator model "claude-opus-4-7"   privacy public }
+client sonnet { tier execution   model "claude-sonnet-4-6" }
+client haiku  { model "claude:haiku" effort low privacy public }
+client local  { model "ollama:qwen" privacy local_only }
+
+tier t      blank
+tier opus   opus
+tier sonnet sonnet
+tier low    haiku
+tier local  local
