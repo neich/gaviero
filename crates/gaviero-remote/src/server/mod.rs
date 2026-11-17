@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -29,6 +29,22 @@ use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
 use crate::dto::{Limits, MachineInfo, WorkspaceInfo};
+
+/// The machine's `gaviero-cli` runs (1.11 `cli_runs`). The host supplies
+/// it — the record format belongs to `gaviero-core`, which this crate never
+/// depends on — and the server only authenticates, rate-limits and routes.
+/// Both calls read files: they run on the blocking pool.
+pub trait CliRunSource: Send + Sync {
+    /// `GET /v1/cli-runs` body.
+    fn list(&self, host: &str) -> serde_json::Value;
+    /// `GET /v1/cli-runs/<id>` body; `None` ⇒ 404.
+    fn detail(
+        &self,
+        id: &str,
+        agent_id: Option<&str>,
+        output_token: Option<&str>,
+    ) -> Option<serde_json::Value>;
+}
 
 pub struct RemoteServerConfig {
     pub bind_addr: SocketAddr,
@@ -60,6 +76,8 @@ pub struct RemoteServerConfig {
     pub registry: Option<RegistryConfig>,
     pub heartbeat_interval: Duration,
     pub stale_after: Duration,
+    /// 1.11: serves `GET /v1/cli-runs[/<id>]`. `None` ⇒ both answer 404.
+    pub cli_runs: Option<Arc<dyn CliRunSource>>,
     /// Wire defaults: ping 20 s, idle 60 s. Configurable for tests only.
     pub ping_interval: Duration,
     pub idle_timeout: Duration,
@@ -132,12 +150,14 @@ pub(crate) struct SharedState {
     registry_dir: Option<std::path::PathBuf>,
     host: String,
     stale_after: Duration,
+    cli_runs: Option<Arc<dyn CliRunSource>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     shared: SharedState,
-    /// Per-listener token bucket for `GET /v1/instances` (10/s).
+    /// Per-listener token bucket for `GET /v1/instances` and
+    /// `GET /v1/cli-runs[/<id>]` together (10/s).
     http_rate: Arc<Mutex<HttpRate>>,
 }
 
@@ -188,6 +208,8 @@ fn instance_router(shared: SharedState) -> Router {
     Router::new()
         .route(crate::WS_PATH, any(ws_handler))
         .route(crate::INSTANCES_PATH, get(instances_handler))
+        .route(crate::CLI_RUNS_PATH, get(cli_runs_handler))
+        .route(&format!("{}/{{id}}", crate::CLI_RUNS_PATH), get(cli_run_handler))
         .with_state(state)
 }
 
@@ -222,6 +244,7 @@ pub async fn spawn(config: RemoteServerConfig) -> Result<SpawnedServer, ServerEr
         registry_dir: config.registry.as_ref().map(|r| r.dir.clone()),
         host,
         stale_after: config.stale_after,
+        cli_runs: config.cli_runs.clone(),
     };
 
     let axum_handle = axum_server::Handle::new();
@@ -357,4 +380,72 @@ async fn instances_handler(State(state): State<AppState>, headers: HeaderMap) ->
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// Bearer, then the shared rate bucket — the order `instances_handler` uses.
+fn http_gate(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if !bearer_ok(state, headers) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    if !state.http_rate.lock().expect("http rate").take() {
+        return Err(StatusCode::TOO_MANY_REQUESTS.into_response());
+    }
+    Ok(())
+}
+
+fn no_store(body: serde_json::Value) -> Response {
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// `GET /v1/cli-runs` (1.11).
+async fn cli_runs_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = http_gate(&state, &headers) {
+        return response;
+    }
+    let Some(source) = state.shared.cli_runs.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let host = state.shared.host.clone();
+    match tokio::task::spawn_blocking(move || source.list(&host)).await {
+        Ok(body) => no_store(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CliRunQuery {
+    agent_id: Option<String>,
+    output_token: Option<String>,
+}
+
+/// `GET /v1/cli-runs/<id>?agent_id=&output_token=` (1.11).
+async fn cli_run_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<CliRunQuery>,
+) -> Response {
+    if let Err(response) = http_gate(&state, &headers) {
+        return response;
+    }
+    let Some(source) = state.shared.cli_runs.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        source.detail(
+            &id,
+            query.agent_id.as_deref().filter(|s| !s.is_empty()),
+            query.output_token.as_deref().filter(|s| !s.is_empty()),
+        )
+    });
+    match read.await {
+        Ok(Some(body)) => no_store(body),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

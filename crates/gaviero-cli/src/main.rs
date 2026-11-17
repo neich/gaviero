@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
+use gaviero_core::swarm::live_run::{CliRunStore, LiveRun, LiveRunHandle, LiveUpdate, PlannedAgent};
 use gaviero_core::script_profiles::ProfileCatalog;
 use gaviero_core::scripts::ScriptCatalog;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
@@ -696,6 +697,8 @@ struct CliAcpObserver {
     agent_id: String,
     verbose: bool,
     stream_buffer: Mutex<String>,
+    /// The run's published record (`swarm::live_run`), for the phone app.
+    live: Option<LiveRunHandle>,
 }
 
 impl CliAcpObserver {
@@ -704,6 +707,18 @@ impl CliAcpObserver {
             agent_id: agent_id.into(),
             verbose,
             stream_buffer: Mutex::new(String::new()),
+            live: None,
+        }
+    }
+
+    fn publishing(mut self, live: Option<LiveRunHandle>) -> Self {
+        self.live = live;
+        self
+    }
+
+    fn publish(&self, update: impl FnOnce(String) -> LiveUpdate) {
+        if let Some(live) = &self.live {
+            live.update(update(self.agent_id.clone()));
         }
     }
 
@@ -725,6 +740,10 @@ impl CliAcpObserver {
 
 impl AcpObserver for CliAcpObserver {
     fn on_stream_chunk(&self, text: &str) {
+        self.publish(|id| LiveUpdate::Text {
+            id,
+            text: text.to_string(),
+        });
         if !self.verbose {
             return;
         }
@@ -736,6 +755,10 @@ impl AcpObserver for CliAcpObserver {
     }
 
     fn on_tool_call_started(&self, tool_summary: &str) {
+        self.publish(|id| LiveUpdate::Tool {
+            id,
+            summary: tool_summary.to_string(),
+        });
         self.flush_stream_lines(true);
         eprintln!("  [{}] ⚙ {}", self.agent_id, tool_summary);
     }
@@ -744,6 +767,10 @@ impl AcpObserver for CliAcpObserver {
         if role != "assistant" {
             return;
         }
+        self.publish(|id| LiveUpdate::Message {
+            id,
+            content: content.to_string(),
+        });
         self.flush_stream_lines(true);
         if self.verbose {
             return;
@@ -760,14 +787,26 @@ impl AcpObserver for CliAcpObserver {
     fn on_proposal_deferred(
         &self,
         path: &std::path::Path,
-        _old_content: Option<&str>,
-        _new_content: &str,
+        old_content: Option<&str>,
+        new_content: &str,
     ) {
+        let old_lines = old_content.map(|s| s.lines().count()).unwrap_or(0);
+        let new_lines = new_content.lines().count();
+        self.publish(|id| LiveUpdate::File {
+            id,
+            path: path.display().to_string(),
+            additions: new_lines.saturating_sub(old_lines),
+            deletions: old_lines.saturating_sub(new_lines),
+        });
         self.flush_stream_lines(true);
         eprintln!("  [{}] ✎ {}", self.agent_id, path.display());
     }
 
     fn on_streaming_status(&self, status: &str) {
+        self.publish(|id| LiveUpdate::Status {
+            id,
+            status: status.to_string(),
+        });
         self.flush_stream_lines(true);
         eprintln!("  [{}] … {}", self.agent_id, status);
     }
@@ -792,15 +831,33 @@ impl AcpObserver for CliAcpObserver {
     }
 }
 
-/// CLI observer for swarm events.
-struct CliSwarmObserver;
+/// CLI observer for swarm events. With `live`, every event also goes into
+/// the run's published record (`swarm::live_run`) the phone app reads.
+#[derive(Default)]
+struct CliSwarmObserver {
+    live: Option<LiveRunHandle>,
+}
+
+impl CliSwarmObserver {
+    fn publish(&self, update: LiveUpdate) {
+        if let Some(live) = &self.live {
+            live.update(update);
+        }
+    }
+}
 
 impl SwarmObserver for CliSwarmObserver {
     fn on_phase_changed(&self, phase: &str) {
+        self.publish(LiveUpdate::Phase(phase.to_string()));
         eprintln!("[phase] {}", phase);
     }
 
     fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, detail: &str) {
+        self.publish(LiveUpdate::Agent {
+            id: work_unit_id.to_string(),
+            status: status.clone(),
+            detail: detail.to_string(),
+        });
         match status {
             AgentStatus::Running => {
                 if detail.is_empty() {
@@ -827,10 +884,15 @@ impl SwarmObserver for CliSwarmObserver {
     }
 
     fn on_tier_started(&self, current: usize, total: usize) {
+        self.publish(LiveUpdate::Tier { current, total });
         eprintln!("[tier] {}/{}", current, total);
     }
 
     fn on_merge_conflict(&self, branch: &str, files: &[String]) {
+        self.publish(LiveUpdate::Notice(format!(
+            "Merge conflict in {branch}: {}",
+            files.join(", ")
+        )));
         eprintln!("[conflict] branch={}  files={}", branch, files.join(", "));
     }
 
@@ -864,6 +926,11 @@ impl SwarmObserver for CliSwarmObserver {
     }
 
     fn on_tier_dispatch(&self, unit_id: &str, tier: gaviero_core::types::ModelTier, backend: &str) {
+        self.publish(LiveUpdate::Dispatch {
+            id: unit_id.to_string(),
+            tier,
+            backend: backend.to_string(),
+        });
         eprintln!(
             "[dispatch] {}  →  {}  ({})",
             unit_id,
@@ -896,6 +963,7 @@ impl SwarmObserver for CliSwarmObserver {
     }
 
     fn on_loop_iteration_started(&self, current: u32, max: u32, agents: &[String]) {
+        self.publish(LiveUpdate::Notice(format!("Loop pass {current}/{max}")));
         eprintln!(
             "[loop] iteration {}/{}  agents=[{}]",
             current,
@@ -923,6 +991,12 @@ impl SwarmObserver for CliSwarmObserver {
     }
 
     fn on_loop_gate_failed(&self, probe: &str, status: &str, output: &str) {
+        let diagnostic = output.lines().next().unwrap_or_default().trim();
+        self.publish(LiveUpdate::Notice(if diagnostic.is_empty() {
+            format!("Loop gate failed: {probe} ({status})")
+        } else {
+            format!("Loop gate failed: {probe} ({status}) - {diagnostic}")
+        }));
         eprintln!("[loop] gate FAIL - {} ({})", probe, status);
         if !output.trim().is_empty() {
             eprintln!("{}", output.trim_end());
@@ -930,6 +1004,7 @@ impl SwarmObserver for CliSwarmObserver {
     }
 
     fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
+        self.publish(LiveUpdate::Cost(estimate.estimated_usd));
         eprintln!("[cost] ~${:.4}", estimate.estimated_usd);
     }
 }
@@ -4735,7 +4810,7 @@ async fn main() -> Result<()> {
     }
 
     // Execute via swarm pipeline
-    let swarm_observer = CliSwarmObserver;
+    let swarm_observer = CliSwarmObserver::default();
     let specificity = workspace.resolve_specificity_config(Some(&repo));
     let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
     // Shell policy from the workspace cascade; agents run in worktrees
@@ -4908,6 +4983,11 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Publish the run for the phone app (any TUI with remote on this machine
+    // serves `~/.gaviero/remote/cli-runs`).
+    let live = start_live_run(&cli, &plan, &repo);
+    let flusher = live.as_ref().map(LiveRunHandle::spawn_flusher);
+    let swarm_observer = CliSwarmObserver { live: live.clone() };
     let result = gaviero_core::swarm::pipeline::execute(
         &plan,
         &config,
@@ -4916,11 +4996,22 @@ async fn main() -> Result<()> {
         &swarm_observer,
         |agent_id| {
             let verbose = cli.script.is_none();
-            Box::new(CliAcpObserver::new(agent_id, verbose))
+            Box::new(CliAcpObserver::new(agent_id, verbose).publishing(live.clone()))
                 as Box<dyn gaviero_core::observer::AcpObserver>
         },
     )
-    .await?;
+    .await;
+    if let Some(flusher) = flusher {
+        flusher.stop().await;
+    }
+    if let Some(live) = live {
+        let outcome = match &result {
+            Ok(result) => LiveUpdate::Completed(Box::new(result.clone())),
+            Err(e) => LiveUpdate::Failed(format!("{e:#}")),
+        };
+        let _ = tokio::task::spawn_blocking(move || live.finish(outcome)).await;
+    }
+    let result = result?;
 
     // Drain the extractor writer before the runtime shuts down, so in-flight
     // swarm-finding extraction (slow LLM calls enqueued right up to the end
@@ -4986,6 +5077,51 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("swarm execution reported failure")
     }
+}
+
+/// Start the run's published record (`swarm::live_run`): every planned agent
+/// queued, labelled like the SWARM panel labels a run. None when there is no
+/// machine folder; a write failure only logs.
+fn start_live_run(
+    cli: &Cli,
+    plan: &gaviero_core::swarm::plan::CompiledPlan,
+    run_root: &std::path::Path,
+) -> Option<LiveRunHandle> {
+    let store = CliRunStore::machine_default()?;
+    let stem = |p: &std::path::Path| {
+        p.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let mut script = if let Some(path) = &cli.script {
+        stem(path)
+    } else if let Some(path) = &cli.plan {
+        stem(path)
+    } else if cli.work_units.is_some() {
+        "work units".to_string()
+    } else {
+        "task".to_string()
+    };
+    if let Some(workflow) = &cli.workflow {
+        script = format!("{script} · {workflow}");
+    }
+    let folder = run_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let planned = plan
+        .work_units_ordered()
+        .unwrap_or_default()
+        .iter()
+        .chain(plan.loop_judge_units.iter())
+        .map(|unit| PlannedAgent {
+            id: unit.id.clone(),
+            tier: unit.tier,
+            model: unit.model.clone(),
+        })
+        .collect();
+    let run = LiveRun::new(CliRunStore::new_run_id(), script, folder, planned);
+    Some(LiveRunHandle::start(store, run))
 }
 
 /// Build an extraction-LLM-equipped memory writer for the headless swarm

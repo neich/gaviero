@@ -22,14 +22,16 @@ use serde::{Deserialize, Serialize};
 /// capability and the `request_skill_completions` client frame. Minor 9 is
 /// additive: optional `InstanceInfo.last_activity_at` in `GET /v1/instances`.
 /// Minor 10 is additive: the `swarm_activity` capability and the
-/// `request_swarm` client frame.
+/// `request_swarm` client frame. Minor 11 is additive: the `cli_runs`
+/// capability and the `GET /v1/cli-runs` / `GET /v1/cli-runs/<id>`
+/// resources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 10 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 11 };
 
 /// `hello.capabilities` entries this server version advertises (Plan C §4.1).
 pub mod capability {
@@ -58,6 +60,10 @@ pub mod capability {
     /// 1.10: `request_swarm` reads the SWARM panel's run — its agents, their
     /// state, and one agent's output. Read-only.
     pub const SWARM_ACTIVITY: &str = "swarm_activity";
+    /// 1.11: `GET /v1/cli-runs` lists the machine's `gaviero-cli` runs and
+    /// `GET /v1/cli-runs/<id>` reads one, in the `request_swarm` shape.
+    /// Read-only.
+    pub const CLI_RUNS: &str = "cli_runs";
 }
 
 /// Why a peer's version is unacceptable.
@@ -95,7 +101,7 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            ours.check_compatible(&ProtocolVersion { major: 1, minor: 10 })
+            ours.check_compatible(&ProtocolVersion { major: 1, minor: 11 })
                 .is_ok()
         );
     }

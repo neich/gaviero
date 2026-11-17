@@ -23,6 +23,8 @@ use crate::widgets::scrollbar::render_scrollbar;
 use crate::widgets::text_input::TextInput;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::swarm::plan::ExecutionMode;
+use gaviero_core::swarm::run_history::{RunAgentRecord, RunHistory, RunOutcome, SwarmRunRecord};
+use serde::{Deserialize, Serialize};
 use gaviero_core::types::ModelTier;
 use gaviero_dsl::ast::ReviewerEntry;
 use gaviero_dsl::workflow_params::{list_literal_entry, parse_reviewers_override};
@@ -86,7 +88,9 @@ pub enum SwarmUpdate {
 
 // ── Activity ────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+/// Serialized into each agent's saved output (`run_history` agent logs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActivityKind {
     Text,
     ToolCall,
@@ -94,10 +98,82 @@ pub enum ActivityKind {
     FileChange,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityLine {
     pub kind: ActivityKind,
     pub text: String,
+}
+
+// ── Run history ─────────────────────────────────────────────────
+
+/// The record of the run on screen: the live one, or one opened from history.
+pub struct RunRecordState {
+    pub history: RunHistory,
+    pub record: SwarmRunRecord,
+    /// The run can be continued from its checkpoint (`c`).
+    pub resumable: bool,
+    /// Activity revision last saved, per agent.
+    pub saved_revisions: HashMap<String, u64>,
+}
+
+impl RunRecordState {
+    pub fn new(history: RunHistory, record: SwarmRunRecord) -> Self {
+        Self {
+            history,
+            record,
+            resumable: false,
+            saved_revisions: HashMap::new(),
+        }
+    }
+}
+
+/// One past run in the History list.
+#[derive(Debug, Clone)]
+pub struct HistoryRow {
+    pub history: RunHistory,
+    pub record: SwarmRunRecord,
+    pub resumable: bool,
+    /// Its record says running, but nothing is running it.
+    pub interrupted: bool,
+}
+
+impl HistoryRow {
+    /// What became of the run, as the list and the run header say it.
+    pub fn outcome_label(&self) -> &'static str {
+        if self.interrupted {
+            "interrupted"
+        } else {
+            self.record.outcome.label()
+        }
+    }
+}
+
+pub struct HistoryList {
+    pub rows: Vec<HistoryRow>,
+    pub scroll: ScrollState,
+    list_rect: Rect,
+}
+
+impl HistoryList {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            scroll: ScrollState::new(),
+            list_rect: Rect::default(),
+        }
+    }
+
+    pub fn selected(&self) -> Option<&HistoryRow> {
+        self.rows.get(self.scroll.selected)
+    }
+
+    pub fn index_at(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.list_rect.contains((column, row).into()) {
+            return None;
+        }
+        let index = self.scroll.offset + (row - self.list_rect.y) as usize;
+        (index < self.rows.len()).then_some(index)
+    }
 }
 
 // ── Picker ──────────────────────────────────────────────────────
@@ -1421,6 +1497,8 @@ impl AgentEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwarmView {
     Picker,
+    /// Past runs, newest first (`Tab` from the picker).
+    History,
     Form,
     Run,
 }
@@ -1494,6 +1572,8 @@ pub struct SwarmDashboardState {
     pub follow_running: bool,
     pub diff_agent: Option<SwarmAgentDiffState>,
     pub pending_undo_confirm: bool,
+    /// `c` was pressed once; a second `c` continues the run.
+    pub pending_continue_confirm: bool,
     pub pending_stop_confirm: bool,
     pub table_rect: Rect,
     pub detail_rect: Rect,
@@ -1503,6 +1583,11 @@ pub struct SwarmDashboardState {
     pub last_forms: HashMap<PathBuf, SwarmForm>,
     /// Script of the run on screen, for `r`.
     pub last_script: Option<PathBuf>,
+    pub history: HistoryList,
+    /// Record of the run on screen, saved as it goes.
+    pub record: Option<RunRecordState>,
+    /// The run on screen was opened from History, not run in this session.
+    pub viewing_history: bool,
 }
 
 impl SwarmDashboardState {
@@ -1532,12 +1617,16 @@ impl SwarmDashboardState {
             follow_running: true,
             diff_agent: None,
             pending_undo_confirm: false,
+            pending_continue_confirm: false,
             pending_stop_confirm: false,
             table_rect: Rect::default(),
             detail_rect: Rect::default(),
             wrapped: WrappedOutput::default(),
             last_forms: HashMap::new(),
             last_script: None,
+            history: HistoryList::new(),
+            record: None,
+            viewing_history: false,
         }
     }
 
@@ -1590,9 +1679,97 @@ impl SwarmDashboardState {
         self.follow_running = true;
         self.diff_agent = None;
         self.pending_undo_confirm = false;
+        self.pending_continue_confirm = false;
         self.pending_stop_confirm = false;
         self.wrapped = WrappedOutput::default();
+        self.record = None;
+        self.viewing_history = false;
         self.run_id
+    }
+
+    /// An agent a continued run will not run again: done in an earlier pass,
+    /// with the output that pass saved.
+    pub fn seed_completed(&mut self, id: &str, detail: String, activity: Vec<ActivityLine>) {
+        let entry = self.agent_or_insert(id);
+        entry.status = AgentStatus::Completed;
+        entry.detail = detail;
+        entry.started_at = None;
+        entry.finished_after = None;
+        entry.saw_text = activity.iter().any(|l| l.kind == ActivityKind::Text);
+        entry.activity = activity;
+        entry.trim_activity();
+    }
+
+    /// Every agent's state, as the run record keeps it.
+    pub fn record_agents(&self) -> Vec<RunAgentRecord> {
+        self.agents
+            .iter()
+            .map(|a| RunAgentRecord {
+                id: a.id.clone(),
+                status: a.status.clone(),
+                detail: a.detail.clone(),
+                branch: a.branch.clone(),
+                modified_files: a.modified_files.clone(),
+                tier: a.model_tier,
+                backend: a.backend.clone(),
+                elapsed_secs: a.elapsed().map(|d| d.as_secs()),
+            })
+            .collect()
+    }
+
+    /// Show a past run: its agents as they ended, with the output each saved.
+    /// Nothing runs; `c` continues it when `row.resumable`.
+    pub fn show_record(&mut self, row: HistoryRow, mut activity: HashMap<String, Vec<ActivityLine>>) {
+        self.run_id += 1;
+        self.running = false;
+        self.abort = None;
+        self.view = SwarmView::Run;
+        self.script_label = row.record.script_label.clone();
+        self.run_root = Some(row.record.root.clone());
+        self.agents = row
+            .record
+            .agents
+            .iter()
+            .map(|a| {
+                let mut entry = AgentEntry::new(a.id.clone(), a.status.clone(), a.detail.clone());
+                entry.started_at = None;
+                entry.branch = a.branch.clone();
+                entry.modified_files = a.modified_files.clone();
+                entry.model_tier = a.tier;
+                entry.backend = a.backend.clone();
+                entry.finished_after = a.elapsed_secs.map(Duration::from_secs);
+                entry.activity = activity.remove(&a.id).unwrap_or_default();
+                entry.saw_text = entry.activity.iter().any(|l| l.kind == ActivityKind::Text);
+                entry.trim_activity();
+                entry
+            })
+            .collect();
+        self.scroll.reset();
+        self.phase = row.outcome_label().to_string();
+        self.tier_current = 0;
+        self.tier_total = 0;
+        self.result = None;
+        self.estimated_cost_usd = row.record.cost_usd;
+        self.status_message = row.record.message.clone();
+        self.detail_scroll = 0;
+        self.detail_auto_scroll = true;
+        self.focus = DashboardFocus::Table;
+        self.output_maximized = false;
+        self.follow_running = false;
+        self.diff_agent = None;
+        self.pending_undo_confirm = false;
+        self.pending_continue_confirm = false;
+        self.pending_stop_confirm = false;
+        self.wrapped = WrappedOutput::default();
+        let mut state = RunRecordState::new(row.history, row.record);
+        state.resumable = row.resumable;
+        self.record = Some(state);
+        self.viewing_history = true;
+    }
+
+    /// The run on screen can be continued now.
+    pub fn can_continue(&self) -> bool {
+        !self.running && self.record.as_ref().is_some_and(|r| r.resumable)
     }
 
     pub fn counts(&self) -> AgentCounts {
@@ -1892,6 +2069,7 @@ impl SwarmDashboardState {
         }
         match self.view {
             SwarmView::Picker => self.render_picker(area, buf, focused),
+            SwarmView::History => self.render_history(area, buf, focused),
             SwarmView::Form => self.render_form(area, buf, focused),
             SwarmView::Run => self.render_run(area, buf, focused),
         }
@@ -1965,11 +2143,112 @@ impl SwarmDashboardState {
             put(buf, area.x + 1, footer_y, right, warning, fg(theme::WARNING));
         }
         let hint = if self.has_run() {
-            " ↑↓ select  Enter open  Esc back to run"
+            " ↑↓ select  Enter open  Tab history  Esc back to run"
         } else {
-            " ↑↓ select  Enter open  type to filter or a path"
+            " ↑↓ select  Enter open  Tab history  type to filter or a path"
         };
         put(buf, area.x, area.bottom() - 1, right, hint, fg(theme::TEXT_DIM));
+    }
+
+    fn render_history(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
+        let bg = theme::PANEL_BG;
+        let right = area.right();
+        put(buf, area.x, area.y, right, " SWARM  run history", bold(theme::WARNING));
+
+        let footer_rows: u16 = 1;
+        let list = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1 + footer_rows),
+        };
+        self.history.list_rect = list;
+        self.history.scroll.set_viewport(list.height as usize);
+        self.history.scroll.ensure_visible_on_render();
+
+        if self.history.rows.is_empty() && list.height > 0 {
+            put(
+                buf,
+                list.x,
+                list.y,
+                right,
+                " No runs yet. Runs started here are kept in .gaviero/swarm-runs.",
+                fg(theme::TEXT_DIM),
+            );
+        }
+        let selected_bg = if focused {
+            theme::FOCUSED_SELECTION_BG
+        } else {
+            theme::DARK_BG
+        };
+        for (index, row) in self
+            .history
+            .rows
+            .iter()
+            .enumerate()
+            .skip(self.history.scroll.offset)
+            .take(list.height as usize)
+        {
+            let y = list.y + (index - self.history.scroll.offset) as u16;
+            let row_bg = if index == self.history.scroll.selected {
+                selected_bg
+            } else {
+                bg
+            };
+            for x in area.x..right {
+                buf[(x, y)].set_style(Style::default().bg(row_bg));
+            }
+            let x = put(
+                buf,
+                area.x + 1,
+                y,
+                right,
+                &format!("{} ", format_started(row.record.started_at)),
+                fg(theme::TEXT_DIM).bg(row_bg),
+            );
+            let x = put(buf, x, y, right, &row.record.script_label, bold(theme::TEXT_FG).bg(row_bg));
+            let outcome_color = if row.interrupted {
+                theme::WARNING
+            } else {
+                match row.record.outcome {
+                    RunOutcome::Completed => theme::SUCCESS,
+                    RunOutcome::Running => theme::FOCUS_BORDER,
+                    _ => theme::ERROR,
+                }
+            };
+            let x = put(
+                buf,
+                x,
+                y,
+                right,
+                &format!("  {}", row.outcome_label()),
+                fg(outcome_color).bg(row_bg),
+            );
+            let mut tail = format!(
+                "  {}/{} done",
+                row.record.completed_count(),
+                row.record.agents.len()
+            );
+            if row.record.cost_usd > 0.0 {
+                tail.push_str(&format!("  ~${:.3}", row.record.cost_usd));
+            }
+            if row.record.resumes > 0 {
+                tail.push_str(&format!("  continued ×{}", row.record.resumes));
+            }
+            let x = put(buf, x, y, right, &tail, fg(theme::TEXT_DIM).bg(row_bg));
+            if row.resumable {
+                put(buf, x, y, right, "  ⟳ can continue", bold(theme::INFO_CYAN).bg(row_bg));
+            }
+        }
+
+        put(
+            buf,
+            area.x,
+            area.bottom() - 1,
+            right,
+            " ↑↓ select  Enter open  Tab/Esc scripts",
+            fg(theme::TEXT_DIM),
+        );
     }
 
     fn render_picker_empty(&self, list: Rect, buf: &mut Buffer) {
@@ -2337,25 +2616,33 @@ impl SwarmDashboardState {
         }
 
         let hint = self.run_hint();
-        let style = if self.pending_stop_confirm || self.pending_undo_confirm {
+        let style = if self.pending_stop_confirm
+            || self.pending_undo_confirm
+            || self.pending_continue_confirm
+        {
             bold(theme::WARNING)
         } else {
             fg(theme::TEXT_DIM)
         };
-        put(buf, area.x + 1, footer_y, right, hint, style);
+        put(buf, area.x + 1, footer_y, right, &hint, style);
     }
 
-    fn run_hint(&self) -> &'static str {
+    fn run_hint(&self) -> String {
+        let continue_hint = if self.can_continue() { "  c continue" } else { "" };
         if self.pending_stop_confirm {
-            "Press x again to stop every agent. Esc cancels."
+            "Press x again to stop every agent. Esc cancels.".to_string()
         } else if self.pending_undo_confirm {
-            "Press u again to undo the whole run. Esc cancels."
+            "Press u again to undo the whole run. Esc cancels.".to_string()
+        } else if self.pending_continue_confirm {
+            "Press c again to run the agents this run did not complete. Esc cancels.".to_string()
         } else if self.diff_agent.is_some() {
-            "↑↓ scroll  Esc back to output"
+            "↑↓ scroll  Esc back to output".to_string()
         } else if self.running {
-            "↑↓ agent  Enter expand  Tab scroll output  x stop"
+            "↑↓ agent  Enter expand  Tab scroll output  x stop".to_string()
+        } else if self.viewing_history {
+            format!("Esc history{continue_hint}  ↑↓ agent  Enter expand  d diff")
         } else {
-            "Esc scripts  r run again  ↑↓ agent  Enter expand  d diff  u undo"
+            format!("Esc scripts{continue_hint}  r run again  ↑↓ agent  Enter expand  d diff  u undo")
         }
     }
 
@@ -2729,6 +3016,13 @@ fn spinner() -> &'static str {
         .as_millis()
         / 200;
     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(tick % 10) as usize]
+}
+
+/// A run's start time in local time, for the History list.
+fn format_started(unix_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(unix_secs, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// First row to draw so the focused field is on screen, preferring to show

@@ -29,6 +29,10 @@ pub const SUBPROTOCOL: &str = "gaviero.v1";
 /// HTTPS path of the instance directory (1.1): served on every instance
 /// listener, so any instance's relay route lists the whole machine.
 pub const INSTANCES_PATH: &str = "/v1/instances";
+/// HTTPS path of the machine's `gaviero-cli` runs (1.11, `cli_runs`): the
+/// list here, one run at `<CLI_RUNS_PATH>/<id>`. Served on every instance
+/// listener, like [`INSTANCES_PATH`].
+pub const CLI_RUNS_PATH: &str = "/v1/cli-runs";
 
 /// Application close codes (4000–4999). Committed in PROTOCOL.md.
 pub mod close_code {

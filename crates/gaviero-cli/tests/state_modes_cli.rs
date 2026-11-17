@@ -131,6 +131,7 @@ fn run(script: &Path, workspace: &Path, extra: &[&str]) -> Output {
         .args(extra)
         // Covers the isolated run with no settings to read.
         .env("GAVIERO_EMBEDDER_MODEL", "null")
+        .env("GAVIERO_CLI_RUNS_DIR", shared_cli_runs_dir())
         .output()
         .expect("spawn gaviero-cli")
 }
@@ -159,8 +160,18 @@ fn enclosed_by_a_workspace(dir: &Path) -> bool {
         .any(|d| Some(d) != home.as_deref() && has_workspace_marker(d))
 }
 
+/// Where test runs publish their live record (`swarm::live_run`) — never
+/// the user's `~/.gaviero/remote/cli-runs`, which the phone lists.
+fn shared_cli_runs_dir() -> PathBuf {
+    std::env::temp_dir().join("gaviero-cli-runs-tests")
+}
+
 /// `gaviero-cli --script` started from `cwd`, with no root flags.
 fn run_from(cwd: &Path, script: &Path) -> Output {
+    run_from_publishing(cwd, script, &shared_cli_runs_dir())
+}
+
+fn run_from_publishing(cwd: &Path, script: &Path, cli_runs: &Path) -> Output {
     Command::new(gaviero_cli())
         .current_dir(cwd)
         .arg("--script")
@@ -172,6 +183,7 @@ fn run_from(cwd: &Path, script: &Path) -> Output {
         .args(["--model", "ollama:qwen", "--no-mcp"])
         .args(["--skip-mcp-preflight", "--run-timeout", "120"])
         .env("GAVIERO_EMBEDDER_MODEL", "null")
+        .env("GAVIERO_CLI_RUNS_DIR", cli_runs)
         .output()
         .expect("spawn gaviero-cli")
 }
@@ -222,6 +234,39 @@ fn a_run_from_the_workspace_folder_uses_its_memory_and_graph() {
     assert!(root.join(".gaviero/memory.db").is_file(), "{stderr}");
     assert!(root.join(".gaviero/code_graph.db").is_file(), "{stderr}");
     assert!(!root.join(".gaviero/graphs").exists(), "{stderr}");
+}
+
+/// Every run is published for the phone app: one record under the machine
+/// folder, finished, with the agent's row and its output.
+#[test]
+fn a_run_is_published_for_the_phone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    configure(&root);
+    init_repo(&root);
+    let script = write_repo_script(&root);
+    let runs = tmp.path().join("cli-runs");
+
+    let stderr = stderr_of(&run_from_publishing(&root, &script, &runs));
+
+    let records: Vec<_> = std::fs::read_dir(&runs)
+        .unwrap_or_else(|e| panic!("no cli-runs folder ({e}): {stderr}"))
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let run: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(records[0].join("run.json")).unwrap())
+            .unwrap();
+    assert_eq!(run["script"], "wf", "{run}");
+    assert_eq!(run["folder"], "proj", "{run}");
+    assert_eq!(run["running"], false, "{run}");
+    assert_eq!(run["phase"], "completed", "{run}");
+    assert_eq!(run["agents"][0]["id"], "writer", "{run}");
+    assert_eq!(run["agents"][0]["status"], "completed", "{run}");
+    let output = std::fs::read_to_string(records[0].join("agents/writer.json")).unwrap();
+    assert!(output.contains("Running"), "{output}");
 }
 
 /// Each folder of a multi-folder workspace has its own graph in the TUI, so

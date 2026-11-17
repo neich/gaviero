@@ -554,6 +554,25 @@ pub fn qr_payload_for(config: &RemoteConfig, token: &str, tls_ca: &str) -> Strin
 
 // ── Server startup ──────────────────────────────────────────────────
 
+/// The machine's `gaviero-cli` runs (protocol 1.11 `cli_runs`), read from
+/// the records the CLI publishes (core `swarm::live_run`).
+struct CliRuns(gaviero_core::swarm::live_run::CliRunStore);
+
+impl gaviero_remote::server::CliRunSource for CliRuns {
+    fn list(&self, host: &str) -> serde_json::Value {
+        self.0.list_json(host)
+    }
+
+    fn detail(
+        &self,
+        id: &str,
+        agent_id: Option<&str>,
+        output_token: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        self.0.detail_json(id, agent_id, output_token)
+    }
+}
+
 /// Everything the bootstrap learned, delivered to the event loop as
 /// `Event::RemoteStarted` and rendered by `/remote`.
 #[derive(Clone)]
@@ -601,6 +620,10 @@ pub async fn start(
             .collect()
     };
     let last = *candidates.last().expect("at least one candidate");
+    // Served (and advertised) only when the machine folder resolves.
+    let cli_runs: Option<std::sync::Arc<dyn gaviero_remote::server::CliRunSource>> =
+        gaviero_core::swarm::live_run::CliRunStore::machine_default()
+            .map(|store| std::sync::Arc::new(CliRuns(store)) as _);
 
     let mut last_bind_error = String::new();
     for port in candidates {
@@ -648,7 +671,14 @@ pub async fn start(
                 gaviero_remote::version::capability::SHELL_HISTORY.to_string(),
                 gaviero_remote::version::capability::SKILL_COMPLETIONS.to_string(),
                 gaviero_remote::version::capability::SWARM_ACTIVITY.to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                cli_runs
+                    .is_some()
+                    .then(|| gaviero_remote::version::capability::CLI_RUNS.to_string()),
+            )
+            .collect(),
             machine: Some(gaviero_remote::dto::MachineInfo {
                 host: config.machine_host.clone(),
                 directory_url: Some(directory_url(config)),
@@ -658,6 +688,7 @@ pub async fn start(
             registry,
             heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
             stale_after: gaviero_remote::server::registry::STALE_AFTER,
+            cli_runs: cli_runs.clone(),
             confirm_required: crate::app::remote::REMOTE_CONFIRM_REQUIRED
                 .iter()
                 .map(|s| s.to_string())

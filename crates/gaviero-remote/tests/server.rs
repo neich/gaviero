@@ -65,6 +65,7 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         registry: None,
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
+        cli_runs: None,
         confirm_required: vec![
             "/autoapprove".into(),
             "/yolo".into(),
@@ -1141,4 +1142,98 @@ async fn instances_get_flood_returns_429() {
         }
     }
     assert!(saw_429, "flooding GET /v1/instances must hit the 10/s cap");
+}
+
+// ── 1.11: GET /v1/cli-runs ───────────────────────────────────────
+
+use gaviero_remote::CLI_RUNS_PATH;
+use gaviero_remote::server::CliRunSource;
+
+/// One run, `run-1`; records what each detail call asked for.
+#[derive(Default)]
+struct FakeCliRuns {
+    asked: std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>,
+}
+
+impl CliRunSource for FakeCliRuns {
+    fn list(&self, host: &str) -> serde_json::Value {
+        serde_json::json!({ "host": host, "runs": [{ "id": "run-1", "state": "running" }] })
+    }
+
+    fn detail(
+        &self,
+        id: &str,
+        agent_id: Option<&str>,
+        output_token: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        self.asked.lock().unwrap().push((
+            id.to_string(),
+            agent_id.map(str::to_string),
+            output_token.map(str::to_string),
+        ));
+        (id == "run-1").then(|| serde_json::json!({ "run": { "id": id }, "selected_id": agent_id }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_runs_are_served_behind_the_bearer() {
+    let tls = make_tls();
+    let source = Arc::new(FakeCliRuns::default());
+    let mut config = test_config(&tls);
+    config.machine = Some(MachineInfo {
+        host: TEST_HOST.into(),
+        directory_url: None,
+    });
+    config.cli_runs = Some(source.clone());
+    let server = spawn(config).await.unwrap();
+    let addr = server.local_addr;
+
+    let (status, _, _) = https_get(&tls, addr, TEST_HOST, None, CLI_RUNS_PATH).await;
+    assert_eq!(status, 401);
+    let (status, _, _) =
+        https_get(&tls, addr, TEST_HOST, None, &format!("{CLI_RUNS_PATH}/run-1")).await;
+    assert_eq!(status, 401);
+    assert!(source.asked.lock().unwrap().is_empty(), "no read without a token");
+
+    let (status, head, body) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), CLI_RUNS_PATH).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(head.to_ascii_lowercase().contains("cache-control: no-store"), "{head}");
+    let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list["host"], TEST_HOST);
+    assert_eq!(list["runs"][0]["id"], "run-1");
+
+    let path = format!("{CLI_RUNS_PATH}/run-1?agent_id=scout&output_token=1%3A2");
+    let (status, _, body) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), &path).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["selected_id"], "scout");
+    assert_eq!(
+        source.asked.lock().unwrap().last().cloned(),
+        Some(("run-1".into(), Some("scout".into()), Some("1:2".into())))
+    );
+
+    // Empty query values read as absent.
+    let path = format!("{CLI_RUNS_PATH}/run-1?agent_id=&output_token=");
+    let (status, _, _) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), &path).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        source.asked.lock().unwrap().last().cloned(),
+        Some(("run-1".into(), None, None))
+    );
+
+    let (status, _, _) =
+        https_get(&tls, addr, TEST_HOST, Some(TOKEN), &format!("{CLI_RUNS_PATH}/gone")).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_source_cli_runs_are_not_found() {
+    let tls = make_tls();
+    let server = spawn(test_config(&tls)).await.unwrap();
+    let addr = server.local_addr;
+    let (status, _, _) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), CLI_RUNS_PATH).await;
+    assert_eq!(status, 404);
+    let (status, _, _) =
+        https_get(&tls, addr, TEST_HOST, Some(TOKEN), &format!("{CLI_RUNS_PATH}/x")).await;
+    assert_eq!(status, 404);
 }

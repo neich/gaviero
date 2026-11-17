@@ -1,4 +1,4 @@
-# Gaviero Remote Protocol — v1.10 (1.0 frozen; 1.1 through 1.10 additive)
+# Gaviero Remote Protocol — v1.11 (1.0 frozen; 1.1 through 1.11 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
 1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
@@ -8,10 +8,11 @@ truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where p
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 10 }
+PROTOCOL_VERSION  = { major: 1, minor: 11 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
 Instances path    = /v1/instances      (HTTPS GET, 1.1, on every instance)
+CLI runs path     = /v1/cli-runs       (HTTPS GET, 1.11, on every instance)
 ```
 
 The document version of the plan that produced this (V3 / Plan C V1) is unrelated to the wire
@@ -221,7 +222,7 @@ share a folder name, each gains the nearest parent folder that tells them apart
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
 minor versions can advertise features. 1.1 advertises `latest_page` and `instances`; 1.2 adds
-`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`; 1.8 adds `skill_completions`; 1.10 adds `swarm_activity`. Clients
+`turn_review`; 1.3 adds `file_browser`; 1.4 adds `permission_turn_grant`; 1.6 adds `permission_grants`; 1.7 adds `shell_history`; 1.8 adds `skill_completions`; 1.10 adds `swarm_activity`; 1.11 adds `cli_runs`. Clients
 ignore unknown entries.
 
 ## DTOs
@@ -537,6 +538,50 @@ No run since the desktop started ⇒ `{ "run": null, "selected_id": null, "outpu
 
 The Flutter client polls it about once a second while its Swarm section is on screen. Older
 servers receive no swarm requests.
+
+## CLI runs (`cli_runs` capability, 1.11)
+
+`gaviero-cli` runs a script through the same pipeline as the desktop SWARM panel, but has no
+listener of its own. Each run publishes a record on its machine (`~/.gaviero/remote/cli-runs/`,
+written at most once a second and at least every 30 s while it runs); every instance listener of
+that machine serves those records over HTTPS, like `GET /v1/instances` — so the list works from the
+instance picker without a WebSocket, and a CLI run is visible while at least one instance with
+remote runs on the machine. Read-only: no start, stop or continue.
+
+Both resources need `Authorization: Bearer` (`401` otherwise), answer `Cache-Control: no-store`,
+and share the listener's 10 requests/s budget with `GET /v1/instances` (`429` above it). A server
+without `cli_runs` answers `404`.
+
+`GET /v1/cli-runs` — every kept record (the CLI keeps the newest 20), running ones first, then
+newest first:
+
+```json
+{ "host": "desk.gaviero.example.com", "generated_at": "2026-11-17T10:00:05Z",
+  "runs": [ { "id": "20261117-095800-123-4242", "script": "deep_explore", "folder": "gaviero",
+              "state": "running", "phase": "running", "running": true,
+              "started_at": "2026-11-17T09:58:00Z", "updated_at": "2026-11-17T10:00:04Z",
+              "cost_usd": 0.042, "counts": { "running": 1, "queued": 2, "done": 0, "failed": 0 },
+              "agents": 3 } ] }
+```
+
+- `state ∈ running | completed | completed_with_failures | failed | interrupted`. `interrupted` is a
+  record still marked running whose last write is older than 90 s: the CLI process went away.
+  `phase` is the pipeline's display string while running, `interrupted` when interrupted.
+- `folder` is the name of the folder the run ran in — never a path. `script` is the script's file
+  name without extension (`task` / `work units` for those modes), plus ` · <workflow>` when one was
+  chosen.
+
+`GET /v1/cli-runs/<id>?agent_id=<agent>&output_token=<token>` (both query parameters optional) —
+one run, in exactly the `request_swarm` result shape (§Swarm activity), with four more `run` keys:
+`id`, `folder`, `state`, `started_at`. `run.run_id` is a number (the start time in Unix ms) and
+`output.token` is `<run_id>:<revision>`, with the same `unchanged` rule. Without `agent_id` the
+output follows the agent that started last (unless the one followed is still running). In an
+`interrupted` run, agents that never finished read `status: failed`, `error: "interrupted"`.
+Unknown `<id>` ⇒ `404`.
+
+The Flutter client lists CLI runs in a tab of its instance picker (polling the list about every
+3 s while shown) and opens one in a screen like the Swarm section, polling the run about once a
+second. Older servers answer `404`; the client says the computer needs a newer Gaviero.
 
 ## File browser (`file_browser` capability)
 

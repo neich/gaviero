@@ -291,7 +291,29 @@ prompt curate-body #"
        when little is open. `[]` when nothing open is worth a lane.
        Never assign a question already in archive.md.
 
-    Write {{OUT_DIR}}/frontier-v{{ITER}}.json:
+    E. Keep the frontier small. It is read and written every pass, and
+       re-typing a large file by hand is slow and loses detail.
+       - From pass 2 on, never re-type the whole frontier. Copy
+         {{OUT_DIR}}/frontier-v{{PREV_ITER}}.json to
+         {{OUT_DIR}}/frontier-v{{ITER}}.json with a command or a short
+         script, then change only what this pass changed: edit those
+         entries, or load the JSON in a short Python script, apply the
+         changes and write it back. Then load the result as JSON to check
+         it parses and that no question id was lost.
+       - `question`: at most 250 characters. Narrowing a question replaces
+         its wording; the old wording goes to journal.md, not the field.
+       - `why`: at most 300 characters, the current evidence hook only.
+         Replace it, never append to it; its history belongs in
+         journal.md.
+       - closed and dead questions keep only id, question, status,
+         operator, parent, depth and supported_claims. A parked question
+         also keeps `why`: the experiment or data that would answer it.
+       - `leading_claims`: at most 5, each at most 200 characters.
+       - No top-level keys beyond the ones below.
+       A frontier already over these limits is brought within them this
+       pass, once, by script; say so in journal.md.
+
+    Write {{OUT_DIR}}/frontier-v{{ITER}}.json (kept small as in E):
     {"pass": {{ITER}}, "collection": "<name>",
      "questions": [{"id": "q7", "question": "…", "kind": "core|mechanism|method|contrarian|adjacent|gap|bridge|blind_spot",
                     "operator": "seed|decompose|falsify|bridge|analogy|recency|gap|method_transfer|child",
@@ -452,10 +474,20 @@ prompt verify-body #"
     even if it said "exact". Flag claims that two lanes state in
     contradiction.
 
+    Failures. A timeout or 429: wait, retry once, then move on. If the
+    `{{ACADEMIC_SERVER}}` server is unreachable or its tools are not in
+    your toolset, do not stop and do not ask what to do: this run is
+    unattended and nobody will answer. Check what you can on the web
+    (WebSearch/WebFetch, if you have them): existence, title and year,
+    with "checked_via": "web". Mark every claim you could not check
+    against the source's own text `cannot_verify` with reason "academic
+    server unavailable", and say so in "saturation". Never give a
+    `supported` verdict you did not check. Always write the file below.
+
     Write {{OUT_DIR}}/audit-v{{ITER}}.json:
     {"pass": {{ITER}},
      "claims": [{"finding": "<assignment id>", "index": 0, "verdict": "supported|partial|not_supported|cannot_verify",
-                 "reason": "…", "passage": "<quote>", "checked_via": "corpus|fulltext|abstract|citations",
+                 "reason": "…", "passage": "<quote>", "checked_via": "corpus|fulltext|abstract|citations|web",
                  "retracted": false, "resolved": true, "sampled": false}],
      "fidelity": [{"finding": "<id>", "verdict": "exact|narrowed|substituted", "note": "…"}],
      "contradictions": [{"a": "<id>#<i>", "b": "<id>#<i>", "note": "…"}],
@@ -595,7 +627,9 @@ agent curator {
         "{{OUT_DIR}}/frontier-v{{ITER}}.json"
         "{{OUT_DIR}}/assignments-v{{ITER}}.json"
     ]
-    timeout 1800
+    // Reading every pass's findings and the frontier takes longer as the
+    // run grows; 30 minutes was not enough by pass 5 of a real run.
+    timeout 3600
     prompt curate-body
 }
 

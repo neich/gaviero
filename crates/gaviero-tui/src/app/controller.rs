@@ -1670,7 +1670,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.remote.status = crate::app::remote::RemoteStatus::Unavailable(reason);
         }
         Event::Swarm { run, update } => {
-            app.swarm_dashboard.apply(run, update);
+            crate::app::swarm_run::apply_update(app, run, update);
         }
         Event::Tick => {
             app.terminal_manager.tick();

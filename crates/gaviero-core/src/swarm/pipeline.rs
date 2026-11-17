@@ -560,6 +560,17 @@ pub async fn execute(
     // Execution state tracks per-node progress (populated as nodes complete)
     let mut exec_state = initial_state.unwrap_or_else(|| ExecutionState::new_from_plan(plan));
     let plan_hash = plan.hash();
+    // On resume, agents the checkpoint shows as completed are skipped, so
+    // their branches never reach `all_manifests`. If the earlier run was
+    // interrupted before its merge phase, those branches are still unmerged;
+    // the merge phase below picks them up (only if still pending).
+    let resumed_manifests: Vec<AgentManifest> = exec_state
+        .node_states
+        .values()
+        .filter(|node| node.status == NodeStatus::Completed)
+        .filter_map(|node| node.result.clone())
+        .filter(|manifest| manifest.branch.is_some())
+        .collect();
 
     // Filter out already-completed nodes if resuming
     let work_units: Vec<WorkUnit> = work_units
@@ -861,6 +872,16 @@ pub async fn execute(
             // marking them Completed keeps the tier dispatch from rewriting it.
             for init_id in &resume.satisfied_init_units {
                 exec_state.set_status(init_id, NodeStatus::Completed);
+            }
+            // A checkpoint (`--resume`) marks a loop body agent Completed for
+            // whatever pass it ran last, not for the pass resumed here. The
+            // tier dispatch runs the loop's first pass and skips Completed
+            // agents, so left as is it would skip the resumed pass and the
+            // loop would judge and continue past a pass that never ran.
+            for agent_id in &lc.agent_ids {
+                if exec_state.status(agent_id) == NodeStatus::Completed {
+                    exec_state.set_status(agent_id, NodeStatus::Pending);
+                }
             }
             lc.iter_start = resume.resume_iter_start;
             observer.on_loop_resumed(&resume);
@@ -2597,7 +2618,17 @@ pub async fn execute(
             }
             false
         };
-        for manifest in &all_manifests {
+        // `true` marks a branch left by an earlier, interrupted run.
+        let stranded = resumed_manifests
+            .iter()
+            .filter(|m| {
+                m.branch
+                    .as_deref()
+                    .is_some_and(|b| merge::branch_pending_merge(&config.workspace_root, b))
+            })
+            .map(|m| (true, m));
+        for (from_earlier_run, manifest) in stranded.chain(all_manifests.iter().map(|m| (false, m)))
+        {
             if let Some(ref branch) = manifest.branch
                 && matches!(manifest.status, AgentStatus::Completed)
             {
@@ -2605,7 +2636,26 @@ pub async fn execute(
                     tracing::debug!("skipping merge of stacked iteration branch '{}'", branch);
                     continue;
                 }
-                let mut result = merge::merge_branch(&config.workspace_root, branch)?;
+                let mut result = match merge::merge_branch(&config.workspace_root, branch) {
+                    Ok(result) => result,
+                    // This run's work still merges; a leftover branch that
+                    // will not is reported (the run ends with failures) and
+                    // left for the user to merge.
+                    Err(e) if from_earlier_run => {
+                        tracing::warn!("could not merge {branch} from the earlier run: {e:#}");
+                        observer.on_merge_conflict(
+                            branch,
+                            &[format!("merge failed, branch kept for a manual merge: {e}")],
+                        );
+                        all_merges.push(MergeResult {
+                            work_unit_id: manifest.work_unit_id.clone(),
+                            success: false,
+                            conflicts: Vec::new(),
+                        });
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if !result.success && !result.conflicts.is_empty() {
                     let files: Vec<String> = result
                         .conflicts
