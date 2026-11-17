@@ -76,6 +76,24 @@ fn collect_conflict_files(repo_dir: &Path) -> Result<Vec<MergeConflict>> {
     Ok(conflicts)
 }
 
+/// True when `branch` exists and HEAD does not contain it yet: an agent
+/// branch a previous run finished but never merged (the run was interrupted
+/// before its merge phase). A missing branch, or one already merged, is false.
+pub fn branch_pending_merge(repo_dir: &Path, branch: &str) -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let reference = format!("refs/heads/{branch}");
+    git(&["rev-parse", "--verify", "--quiet", &reference])
+        && !git(&["merge-base", "--is-ancestor", &reference, "HEAD"])
+}
+
 /// Abort an in-progress merge.
 pub fn abort_merge(repo_dir: &Path) -> Result<()> {
     Command::new("git")
@@ -237,4 +255,48 @@ async fn resolve_single_file(
     };
 
     Ok(cleaned.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn commit(dir: &Path, file: &str) {
+        std::fs::write(dir.join(file), file).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-qm", file]);
+    }
+
+    #[test]
+    fn only_an_existing_unmerged_branch_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["config", "user.email", "t@t"]);
+        commit(root, "base.txt");
+
+        git(root, &["branch", "gaviero/done"]);
+        git(root, &["checkout", "-q", "-b", "gaviero/agent"]);
+        commit(root, "agent.txt");
+        git(root, &["checkout", "-q", "main"]);
+
+        assert!(branch_pending_merge(root, "gaviero/agent"), "unmerged work");
+        assert!(!branch_pending_merge(root, "gaviero/done"), "already in HEAD");
+        assert!(!branch_pending_merge(root, "gaviero/missing"), "no such branch");
+
+        merge_branch(root, "gaviero/agent").unwrap();
+        assert!(!branch_pending_merge(root, "gaviero/agent"), "merged now");
+    }
 }

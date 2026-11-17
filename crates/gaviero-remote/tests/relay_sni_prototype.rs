@@ -168,6 +168,7 @@ async fn sidecar(bundle: Vec<u8>, token: String) -> SpawnedServer {
         registry: None,
         heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
         stale_after: gaviero_remote::server::registry::STALE_AFTER,
+        cli_runs: None,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
         limits: Limits {

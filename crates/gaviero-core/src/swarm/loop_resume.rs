@@ -156,6 +156,9 @@ pub fn detect(
 
     // version → agent id → coverage
     let mut by_version: BTreeMap<u32, BTreeMap<&str, Coverage>> = BTreeMap::new();
+    // Per agent, the owned globs that hold versioned artefacts in some pass.
+    let mut versioned_globs: BTreeMap<&str, std::collections::BTreeSet<usize>> =
+        owned.keys().map(|id| (*id, Default::default())).collect();
 
     for (rel, len) in &files {
         let Some(version) = parse_version(rel) else {
@@ -168,6 +171,7 @@ pub fn detect(
             else {
                 continue;
             };
+            versioned_globs.entry(agent_id).or_default().insert(idx);
             let entry = by_version
                 .entry(version)
                 .or_default()
@@ -214,19 +218,41 @@ pub fn detect(
             notes.push(format!("v{version} incomplete — a runtime `for` wrote nothing"));
             continue;
         }
-        let mut vectors = per_agent
+        // Roster clones share one glob layout and must produce the same
+        // artefact set, so no reviewer reads peer input a peer never wrote.
+        // Agents with a layout of their own (a curator and a verifier in one
+        // panel) cannot be compared that way; each must instead cover every
+        // glob it writes versioned files to in any pass. Unversioned globs
+        // (`archive.md`) never count.
+        let fixed: Vec<(&str, &Coverage)> = per_agent
             .iter()
             .filter(|(id, _)| !dynamic.contains(*id))
-            .map(|(_, c)| &c.counts);
-        let Some(first) = vectors.next() else {
+            .map(|(id, c)| (*id, c))
+            .collect();
+        if fixed.is_empty() {
             // Only runtime `for` members, each with at least one artefact.
             last_complete = Some(*version);
             continue;
-        };
-        if first.iter().sum::<usize>() == 0 {
+        }
+        if fixed.iter().any(|(_, c)| c.total() == 0) {
             continue;
         }
-        if vectors.all(|v| v == first) {
+        let layout = |id: &str| owned.get(id).map_or(0, Vec::len);
+        let consistent = fixed.iter().all(|(id, c)| {
+            let peers: Vec<&&Coverage> = fixed
+                .iter()
+                .filter(|(other, _)| other != id && layout(other) == layout(id))
+                .map(|(_, c)| c)
+                .collect();
+            if peers.is_empty() {
+                versioned_globs[*id]
+                    .iter()
+                    .all(|&glob| c.counts.get(glob).is_some_and(|&n| n > 0))
+            } else {
+                peers.iter().all(|p| p.counts == c.counts)
+            }
+        });
+        if consistent {
             last_complete = Some(*version);
         } else {
             let detail: Vec<String> = per_agent
@@ -234,7 +260,8 @@ pub fn detect(
                 .map(|(id, c)| format!("{id}={}", c.total()))
                 .collect();
             notes.push(format!(
-                "v{version} incomplete — reviewers produced different artefact sets ({})",
+                "v{version} incomplete — an agent's artefact set is short or differs from its \
+                 peers' ({})",
                 detail.join(", ")
             ));
         }
@@ -702,6 +729,62 @@ mod tests {
             .expect("passes 1 and 2 are complete");
         assert_eq!(resume.last_complete_iter, 2);
         assert_eq!(resume.resume_iter_start, 3);
+    }
+
+    /// The `deep_explore.gaviero` shape: a curator (four owned globs, two of
+    /// them unversioned), a verifier (one) and a runtime `for` investigator
+    /// in one loop. Their artefact sets differ by design; each pass is
+    /// complete once each agent covered its own versioned globs.
+    fn deep_explore_units() -> Vec<WorkUnit> {
+        vec![
+            unit(
+                "curator",
+                &[
+                    "out/frontier-v*.json",
+                    "out/assignments-v*.json",
+                    "out/archive.md",
+                    "out/journal.md",
+                ],
+            ),
+            unit("verifier", &["out/audit-v*.json"]),
+            unit("investigator", &["out/{{q.id}}-finding-v*.json"]),
+        ]
+    }
+
+    fn deep_explore_pass(root: &Path, v: u32, audit: bool) {
+        write(root, &format!("out/frontier-v{v}.json"), "x");
+        write(root, &format!("out/assignments-v{v}.json"), "x");
+        write(root, &format!("out/q{v}-p{v}-finding-v{v}.json"), "x");
+        if audit {
+            write(root, &format!("out/audit-v{v}.json"), "x");
+        }
+    }
+
+    #[test]
+    fn a_panel_of_different_agents_resumes_after_its_last_audited_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "out/landscape.json", "x");
+        write(root, "out/journal.md", "x");
+        write(root, "out/archive.md", "x");
+        for v in 1..=3 {
+            deep_explore_pass(root, v, true);
+        }
+        // Pass 4: the lanes ran, the verifier never wrote its audit.
+        deep_explore_pass(root, 4, false);
+        let units = deep_explore_units();
+        let lc = loop_config(&["curator", "verifier", "investigator"], "out", 1);
+
+        let resume = detect(root, &lc, &map(&units)).expect("passes 1-3 are complete");
+        assert_eq!(resume.last_complete_iter, 3);
+        assert_eq!(resume.resume_iter_start, 4);
+        assert!(resume.discarded.iter().all(|p| p.contains("-v4.")));
+        assert_eq!(resume.discarded.len(), 3);
+
+        // The curator wrote its frontier but not its assignments: not done.
+        std::fs::remove_file(root.join("out/assignments-v3.json")).unwrap();
+        let resume = detect(root, &lc, &map(&units)).expect("passes 1-2 are complete");
+        assert_eq!(resume.last_complete_iter, 2);
     }
 
     #[test]

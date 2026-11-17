@@ -18,6 +18,7 @@ pub fn protocol_schema() -> Value {
         "ws_path": crate::WS_PATH,
         "subprotocol": crate::SUBPROTOCOL,
         "instances_path": crate::INSTANCES_PATH,
+        "cli_runs_path": crate::CLI_RUNS_PATH,
         "client_envelope": client,
         "server_envelope": server,
         "instance_directory": directory,

@@ -15,16 +15,21 @@ use super::state::{Focus, SidePanelMode};
 use crate::event::Event;
 use crate::keymap::Action;
 use crate::panels::swarm_dashboard::{
-    DashboardFocus, FieldRole, FormValues, ListTarget, PlannedAgent, ScriptRow, SwarmForm,
-    SwarmUpdate, SwarmView,
+    ActivityLine, DashboardFocus, FieldRole, FormValues, HistoryRow, ListTarget, PlannedAgent,
+    RunRecordState, ScriptRow, SwarmForm, SwarmUpdate, SwarmView,
 };
 use crate::widgets::prompt_input::{self, AutocompleteMode};
 use crate::widgets::render_utils::strip_ansi;
 use crate::widgets::text_input::TextInput;
 use gaviero_core::script_profiles::ProfileCatalog;
 use gaviero_core::scripts::{ScriptCatalog, is_repo_scoped};
+use gaviero_core::swarm::execution_state::{ExecutionState, NodeStatus};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::swarm::plan::ExecutionMode;
+use gaviero_core::swarm::run_history::{
+    KEEP_RUNS, RunAgentRecord, RunHistory, RunInputs, RunOutcome, RunTierOverride,
+    SwarmRunRecord, resume_checkpoint,
+};
 use gaviero_core::swarm::{pipeline, script_run};
 use gaviero_core::workspace::settings as S;
 
@@ -164,8 +169,10 @@ pub(super) fn open_panel(app: &mut App) {
     app.panel_visible.side_panel = true;
     app.side_panel = SidePanelMode::SwarmDashboard;
     app.focus = Focus::SidePanel;
-    if app.swarm_dashboard.view == SwarmView::Picker {
-        refresh_picker(app);
+    match app.swarm_dashboard.view {
+        SwarmView::Picker => refresh_picker(app),
+        SwarmView::History => refresh_history(app),
+        _ => {}
     }
 }
 
@@ -290,6 +297,34 @@ fn script_from_typed_path(app: &App, typed: &str) -> Option<ScriptRow> {
     })
 }
 
+/// A picker row for a script known only by its path (a run from History).
+/// Named as the catalog names it: its folder, or the file for a loose script.
+fn script_row_from_path(
+    workspace: &gaviero_core::workspace::Workspace,
+    path: &Path,
+) -> Option<ScriptRow> {
+    if !path.is_file() {
+        return None;
+    }
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let in_own_folder = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|dir| dir.to_string_lossy() == stem);
+    let name = if in_own_folder {
+        stem
+    } else {
+        path.file_name()?.to_string_lossy().to_string()
+    };
+    Some(ScriptRow {
+        name,
+        source: "history".to_string(),
+        description: None,
+        path: path.to_path_buf(),
+        owner: workspace.folder_for_path(path).map(Path::to_path_buf),
+    })
+}
+
 /// What the user should know before starting: writes land in this checkout.
 fn refresh_form_warnings(app: &mut App) {
     let chat_turn_running = app
@@ -361,13 +396,81 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
     let script = form.script.clone();
     let execution_mode = form.execution_mode();
 
+    // `$skill` is expanded once, here; the record keeps the result, so a
+    // continued run compiles the same prompt whatever the catalog holds then.
+    let mut skill_notes = Vec::new();
+    let prompt = values.prompt.as_deref().map(|prompt| {
+        let repo = gaviero_core::memory::scope::hash_path(&values.root);
+        let (expanded, notes) = expand_prompt_skills(prompt, &app.skill_catalog, &repo);
+        skill_notes = notes;
+        expanded
+    });
+    let label = match &values.workflow {
+        Some(workflow) if workflow != &script.name => format!("{} / {workflow}", script.name),
+        _ => script.name.clone(),
+    };
+    let inputs = RunInputs {
+        form_root: values.root,
+        workflow: values.workflow,
+        profile: values.profile,
+        prompt,
+        vars: values.vars,
+        params: values.params,
+        agent_tiers: values.agent_tiers,
+        tier_overrides: values
+            .tier_overrides
+            .into_iter()
+            .map(|o| RunTierOverride {
+                tier: o.tier,
+                client: o.client,
+                effort: o.effort,
+            })
+            .collect(),
+    };
+    let prepared = prepare_run(app, &script.path, label, execution_mode, &inputs, skill_notes)?;
+
+    let history = history_for(app, &prepared.root);
+    history.prune(KEEP_RUNS.saturating_sub(1));
+    let record = SwarmRunRecord::new(
+        RunHistory::new_run_id(),
+        script.path.clone(),
+        prepared.label.clone(),
+        prepared.root.clone(),
+        prepared.plan.hash(),
+        inputs,
+    );
+    start_run(app, prepared, RunRecordState::new(history, record), None);
+    Ok(())
+}
+
+/// A compiled run, ready to start.
+struct PreparedRun {
+    label: String,
+    root: PathBuf,
+    plan: gaviero_core::swarm::plan::CompiledPlan,
+    config: pipeline::SwarmConfig,
+    planned: Vec<PlannedAgent>,
+    notes: Vec<String>,
+}
+
+/// Compile `script` with `inputs` and set up its run, as `gaviero-cli
+/// --script` does. `inputs` are final: skills already expanded, file vars
+/// already located. Nothing runs yet.
+fn prepare_run(
+    app: &App,
+    script: &Path,
+    label: String,
+    execution_mode: ExecutionMode,
+    inputs: &RunInputs,
+    extra_notes: Vec<String>,
+) -> Result<PreparedRun, String> {
     let anchor = script_run::anchor_script_run(
-        &values.root,
-        &values.root,
+        &inputs.form_root,
+        &inputs.form_root,
         None,
         true,
         execution_mode,
-        values.vars,
+        inputs.vars.clone(),
     )
     .map_err(|e| format!("{e:#}"))?;
     let root = std::fs::canonicalize(&anchor.root)
@@ -381,25 +484,28 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
 
     let profile = ProfileCatalog::scan(&app.workspace, &ScriptCatalog::global_scripts_dir())
         .select(
-            values.profile.as_deref(),
+            inputs.profile.as_deref(),
             Some(&gaviero_core::memory::scope::hash_path(&root)),
             &root,
         )?;
     if let Some(profile) = &profile {
         notes.push(format!("Profile: {}", profile.name));
     }
+    notes.extend(extra_notes);
 
-    let prompt = values.prompt.as_deref().map(|prompt| {
-        let repo = gaviero_core::memory::scope::hash_path(&values.root);
-        let (expanded, skill_notes) = expand_prompt_skills(prompt, &app.skill_catalog, &repo);
-        notes.extend(skill_notes);
-        expanded
-    });
-
-    for (agent, tier) in &values.agent_tiers {
+    let tier_overrides: Vec<gaviero_dsl::TierOverride> = inputs
+        .tier_overrides
+        .iter()
+        .map(|o| gaviero_dsl::TierOverride {
+            tier: o.tier.clone(),
+            client: o.client.clone(),
+            effort: o.effort.clone(),
+        })
+        .collect();
+    for (agent, tier) in &inputs.agent_tiers {
         notes.push(format!("Agent {agent} runs on tier {tier}"));
     }
-    for o in &values.tier_overrides {
+    for o in &tier_overrides {
         notes.push(match (&o.client, &o.effort) {
             (Some(client), Some(effort)) => {
                 format!("Tier {} runs on client {client} at effort {effort}", o.tier)
@@ -410,14 +516,14 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         });
     }
     let plan = gaviero_dsl::compile_file_with_models(
-        &script.path,
+        script,
         profile.as_ref(),
-        &values.tier_overrides,
-        values.workflow.as_deref(),
-        prompt.as_deref(),
+        &tier_overrides,
+        inputs.workflow.as_deref(),
+        inputs.prompt.as_deref(),
         &vars,
-        &values.agent_tiers,
-        &values.params,
+        &inputs.agent_tiers,
+        &inputs.params,
     )
     .map_err(|report| report_text(&report))?;
 
@@ -448,13 +554,72 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
         mcp_config,
         worktree_context_paths,
     );
-    let memory = app.memory.clone();
+    Ok(PreparedRun {
+        label,
+        root,
+        plan,
+        config,
+        planned,
+        notes,
+    })
+}
 
-    let label = match &values.workflow {
-        Some(workflow) if workflow != &script.name => format!("{} / {workflow}", script.name),
-        _ => script.name.clone(),
-    };
+/// Where a run's record is kept: the workspace folder it ran in, else its root.
+fn history_for(app: &App, root: &Path) -> RunHistory {
+    let folder = app.workspace.folder_for_path(root).unwrap_or(root);
+    RunHistory::for_folder(folder)
+}
+
+/// Show the run, save its record and start it. `initial_state` continues a
+/// run from its checkpoint: the agents it completed are not run again.
+fn start_run(
+    app: &mut App,
+    prepared: PreparedRun,
+    mut state: RunRecordState,
+    initial_state: Option<ExecutionState>,
+) {
+    let PreparedRun {
+        label,
+        root,
+        plan,
+        config,
+        planned,
+        notes,
+    } = prepared;
+    let memory = app.memory.clone();
     let run = app.swarm_dashboard.begin_run(label, root, planned, notes);
+
+    if let Some(checkpoint) = &initial_state {
+        let earlier: Vec<RunAgentRecord> = state.record.agents.clone();
+        let mut done: Vec<&String> = checkpoint
+            .node_states
+            .iter()
+            .filter(|(_, node)| node.status == NodeStatus::Completed)
+            .map(|(id, _)| id)
+            .collect();
+        done.sort();
+        for id in done {
+            let detail = earlier
+                .iter()
+                .find(|a| &a.id == id)
+                .map(|a| a.detail.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "done in an earlier pass".to_string());
+            let activity = load_activity(&state.history, &state.record.id, id);
+            app.swarm_dashboard.seed_completed(id, detail, activity);
+        }
+    }
+
+    state.record.outcome = RunOutcome::Running;
+    state.record.ended_at = None;
+    state.record.agents = app.swarm_dashboard.record_agents();
+    if let Err(e) = state.history.save(&state.record) {
+        tracing::warn!("swarm run record not saved: {e:#}");
+        app.swarm_dashboard.status_message.push_str(&format!(
+            "\nThis run is not recorded in History: {e:#}"
+        ));
+    }
+    app.swarm_dashboard.record = Some(state);
 
     let tx = app.event_tx.clone();
     let task = tokio::spawn({
@@ -473,13 +638,19 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
                         agent: agent.to_string(),
                     })
                 };
-            let update =
-                match pipeline::execute(&plan, &config, None, memory, &observer, make_observer)
-                    .await
-                {
-                    Ok(result) => SwarmUpdate::Completed(Box::new(result)),
-                    Err(e) => SwarmUpdate::Failed(format!("{e:#}")),
-                };
+            let update = match pipeline::execute(
+                &plan,
+                &config,
+                initial_state,
+                memory,
+                &observer,
+                make_observer,
+            )
+            .await
+            {
+                Ok(result) => SwarmUpdate::Completed(Box::new(result)),
+                Err(e) => SwarmUpdate::Failed(format!("{e:#}")),
+            };
             let _ = tx.send(Event::Swarm { run, update });
         }
     });
@@ -494,7 +665,235 @@ fn prepare_and_start(app: &mut App) -> Result<(), String> {
             let _ = tx.send(Event::Swarm { run, update });
         }
     });
-    Ok(())
+}
+
+// ── Run history ─────────────────────────────────────────────────
+
+/// Every run update goes through here: the panel shows it, and the run's
+/// record is saved whenever an agent changes state and when the run ends,
+/// so a run cut short (editor closed, machine asleep) is still in History.
+pub(super) fn apply_update(app: &mut App, run: u64, update: SwarmUpdate) {
+    let current = run == app.swarm_dashboard.run_id;
+    let end = match &update {
+        SwarmUpdate::Completed(result) if result.success => Some(RunOutcome::Completed),
+        SwarmUpdate::Completed(_) => Some(RunOutcome::CompletedWithFailures),
+        SwarmUpdate::Failed(_) => Some(RunOutcome::Failed),
+        SwarmUpdate::Stopped => Some(RunOutcome::Stopped),
+        _ => None,
+    };
+    let progress = end.is_some() || matches!(update, SwarmUpdate::Agent { .. });
+    let reverted = matches!(update, SwarmUpdate::Reverted(Ok(())));
+    app.swarm_dashboard.apply(run, update);
+    if current && progress && !app.swarm_dashboard.viewing_history {
+        save_progress(&mut app.swarm_dashboard, end);
+    }
+    // An undone run's checkpoint no longer describes the tree: continuing it
+    // would skip agents whose work is gone.
+    if current
+        && reverted
+        && let Some(state) = app.swarm_dashboard.record.as_mut()
+    {
+        state.record.reverted = true;
+        state.resumable = false;
+        if let Err(e) = state.history.save(&state.record) {
+            tracing::warn!("swarm run record not saved: {e:#}");
+        }
+    }
+}
+
+fn save_progress(
+    dash: &mut crate::panels::swarm_dashboard::SwarmDashboardState,
+    end: Option<RunOutcome>,
+) {
+    let agents = dash.record_agents();
+    let cost = dash.estimated_cost_usd;
+    let message = dash.status_message.clone();
+    let Some(state) = dash.record.as_mut() else {
+        return;
+    };
+    state.record.agents = agents;
+    state.record.cost_usd = cost;
+    // Output is saved as it changes, so an interrupted run keeps it too.
+    for agent in &dash.agents {
+        if agent.activity.is_empty()
+            || state.saved_revisions.get(&agent.id) == Some(&agent.revision())
+        {
+            continue;
+        }
+        let json = match serde_json::to_string(&agent.activity) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("swarm output of {} not saved: {e}", agent.id);
+                continue;
+            }
+        };
+        match state.history.write_agent_log(&state.record.id, &agent.id, &json) {
+            Ok(()) => {
+                state.saved_revisions.insert(agent.id.clone(), agent.revision());
+            }
+            Err(e) => tracing::warn!("swarm output of {} not saved: {e:#}", agent.id),
+        }
+    }
+    if let Some(outcome) = end {
+        state.record.outcome = outcome;
+        state.record.ended_at = Some(chrono::Utc::now().timestamp());
+        state.record.message = message;
+    }
+    if let Err(e) = state.history.save(&state.record) {
+        tracing::warn!("swarm run record not saved: {e:#}");
+    }
+    if end.is_some() {
+        state.resumable = resume_checkpoint(&state.record, &state.history.list()).is_some();
+    }
+}
+
+/// An agent's saved output; empty when there is none or it does not parse.
+fn load_activity(history: &RunHistory, run_id: &str, agent: &str) -> Vec<ActivityLine> {
+    history
+        .read_agent_log(run_id, agent)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Reload History: the runs of every workspace folder, newest first.
+pub(super) fn refresh_history(app: &mut App) {
+    let dash = &app.swarm_dashboard;
+    let live = dash
+        .record
+        .as_ref()
+        .filter(|_| dash.running)
+        .map(|state| state.record.id.clone());
+    let mut folders: Vec<PathBuf> = workspace_folders(app).into_iter().map(|(_, p)| p).collect();
+    folders.dedup();
+    let mut rows = Vec::new();
+    for folder in folders {
+        let history = RunHistory::for_folder(&folder);
+        let records = history.list();
+        for record in &records {
+            let is_live = live.as_ref() == Some(&record.id);
+            rows.push(HistoryRow {
+                history: history.clone(),
+                record: record.clone(),
+                resumable: !is_live && resume_checkpoint(record, &records).is_some(),
+                interrupted: !is_live && record.outcome == RunOutcome::Running,
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.record
+            .started_at
+            .cmp(&a.record.started_at)
+            .then_with(|| b.record.id.cmp(&a.record.id))
+    });
+    let list = &mut app.swarm_dashboard.history;
+    list.rows = rows;
+    list.scroll.selected = list.scroll.selected.min(list.rows.len().saturating_sub(1));
+}
+
+fn open_history(app: &mut App) {
+    app.swarm_dashboard.view = SwarmView::History;
+    refresh_history(app);
+}
+
+/// History `Enter`: show the run as it ended. The live run is shown live.
+fn open_history_row(app: &mut App) {
+    let Some(row) = app.swarm_dashboard.history.selected().cloned() else {
+        return;
+    };
+    let dash = &mut app.swarm_dashboard;
+    let is_live = dash.running
+        && dash
+            .record
+            .as_ref()
+            .is_some_and(|state| state.record.id == row.record.id);
+    if is_live {
+        dash.view = SwarmView::Run;
+        return;
+    }
+    let activity = row
+        .record
+        .agents
+        .iter()
+        .map(|a| (a.id.clone(), load_activity(&row.history, &row.record.id, &a.id)))
+        .collect();
+    dash.show_record(row, activity);
+}
+
+/// `c` twice: continue the run on screen from its checkpoint, running only
+/// the agents it did not complete, with the inputs it was started with.
+/// Refused when the script's agents (ids and descriptions) changed since.
+fn continue_run(app: &mut App) {
+    let dash = &mut app.swarm_dashboard;
+    if !dash.can_continue() {
+        return;
+    }
+    let Some(state) = dash.record.as_ref() else {
+        return;
+    };
+    let history = state.history.clone();
+    let mut record = state.record.clone();
+    let Some(checkpoint) = resume_checkpoint(&record, &history.list()) else {
+        if let Some(state) = dash.record.as_mut() {
+            state.resumable = false;
+        }
+        dash.status_message =
+            "This run can no longer be continued: its checkpoint is gone or a later run of \
+             the same script replaced it."
+                .to_string();
+        return;
+    };
+    let execution_mode = match gaviero_dsl::inspect_file(&record.script_path) {
+        Ok(inspection) => record
+            .inputs
+            .workflow
+            .as_deref()
+            .and_then(|name| inspection.workflows.iter().find(|w| w.name == name))
+            .map_or(inspection.default_execution, |w| w.execution),
+        Err(report) => {
+            dash.status_message = format!(
+                "Cannot continue: {}: {}",
+                record.script_path.display(),
+                report_text(&report)
+            );
+            return;
+        }
+    };
+    let done = checkpoint
+        .node_states
+        .values()
+        .filter(|n| n.status == NodeStatus::Completed)
+        .count();
+    let note = format!(
+        "Continuing: {done} of {} agents already done.",
+        checkpoint.node_states.len()
+    );
+    let prepared = match prepare_run(
+        app,
+        &record.script_path,
+        record.script_label.clone(),
+        execution_mode,
+        &record.inputs,
+        vec![note],
+    ) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            app.swarm_dashboard.status_message = format!("Cannot continue: {message}");
+            return;
+        }
+    };
+    // The checkpoint is keyed by the plan's agents (ids and descriptions,
+    // `CompiledPlan::hash`). An edit that keeps them — a reworded prompt —
+    // is continued with the edited script.
+    if prepared.plan.hash() != record.plan_hash {
+        app.swarm_dashboard.status_message = "Cannot continue: the script's agents changed \
+             since this run, so its checkpoint no longer matches them. Run it again from the form."
+            .to_string();
+        return;
+    }
+    record.resumes += 1;
+    let script_path = record.script_path.clone();
+    start_run(app, prepared, RunRecordState::new(history, record), Some(checkpoint));
+    app.swarm_dashboard.last_script = Some(script_path);
 }
 
 /// Turn each `file` and `dir` var into the path agents should see. Values
@@ -712,8 +1111,34 @@ fn swarm_config(
 pub(super) fn handle_action(app: &mut App, action: Action) {
     match app.swarm_dashboard.view {
         SwarmView::Picker => handle_picker(app, action),
+        SwarmView::History => handle_history(app, action),
         SwarmView::Form => handle_form(app, action),
         SwarmView::Run => handle_run(app, action),
+    }
+}
+
+fn handle_history(app: &mut App, action: Action) {
+    let list = &mut app.swarm_dashboard.history;
+    let count = list.rows.len();
+    match action {
+        Action::CursorUp | Action::InsertChar('k') => list.scroll.move_up(),
+        Action::CursorDown | Action::InsertChar('j') => list.scroll.move_down(count),
+        Action::PageUp => {
+            for _ in 0..10 {
+                list.scroll.move_up();
+            }
+        }
+        Action::PageDown => {
+            for _ in 0..10 {
+                list.scroll.move_down(count);
+            }
+        }
+        Action::Enter => open_history_row(app),
+        Action::Tab => {
+            app.swarm_dashboard.view = SwarmView::Picker;
+            refresh_picker(app);
+        }
+        _ => {}
     }
 }
 
@@ -745,16 +1170,28 @@ pub(super) fn handle_escape(app: &mut App) -> bool {
             true
         }
         SwarmView::Picker => false,
+        SwarmView::History => {
+            dash.view = SwarmView::Picker;
+            refresh_picker(app);
+            true
+        }
         SwarmView::Run => {
             if dash.diff_agent.is_some() {
                 dash.diff_agent = None;
                 true
-            } else if dash.pending_stop_confirm || dash.pending_undo_confirm {
+            } else if dash.pending_stop_confirm
+                || dash.pending_undo_confirm
+                || dash.pending_continue_confirm
+            {
                 dash.pending_stop_confirm = false;
                 dash.pending_undo_confirm = false;
+                dash.pending_continue_confirm = false;
                 true
             } else if dash.output_maximized {
                 dash.output_maximized = false;
+                true
+            } else if !dash.running && dash.viewing_history {
+                open_history(app);
                 true
             } else if !dash.running {
                 dash.view = SwarmView::Picker;
@@ -789,7 +1226,7 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
                 }
             }
         }
-        SwarmView::Run => {}
+        SwarmView::History | SwarmView::Run => {}
     }
 }
 
@@ -816,6 +1253,7 @@ fn edit_input(input: &mut TextInput, action: &Action) -> bool {
 fn handle_picker(app: &mut App, action: Action) {
     let visible = app.swarm_dashboard.picker.visible().len();
     match action {
+        Action::Tab => open_history(app),
         Action::CursorUp => app.swarm_dashboard.picker.scroll.move_up(),
         Action::CursorDown => app.swarm_dashboard.picker.scroll.move_down(visible),
         Action::Enter => {
@@ -1160,12 +1598,31 @@ fn handle_run(app: &mut App, action: Action) {
             show_selected_diff(app);
             return;
         }
+        // Continuing starts paid agent work: like `x` and `u`, it asks first.
+        Action::InsertChar('c') if dash.can_continue() => {
+            if dash.pending_continue_confirm {
+                dash.pending_continue_confirm = false;
+                continue_run(app);
+            } else {
+                dash.pending_continue_confirm = true;
+            }
+            return;
+        }
+        Action::InsertChar('r') if !dash.running && dash.viewing_history => return,
+        Action::InsertChar('u') if !dash.running && dash.viewing_history => {
+            dash.status_message =
+                "Undo is offered only right after a run, not for one opened from History."
+                    .to_string();
+            return;
+        }
         Action::InsertChar('r') if !dash.running => {
-            let script = dash
-                .last_script
-                .as_ref()
-                .and_then(|path| dash.last_forms.get(path))
-                .map(|form| form.script.clone());
+            let script = dash.last_script.as_ref().and_then(|path| {
+                dash.last_forms
+                    .get(path)
+                    .map(|form| form.script.clone())
+                    // A run continued from History has no form this session.
+                    .or_else(|| script_row_from_path(&app.workspace, path))
+            });
             if let Some(script) = script {
                 open_form(app, script);
             }
@@ -1321,6 +1778,14 @@ pub(super) fn scroll_wheel(app: &mut App, up: bool, col: u16, row: u16) {
                 dash.picker.scroll.scroll_down(delta, visible);
             }
         }
+        SwarmView::History => {
+            let count = dash.history.rows.len();
+            if up {
+                dash.history.scroll.scroll_up(delta);
+            } else {
+                dash.history.scroll.scroll_down(delta, count);
+            }
+        }
         SwarmView::Form => {
             if let Some(form) = dash.form.as_mut()
                 && form.completion.is_open()
@@ -1363,6 +1828,11 @@ pub(super) fn click(app: &mut App, col: u16, row: u16) {
         SwarmView::Picker => {
             if let Some(index) = dash.picker.index_at(col, row) {
                 dash.picker.scroll.selected = index;
+            }
+        }
+        SwarmView::History => {
+            if let Some(index) = dash.history.index_at(col, row) {
+                dash.history.scroll.selected = index;
             }
         }
         SwarmView::Form => {
@@ -1595,9 +2065,7 @@ workflow run {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !done(app) {
                 match rx.recv().await {
-                    Some(Event::Swarm { run, update }) => {
-                        app.swarm_dashboard.apply(run, update);
-                    }
+                    Some(Event::Swarm { run, update }) => apply_update(app, run, update),
                     Some(_) => {}
                     None => panic!("event channel closed"),
                 }
@@ -2475,5 +2943,393 @@ workflow run {
 
         scroll_output(&mut dash, 1);
         assert!(dash.detail_auto_scroll, "back at the end, following resumes");
+    }
+
+    // ── Run history ─────────────────────────────────────────────
+
+    const TWO_STEP_SCRIPT: &str = r#"// description: Two parts
+agent first {
+    description "write part one"
+    tier local
+    scope { owned ["out/first.md"] }
+    produces ["out/first.md"]
+    prompt "Write the FIRST part about {{PROMPT}}."
+    max_retries 0
+}
+
+agent second {
+    description "write part two"
+    tier local
+    depends_on [first]
+    scope { owned ["out/second.md"] }
+    produces ["out/second.md"]
+    prompt "Write the SECOND part."
+    max_retries 0
+}
+
+workflow run {
+    execution_mode document
+    steps [first second]
+    max_parallel 1
+}
+"#;
+
+    /// An Ollama that writes the part the prompt asks for, and answers
+    /// request number `fail_on` (1-based) with an error, as a provider whose
+    /// usage limit ran out would.
+    fn flaky_ollama(fail_on: usize) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let request = read_request(&stream);
+                let _ = seen_tx.send(request.clone());
+                if index + 1 == fail_on {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\
+                         Connection: close\r\n\r\nlimit"
+                    );
+                    continue;
+                }
+                let path = if request.contains("SECOND") {
+                    "out/second.md"
+                } else {
+                    "out/first.md"
+                };
+                let content = format!("<file path=\"{path}\">\npart body\n</file>");
+                let chunk = serde_json::json!({
+                    "model": "qwen",
+                    "message": {"role": "assistant", "content": content},
+                    "done": false
+                });
+                let done = serde_json::json!({"model": "qwen", "done": true});
+                let body = format!("{chunk}\n{done}\n");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), seen_rx)
+    }
+
+    fn drain(rx: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+        std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(200)).ok()).collect()
+    }
+
+    /// Open the only script, type `prompt` and run it to the end.
+    async fn run_to_end(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>, prompt: &str) {
+        open_panel(app);
+        handle_action(app, Action::Enter);
+        assert_eq!(
+            app.swarm_dashboard.view,
+            SwarmView::Form,
+            "{:?}",
+            app.swarm_dashboard.picker.error
+        );
+        type_text(app, prompt);
+        press_run(app);
+        assert_eq!(
+            app.swarm_dashboard.view,
+            SwarmView::Run,
+            "error: {:?}",
+            app.swarm_dashboard.form.as_ref().and_then(|f| f.error.clone())
+        );
+        pump_until(app, rx, |a| !a.swarm_dashboard.running).await;
+    }
+
+    fn records(root: &Path) -> Vec<SwarmRunRecord> {
+        RunHistory::for_folder(root).list()
+    }
+
+    fn render_text(app: &mut App) -> String {
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.swarm_dashboard.render(area, &mut buf, true);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panel_run_is_recorded_with_its_inputs_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, _asked) = fake_ollama("default_out/report.md");
+        let (mut app, mut rx) = app_with_script(&root, &url);
+
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        assert_eq!(app.swarm_dashboard.phase, "completed");
+
+        let saved = records(&root);
+        assert_eq!(saved.len(), 1);
+        let record = &saved[0];
+        assert_eq!(record.outcome, RunOutcome::Completed);
+        assert_eq!(record.inputs.prompt.as_deref(), Some("the moon"));
+        assert_eq!(record.script_label, "report / run");
+        assert!(record.ended_at.is_some());
+        assert_eq!(record.agents.len(), 1);
+        assert_eq!(record.agents[0].id, "writer");
+        assert_eq!(record.agents[0].status, AgentStatus::Completed);
+        let output = load_activity(&RunHistory::for_folder(&root), &record.id, "writer");
+        assert!(!output.is_empty(), "the agent's output was saved");
+        assert!(
+            !app.swarm_dashboard.can_continue(),
+            "a completed run has nothing to continue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_lists_runs_newest_first_and_marks_interrupted_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut app, _rx) = app_with_script(&root, "http://127.0.0.1:9");
+        let history = RunHistory::for_folder(&root);
+        let inputs = RunInputs {
+            form_root: root.clone(),
+            ..Default::default()
+        };
+
+        let mut done = SwarmRunRecord::new(
+            "20260101-000000-000".into(),
+            root.join("s.gaviero"),
+            "older".into(),
+            root.clone(),
+            "plan-a".into(),
+            inputs.clone(),
+        );
+        done.started_at = 100;
+        done.outcome = RunOutcome::Completed;
+        history.save(&done).unwrap();
+
+        // Cut short: the record still says running and the checkpoint has an
+        // agent that never finished.
+        let mut cut = SwarmRunRecord::new(
+            "20260102-000000-000".into(),
+            root.join("s.gaviero"),
+            "newer".into(),
+            root.clone(),
+            "plan-b".into(),
+            inputs,
+        );
+        cut.started_at = 200;
+        history.save(&cut).unwrap();
+        let mut checkpoint = ExecutionState::default();
+        checkpoint.set_status("writer", NodeStatus::Running);
+        checkpoint.save(&root, "plan-b").unwrap();
+
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Tab);
+        assert_eq!(app.swarm_dashboard.view, SwarmView::History);
+        let rows = &app.swarm_dashboard.history.rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].record.script_label, "newer");
+        assert!(rows[0].interrupted && rows[0].resumable);
+        assert_eq!(rows[1].record.script_label, "older");
+        assert!(!rows[1].interrupted && !rows[1].resumable);
+
+        let text = render_text(&mut app);
+        let newer = text.lines().find(|l| l.contains("newer")).unwrap();
+        assert!(newer.contains("interrupted") && newer.contains("can continue"), "{newer}");
+        let older = text.lines().find(|l| l.contains("older")).unwrap();
+        assert!(older.contains("completed") && !older.contains("can continue"), "{older}");
+
+        // Tab and Esc both go back to the scripts.
+        handle_action(&mut app, Action::Tab);
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Picker);
+        handle_action(&mut app, Action::Tab);
+        assert!(handle_escape(&mut app));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Picker);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_a_past_run_shows_its_agents_and_saved_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, _asked) = fake_ollama("default_out/report.md");
+        let (mut app, mut rx) = app_with_script(&root, &url);
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        let live_output = app.swarm_dashboard.agents[0].activity.len();
+
+        // A later session: nothing in memory but what was saved.
+        let (mut app, _rx) = app_with_script(&root, &url);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Tab);
+        handle_action(&mut app, Action::Enter);
+
+        let dash = &app.swarm_dashboard;
+        assert_eq!(dash.view, SwarmView::Run);
+        assert!(dash.viewing_history && !dash.running);
+        assert_eq!(dash.phase, "completed");
+        assert_eq!(dash.agents.len(), 1);
+        assert_eq!(dash.agents[0].id, "writer");
+        assert!(matches!(dash.agents[0].status, AgentStatus::Completed));
+        assert_eq!(dash.agents[0].activity.len(), live_output, "saved output restored");
+
+        handle_action(&mut app, Action::InsertChar('u'));
+        assert!(app.swarm_dashboard.status_message.contains("Undo is offered only"));
+        assert!(handle_escape(&mut app));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::History);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interrupted_run_continues_with_only_the_unfinished_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // The second agent's request fails, as when a usage limit runs out.
+        let (url, asked) = flaky_ollama(2);
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        assert_eq!(
+            app.swarm_dashboard.phase,
+            "completed with failures",
+            "{}",
+            app.swarm_dashboard.status_message
+        );
+        assert_eq!(drain(&asked).len(), 2);
+        assert!(app.swarm_dashboard.can_continue());
+        assert_eq!(records(&root)[0].outcome, RunOutcome::CompletedWithFailures);
+
+        // Later, from History.
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Tab);
+        assert!(app.swarm_dashboard.history.rows[0].resumable);
+        handle_action(&mut app, Action::Enter);
+        assert!(render_text(&mut app).contains("c continue"));
+        handle_action(&mut app, Action::InsertChar('c'));
+        assert!(!app.swarm_dashboard.running, "one `c` only asks");
+        assert!(render_text(&mut app).contains("Press c again"));
+        handle_action(&mut app, Action::InsertChar('c'));
+        assert!(
+            app.swarm_dashboard.running,
+            "continue started: {}",
+            app.swarm_dashboard.status_message
+        );
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        let dash = &app.swarm_dashboard;
+        assert_eq!(dash.phase, "completed", "{}", dash.status_message);
+        let asked_now = drain(&asked);
+        assert_eq!(asked_now.len(), 1, "only the unfinished agent ran");
+        assert!(asked_now[0].contains("SECOND"), "{}", asked_now[0]);
+        assert!(matches!(dash.agents[0].status, AgentStatus::Completed));
+        assert!(matches!(dash.agents[1].status, AgentStatus::Completed));
+        assert!(!dash.agents[0].activity.is_empty(), "the first pass's output is shown");
+        assert!(root.join("out/second.md").is_file());
+
+        let saved = records(&root);
+        assert_eq!(saved.len(), 1, "continuing keeps the same record");
+        assert_eq!(saved[0].outcome, RunOutcome::Completed);
+        assert_eq!(saved[0].resumes, 1);
+        assert!(!app.swarm_dashboard.can_continue());
+    }
+
+    /// The checkpoint is keyed by the agents: a script whose agents changed
+    /// cannot be continued from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_whose_script_agents_changed_is_not_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, asked) = flaky_ollama(2);
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        assert!(app.swarm_dashboard.can_continue());
+        drain(&asked);
+
+        let script = root.join(".gaviero/dsl/report/report.gaviero");
+        std::fs::write(
+            &script,
+            TWO_STEP_SCRIPT.replace("write part two", "write part two and three"),
+        )
+        .unwrap();
+        handle_action(&mut app, Action::InsertChar('c'));
+        handle_action(&mut app, Action::InsertChar('c'));
+
+        let dash = &app.swarm_dashboard;
+        assert!(!dash.running);
+        assert!(dash.status_message.contains("changed"), "{}", dash.status_message);
+        assert!(drain(&asked).is_empty(), "nothing ran");
+        assert_eq!(records(&root)[0].resumes, 0);
+    }
+
+    /// The editor went away mid-run: the record still says running and the
+    /// checkpoint has the second agent unfinished. A later session lists it as
+    /// interrupted and continues it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_cut_short_by_closing_the_editor_is_continued_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, asked) = flaky_ollama(2);
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        drain(&asked);
+
+        let history = RunHistory::for_folder(&root);
+        let mut record = history.list().remove(0);
+        record.outcome = RunOutcome::Running;
+        record.ended_at = None;
+        history.save(&record).unwrap();
+        let mut checkpoint = ExecutionState::load(&root, &record.plan_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status("first"), NodeStatus::Completed);
+        checkpoint.set_status("second", NodeStatus::Running);
+        checkpoint.save(&root, &record.plan_hash).unwrap();
+
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+        open_panel(&mut app);
+        handle_action(&mut app, Action::Tab);
+        let row = &app.swarm_dashboard.history.rows[0];
+        assert!(row.interrupted && row.resumable);
+        handle_action(&mut app, Action::Enter);
+        assert_eq!(app.swarm_dashboard.phase, "interrupted");
+        handle_action(&mut app, Action::InsertChar('c'));
+        handle_action(&mut app, Action::InsertChar('c'));
+        assert!(app.swarm_dashboard.running, "{}", app.swarm_dashboard.status_message);
+        pump_until(&mut app, &mut rx, |a| !a.swarm_dashboard.running).await;
+
+        assert_eq!(app.swarm_dashboard.phase, "completed", "{}", app.swarm_dashboard.status_message);
+        let asked_now = drain(&asked);
+        assert_eq!(asked_now.len(), 1);
+        assert!(asked_now[0].contains("SECOND"));
+        assert_eq!(records(&root)[0].outcome, RunOutcome::Completed);
+
+        // `r` now opens the script's form, though this session never had one.
+        handle_action(&mut app, Action::InsertChar('r'));
+        assert_eq!(app.swarm_dashboard.view, SwarmView::Form);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_undone_run_cannot_be_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (url, _asked) = flaky_ollama(2);
+        let (mut app, mut rx) = app_with_source(&root, &url, TWO_STEP_SCRIPT);
+        run_to_end(&mut app, &mut rx, "the moon").await;
+        assert!(app.swarm_dashboard.can_continue());
+
+        let run = app.swarm_dashboard.run_id;
+        apply_update(&mut app, run, SwarmUpdate::Reverted(Ok(())));
+        assert!(!app.swarm_dashboard.can_continue());
+        handle_action(&mut app, Action::InsertChar('c'));
+        assert!(!app.swarm_dashboard.pending_continue_confirm);
+        assert!(records(&root)[0].reverted);
+
+        open_panel(&mut app);
+        handle_escape(&mut app);
+        handle_action(&mut app, Action::Tab);
+        assert!(!app.swarm_dashboard.history.rows[0].resumable);
     }
 }
