@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="Gaviero logo" width="400">
+</p>
+
 # Gaviero
 
 **A terminal editor for working with AI coding agents (Claude Code, Codex, Cursor, DeepSeek, Ollama). Every change an agent makes is reviewed before the conversation continues.**
