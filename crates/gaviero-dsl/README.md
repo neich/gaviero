@@ -99,7 +99,7 @@ Model strings appear only in model profiles (`client { model "…" }`). Canonica
 | Provider | Examples |
 |---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:claude-fable-5-2`, `claude:claude-opus-5-5` |
-| Codex | `codex:gpt-6.1-sol`, `codex:gpt-6-astra`, `codex:gpt-6.1-terra`, `codex:gpt-6-sol`, `codex:gpt-6-luna`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` |
+| Codex | `codex:gpt-6.1-sol`, `codex:gpt-6-astra`, `codex:gpt-6-sol`, `codex:gpt-6-luna`, `codex:gpt-5.6-sol`, `codex:gpt-6.1-terra`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`, `codex:gpt-5.5` |
 | Cursor | `cursor:composer-2.5`, `cursor:grok-4.7-high` (ids embed effort — see `agent --list-models`) |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` (legacy: `deepseek:deepseek-v4-flash`) |
