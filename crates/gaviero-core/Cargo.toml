@@ -102,6 +102,11 @@ ignore = { workspace = true }
 rustdoc-types = "0.57"
 syn = { version = "2", features = ["full", "parsing"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# `mcp/ask.rs` reads the `http::request::Parts` rmcp inserts into a request's
+# extensions, to recover the conversation header. Crate-local and versionless
+# with the `http` axum/rmcp already resolve (1.x) — a second copy never enters
+# the graph.
+http = "1"
 subtle = "2.6"
 rand = "0.9"
 

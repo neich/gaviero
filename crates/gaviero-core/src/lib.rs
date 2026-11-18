@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod agent_guard;
 pub mod agent_session;
+pub mod ask_user;
 pub mod context_planner;
 pub mod diff_engine;
 pub mod egress;

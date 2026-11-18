@@ -17,15 +17,17 @@
 //!    remote protocol. A second channel would need a second overlay, a second
 //!    remote frame, and a second "first valid answer wins" race.
 //!
-//! 2. **The wire shape is Claude's, byte-for-byte.** `questions[]` entries are
-//!    `{ question, header, multiSelect, options[{ label, description }] }` — the
-//!    exact shape `AskUserQuestionState::from_input` parses in the TUI. The
-//!    overlay therefore needed no new renderer, and the answers come back in the
-//!    same `updated_input.answers` object the desktop and remote paths already
-//!    agree on. What *did* have to change is that the TUI used to key the
-//!    overlay on the tool *name*; it now keys on the shape (see
-//!    `PendingPermission::new`), which is what makes this tool reach the UI at
-//!    all.
+//! 2. **The wire shape is Claude's, byte-for-byte** — and it is shared with the
+//!    MCP surface for `dsh:` ([`crate::mcp::ask`]) through
+//!    [`crate::ask_user`], so the two channels cannot drift apart.
+//!    `questions[]` entries are `{ question, header, multiSelect,
+//!    options[{ label, description }] }` — the exact shape
+//!    `AskUserQuestionState::from_input` parses in the TUI. The overlay
+//!    therefore needed no new renderer, and the answers come back in the same
+//!    `updated_input.answers` object the desktop and remote paths already agree
+//!    on. What *did* have to change is that the TUI used to key the overlay on
+//!    the tool *name*; it now keys on the shape (see `PendingPermission::new`),
+//!    which is what makes this tool reach the UI at all.
 //!
 //! Deliberately **not** gated on `ToolCtx::auto_approve`: `/autoapprove` grants
 //! *permission to run a tool*, not the answer to a question. Auto-allowing this
@@ -35,13 +37,7 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolOutcome};
 use crate::acp::session::ASK_USER_QUESTION_TOOL;
-
-/// Claude's documented ceiling. Enforced (not just advertised) because the
-/// overlay auto-grows to fit the questions and a model that ignores the schema
-/// would otherwise produce an unusable full-screen form.
-const MAX_QUESTIONS: usize = 4;
-/// Claude's documented ceiling per question.
-const MAX_OPTIONS: usize = 4;
+use crate::ask_user::{self, ASK_TOOL_DESCRIPTION};
 
 /// The in-process loop's implementation of Claude's `AskUserQuestion`.
 pub struct AskQuestionTool;
@@ -57,66 +53,14 @@ impl Tool for AskQuestionTool {
             "type": "function",
             "function": {
                 "name": ASK_USER_QUESTION_TOOL,
-                "description": "Ask the user one or more multiple-choice questions when you need a \
-                    decision you cannot make from the repository alone. Use this instead of \
-                    guessing, and instead of writing the question as prose — the user gets a \
-                    selectable list and the answers come back to you as text.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "questions": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": MAX_QUESTIONS,
-                            "description": "The questions to ask, at most 4.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "question": {
-                                        "type": "string",
-                                        "description": "The question to ask, in the user's language."
-                                    },
-                                    "header": {
-                                        "type": "string",
-                                        "description": "Short label (max ~12 chars) for the question."
-                                    },
-                                    "multiSelect": {
-                                        "type": "boolean",
-                                        "description": "True when more than one option may be selected."
-                                    },
-                                    "options": {
-                                        "type": "array",
-                                        "minItems": 2,
-                                        "maxItems": MAX_OPTIONS,
-                                        "description": "The selectable answers, at most 4.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": {
-                                                    "type": "string",
-                                                    "description": "Short name for the option."
-                                                },
-                                                "description": {
-                                                    "type": "string",
-                                                    "description": "What choosing this option means."
-                                                }
-                                            },
-                                            "required": ["label", "description"]
-                                        }
-                                    }
-                                },
-                                "required": ["question", "header", "multiSelect", "options"]
-                            }
-                        }
-                    },
-                    "required": ["questions"]
-                }
+                "description": ASK_TOOL_DESCRIPTION,
+                "parameters": ask_user::ask_tool_schema(),
             }
         })
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutcome {
-        if let Err(e) = validate_questions(&args) {
+        if let Err(e) = ask_user::validate_questions(&args) {
             return ToolOutcome::error(e);
         }
 
@@ -126,7 +70,7 @@ impl Tool for AskQuestionTool {
             );
         };
 
-        let description = first_question(&args).unwrap_or("Clarifying question");
+        let description = ask_user::first_question(&args).unwrap_or("Clarifying question");
         let (tx, rx) = tokio::sync::oneshot::channel();
         observer.on_permission_request(ASK_USER_QUESTION_TOOL, description, &args, tx);
 
@@ -140,7 +84,7 @@ impl Tool for AskQuestionTool {
 
         match decision {
             crate::observer::PermissionDecision::Allow { .. } => {
-                match answers_from(decision.updated_input()) {
+                match ask_user::answers_from(decision.updated_input()) {
                     Some(text) => ToolOutcome::ok(text),
                     // The host allowed the call but supplied no answer — e.g. an
                     // observer whose `on_permission_request` is the default
@@ -157,99 +101,6 @@ impl Tool for AskQuestionTool {
             ),
         }
     }
-}
-
-/// First question's text, for the one-line summary the host shows.
-fn first_question(args: &Value) -> Option<&str> {
-    args.get("questions")?
-        .as_array()?
-        .first()?
-        .get("question")?
-        .as_str()
-}
-
-/// Reject anything the overlay would not be able to render as a form.
-///
-/// `AskUserQuestionState::from_input` silently drops questions with no options
-/// and returns `None` when every question is dropped. Without this check that
-/// turns into a dead end the model cannot diagnose: the user sees a y/n overlay
-/// for `AskUserQuestion`, answers it, and the tool reports "no answers". Failing
-/// before the prompt means the model gets a message it can act on instead.
-fn validate_questions(args: &Value) -> Result<(), String> {
-    let Some(questions) = args.get("questions").and_then(Value::as_array) else {
-        return Err(
-            "missing required argument 'questions' (expected a non-empty array)".to_string(),
-        );
-    };
-    if questions.is_empty() {
-        return Err("'questions' must contain at least one question".to_string());
-    }
-    if questions.len() > MAX_QUESTIONS {
-        return Err(format!(
-            "'questions' holds {} entries; at most {MAX_QUESTIONS} are supported",
-            questions.len()
-        ));
-    }
-    for (i, q) in questions.iter().enumerate() {
-        let n = i + 1;
-        if q.get("question")
-            .and_then(Value::as_str)
-            .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(format!(
-                "question {n} is missing a non-empty 'question' string"
-            ));
-        }
-        let Some(options) = q.get("options").and_then(Value::as_array) else {
-            return Err(format!(
-                "question {n} is missing an 'options' array (at least 2 are required)"
-            ));
-        };
-        if options.is_empty() {
-            return Err(format!("question {n} has an empty 'options' array"));
-        }
-        if options.len() > MAX_OPTIONS {
-            return Err(format!(
-                "question {n} holds {} options; at most {MAX_OPTIONS} are supported",
-                options.len()
-            ));
-        }
-        for (j, opt) in options.iter().enumerate() {
-            if opt
-                .get("label")
-                .and_then(Value::as_str)
-                .is_none_or(|s| s.trim().is_empty())
-            {
-                return Err(format!(
-                    "question {n} option {} is missing a non-empty 'label' string",
-                    j + 1
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Render the host's `answers` object as the tool result the model reads back.
-///
-/// Questions are matched by **text**, not by position: `answers` is a JSON
-/// object keyed by question text, and object key order is not guaranteed to
-/// survive the round trip (it is alphabetical unless `serde_json` was built with
-/// `preserve_order`). Printing each pair keeps the association unambiguous.
-fn answers_from(updated_input: Option<&Value>) -> Option<String> {
-    let answers = updated_input?.get("answers")?.as_object()?;
-    if answers.is_empty() {
-        return None;
-    }
-    let mut lines = Vec::with_capacity(answers.len());
-    for (question, answer) in answers {
-        let value = match answer {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        lines.push(format!("{question}\n  → {value}"));
-    }
-    Some(format!("Answers from the user:\n{}", lines.join("\n")))
 }
 
 #[cfg(test)]
@@ -445,77 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_shapes_the_overlay_could_not_render() {
-        assert!(validate_questions(&json!({})).is_err());
-        assert!(validate_questions(&json!({ "questions": [] })).is_err());
-        assert!(validate_questions(&json!({ "questions": "nope" })).is_err());
-        // A question with no options is the dead-end case: the overlay would
-        // drop it (and, if it were the only question, show a y/n prompt).
-        assert!(
-            validate_questions(&json!({
-                "questions": [{ "question": "Q?", "options": [] }]
-            }))
-            .is_err()
-        );
-        assert!(
-            validate_questions(&json!({
-                "questions": [{ "question": "Q?" }]
-            }))
-            .is_err()
-        );
-        assert!(
-            validate_questions(&json!({
-                "questions": [{
-                    "question": "Q?",
-                    "options": [{ "description": "no label" }]
-                }]
-            }))
-            .is_err()
-        );
-        assert!(
-            validate_questions(&json!({
-                "questions": [{ "question": "  ", "options": [{ "label": "A" }] }]
-            }))
-            .is_err()
-        );
-        assert!(validate_questions(&two_questions()).is_ok());
-        // `multiSelect` absent is fine — the overlay defaults it to false.
-        assert!(
-            validate_questions(&json!({
-                "questions": [{
-                    "question": "Q?",
-                    "options": [{ "label": "A" }, { "label": "B" }]
-                }]
-            }))
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_enforces_the_declared_ceilings() {
-        let opt = |i: usize| json!({ "label": format!("o{i}") });
-        let q =
-            |n: usize| json!({ "question": "Q?", "options": (0..n).map(opt).collect::<Vec<_>>() });
-        let many = json!({ "questions": (0..MAX_QUESTIONS + 1).map(|_| q(2)).collect::<Vec<_>>() });
-        assert!(validate_questions(&many).is_err());
-        let wide = json!({ "questions": [q(MAX_OPTIONS + 1)] });
-        assert!(validate_questions(&wide).is_err());
-    }
-
-    #[test]
-    fn answers_from_tolerates_a_missing_or_empty_answers_object() {
-        assert!(answers_from(None).is_none());
-        assert!(answers_from(Some(&json!({}))).is_none());
-        assert!(answers_from(Some(&json!({ "answers": {} }))).is_none());
-        assert!(answers_from(Some(&json!({ "answers": { "Q?": "A" } }))).is_some());
-    }
-
-    #[test]
     fn the_schema_uses_the_camel_case_keys_the_overlay_parses() {
         let schema = AskQuestionTool.schema();
         let text = schema.to_string();
         assert!(text.contains("multiSelect"), "{text}");
         assert!(!text.contains("multi_select"), "{text}");
         assert_eq!(schema["function"]["name"], ASK_USER_QUESTION_TOOL);
+        // The parameters are the shared ones, not a private copy.
+        assert_eq!(schema["function"]["parameters"], ask_user::ask_tool_schema());
     }
 }

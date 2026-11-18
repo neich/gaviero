@@ -1999,9 +1999,9 @@ impl AgentChatState {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
                          claude:claude-fable-5-2, claude:claude-opus-5-5, \
-                         codex:gpt-6.1-sol, codex:gpt-6-astra, codex:gpt-6.1-terra, \
-                         codex:gpt-6-sol, codex:gpt-6-luna, codex:gpt-5.6-sol, \
-                         codex:gpt-5.6-terra, codex:gpt-5.6-luna, \
+                         codex:gpt-6.1-sol, codex:gpt-6-astra, codex:gpt-6-sol, \
+                         codex:gpt-6-luna, codex:gpt-5.6-sol, codex:gpt-6.1-terra, \
+                         codex:gpt-5.6-terra, codex:gpt-5.6-luna, codex:gpt-5.5, \
                          cursor:composer-2.5, cursor:grok-4.7-high, \
                          ollama:qwen2.5-coder:7b"
                             .to_string()
@@ -7493,7 +7493,9 @@ mod tests {
             8_192
         );
         assert_eq!(state.context_limit_tokens_for("codex:gpt-5.6-sol"), 272_000);
-        assert_eq!(state.context_limit_tokens_for("codex:gpt-6.1-sol"), 500_000);
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-6.1-sol"), 272_000);
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-6.1-terra"), 500_000);
+        assert_eq!(state.context_limit_tokens_for("codex:gpt-5.5"), 272_000);
         assert_eq!(
             state.context_limit_tokens_for("claude:sonnet[1m]"),
             1_000_000

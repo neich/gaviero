@@ -1317,21 +1317,24 @@ impl App {
     }
 
     /// What a session host shows on this session's tab: `attention` while a
-    /// permission prompt or a turn review waits for the user, `busy` while
-    /// an agent, swarm or terminal task runs, else `idle`. `main` reports it
-    /// in the window title, only under a host, followed by `:` and the work
-    /// closing this session would cut off (`restart::work_in_progress`), so
-    /// the host can warn before it closes the tab: `busy:agent,unsaved`.
-    /// Not `;`: terminals split OSC parameters on it. `shell-input` is
-    /// added when a shell command seems to wait for the user, for the
-    /// host's shell circle; it is not work the close guard lists.
+    /// permission prompt or an agent's question waits for the user, `busy`
+    /// while an agent, swarm or terminal task runs, else `idle`. A pending
+    /// turn review is *not* attention: its turn finished and the user can
+    /// continue whenever, so it only adds the `review` detail and the host
+    /// draws the finished badge. `main` reports the status in the window
+    /// title, only under a host, followed by `:` and the work closing this
+    /// session would cut off (`restart::work_in_progress`), so the host can
+    /// warn before it closes the tab: `busy:agent,unsaved`. Not `;`:
+    /// terminals split OSC parameters on it. `shell-input` is added when a
+    /// shell command seems to wait for the user, for the host's shell
+    /// badge; it is not work the close guard lists.
     pub(crate) fn session_host_status(&self) -> String {
         let waiting = self
             .chat_state
             .conversations
             .iter()
-            .any(|c| c.pending_permission.is_some())
-            || !self.pending_turn_reviews.is_empty();
+            .any(|c| c.pending_permission.is_some());
+        let review = !self.pending_turn_reviews.is_empty();
         let status = if waiting {
             "attention"
         } else if restart::running_task(self).is_some() {
@@ -1340,6 +1343,12 @@ impl App {
             "idle"
         };
         let mut work = restart::work_in_progress(self);
+        // A pending review means the turn is over, so it is reported beside
+        // the work keywords, never as `attention`; the host reads it as the
+        // finished state (`session_host::session::parse_activity`).
+        if review {
+            work.push("review");
+        }
         if restart::terminal_awaiting_input(self) {
             work.push("shell-input");
         }
@@ -1849,6 +1858,28 @@ mod session_host_tests {
         assert_eq!(app.session_host_status(), "idle");
         app.chat_state.conversations[0].is_streaming = true;
         assert_eq!(app.session_host_status(), "busy:agent");
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn session_host_status_reports_a_turn_review_as_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = host_app(dir.path());
+        let set = gaviero_core::turn_capture::TurnChangeSet {
+            turn_id: "t1".into(),
+            conv_id: None,
+            started_at_ms: 0,
+            ended_at_ms: 1,
+            outcome: gaviero_core::turn_capture::TurnOutcome::Completed,
+            files: Vec::new(),
+            warnings: Vec::new(),
+            auto_reverted: Vec::new(),
+        };
+        app.pending_turn_reviews
+            .push(gaviero_core::turn_capture::PendingReview::new(set));
+        // The review's turn is over, so the host is told `review` (finished,
+        // blue) and never `attention` (waiting, yellow).
+        assert_eq!(app.session_host_status(), "idle:review");
         cleanup_session(dir.path());
     }
 
