@@ -5,7 +5,9 @@
 [![CI](https://github.com/neich/gaviero/actions/workflows/ci.yml/badge.svg)](https://github.com/neich/gaviero/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-<!-- DEMO: put a 20–40 s recording here (asciinema or GIF): ask an agent for a change, reject one file in TURN REVIEW, keep the rest, continue. -->
+![A 38-second tour of gaviero: switching the chat to claude:opus at high effort, the code graph, the embedded terminal, agent chat, project memory, a swarm script form, the SSH session picker and session tabs](docs/demo/gaviero-demo-wide.gif)
+
+*A 38-second tour, with no agent turn. A Rust file is open with tree-sitter highlighting, and the chat is switched to `claude:opus` at `high` effort and renamed. Then: the code graph for `validate_token`, `ls` in the embedded terminal, a chat prompt being written, project memory, a DSL swarm script's form, the SSH session picker, and two sessions in one window.*
 
 During a turn, agents work freely: edit tools, shell commands, formatters, deletes, renames. When the turn ends, gaviero compares the workspace with a snapshot taken before your prompt and opens a review. For each file you either keep the change or go back to the pre-prompt version, and the conversation waits until every file is decided. No git required.
 
