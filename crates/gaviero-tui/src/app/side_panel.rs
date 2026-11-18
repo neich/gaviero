@@ -333,6 +333,10 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                 {
                     // First-token match: `/add-dirx` stays an unknown command.
                     app.handle_add_dir_command();
+                } else if app.chat_state.text_input.text.split_whitespace().next()
+                    == Some("/remove-dir")
+                {
+                    app.handle_remove_dir_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/attach") {
                     app.handle_attach_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/detach") {
