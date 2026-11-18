@@ -1285,11 +1285,30 @@ fn initial_paths(launch: &HostLaunch, saved: &state::HostState) -> Result<Vec<Ta
     }
 }
 
-/// Log to `gaviero-sessions.log` beside `gaviero.log`; children keep theirs.
+/// The folder this host writes `gaviero-sessions.log` to, also passed to its
+/// local tabs (`LOG_DIR_ENV`) for their `gaviero.log`. A host on its own state
+/// file (`GAVIERO_SESSION_HOST_STATE`) logs beside that file: one host per
+/// state file ([`claim_instance`]) makes that one host per log, so a second
+/// host — a test, a demo recording — never truncates a running host's logs.
+/// Otherwise `GAVIERO_LOG_DIR`, else the default cache folder.
+pub(crate) fn host_log_dir() -> PathBuf {
+    log_dir_for(state::state_override().as_deref(), crate::log_dir)
+}
+
+/// [`host_log_dir`] for a state-file override (`state`) and the log folder
+/// used without one (`fallback`).
+fn log_dir_for(state: Option<&std::path::Path>, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
+    state
+        .and_then(|state| state.parent())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(fallback)
+}
+
+/// Log to `gaviero-sessions.log` in [`host_log_dir`]; children log to
+/// `gaviero.log` there.
 fn init_logging() {
-    let log_dir = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("gaviero");
+    let log_dir = host_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let Ok(log_file) = std::fs::File::create(log_dir.join("gaviero-sessions.log")) else {
         return;
@@ -1465,6 +1484,7 @@ async fn host_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -1571,6 +1591,21 @@ mod tests {
         assert_eq!(previous_active(1, 3, 3), 1);
         // The last tab gone.
         assert_eq!(previous_active(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_host_on_its_own_state_file_logs_beside_it() {
+        let fallback = || PathBuf::from("default-logs");
+        assert_eq!(
+            log_dir_for(Some(Path::new("C:\\demo\\out\\session-host.json")), fallback),
+            PathBuf::from("C:\\demo\\out")
+        );
+        // No override, or a bare file name with no folder: the usual folder.
+        assert_eq!(log_dir_for(None, fallback), PathBuf::from("default-logs"));
+        assert_eq!(
+            log_dir_for(Some(Path::new("session-host.json")), fallback),
+            PathBuf::from("default-logs")
+        );
     }
 
     #[test]

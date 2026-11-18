@@ -227,6 +227,28 @@ impl RenderScheduler {
     }
 }
 
+/// Overrides where `gaviero.log` (and a session host's
+/// `gaviero-sessions.log`) is written. A session host sets it on its local
+/// tabs, so a host with its own state file keeps its tabs' log beside its own
+/// (`session_host::host_log_dir`).
+pub(crate) const LOG_DIR_ENV: &str = "GAVIERO_LOG_DIR";
+
+/// The folder `gaviero.log` goes to: `GAVIERO_LOG_DIR` when set, else
+/// `<cache dir>/gaviero`.
+pub(crate) fn log_dir() -> PathBuf {
+    std::env::var_os(LOG_DIR_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_log_dir)
+}
+
+/// `<cache dir>/gaviero`, the log folder when nothing overrides it.
+fn default_log_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gaviero")
+}
+
 /// RAII guard that restores the terminal when dropped — covers `?` returns
 /// and normal scope exit.
 struct TerminalGuard;
@@ -379,9 +401,7 @@ fn folder_launch_workspace(path: &Path) -> Result<Option<PathBuf>> {
 /// installed build.
 async fn run(cli: Cli) -> Result<bool> {
     // Write tracing output to a log file (stderr is hidden in TUI mode)
-    let log_dir = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("gaviero");
+    let log_dir = log_dir();
     std::fs::create_dir_all(&log_dir).context("creating log directory")?;
     let log_file =
         std::fs::File::create(log_dir.join("gaviero.log")).context("creating log file")?;

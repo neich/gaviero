@@ -224,6 +224,8 @@ fn local_command(
     }
     cmd.env(HOST_ENV, "1");
     cmd.env(CONTROL_ENV, control);
+    // The tab logs where its host does (`host_log_dir`).
+    cmd.env(crate::LOG_DIR_ENV, super::host_log_dir());
     // The host's own restart file is no business of its tabs.
     cmd.env_remove(crate::supervisor::HOST_RESTART_ENV);
     if host_restarts {
