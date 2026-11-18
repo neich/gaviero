@@ -32,13 +32,14 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
 }
 
 /// Badge palette, shared by both badges: green = working, yellow = waiting
-/// for the user, blue = finished while out of view. Pure hues at 80%
-/// brightness (204/255), so the three tell apart at a glance.
+/// for the user, blue = finished (a turn whose review is pending, or work
+/// that ended while the tab was out of view). Pure hues at 80% brightness
+/// (204/255), so the three tell apart at a glance.
 const GREEN: Color = Color::Rgb(0, 204, 0);
 const YELLOW: Color = Color::Rgb(204, 204, 0);
 const BLUE: Color = Color::Rgb(0, 0, 204);
 /// Agent badge (`A`): an agent or swarm is running / waits for the user (a
-/// permission, a question, a turn review) / finished while out of view.
+/// permission, a question) / finished, its turn review included.
 const AGENT_LETTER: char = 'A';
 const AGENT_RUNNING: Color = GREEN;
 const AGENT_WAITING: Color = YELLOW;
@@ -60,7 +61,9 @@ pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
 
 /// The colours of a tab's two badges: the agent one, then the shell one.
 /// The current tab shows them too; its "finished" marks stay until the user
-/// leaves it.
+/// leaves it. A pending turn review is finished, not waiting: the turn is
+/// over, so it is blue like work that ended out of view (a running agent
+/// still wins, the tab being busy).
 pub(crate) fn badges(
     activity: Activity,
     agent_done_unseen: bool,
@@ -70,7 +73,7 @@ pub(crate) fn badges(
         Some(AGENT_WAITING)
     } else if activity.agent {
         Some(AGENT_RUNNING)
-    } else if agent_done_unseen {
+    } else if activity.review || agent_done_unseen {
         Some(AGENT_DONE)
     } else {
         None
@@ -261,7 +264,7 @@ mod tests {
     #[test]
     fn badges_show_agent_and_shell_state() {
         let none = Activity::default();
-        let running = Activity { waiting: false, agent: true, shell: true, shell_waiting: false };
+        let running = Activity { agent: true, shell: true, ..none };
         let asking = Activity { waiting: true, ..running };
         assert_eq!(badges(none, false, false), [None, None]);
         assert_eq!(
@@ -270,9 +273,14 @@ mod tests {
         );
         // Waiting for the user wins over running.
         assert_eq!(badges(asking, false, false)[0], Some(AGENT_WAITING));
-        // A turn review pending after the turn: waiting, not finished.
-        let review = Activity { waiting: true, ..none };
-        assert_eq!(badges(review, true, false), [Some(AGENT_WAITING), None]);
+        // A turn review pending after the turn: finished, so blue.
+        let review = Activity { review: true, ..none };
+        assert_eq!(badges(review, false, false), [Some(AGENT_DONE), None]);
+        // A running agent still wins over a pending review.
+        assert_eq!(
+            badges(Activity { review: true, ..running }, false, false)[0],
+            Some(AGENT_RUNNING)
+        );
         // Finished while out of view.
         assert_eq!(badges(none, true, true), [Some(AGENT_DONE), Some(SHELL_DONE)]);
         // Running again wins over an earlier finish.

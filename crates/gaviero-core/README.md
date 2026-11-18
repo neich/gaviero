@@ -49,7 +49,7 @@ println!("{}", plan.to_gaviero_script()?);
 | Provider | Examples | Notes |
 |---|---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:claude-fable-5-2`, `claude:claude-opus-5-5` | Subprocess (Claude Code); `fable` → Fable 5.2, `opus` → Opus 5.5, `sonnet` → Sonnet 5 — the bare `fable`/`opus`/`sonnet` aliases are pinned to those ids at dispatch, so Opus 5.5 needs Claude Code ≥ 2.1.280 |
-| Codex | `codex:gpt-6.1-sol`, `codex:gpt-6-astra`, `codex:gpt-6.1-terra`, `codex:gpt-6-sol`, `codex:gpt-6-luna`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` | Subprocess (exec / app-server); the `/model` picker reads the installed CLI's catalog (`codex debug models`) |
+| Codex | `codex:gpt-6.1-sol`, `codex:gpt-6-astra`, `codex:gpt-6-sol`, `codex:gpt-6-luna`, `codex:gpt-5.6-sol`, `codex:gpt-6.1-terra`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`, `codex:gpt-5.5` | Subprocess (exec / app-server); the `/model` picker reads the installed CLI's catalog (`codex debug models`) |
 | Cursor | `cursor:composer-2.5`, `cursor:grok-4.7-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
@@ -114,7 +114,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `acp/` | Claude subprocess protocol, file-block routing |
 | `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (`deepseek:`), `agent_client_protocol` (`dsh:`), `registry` |
 | `swarm/` | Orchestration, tier routing, DAG execution, backends, verification, git merge |
-| `mcp/` | In-process MCP server (ten tools: nine read-only incl. `memory_ping` and `symbol_refs` + write-adjacent `memory_flag`), config synthesis, stdio + loopback HTTP transport, reach probe |
+| `mcp/` | In-process MCP server (eleven tools: nine read-only incl. `memory_ping` and `symbol_refs` + write-adjacent `memory_flag` + interactive `ask_user_question`, listed only for a loopback-HTTP connection that names its conversation), config synthesis, stdio + loopback HTTP transport, reach probe |
 | `memory/` | Five-level scoped embeddings, RRF retrieval, consolidation, soft-delete |
 | `write_gate/` | Diff review, hunk acceptance, scope enforcement |
 | `validation_gate/` | tree-sitter syntax, cargo compile, test verification |

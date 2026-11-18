@@ -1042,6 +1042,36 @@ async fn dsh_backend_happy_turn_with_fake_agent() {
     );
 }
 
+/// `$skill` invocations must reach a `dsh:` turn the same way they reach
+/// Claude: the rendered `SKILL.md` body rides the ACP prompt as a
+/// `<skill name="…">` block.
+#[tokio::test]
+async fn skill_selection_is_rendered_into_the_acp_prompt() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("inspect"));
+    let mut t = turn("please migrate", true);
+    t.skill_selections
+        .push(gaviero_core::context_planner::SkillSelection {
+            name: "migrate-component".into(),
+            scope_level: 0,
+            rendered_body: "SKILL-BODY-SENTINEL".into(),
+        });
+    let events = drain_turn(&mut session, t).await;
+    let report = inspect_prompt(&events);
+    let prompt = report["prompt"].to_string();
+    assert!(prompt.contains("SKILL-BODY-SENTINEL"), "{prompt}");
+    Box::new(session).close().await;
+}
+
 #[tokio::test]
 async fn missing_api_key_surfaces_on_first_turn() {
     if std::env::var_os("DEEPSEEK_API_KEY").is_some()

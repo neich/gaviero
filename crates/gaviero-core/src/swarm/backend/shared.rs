@@ -71,27 +71,30 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
 /// list when the CLI is missing or fails.
 ///
 /// Mirrors the `visibility: "list"` slugs of that catalog (client 0.167.0,
-/// 2026-11-09), in upstream `priority` order. Hidden slugs (`gpt-reserve`,
-/// `codex-auto-review`) are deliberately absent.
+/// 2026-11-17), in upstream `priority` order. Hidden slugs (the
+/// `gpt-daybreak-*-latest` experiments and `codex-auto-review`) are
+/// deliberately absent.
 ///
 /// Listing a model an older CLI is not served is deliberate: this is host-side
 /// picker UX, and the spec is forwarded verbatim to whichever CLI is installed,
 /// so an outdated CLI fails at dispatch rather than silently substituting a
 /// model.
 ///
-/// `gpt-5.2` / `gpt-5.3-codex-spark` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.5`
-/// are gone because Codex delisted them upstream. Free-form ids still pass
-/// [`validate_model_spec`], so an existing pin is still sent as written; it
-/// just no longer shows up in the picker.
+/// `gpt-5.2` / `gpt-5.3-codex-spark` / `gpt-5.4` / `gpt-5.4-mini` are gone
+/// because Codex delisted them upstream; `gpt-5.5` was delisted too and came
+/// back as the last `list` entry, so it is offered again. Free-form ids still
+/// pass [`validate_model_spec`], so a pin to a delisted id is still sent as
+/// written; it just no longer shows up in the picker.
 pub const CODEX_MODEL_ALIASES: &[&str] = &[
     "gpt-6.1-sol",
     "gpt-6-astra",
-    "gpt-6.1-terra",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-sol",
+    "gpt-6.1-terra",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-5.5",
 ];
 
 /// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
@@ -1298,12 +1301,12 @@ mod tests {
         );
         // Delisted upstream, so they are no longer offered — but an explicit
         // pin must still validate, since the picker list is UX only.
+        // (`gpt-5.5` is listed again and is covered by the alias loop above.)
         for delisted in [
             "codex:gpt-5.2",
             "codex:gpt-5.4",
             "codex:gpt-5.4-mini",
             "codex:gpt-5.3-codex-spark",
-            "codex:gpt-5.5",
         ] {
             assert!(!hits.contains(&delisted.to_string()), "got {hits:?}");
             validate_model_spec(delisted).unwrap();

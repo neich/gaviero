@@ -1489,7 +1489,17 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     ))
                     // The same live graphs chat injection reads (last: it
                     // supersedes the fallback the builders above configure).
-                    .with_graph_services(app.graph_services.clone());
+                    .with_graph_services(app.graph_services.clone())
+                    // `dsh:`'s interactive channel: an MCP `ask_user_question`
+                    // call parks the overlay via `Event::PermissionRequest`,
+                    // exactly as Claude's `AskUserQuestion` does. The tool is
+                    // only listed for a connection whose request carries the
+                    // conversation header `dsh.rs` puts on dsh's MCP entry.
+                    .with_user_question_sink(std::sync::Arc::new(
+                        super::observers::TuiUserQuestionSink {
+                            tx: app.event_tx.clone(),
+                        },
+                    ));
                     // D3: memory_flag ships enabled. The sink is the only
                     // seam through which a tool call can cause a write, and
                     // it goes through the S2 writer task like everything else.

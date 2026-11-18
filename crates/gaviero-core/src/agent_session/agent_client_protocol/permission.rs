@@ -118,6 +118,19 @@ pub(super) fn plan_permission(
     let name = field("title").and_then(|v| v.as_str()).unwrap_or("");
     let raw_input = field("rawInput").cloned().unwrap_or(Value::Null);
 
+    // The ask-user tool *is* the question channel: gaviero's MCP
+    // `ask_user_question` parks the overlay itself, so approving the call would
+    // put two prompts in a row — the approval first, the question second. There
+    // is nothing to approve either: the call's only effect is that question.
+    // Same rule as `agent_session/tool_agent/tools/ask.rs` ("the permission
+    // channel is the question channel").
+    //
+    // Matched as a suffix because clients namespace MCP tools differently —
+    // `mcp__gaviero__ask_user_question` under Claude, and dsh may prefix its own.
+    if name.trim_end().ends_with(crate::mcp::ask::TOOL_ASK_USER_QUESTION) {
+        return PermissionPlan::Allow;
+    }
+
     if is_shell_tool(name)
         && let Some(command) = raw_input.get("command").and_then(|v| v.as_str())
     {
@@ -302,6 +315,41 @@ mod tests {
         );
         assert!(
             matches!(&plan, PermissionPlan::Ask { tool_name, .. } if tool_name == "write_file"),
+            "{plan:?}"
+        );
+    }
+
+    /// `ask_user_question` must never cost two prompts: the tool exists only to
+    /// ask, so its own call is allowed straight through and the parked question
+    /// is the one thing the user sees.
+    #[test]
+    fn the_ask_user_tool_is_allowed_without_an_extra_prompt() {
+        for title in [
+            "ask_user_question",
+            "mcp__gaviero__ask_user_question",
+            "gaviero/ask_user_question",
+        ] {
+            let log = log_with("c1", title, json!({ "questions": [] }));
+            let plan = plan_permission(
+                &request("c1"),
+                &log,
+                &surface(&[], &[], &[]),
+                false,
+                Path::new("."),
+            );
+            assert_eq!(plan, PermissionPlan::Allow, "{title} must not prompt");
+        }
+        // A lookalike that is not the tool still asks.
+        let log = log_with("c1", "ask_user_question_helper", json!({}));
+        let plan = plan_permission(
+            &request("c1"),
+            &log,
+            &surface(&[], &[], &[]),
+            false,
+            Path::new("."),
+        );
+        assert!(
+            matches!(&plan, PermissionPlan::Ask { tool_name, .. } if tool_name == "ask_user_question_helper"),
             "{plan:?}"
         );
     }

@@ -89,7 +89,7 @@ struct Cli {
 
     /// Model spec to use for synthetic task execution and as the default runtime model.
     /// Canonical form is `provider:model` — e.g. `claude:sonnet`, `claude:opus`,
-    /// `codex:gpt-5.5`, `ollama:qwen2.5-coder:7b`. Defaults to workspace agent.model,
+    /// `codex:gpt-6.1-sol`, `ollama:qwen2.5-coder:7b`. Defaults to workspace agent.model,
     /// then `claude:sonnet`.
     #[arg(long)]
     model: Option<String>,

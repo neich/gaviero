@@ -86,7 +86,7 @@ gaviero-core/src/
 ├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
 │  ├─ signal.rs           MemorySignalSink — the one write-adjacent seam
-│  ├─ tools.rs            Ten tools (see MCP below)
+│  ├─ tools.rs            Eleven tools (see MCP below)
 │  ├─ probe.rs            ProbeLedger + memory_ping receipts
 │  ├─ transport.rs        McpEndpoint (Unix socket / Windows named pipe)
 │  ├─ http.rs             Loopback streamable-HTTP listener
@@ -168,7 +168,7 @@ Writes, TUI chat: every provider writes during the turn (`AgentOptions::host_cap
 ### Memory / MCP / observers
 
 - [`MemoryStores`](src/memory/stores.rs) + [`WriterHandle`](src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](src/mcp/server.rs) — ten tools (nine read-only including `memory_ping` and `symbol_refs` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs). Loopback HTTP: [`mcp/http.rs`](src/mcp/http.rs). Shim lookup: [`mcp/endpoint_file.rs`](src/mcp/endpoint_file.rs). Lean surface: `mcp.gavieroServer.exposedTools` (default all ten; lean preset `memory_search`/`memory_get`/`memory_ping`).
+- [`GavieroMcpServer`](src/mcp/server.rs) — eleven tools (nine read-only including `memory_ping` and `symbol_refs` + write-adjacent `memory_flag` + interactive `ask_user_question`, listed only for a loopback-HTTP connection that names its conversation with `x-gaviero-conversation`, and parking the TUI question overlay); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs). Loopback HTTP: [`mcp/http.rs`](src/mcp/http.rs). Shim lookup: [`mcp/endpoint_file.rs`](src/mcp/endpoint_file.rs). Lean surface: `mcp.gavieroServer.exposedTools` (default all ten routed; lean preset `memory_search`/`memory_get`/`memory_ping`).
 - Observers in [`observer.rs`](src/observer.rs) / [`memory/observer.rs`](src/memory/observer.rs) / [`mcp/observer.rs`](src/mcp/observer.rs).
 
 ---

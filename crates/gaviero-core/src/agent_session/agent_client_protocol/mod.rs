@@ -246,7 +246,11 @@ impl AcpClientSession {
         } else {
             self.additional_roots.clone()
         };
-        let servers = mcp_servers_for_session(&self.workspace_root, self.capabilities);
+        let servers = mcp_servers_for_session(
+            &self.workspace_root,
+            self.capabilities,
+            self.conv_id.as_deref(),
+        );
         // Keyed on gaviero's *own* server, not on the list being empty:
         // context7 and `extraServers` can be registered while gaviero's
         // endpoint is down, and `exposedTools` describes gaviero's retrieval

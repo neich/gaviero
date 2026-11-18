@@ -527,4 +527,217 @@ mod tests {
         handle.shutdown().await;
         drop(occupant);
     }
+
+    // ── ask_user_question over the real loopback HTTP listener ───────
+
+    use crate::mcp::ask::{FakeQuestionReply, FakeQuestionSink};
+
+    fn fixture_server_with_sink(sink: Arc<FakeQuestionSink>) -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        GavieroMcpServer::with_defaults(stores, PathBuf::from("/tmp")).with_user_question_sink(sink)
+    }
+
+    /// The JSON payload of an SSE response: the last non-empty `data:` line.
+    fn last_sse_json(body: &str) -> serde_json::Value {
+        let line = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or_else(|| panic!("no data: line in SSE body: {body}"));
+        serde_json::from_str(line).unwrap_or_else(|e| panic!("bad SSE json ({e}): {line}"))
+    }
+
+    /// One JSON-RPC POST to `/mcp`, with the same headers a client must send.
+    ///
+    /// Returns `(status, new session id, body)`.
+    async fn post_rpc(
+        client: &reqwest::Client,
+        port: u16,
+        token: &str,
+        session: Option<&str>,
+        conversation: Option<&str>,
+        body: String,
+    ) -> (reqwest::StatusCode, Option<String>, String) {
+        let mut request = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .body(body);
+        if let Some(session) = session {
+            request = request.header("Mcp-Session-Id", session);
+        }
+        if let Some(conversation) = conversation {
+            request = request.header(crate::mcp::ask::CONVERSATION_HEADER, conversation);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let text = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            response.text(),
+        )
+        .await
+        .expect("SSE body must close after the response")
+        .unwrap();
+        (status, session, text)
+    }
+
+    fn ask_question() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "Which database?",
+                "header": "DB",
+                "multiSelect": false,
+                "options": [
+                    { "label": "Postgres", "description": "relational" },
+                    { "label": "SQLite", "description": "embedded" }
+                ]
+            }]
+        })
+    }
+
+    /// The load-bearing check for the whole feature: the header on the real
+    /// HTTP request is what makes the tool exist, and the parked question's
+    /// answer comes back as the tool result.
+    #[tokio::test]
+    async fn http_conversation_header_gates_ask_user_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "test-token-abcdefghijklmnopqrstuvwxyz".to_string();
+        write_token_file(&token_path(dir.path()), &token).unwrap();
+        let std_l = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let preferred = std_l.local_addr().unwrap().port();
+        drop(std_l);
+
+        let sink = FakeQuestionSink::new(FakeQuestionReply::FirstOption);
+        let handle = spawn_http_listener(
+            fixture_server_with_sink(sink.clone()),
+            dir.path(),
+            preferred,
+            token.clone(),
+        )
+        .unwrap();
+        let port = handle.endpoint.port;
+        let client = reqwest::Client::new();
+
+        let (status, session, _body) = post_rpc(
+            &client,
+            port,
+            &token,
+            None,
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#.to_string(),
+        )
+        .await;
+        assert!(status.is_success(), "initialize {status}");
+        let session = session.expect("initialize returns a session id");
+
+        // 1. With the conversation header: the tool is advertised.
+        let (status, _, body) = post_rpc(
+            &client,
+            port,
+            &token,
+            Some(&session),
+            Some("conv-1"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#.to_string(),
+        )
+        .await;
+        assert!(status.is_success(), "tools/list {status}");
+        let list = last_sse_json(&body);
+        let names: Vec<String> = list["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            names.contains(&crate::mcp::ask::TOOL_ASK_USER_QUESTION.to_string()),
+            "ask_user_question must be listed for a dsh connection: {names:?}"
+        );
+
+        // 2. With the header: the call parks on the sink and returns labels.
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": crate::mcp::ask::TOOL_ASK_USER_QUESTION,
+                "arguments": ask_question(),
+            }
+        })
+        .to_string();
+        let (status, _, body) = post_rpc(
+            &client,
+            port,
+            &token,
+            Some(&session),
+            Some("conv-1"),
+            call.clone(),
+        )
+        .await;
+        assert!(status.is_success(), "tools/call {status}: {body}");
+        let result = last_sse_json(&body);
+        assert_eq!(
+            result["result"]["isError"],
+            serde_json::Value::Bool(false),
+            "{}",
+            result
+        );
+        let text = result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text content: {result}"));
+        assert!(text.contains("Which database?"), "{text}");
+        assert!(text.contains("Postgres"), "{text}");
+        assert_eq!(
+            sink.seen().first().map(|(conv, _)| conv.as_str()),
+            Some("conv-1"),
+            "the sink must receive the conversation the header named"
+        );
+
+        // 3. The same session without the header: the tool is gone.
+        let (status, _, body) = post_rpc(
+            &client,
+            port,
+            &token,
+            Some(&session),
+            None,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#.to_string(),
+        )
+        .await;
+        assert!(status.is_success(), "tools/list {status}");
+        let list = last_sse_json(&body);
+        let names: Vec<String> = list["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !names.contains(&crate::mcp::ask::TOOL_ASK_USER_QUESTION.to_string()),
+            "without the header the tool must not exist: {names:?}"
+        );
+
+        // 4. And an explicit call for it is rejected, not parked.
+        let (status, _, body) = post_rpc(&client, port, &token, Some(&session), None, call).await;
+        assert!(status.is_success(), "tools/call {status}");
+        let result = last_sse_json(&body);
+        assert!(
+            result.get("error").is_some(),
+            "a call without the header must be a JSON-RPC error: {result}"
+        );
+        assert_eq!(
+            sink.seen().len(),
+            1,
+            "the rejected call must never reach the sink"
+        );
+
+        handle.shutdown().await;
+    }
 }

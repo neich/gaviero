@@ -1,6 +1,6 @@
 //! Gaviero as an MCP server (Tier A / A5).
 //!
-//! Ten tools for subprocess coding agents — nine read-only:
+//! Eleven tools for subprocess coding agents — nine read-only:
 //! * `memory_search` — merged multi-scope hybrid search over memories
 //!   (repo + workspace + global; `module` / `run` need per-file / per-run
 //!   identity that does not cross the shim)
@@ -17,6 +17,15 @@
 //! * `memory_flag` — demote a stale memory's trust. Creates and deletes
 //!   nothing; refuses user-authored and History rows; idempotent; every
 //!   applied flag writes a reversible audit row.
+//!
+//! …and one that is interactive ([`ask`]):
+//! * `ask_user_question` — ask the user a multiple-choice question and return
+//!   the answers as the tool result. Listed **only** on a loopback-HTTP
+//!   connection that carries [`ask::CONVERSATION_HEADER`] and only when the
+//!   host installed a [`ask::UserQuestionSink`]; it parks the same overlay
+//!   Claude's `AskUserQuestion` uses. It touches no store, and `mcp.permissions`
+//!   hides and rejects it like any other tool. This is the only way a `dsh:`
+//!   session can ask a structured question: ACP carries no elicitation.
 //!
 //! The server runs as an in-process tokio task launched at
 //! `Workspace::open` time. A small `gaviero-mcp-shim` binary connects
@@ -58,6 +67,7 @@
 //! nothing here bypasses the writer task or the Write Gate.
 
 pub mod agent_defs;
+pub mod ask;
 pub mod client;
 pub mod client_http;
 pub mod config_synth;
@@ -82,6 +92,9 @@ pub mod user_scope;
 pub use agent_defs::{
     claude_agents_json, claude_agents_json_if_required, codex_agent_toml,
     report_user_agent_definitions,
+};
+pub use ask::{
+    CONVERSATION_HEADER, TOOL_ASK_USER_QUESTION, UserQuestionSink, conversation_from, tool_definition,
 };
 pub use config_synth::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, HttpSynthEndpoint,

@@ -4,7 +4,7 @@
 //! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
 //! on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
-//! framing, initialize, and tools/list. Gaviero owns only the ten
+//! framing, initialize, and tools/list. Gaviero owns only the eleven
 //! tool handlers below.
 //!
 //! **The invariant this module enforces is #11: every write goes
@@ -15,7 +15,7 @@
 //! `store_scoped`. Rejected `memory_store` / `memory_update` /
 //! `memory_delete` tools remain unimplementable by construction.
 //!
-//! Nine of the ten tools are strictly read-only. `memory_ping` writes
+//! Nine of the ten routed tools are strictly read-only. `memory_ping` writes
 //! only to an in-memory [`super::probe::ProbeLedger`]. `memory_flag` is
 //! write-adjacent: it emits a signal through
 //! [`super::signal::MemorySignalSink`] — a narrow trait object, not the
@@ -23,6 +23,10 @@
 //! plus an audit row. It creates and deletes nothing. See
 //! `mcp/mod.rs`'s header for why read-only is a default posture rather
 //! than a hard constraint.
+//!
+//! The eleventh tool, `ask_user_question` ([`super::ask`]), is outside the
+//! router: it exists only on a loopback-HTTP connection that names a chat
+//! conversation, and it writes nothing at all.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +38,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{CallToolRequestParams, ListToolsResult};
+use rmcp::model::{CallToolRequestParams, Content, ListToolsResult};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
@@ -59,8 +63,9 @@ use super::tools::{
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
-/// dispatches tool calls to the ten handlers below (nine read-only
-/// plus write-adjacent `memory_flag`).
+/// dispatches tool calls to the ten routed handlers below (nine
+/// read-only plus write-adjacent `memory_flag`), and — on a connection
+/// that names a chat conversation — to `ask_user_question` ([`super::ask`]).
 ///
 /// `tool_router` is the rmcp-macro-generated dispatch table — see
 /// `rmcp::handler::server::router::tool` for the shape.
@@ -142,6 +147,15 @@ pub struct GavieroMcpServer {
     /// without [`Self::with_signal_sink`]) makes `memory_flag` return a
     /// clear error rather than silently no-op.
     signal_sink: Option<Arc<dyn MemorySignalSink>>,
+    /// The interactive seam: where `ask_user_question` parks a question.
+    /// `None` (every server built without [`Self::with_user_question_sink`],
+    /// including the CLI's and the shim's) means the tool is never listed and
+    /// every call reports that no interactive host is attached — never a
+    /// silent empty answer.
+    ///
+    /// Held as a trait object for the same reason as `signal_sink`: the server
+    /// learns nothing about the TUI, only that a question has somewhere to go.
+    user_questions: Option<Arc<dyn super::ask::UserQuestionSink>>,
     /// Optional in-memory ping ledger for `memory_ping`. Unattached
     /// servers still answer the tool; they just do not record.
     probe_ledger: Option<ProbeLedger>,
@@ -385,6 +399,7 @@ impl GavieroMcpServer {
             permissions: super::McpPermissions::default(),
             first_tool_call_done: Arc::new(AtomicBool::new(false)),
             signal_sink: None,
+            user_questions: None,
             probe_ledger: None,
             started_at: chrono::Utc::now(),
             exposed_tools: None,
@@ -512,6 +527,43 @@ impl GavieroMcpServer {
         }
     }
 
+    /// The chat conversation that owns this request, if the connection names
+    /// one.
+    ///
+    /// Only a streamable-HTTP request carries [`super::ask::CONVERSATION_HEADER`]:
+    /// rmcp inserts the request's `http::request::Parts` into the handler
+    /// context (`transport/streamable_http_server/tower.rs`), and it is cloned
+    /// into `RequestContext.extensions` (`service/server.rs`). stdio, the named
+    /// pipe and the shim therefore never have one — and never see the tool.
+    ///
+    /// Takes the `Parts` rather than the context so the gate is testable:
+    /// `RequestContext` cannot be built outside rmcp (its `Peer` constructor is
+    /// crate-private), while a `Parts` is one `http::Request::builder()` away.
+    /// The `list_tools` / `call_tool` callers pass
+    /// `context.extensions.get::<http::request::Parts>()` and nothing else.
+    fn ask_conversation(parts: Option<&http::request::Parts>) -> Option<String> {
+        super::ask::conversation_from(parts?).map(str::to_string)
+    }
+
+    /// Whether `ask_user_question` belongs on this connection's `tools/list`.
+    ///
+    /// Three conditions, all required: an interactive host installed a sink, the
+    /// `mcp.permissions` policy allows the tool, and the request names a
+    /// conversation to park the question in.
+    ///
+    /// Deliberately **exempt from `exposedTools`**, the same exemption
+    /// `memory_ping` has ([`Self::tool_is_listed`]): that list budgets
+    /// *retrieval* tools, and this one is the interactive channel itself. Hiding
+    /// it would leave a `dsh:` session unable to ask anything. A deny in
+    /// `mcp.permissions` still hides and rejects it.
+    fn ask_tool_listed(&self, parts: Option<&http::request::Parts>) -> bool {
+        self.user_questions.is_some()
+            && self
+                .permissions
+                .tool_allowed("gaviero", super::ask::TOOL_ASK_USER_QUESTION)
+            && Self::ask_conversation(parts).is_some()
+    }
+
     /// Enable symbol MCP tools (`symbol_search`, `symbol_doc`). Requires a
     /// populated `symbol_docs` sidecar from `gaviero-cli --graph --enrich`.
     pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
@@ -527,6 +579,22 @@ impl GavieroMcpServer {
     /// its three call sites.
     pub fn with_signal_sink(mut self, sink: Arc<dyn MemorySignalSink>) -> Self {
         self.signal_sink = Some(sink);
+        self
+    }
+
+    /// Install the interactive host that `ask_user_question` parks questions
+    /// in. Without it the tool is **not listed at all** (unlike `memory_flag`,
+    /// which stays listed and errors): there is nothing a question could reach,
+    /// and the schema is not free on every turn.
+    ///
+    /// Listing additionally requires [`super::ask::CONVERSATION_HEADER`] on the
+    /// request, which only a `dsh:` session sends, so no other provider pays
+    /// for the tool.
+    pub fn with_user_question_sink(
+        mut self,
+        sink: Arc<dyn super::ask::UserQuestionSink>,
+    ) -> Self {
+        self.user_questions = Some(sink);
         self
     }
 
@@ -1753,6 +1821,61 @@ impl GavieroMcpServer {
             )),
         }
     }
+
+    /// Park one question on the conversation's overlay and turn the answer into
+    /// a tool result.
+    ///
+    /// Everything that can go wrong is a `CallToolResult` **error**, not a
+    /// dropped call: the model must be able to read what happened and retry.
+    /// In particular an `Allow` with no `answers` is an error — reporting
+    /// success there would make the model believe a question was answered when
+    /// nothing was asked (the same rule `tools/ask.rs` follows).
+    ///
+    /// Validation runs *before* the sink: an unusable form must never become a
+    /// parked question the user has to dismiss.
+    async fn ask_user_question_impl(
+        &self,
+        conv_id: &str,
+        args: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let error = |message: String| -> Result<rmcp::model::CallToolResult, ErrorData> {
+            Ok(rmcp::model::CallToolResult::error(vec![Content::text(
+                message,
+            )]))
+        };
+        if let Err(e) = crate::ask_user::validate_questions(&args) {
+            return error(e);
+        }
+        let Some(sink) = self.user_questions.as_ref() else {
+            return error(
+                "ask_user_question is not configured (no interactive host attached)".to_string(),
+            );
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sink.ask(conv_id, &args, tx);
+        let decision = match rx.await {
+            Ok(decision) => decision,
+            // A dropped sender is a cancel, by the observer contract.
+            Err(_) => {
+                return error("the question was cancelled before it was answered".to_string());
+            }
+        };
+        match decision {
+            crate::observer::PermissionDecision::Allow { .. } => {
+                match crate::ask_user::answers_from(decision.updated_input()) {
+                    Some(text) => Ok(rmcp::model::CallToolResult::success(vec![Content::text(text)])),
+                    None => error(
+                        "the question was allowed but the host returned no answers; \
+                         ask the user in prose instead"
+                            .to_string(),
+                    ),
+                }
+            }
+            crate::observer::PermissionDecision::Deny { message } => error(
+                message.unwrap_or_else(|| "the user declined to answer".to_string()),
+            ),
+        }
+    }
 }
 
 /// One advertised tool, flattened for callers that drive the server in-process
@@ -1770,10 +1893,17 @@ impl ServerHandler for GavieroMcpServer {
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.listed_tools();
+        // Context-dependent extra: `listed_tools()` stays context-free so the
+        // in-process callers, the size pins and every non-HTTP connection keep
+        // exactly the router surface they had.
+        if self.ask_tool_listed(context.extensions.get::<http::request::Parts>()) {
+            tools.push(super::ask::tool_definition());
+        }
         Ok(ListToolsResult {
-            tools: self.listed_tools(),
+            tools,
             ..Default::default()
         })
     }
@@ -1796,12 +1926,31 @@ impl ServerHandler for GavieroMcpServer {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Null);
-        let result = match self.ensure_tool_allowed(&request.name) {
-            Ok(()) => {
-                let tcc = ToolCallContext::new(self, request, context);
-                self.tool_router.call(tcc).await
+        let result = if request.name.as_ref() == super::ask::TOOL_ASK_USER_QUESTION {
+            let parts = context.extensions.get::<http::request::Parts>();
+            match Self::ask_conversation(parts) {
+                Some(conv_id) if self.ask_tool_listed(parts) => {
+                    // `input` is the same arguments the telemetry tail logs.
+                    self.ask_user_question_impl(&conv_id, input.clone()).await
+                }
+                // Not listed on this connection, so this call is out of
+                // contract: report it the same way a permission-denied tool is
+                // reported rather than parking a question nobody can answer.
+                _ => Err(ErrorData::invalid_request(
+                    "gaviero MCP tool \"ask_user_question\" is not available on this \
+                     connection (it needs an interactive host, mcp.permissions allowing it \
+                     and an x-gaviero-conversation request header)",
+                    None,
+                )),
             }
-            Err(e) => Err(e),
+        } else {
+            match self.ensure_tool_allowed(&request.name) {
+                Ok(()) => {
+                    let tcc = ToolCallContext::new(self, request, context);
+                    self.tool_router.call(tcc).await
+                }
+                Err(e) => Err(e),
+            }
         };
         let (output, error) = match &result {
             Ok(r) if r.is_error == Some(true) => (
@@ -1819,6 +1968,18 @@ impl ServerHandler for GavieroMcpServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if name == super::ask::TOOL_ASK_USER_QUESTION {
+            // This method carries no `RequestContext`, so the conversation
+            // header cannot be checked here. It is only used by rmcp for
+            // task-support validation, and `call_tool` re-checks header,
+            // permissions and sink before anything is parked — the reply below
+            // can never be a way to call the tool.
+            return (self.user_questions.is_some()
+                && self
+                    .permissions
+                    .tool_allowed("gaviero", super::ask::TOOL_ASK_USER_QUESTION))
+            .then(super::ask::tool_definition);
+        }
         if !self.tool_is_listed(name) {
             return None;
         }
@@ -4650,6 +4811,178 @@ mod tests {
             lean_min.len() < 1200,
             "lean compact tools/list {} B should be < 1200",
             lean_min.len()
+        );
+    }
+
+    // ── ask_user_question: dsh's interactive channel ─────────────────
+
+    use super::super::ask::{FakeQuestionReply, FakeQuestionSink};
+
+    fn ask_parts(header: Option<&str>) -> http::request::Parts {
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1:9/mcp");
+        if let Some(value) = header {
+            builder = builder.header(super::super::ask::CONVERSATION_HEADER, value);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    fn question_input() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "Which database?",
+                "header": "DB",
+                "multiSelect": false,
+                "options": [
+                    { "label": "Postgres", "description": "relational" },
+                    { "label": "SQLite", "description": "embedded" }
+                ]
+            }]
+        })
+    }
+
+    fn server_with_sink(reply: FakeQuestionReply) -> (GavieroMcpServer, Arc<FakeQuestionSink>) {
+        let sink = FakeQuestionSink::new(reply);
+        (
+            fixture().with_user_question_sink(sink.clone()),
+            sink,
+        )
+    }
+
+    fn render(result: &rmcp::model::CallToolResult) -> String {
+        super::super::client::render_call_result(result)
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_returns_the_chosen_labels() {
+        let (s, sink) = server_with_sink(FakeQuestionReply::FirstOption);
+        let out = s
+            .ask_user_question_impl("conv-1", question_input())
+            .await
+            .expect("a parked question is a normal result, not a protocol error");
+        assert_ne!(out.is_error, Some(true), "{}", render(&out));
+        let text = render(&out);
+        assert!(text.contains("Which database?"), "{text}");
+        assert!(text.contains("Postgres"), "{text}");
+        // The sink got the conversation and the model's input verbatim — the
+        // overlay parses that input, so any rewrite would break the card.
+        let seen = sink.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "conv-1");
+        assert_eq!(seen[0].1, question_input());
+    }
+
+    #[tokio::test]
+    async fn a_denied_question_is_a_tool_error_carrying_the_host_message() {
+        let (s, _sink) = server_with_sink(FakeQuestionReply::Deny("user said no"));
+        let out = s
+            .ask_user_question_impl("conv-1", question_input())
+            .await
+            .unwrap();
+        assert_eq!(out.is_error, Some(true));
+        assert!(render(&out).contains("user said no"), "{}", render(&out));
+    }
+
+    #[tokio::test]
+    async fn an_allowed_question_without_answers_is_a_tool_error() {
+        // Never a fake success: the model would believe it has an answer.
+        let (s, _sink) = server_with_sink(FakeQuestionReply::NoAnswers);
+        let out = s
+            .ask_user_question_impl("conv-1", question_input())
+            .await
+            .unwrap();
+        assert_eq!(out.is_error, Some(true));
+        assert!(render(&out).contains("no answers"), "{}", render(&out));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_without_a_sink_is_a_tool_error() {
+        let out = fixture()
+            .ask_user_question_impl("conv-1", question_input())
+            .await
+            .unwrap();
+        assert_eq!(out.is_error, Some(true));
+        assert!(render(&out).contains("not configured"), "{}", render(&out));
+    }
+
+    #[tokio::test]
+    async fn invalid_questions_never_reach_the_sink() {
+        let (s, sink) = server_with_sink(FakeQuestionReply::FirstOption);
+        // Five options: over Claude's documented ceiling of four.
+        let five = serde_json::json!({
+            "questions": [{
+                "question": "Pick one",
+                "options": [
+                    { "label": "a" }, { "label": "b" }, { "label": "c" },
+                    { "label": "d" }, { "label": "e" }
+                ]
+            }]
+        });
+        let out = s.ask_user_question_impl("conv-1", five).await.unwrap();
+        assert_eq!(out.is_error, Some(true));
+        assert!(render(&out).contains("at most 4"), "{}", render(&out));
+        assert!(
+            sink.seen().is_empty(),
+            "an unusable form must not become a parked question"
+        );
+    }
+
+    #[test]
+    fn ask_tool_is_listed_only_with_a_sink_permission_and_conversation() {
+        let with_sink = fixture().with_user_question_sink(FakeQuestionSink::new(
+            FakeQuestionReply::FirstOption,
+        ));
+        // No HTTP request (stdio / named pipe / shim): no conversation, no tool.
+        assert!(!with_sink.ask_tool_listed(None));
+        // Header absent from an HTTP request.
+        assert!(!with_sink.ask_tool_listed(Some(&ask_parts(None))));
+        // The dsh case.
+        assert!(with_sink.ask_tool_listed(Some(&ask_parts(Some("conv-1")))));
+        // No interactive host installed.
+        assert!(!fixture().ask_tool_listed(Some(&ask_parts(Some("conv-1")))));
+        // mcp.permissions denies it.
+        let denied = with_sink.clone().with_permissions(super::super::McpPermissions {
+            allow: vec![],
+            deny: vec!["gaviero:ask_user_question".into()],
+        });
+        assert!(!denied.ask_tool_listed(Some(&ask_parts(Some("conv-1")))));
+    }
+
+    #[test]
+    fn ask_tool_is_exempt_from_the_exposed_tools_budget() {
+        // `exposedTools` budgets retrieval tools; hiding the interactive
+        // channel would leave a dsh session unable to ask anything. Same
+        // precedent as `memory_ping`.
+        let s = fixture()
+            .with_user_question_sink(FakeQuestionSink::new(FakeQuestionReply::FirstOption))
+            .with_exposed_tools(vec!["memory_search".into()]);
+        assert!(s.ask_tool_listed(Some(&ask_parts(Some("conv-1")))));
+    }
+
+    #[test]
+    fn get_tool_exposes_the_ask_tool_only_when_a_sink_exists() {
+        let s = fixture().with_user_question_sink(FakeQuestionSink::new(
+            FakeQuestionReply::FirstOption,
+        ));
+        let tool = s
+            .get_tool(super::super::ask::TOOL_ASK_USER_QUESTION)
+            .expect("sink installed");
+        assert_eq!(tool.name, super::super::ask::TOOL_ASK_USER_QUESTION);
+        assert!(fixture().get_tool(super::super::ask::TOOL_ASK_USER_QUESTION).is_none());
+    }
+
+    #[test]
+    fn the_context_free_tool_list_never_contains_the_ask_tool() {
+        // `listed_tools()` has no request context, so it must not advertise a
+        // tool whose presence depends on one — the snapshots and the in-process
+        // specs are built from it.
+        let s = fixture().with_user_question_sink(FakeQuestionSink::new(
+            FakeQuestionReply::FirstOption,
+        ));
+        assert!(
+            !s.listed_tool_names()
+                .contains(&super::super::ask::TOOL_ASK_USER_QUESTION.to_string())
         );
     }
 }

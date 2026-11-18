@@ -235,6 +235,45 @@ impl AcpObserver for TuiAcpObserver {
     }
 }
 
+/// The interactive half of the MCP server: `dsh:`'s `ask_user_question` parks a
+/// question here, on the same `Event::PermissionRequest` path an in-process
+/// `AskUserQuestion` uses.
+///
+/// That reuse is the whole point — `PendingPermission::new` keys the overlay on
+/// the input *shape*, so the same card renders whether the question came from
+/// Claude, from gaviero's own agent loop, or from dsh over MCP. Nothing here
+/// re-renders or re-validates: the input is forwarded verbatim, because the
+/// overlay parses it.
+///
+/// The conversation id comes from the MCP request header rather than from this
+/// struct: one sink serves every connection, and the server resolves which chat
+/// asked. Sending fails only after the TUI has exited, and dropping the
+/// `respond` sender is the documented "cancelled" path — the parked MCP call
+/// then reports that the question was never answered.
+pub(super) struct TuiUserQuestionSink {
+    pub tx: mpsc::UnboundedSender<Event>,
+}
+
+impl gaviero_core::mcp::UserQuestionSink for TuiUserQuestionSink {
+    fn ask(
+        &self,
+        conv_id: &str,
+        input: &serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
+    ) {
+        let description = gaviero_core::ask_user::first_question(input)
+            .unwrap_or("Clarifying question")
+            .to_string();
+        let _ = self.tx.send(Event::PermissionRequest {
+            conv_id: conv_id.to_string(),
+            tool_name: gaviero_core::mcp::TOOL_ASK_USER_QUESTION.to_string(),
+            description,
+            input: input.clone(),
+            respond,
+        });
+    }
+}
+
 /// A4: forwards `MemoryObserver` callbacks from the writer task to the
 /// TUI event loop. Fires on every write the writer task processes, so
 /// the memory panel's "Recently Written" section can refresh in real
@@ -457,5 +496,72 @@ mod tests {
             }
         );
         assert_eq!(turns[0].summary.out_tokens_est, 1);
+    }
+
+    // ── dsh's MCP ask-user channel ───────────────────────────────────
+
+    fn ask_input() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "Which database?",
+                "header": "DB",
+                "multiSelect": false,
+                "options": [
+                    { "label": "Postgres", "description": "relational" },
+                    { "label": "SQLite", "description": "embedded" }
+                ]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn user_question_sink_parks_the_question_on_the_right_conversation() {
+        use gaviero_core::mcp::UserQuestionSink as _;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = TuiUserQuestionSink { tx };
+        let (respond, answer) = tokio::sync::oneshot::channel();
+        sink.ask("conv-7", &ask_input(), respond);
+
+        let event = rx.try_recv().expect("the question must reach the event loop");
+        let Event::PermissionRequest {
+            conv_id,
+            tool_name,
+            description,
+            input,
+            respond,
+        } = event
+        else {
+            panic!("expected Event::PermissionRequest");
+        };
+        assert_eq!(conv_id, "conv-7");
+        assert_eq!(tool_name, gaviero_core::mcp::TOOL_ASK_USER_QUESTION);
+        // The overlay's one-line summary is the first question's text.
+        assert_eq!(description, "Which database?");
+        // Verbatim: the overlay parses this shape.
+        assert_eq!(input, ask_input());
+
+        respond
+            .send(gaviero_core::observer::PermissionDecision::allow())
+            .ok();
+        assert!(answer.await.is_ok(), "the answer must travel back");
+    }
+
+    #[tokio::test]
+    async fn a_closed_event_channel_cancels_the_parked_question() {
+        use gaviero_core::mcp::UserQuestionSink as _;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let sink = TuiUserQuestionSink { tx };
+        let (respond, answer) = tokio::sync::oneshot::channel();
+        sink.ask("conv-7", &ask_input(), respond);
+
+        // The failed send drops the whole event, `respond` included, which the
+        // parked MCP call reports as "cancelled" rather than hanging forever.
+        assert!(
+            answer.await.is_err(),
+            "a dropped sender must be observable as a cancel"
+        );
     }
 }

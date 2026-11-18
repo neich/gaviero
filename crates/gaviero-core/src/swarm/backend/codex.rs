@@ -64,8 +64,8 @@ use super::{
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
 
 /// Context window, in tokens, the Codex catalog advertises for `model`
-/// (`context_window` in `codex debug models`, client 0.167.0, 2026-11-09).
-/// The 6.1 family has 500k; every other listed model has 272k, which is also
+/// (`context_window` in `codex debug models`, client 0.167.0, 2026-11-17).
+/// `gpt-6.1-terra` has 500k; every other listed model has 272k, which is also
 /// the assumption for a model the catalog does not describe.
 pub fn codex_context_window(model: &str) -> usize {
     let model = model.trim().to_ascii_lowercase();
@@ -74,7 +74,7 @@ pub fn codex_context_window(model: &str) -> usize {
     } else {
         model.as_str()
     };
-    if model.starts_with("gpt-6.1") {
+    if model.starts_with("gpt-6.1-terra") {
         500_000
     } else {
         272_000
@@ -751,7 +751,8 @@ pub fn codex_effort_levels(model: &str) -> Vec<String> {
 
 /// Highest `model_reasoning_effort` per the catalog as of client 0.167.0
 /// (2026-11): any `-luna` model reaches `max`, every other `gpt-6*` /
-/// `gpt-5.6*` model `ultra`, and older models `xhigh`.
+/// `gpt-5.6*` model `ultra`, and older models (including the re-listed
+/// `gpt-5.5`) `xhigh`.
 fn codex_effort_ceiling(model: &str) -> &'static str {
     let m = model
         .trim()
@@ -1091,10 +1092,11 @@ url = "https://example/mcp/"
 
     #[test]
     fn test_context_window_follows_the_catalog() {
-        assert_eq!(codex_context_window("gpt-6.1-sol"), 500_000);
+        assert_eq!(codex_context_window("gpt-6.1-sol"), 272_000);
         assert_eq!(codex_context_window("gpt-6.1-terra"), 500_000);
         assert_eq!(codex_context_window("gpt-6-astra"), 272_000);
         assert_eq!(codex_context_window("gpt-5.6-luna"), 272_000);
+        assert_eq!(codex_context_window("gpt-5.5"), 272_000);
         assert_eq!(codex_context_window("some-future-model"), 272_000);
         assert_eq!(
             codex_context_window(""),
