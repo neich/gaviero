@@ -38,6 +38,35 @@ pub const GAVIERO_ACP_PATCH: &str = "\
 ";
 pub const GAVIERO_ACP_PATCH_FILE: &str = "gaviero-acp.patch.yml";
 
+/// dsh patch overlay that mounts gaviero's own skill folders into dsh's
+/// `skill-filesystem` provider.
+///
+/// Two halves make a skill usable on a provider:
+///
+/// * **The body.** `$name` is gaviero's invocation syntax: the TUI resolves it
+///   against [`crate::skills::SkillCatalog`] and the rendered `SKILL.md` rides
+///   the ACP prompt as a `<skill name="…">` block
+///   ([`super::build_prompt_blocks`]) — identical to Claude's enriched prompt.
+/// * **The catalog.** dsh's `skill` tool and its `<available_skills>` reminder
+///   are fed by dsh's own provider registry, which scans `<projectRoot>/.dsh/skills`,
+///   `<projectRoot>/.agents/skills`, `~/.dsh/skills`, `~/.agents/skills` and the
+///   bundled root — none of them gaviero's `.gaviero/skills`. Claude reads
+///   `.claude/skills` natively, so a project that mirrors its skills there has
+///   them in Claude's own catalog; dsh has no equivalent for `.gaviero/skills`.
+///   Without this row the `$name` body still arrives, but the model's catalog
+///   contradicts it and it can answer as if nothing was injected.
+///
+/// Applied as an **id-targeted config override** of the bundle's own
+/// `skill-filesystem` row (not a second provider): dsh keeps its default
+/// roots, watchers and `bundledSkillDir`, and the overlay imports no package,
+/// so a dsh that does not ship the provider has nothing new to resolve.
+/// `watch` stays at its default, so a skill added mid-session is catalogued on
+/// the next lookup.
+pub const DSH_SKILLS_PATCH_FILE: &str = "gaviero-skills.patch.yml";
+
+/// Row id of the provider this overlay extends.
+pub const DSH_SKILLS_ROW_ID: &str = "skill-filesystem";
+
 /// Whose DeepSeek key `dsh:` uses (`providers.dsh.credentialSource`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DshCredentialSource {
@@ -195,6 +224,26 @@ impl DshLaunchSpec {
                 ),
             }
         }
+        // Gaviero's skills: dsh's own provider registry also scans gaviero's
+        // skill folders, so the `skill` tool and `<available_skills>` catalog
+        // match what `$name` resolves in chat. Skipped when no skill folder
+        // exists — a `dsh:` launch pays nothing for a feature with no skills.
+        // Real dsh only — the fake agent takes no patch overlays.
+        if !self.skip_api_key {
+            let skill_dirs = gaviero_skill_dirs(workspace_root, additional_roots);
+            if !skill_dirs.is_empty() {
+                match acp_patch_dir() {
+                    Some(dir) => patches.push(ensure_patch_file(
+                        &dir,
+                        DSH_SKILLS_PATCH_FILE,
+                        &skills_patch_body(&skill_dirs),
+                    )?),
+                    None => tracing::warn!(
+                        "dsh: cannot locate ~/.gaviero; dsh's skill catalog stays gaviero-unaware"
+                    ),
+                }
+            }
+        }
         let patch_refs: Vec<&Path> = patches.iter().map(|p| p.as_path()).collect();
         cmd.args(self.launch_args(&patch_refs));
         cmd.current_dir(workspace_root);
@@ -206,6 +255,90 @@ impl DshLaunchSpec {
 /// `~/.gaviero/dsh/` — per-machine, so it ignores `GAVIERO_ROOT`.
 fn acp_patch_dir() -> Option<std::path::PathBuf> {
     crate::workspace::home_gaviero_dir().map(|d| d.join("dsh"))
+}
+
+/// The gaviero skill folders in scope for a launch, most specific first.
+///
+/// Mirrors what `$name` resolves against in a chat turn
+/// ([`crate::skills::SkillCatalog::scan`]): every workspace folder's
+/// `.gaviero/skills`, the workspace layer's (beside the `.gaviero-workspace`
+/// file), and the user-wide root. That user-wide root is
+/// **`$GAVIERO_ROOT/.gaviero/skills`** — the folder gaviero's global skills
+/// have always lived in; `~/.gaviero/skills` is only that root when
+/// `GAVIERO_ROOT` is unset (see [`crate::workspace::user_gaviero_dir`]).
+pub fn gaviero_skill_dirs(
+    workspace_root: &Path,
+    additional_roots: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    gaviero_skill_dirs_with_global(
+        workspace_root,
+        additional_roots,
+        &crate::skills::SkillCatalog::global_skills_dir(),
+    )
+}
+
+/// [`gaviero_skill_dirs`] with an explicit global folder, so tests do not
+/// depend on `$GAVIERO_ROOT`.
+///
+/// The primary folder, the workspace layer and the global root come from
+/// [`crate::skills::SkillCatalog::scan`] itself, so the list cannot drift from
+/// the cascade. `skills.extraRoots` entries ride along for the same reason.
+/// Sibling folders are added explicitly: a single-folder scan only sees the
+/// primary, while `$name` resolves against every member of a multi-folder
+/// workspace.
+pub fn gaviero_skill_dirs_with_global(
+    workspace_root: &Path,
+    additional_roots: &[std::path::PathBuf],
+    global_dir: &Path,
+) -> Vec<std::path::PathBuf> {
+    let workspace = crate::workspace::Workspace::single_folder(workspace_root.to_path_buf());
+    let (catalog, _warnings) = crate::skills::SkillCatalog::scan(&workspace, global_dir);
+    let mut dirs: Vec<std::path::PathBuf> = catalog
+        .scanned_dirs()
+        .iter()
+        .filter(|dir| dir.exists)
+        .map(|dir| dir.path.clone())
+        .collect();
+    // `native_roots` puts the global root last; keep every sibling folder
+    // before it so dsh's catalog keeps the same reach, nearest scope first.
+    let mut insert_at = dirs
+        .iter()
+        .position(|dir| dir.as_path() == global_dir)
+        .unwrap_or(dirs.len());
+    for root in additional_roots {
+        let dir = root.join(".gaviero").join("skills");
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.insert(insert_at, dir);
+            insert_at += 1;
+        }
+    }
+    dirs
+}
+
+/// YAML body of [`DSH_SKILLS_PATCH_FILE`] for `dirs`.
+///
+/// Paths are written with forward slashes and YAML single quotes (literal, so
+/// backslashes need no doubling); a `'` in a path is doubled, the one escape
+/// YAML single-quoted scalars have.
+pub fn skills_patch_body(dirs: &[std::path::PathBuf]) -> String {
+    let mut body = String::from(
+        "# Written by gaviero; regenerated on every dsh: launch. Do not edit.\n\
+         # Extend dsh's own skill provider with gaviero's skill folders, so its\n\
+         # `skill` tool and <available_skills> catalog list the skills that\n\
+         # `$name` resolves in gaviero's chat. dsh's default roots, watchers and\n\
+         # bundled skills are untouched: this only adds scan roots.\n",
+    );
+    body.push_str(&format!("- id: {DSH_SKILLS_ROW_ID}\n"));
+    body.push_str("  config:\n");
+    body.push_str("    customSkillDirs:\n");
+    for dir in dirs {
+        let slashy = dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        body.push_str(&format!("      - '{slashy}'\n"));
+    }
+    body
 }
 
 /// Write [`GAVIERO_ACP_PATCH`] to `<dir>/gaviero-acp.patch.yml` (tmp + rename)
@@ -297,7 +430,18 @@ pub fn stdio_mcp_server(_root: &Path) -> serde_json::Value {
 }
 
 /// HTTP MCP server entry from the endpoint descriptor, if live.
-pub fn http_mcp_server(root: &Path) -> Option<serde_json::Value> {
+///
+/// `conv_id` is the chat conversation this session belongs to. When present it
+/// rides as [`crate::mcp::ask::CONVERSATION_HEADER`] on every request dsh makes
+/// to gaviero's server, which is what lets `ask_user_question` exist for a
+/// `dsh:` session and nowhere else: ACP carries no elicitation, so the question
+/// has to travel over MCP, and the server needs to know which conversation's
+/// overlay to park it on.
+///
+/// Only the `gaviero` entry is tagged. context7 and `mcp.extraServers` are
+/// other people's servers; the header means nothing to them and would leak a
+/// local conversation id into a third party.
+pub fn http_mcp_server(root: &Path, conv_id: Option<&str>) -> Option<serde_json::Value> {
     let desc = crate::mcp::read_descriptor(&crate::mcp::McpEndpointDescriptor::path(root)).ok()?;
     let url = desc.http_url?;
     let token_path = desc.http_token_path?;
@@ -306,11 +450,21 @@ pub fn http_mcp_server(root: &Path) -> Option<serde_json::Value> {
     if token.is_empty() {
         return None;
     }
+    let mut headers = vec![serde_json::json!({
+        "name": "Authorization",
+        "value": format!("Bearer {token}")
+    })];
+    if let Some(conv_id) = conv_id {
+        headers.push(serde_json::json!({
+            "name": crate::mcp::ask::CONVERSATION_HEADER,
+            "value": conv_id,
+        }));
+    }
     Some(serde_json::json!({
         "type": "http",
         "name": "gaviero",
         "url": url,
-        "headers": [{ "name": "Authorization", "value": format!("Bearer {token}") }]
+        "headers": headers,
     }))
 }
 
@@ -368,11 +522,21 @@ pub fn registers_gaviero(servers: &[serde_json::Value]) -> bool {
 /// session is constructed below `create_session` where no `Workspace` is in
 /// scope, and this keeps one call site rather than a new session field.
 ///
+/// `conv_id` tags the `gaviero` entry only ([`http_mcp_server`]). It is what
+/// makes `ask_user_question` available to a `dsh:` session and to nothing else:
+/// the ACP wire has no elicitation, so a structured question has to travel over
+/// MCP, and the header tells gaviero's server which conversation's overlay to
+/// park it on.
+///
 /// Separately: dsh's `session/new` carries **no tool list and no permission
 /// policy** (`agent_client_protocol/mod.rs`), so `agent.availableTools` is
 /// *structurally unenforced* for dsh. That is recorded as
 /// `ToolEnforcement::Unenforced` in the capability table, not attempted here.
-pub fn mcp_servers_for_session(root: &Path, caps: McpCapabilities) -> Vec<serde_json::Value> {
+pub fn mcp_servers_for_session(
+    root: &Path,
+    caps: McpCapabilities,
+    conv_id: Option<&str>,
+) -> Vec<serde_json::Value> {
     // An in-process provider links servers as a live value; it has no MCP
     // transport to hang a `mcpServers` entry on. The two capability axes say
     // *what* a provider may use, not *how* it receives it — so an in-process row
@@ -383,7 +547,7 @@ pub fn mcp_servers_for_session(root: &Path, caps: McpCapabilities) -> Vec<serde_
     }
 
     let mut servers = Vec::new();
-    if let Some(http) = http_mcp_server(root) {
+    if let Some(http) = http_mcp_server(root, conv_id) {
         servers.push(http);
     }
 
@@ -535,6 +699,166 @@ mod tests {
         assert!(!dir.path().join(format!("{GAVIERO_ACP_PATCH_FILE}.tmp")).exists());
     }
 
+    /// Write `<dir>/<name>/SKILL.md` with a minimal valid frontmatter.
+    fn write_skill(dir: &Path, name: &str) {
+        let folder = dir.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\nBody.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn skill_dirs_are_the_scanned_roots_that_exist() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        // The user-wide root is `$GAVIERO_ROOT/.gaviero/skills`, not a copy
+        // under the home directory.
+        let global = dir
+            .path()
+            .join("gaviero-root")
+            .join(".gaviero")
+            .join("skills");
+        std::fs::create_dir_all(&root).unwrap();
+        write_skill(&root.join(".gaviero").join("skills"), "lint");
+        write_skill(&global, "migrate-component");
+
+        let dirs = gaviero_skill_dirs_with_global(&root, &[], &global);
+        let root_skills = root.join(".gaviero").join("skills");
+        assert!(dirs.contains(&root_skills), "{dirs:?}");
+        assert!(dirs.contains(&global), "{dirs:?}");
+        // Most specific first, so dsh's rank tie-break prefers the folder and
+        // the global root stays the fallback.
+        let root_at = dirs.iter().position(|d| d == &root_skills).unwrap();
+        let global_at = dirs.iter().position(|d| d == &global).unwrap();
+        assert!(root_at < global_at, "{dirs:?}");
+        assert_eq!(dirs.last(), Some(&global), "{dirs:?}");
+        // A folder that does not exist is not mounted.
+        assert!(dirs.iter().all(|d| d.exists()), "{dirs:?}");
+    }
+
+    /// A stale `~/.gaviero/skills` left behind by an older setup must never be
+    /// mounted: the launch names `$GAVIERO_ROOT/.gaviero/skills` and nothing
+    /// else for the user-wide scope.
+    #[test]
+    fn skill_dirs_never_add_a_stale_home_copy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let global = dir
+            .path()
+            .join("gaviero-root")
+            .join(".gaviero")
+            .join("skills");
+        let home = dir.path().join("home").join(".gaviero").join("skills");
+        std::fs::create_dir_all(&root).unwrap();
+        write_skill(&global, "deep-research");
+        write_skill(&home, "deep-research");
+
+        let dirs = gaviero_skill_dirs_with_global(&root, &[], &global);
+        assert!(dirs.contains(&global), "{dirs:?}");
+        assert!(!dirs.contains(&home), "{dirs:?}");
+    }
+
+    #[test]
+    fn skill_dirs_include_sibling_workspace_folders() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let sibling = dir.path().join("flutter");
+        let global = dir
+            .path()
+            .join("gaviero-root")
+            .join(".gaviero")
+            .join("skills");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        write_skill(&sibling.join(".gaviero").join("skills"), "flutter-widget");
+
+        let dirs = gaviero_skill_dirs_with_global(&root, &[sibling.clone()], &global);
+        let sibling_skills = sibling.join(".gaviero").join("skills");
+        assert!(dirs.contains(&sibling_skills), "{dirs:?}");
+
+        // A sibling without a skills folder is not mounted, and the folder is
+        // not listed twice when it is passed twice.
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let dirs =
+            gaviero_skill_dirs_with_global(&root, &[sibling.clone(), sibling, bare], &global);
+        assert_eq!(
+            dirs.iter().filter(|d| **d == sibling_skills).count(),
+            1,
+            "{dirs:?}"
+        );
+    }
+
+    /// The global root the launcher mounts is `$GAVIERO_ROOT/.gaviero/skills`
+    /// when the variable is set; the home directory is only the fallback.
+    #[test]
+    fn global_skill_root_follows_gaviero_root() {
+        let dir = crate::skills::SkillCatalog::global_skills_dir();
+        eprintln!("global skills root: {}", dir.display());
+        let Some(root) = std::env::var(crate::workspace::GAVIERO_ROOT_ENV).ok() else {
+            return;
+        };
+        if root.trim().is_empty() {
+            return;
+        }
+        let root = std::path::absolute(std::path::PathBuf::from(root)).unwrap();
+        assert_eq!(dir, root.join(".gaviero").join("skills"));
+        if let Some(home) = dirs::home_dir() {
+            let home_skills = home.join(".gaviero").join("skills");
+            if home_skills != dir {
+                assert_ne!(dir, home_skills);
+            }
+        }
+    }
+
+    #[test]
+    fn skill_dirs_are_empty_when_nothing_is_installed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = dir.path().join("absent").join("skills");
+        assert!(gaviero_skill_dirs_with_global(&root, &[], &global).is_empty());
+    }
+
+    #[test]
+    fn skills_patch_extends_the_bundle_provider_with_each_dir_quoted() {
+        let dirs = vec![
+            std::path::PathBuf::from("C:/repo/.gaviero/skills"),
+            // Backslashes become forward slashes; a quote is YAML-doubled.
+            std::path::PathBuf::from(r"C:\it's\.gaviero\skills"),
+        ];
+        let body = skills_patch_body(&dirs);
+        assert!(body.contains("- id: skill-filesystem\n"), "{body}");
+        assert!(body.contains("  config:\n"), "{body}");
+        assert!(body.contains("    customSkillDirs:\n"), "{body}");
+        assert!(
+            body.contains("      - 'C:/repo/.gaviero/skills'\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("      - 'C:/it''s/.gaviero/skills'\n"),
+            "{body}"
+        );
+        // An override of the existing row, not a second provider: no insert,
+        // no second registration under another provider name.
+        assert!(!body.contains("insert:"), "{body}");
+        assert!(!body.contains("providerName:"), "{body}");
+        assert_eq!(body.matches("- id: ").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn skills_patch_file_is_written_once_and_reused() {
+        let dir = tempdir().unwrap();
+        let body = skills_patch_body(&[std::path::PathBuf::from("C:/repo/.gaviero/skills")]);
+        let first = ensure_patch_file(dir.path(), DSH_SKILLS_PATCH_FILE, &body).unwrap();
+        let second = ensure_patch_file(dir.path(), DSH_SKILLS_PATCH_FILE, &body).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), body);
+    }
+
     #[test]
     fn missing_api_key_is_a_clear_error() {
         if std::env::var_os("DEEPSEEK_API_KEY").is_some()
@@ -559,7 +883,7 @@ mod tests {
     #[test]
     fn mcp_servers_http_only_without_descriptor_is_empty() {
         let dir = tempdir().unwrap();
-        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
         let stdio = stdio_mcp_server(dir.path());
         assert_eq!(stdio["name"], "gaviero");
         assert!(stdio.get("command").and_then(|c| c.as_str()).is_some());
@@ -570,6 +894,87 @@ mod tests {
         let gav = root.join(".gaviero");
         std::fs::create_dir_all(&gav).unwrap();
         std::fs::write(gav.join("settings.json"), body).unwrap();
+    }
+
+    /// A live-looking HTTP endpoint descriptor plus its token file, so
+    /// [`http_mcp_server`] returns an entry.
+    fn write_http_descriptor(root: &Path) {
+        let gav = root.join(".gaviero");
+        std::fs::create_dir_all(&gav).unwrap();
+        let token_path = gav.join("mcp-http-token");
+        std::fs::write(&token_path, "test-token\n").unwrap();
+        let desc = serde_json::json!({
+            "v": 1,
+            "workspace_id": "test",
+            "http_url": "http://127.0.0.1:9/mcp",
+            "http_token_path": token_path,
+            "pid": std::process::id(),
+            "started_at": chrono::Utc::now(),
+        });
+        std::fs::write(
+            crate::mcp::McpEndpointDescriptor::path(root),
+            desc.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A `dsh:` session's gaviero entry names the conversation; nothing else
+    /// does. That header is the only thing that makes `ask_user_question`
+    /// exist for this session, so the two must travel together.
+    #[test]
+    fn the_gaviero_http_entry_carries_the_conversation_header() {
+        let dir = tempdir().unwrap();
+        write_http_descriptor(dir.path());
+        write_settings(dir.path(), r#"{"mcp":{"context7":{"enabled":true}}}"#);
+
+        let tagged = mcp_servers_for_session(dir.path(), dsh_caps(), Some("conv-1"));
+        let gaviero = tagged
+            .iter()
+            .find(|s| s["name"] == "gaviero")
+            .expect("live endpoint must register gaviero");
+        let headers = gaviero["headers"].as_array().expect("headers array");
+        assert!(
+            headers
+                .iter()
+                .any(|h| h["name"] == "Authorization" && h["value"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with("Bearer "))),
+            "the bearer header must stay: {gaviero}"
+        );
+        let conversation = headers
+            .iter()
+            .find(|h| h["name"] == crate::mcp::ask::CONVERSATION_HEADER)
+            .unwrap_or_else(|| panic!("no conversation header in {gaviero}"));
+        assert_eq!(conversation["value"], "conv-1");
+
+        // context7 is another party's server: the conversation id stays home.
+        let ctx7 = tagged
+            .iter()
+            .find(|s| s["name"] == "context7")
+            .expect("context7 enabled in settings");
+        assert!(
+            !ctx7["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["name"] == crate::mcp::ask::CONVERSATION_HEADER),
+            "a local conversation id must not leak to context7: {ctx7}"
+        );
+
+        // A session with no conversation sends no such header.
+        let untagged = mcp_servers_for_session(dir.path(), dsh_caps(), None);
+        let gaviero = untagged
+            .iter()
+            .find(|s| s["name"] == "gaviero")
+            .expect("live endpoint must register gaviero");
+        assert!(
+            !gaviero["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["name"] == crate::mcp::ask::CONVERSATION_HEADER),
+            "no conversation, no header: {gaviero}"
+        );
     }
 
     fn names(servers: &[serde_json::Value]) -> Vec<String> {
@@ -604,7 +1009,7 @@ mod tests {
         let allowed = crate::context_planner::types::Provider::Dsh.mcp_capabilities();
         assert!(allowed.context7 && allowed.extra_servers);
         assert_eq!(
-            names(&mcp_servers_for_session(dir.path(), allowed)),
+            names(&mcp_servers_for_session(dir.path(), allowed, None)),
             vec!["context7", "consensus"]
         );
 
@@ -617,7 +1022,7 @@ mod tests {
         let in_process = crate::context_planner::types::Provider::Deepseek.mcp_capabilities();
         assert!(in_process.extra_servers);
         assert!(!in_process.uses_mcp_servers());
-        assert!(mcp_servers_for_session(dir.path(), in_process).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), in_process, None).is_empty());
     }
 
     /// Decision E: with no gaviero endpoint but context7 on, dsh still gets
@@ -627,7 +1032,7 @@ mod tests {
     fn context7_http_is_registered_without_a_gaviero_endpoint() {
         let dir = tempdir().unwrap();
         write_settings(dir.path(), r#"{"mcp":{"context7":{"enabled":true}}}"#);
-        let servers = mcp_servers_for_session(dir.path(), dsh_caps());
+        let servers = mcp_servers_for_session(dir.path(), dsh_caps(), None);
         assert_eq!(names(&servers), vec!["context7"]);
         let ctx7 = &servers[0];
         assert_eq!(ctx7["type"], "http");
@@ -647,7 +1052,7 @@ mod tests {
             dir.path(),
             r#"{"mcp":{"context7":{"enabled":true,"url":""}}}"#,
         );
-        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
     }
 
     /// Disabled by default: no workspace opt-in, no entry.
@@ -655,7 +1060,7 @@ mod tests {
     fn context7_is_opt_in() {
         let dir = tempdir().unwrap();
         write_settings(dir.path(), r#"{"mcp":{"context7":{"enabled":false}}}"#);
-        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
     }
 
     /// Decision E: URL extras register, stdio extras are skipped.
@@ -669,7 +1074,7 @@ mod tests {
                 {"name":"local-thing","command":"some-server","args":["--x"]}
             ]}}"#,
         );
-        let servers = mcp_servers_for_session(dir.path(), dsh_caps());
+        let servers = mcp_servers_for_session(dir.path(), dsh_caps(), None);
         assert_eq!(names(&servers), vec!["consensus"]);
         assert_eq!(servers[0]["type"], "http");
     }
@@ -687,7 +1092,7 @@ mod tests {
                 "permissions":{"deny":["context7:*","consensus:*"]}
             }}"#,
         );
-        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
     }
 
     /// An `allow` list that never names a server excludes it, matching
@@ -703,6 +1108,6 @@ mod tests {
                 "permissions":{"allow":["gaviero:*"]}
             }}"#,
         );
-        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
     }
 }
