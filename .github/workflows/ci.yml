@@ -8,8 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # ort's build script downloads prebuilt ONNX Runtime binaries; keep them
-  # inside the workspace so Swatinem/rust-cache picks them up.
+  # ort's build script downloads prebuilt ONNX Runtime binaries from
+  # cdn.pyke.io; keep them in the workspace and list the folder in each
+  # rust-cache step's `cache-directories` (rust-cache only saves ~/.cargo
+  # and target/ by default) so a CDN hiccup can't fail a cached run.
   ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
 
 jobs:
@@ -26,6 +28,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: .ort-cache
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
       # Clippy 1.97 fires ~156 new style lints (mostly collapsible_if
@@ -46,6 +50,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: .ort-cache
       # Full test suite under MSVC, including the C-dependency chain
       # (bundled SQLite, sqlite-vec, tree-sitter grammars, libgit2, zstd).
       # Network/model tests stay #[ignore]d.

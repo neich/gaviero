@@ -34,8 +34,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # ort's build script downloads prebuilt ONNX Runtime binaries; keep them
-  # inside the workspace so Swatinem/rust-cache picks them up.
+  # ort's build script downloads prebuilt ONNX Runtime binaries from
+  # cdn.pyke.io; keep them in the workspace and list the folder in the
+  # rust-cache step's `cache-directories` (rust-cache only saves ~/.cargo
+  # and target/ by default).
   ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
   TAG: ${{ inputs.tag || github.ref_name }}
 
@@ -102,6 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          cache-directories: .ort-cache
 
       # The three binaries must ship side by side: gaviero finds
       # gaviero-cli (agent hooks) and gaviero-mcp-shim (MCP bridge) next to
