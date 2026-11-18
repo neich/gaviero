@@ -39,10 +39,17 @@ pub(crate) struct SshHost {
 /// `GAVIERO_SESSION_HOST_STATE` if set, else
 /// `<data dir>/gaviero/session-host.json`.
 pub(crate) fn state_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(STATE_ENV) {
-        return Some(PathBuf::from(path));
+    if let Some(path) = state_override() {
+        return Some(path);
     }
     Some(dirs::data_dir()?.join("gaviero").join("session-host.json"))
+}
+
+/// The state file named by `GAVIERO_SESSION_HOST_STATE`, when set.
+pub(crate) fn state_override() -> Option<PathBuf> {
+    std::env::var_os(STATE_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The saved state; a missing or unreadable file is an empty state.

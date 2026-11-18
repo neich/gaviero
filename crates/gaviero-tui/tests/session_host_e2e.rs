@@ -122,6 +122,14 @@ fn host_forwards_input_and_switches_tabs() {
     assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
     assert!(!pty.contents().contains("ALT"), "screen:\n{}", pty.contents());
     assert!(open_names(&state).is_empty());
+
+    // 7. A host on its own state file logs beside it, never into the
+    // shared log a running host writes.
+    assert!(
+        root.path().join("gaviero-sessions.log").is_file(),
+        "no host log beside {}",
+        state.display()
+    );
 }
 
 /// Type `text` as key records, each with the virtual-key code and Shift
