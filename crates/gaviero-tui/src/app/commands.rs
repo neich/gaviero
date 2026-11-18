@@ -1353,9 +1353,31 @@ pub(super) fn handle_detach_command(app: &mut App) {
     }
 }
 
+/// The active conversation's `/add-dir` grants, numbered from 1 — the
+/// numbers `/remove-dir <N>` takes.
+fn add_dir_listing(grants: &[std::path::PathBuf]) -> String {
+    if grants.is_empty() {
+        return "No folders granted to this conversation.\n\
+                Usage: /add-dir <path>  — let the agent read a folder outside the workspace \
+                (read-only); /remove-dir [N] removes grants."
+            .to_string();
+    }
+    let list: Vec<String> = grants
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("  {}. {}", i + 1, p.display()))
+        .collect();
+    format!(
+        "Folders this conversation's agent may read (read-only):\n{}\n\
+         /remove-dir <N> removes one, /remove-dir removes all.",
+        list.join("\n")
+    )
+}
+
 /// `/add-dir [path]`: grant the active conversation's agent read-only access
-/// to a folder outside the workspace until `/reset`, `/clear` or `/handoff`
-/// (`Conversation::session_read_folders`). The bare form lists the grants.
+/// to a folder outside the workspace (`Conversation::session_read_folders`).
+/// Grants survive `/reset`, `/clear` and `/handoff`; only `/remove-dir`
+/// drops them. The bare form lists the grants, numbered from 1.
 /// Desktop only: `/add-dir` is not in the remote allow-list.
 pub(super) fn handle_add_dir_command(app: &mut App) {
     use gaviero_core::agent_guard::{SessionReadFolderCheck, check_session_read_folder};
@@ -1371,23 +1393,7 @@ pub(super) fn handle_add_dir_command(app: &mut App) {
     let idx = app.chat_state.active_conv;
 
     if arg.is_empty() {
-        let grants = &app.chat_state.conversations[idx].session_read_folders;
-        let msg = if grants.is_empty() {
-            "No folders granted to this conversation.\n\
-             Usage: /add-dir <path>  — let the agent read a folder outside the workspace \
-             (read-only) until /reset, /clear or /handoff."
-                .to_string()
-        } else {
-            let list: Vec<String> = grants
-                .iter()
-                .map(|p| format!("  {}", p.display()))
-                .collect();
-            format!(
-                "Folders this conversation's agent may read (read-only):\n{}\n\
-                 /reset, /clear or /handoff removes them.",
-                list.join("\n")
-            )
-        };
+        let msg = add_dir_listing(&app.chat_state.conversations[idx].session_read_folders);
         app.chat_state.add_system_message_at(idx, &msg);
         return;
     }
@@ -1427,8 +1433,7 @@ pub(super) fn handle_add_dir_command(app: &mut App) {
             let msg = format!(
                 "Read access granted for this conversation: {}\n\
                  The agent can read and search it from the next prompt but cannot write \
-                 there. /reset, /clear or /handoff removes it; /add-dir lists the granted \
-                 folders.",
+                 there. /add-dir lists the granted folders; /remove-dir removes them.",
                 path.display()
             );
             let conv = &mut app.chat_state.conversations[idx];
@@ -1441,6 +1446,60 @@ pub(super) fn handle_add_dir_command(app: &mut App) {
             }
         }
     }
+}
+
+/// `/remove-dir [N]`: the counterpart of `/add-dir`. Bare, it drops every
+/// grant of the active conversation; with `N` it drops the Nth grant in the
+/// order `/add-dir` lists them (1-based). Desktop only, like `/add-dir`.
+pub(super) fn handle_remove_dir_command(app: &mut App) {
+    let input = app.chat_state.take_input();
+    let arg = input
+        .trim()
+        .strip_prefix("/remove-dir")
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    app.chat_state.add_user_message(&input);
+    let idx = app.chat_state.active_conv;
+    let count = app.chat_state.conversations[idx].session_read_folders.len();
+
+    if arg.is_empty() {
+        let msg = if count == 0 {
+            "No folders granted to this conversation.".to_string()
+        } else {
+            let conv = &mut app.chat_state.conversations[idx];
+            conv.session_read_folders.clear();
+            conv.bump_revision();
+            format!(
+                "Removed {count} granted folder(s). The agent loses read access from the next \
+                 prompt."
+            )
+        };
+        app.chat_state.add_system_message_at(idx, &msg);
+        return;
+    }
+
+    let msg = match arg.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= count => {
+            let conv = &mut app.chat_state.conversations[idx];
+            let removed = conv.session_read_folders.remove(n - 1);
+            conv.bump_revision();
+            format!(
+                "Removed read access for this conversation: {}\n\
+                 The agent loses it from the next prompt.",
+                removed.display()
+            )
+        }
+        _ if count == 0 => format!(
+            "No folder number {arg}: no folders are granted to this conversation."
+        ),
+        _ => format!(
+            "No folder number {arg}. Usage: /remove-dir <N> with N from 1 to {count}, \
+             or /remove-dir to remove all.\n{}",
+            add_dir_listing(&app.chat_state.conversations[idx].session_read_folders)
+        ),
+    };
+    app.chat_state.add_system_message_at(idx, &msg);
 }
 
 #[cfg(test)]
@@ -1533,7 +1592,75 @@ mod add_dir_tests {
     }
 
     #[test]
+    fn bare_add_dir_numbers_grants_from_one() {
+        let (_ws, mut app) = test_app();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        run(&mut app, &format!("/add-dir {}", a.path().display()));
+        run(&mut app, &format!("/add-dir {}", b.path().display()));
+        run(&mut app, "/add-dir");
+        let listing = last_system(&app);
+        assert!(
+            listing.contains(&format!("  1. {}", a.path().display())),
+            "{listing}"
+        );
+        assert!(
+            listing.contains(&format!("  2. {}", b.path().display())),
+            "{listing}"
+        );
+    }
+
+    fn remove(app: &mut App, line: &str) {
+        app.chat_state.text_input.text = line.to_string();
+        handle_remove_dir_command(app);
+    }
+
+    fn three_grants(app: &mut App) -> Vec<tempfile::TempDir> {
+        let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            run(app, &format!("/add-dir {}", d.path().display()));
+        }
+        assert_eq!(grants(app).len(), 3);
+        dirs
+    }
+
+    #[test]
+    fn remove_dir_n_removes_the_nth_grant() {
+        let (_ws, mut app) = test_app();
+        let dirs = three_grants(&mut app);
+        remove(&mut app, "/remove-dir 2");
+        assert_eq!(
+            grants(&app),
+            vec![dirs[0].path().to_path_buf(), dirs[2].path().to_path_buf()]
+        );
+        assert!(last_system(&app).starts_with("Removed read access"), "{}", last_system(&app));
+    }
+
+    #[test]
+    fn bare_remove_dir_removes_every_grant() {
+        let (_ws, mut app) = test_app();
+        three_grants(&mut app);
+        remove(&mut app, "/remove-dir");
+        assert!(grants(&app).is_empty());
+        assert!(last_system(&app).starts_with("Removed 3"), "{}", last_system(&app));
+        remove(&mut app, "/remove-dir");
+        assert!(last_system(&app).starts_with("No folders granted"), "{}", last_system(&app));
+    }
+
+    #[test]
+    fn remove_dir_rejects_out_of_range_or_non_numeric() {
+        let (_ws, mut app) = test_app();
+        three_grants(&mut app);
+        for bad in ["/remove-dir 0", "/remove-dir 4", "/remove-dir two"] {
+            remove(&mut app, bad);
+            assert_eq!(grants(&app).len(), 3, "{bad}");
+            assert!(last_system(&app).starts_with("No folder number"), "{}", last_system(&app));
+        }
+    }
+
+    #[test]
     fn add_dir_is_not_allowed_remotely() {
         assert!(!crate::app::remote::REMOTE_ALLOWED_SLASH.contains(&"/add-dir"));
+        assert!(!crate::app::remote::REMOTE_ALLOWED_SLASH.contains(&"/remove-dir"));
     }
 }

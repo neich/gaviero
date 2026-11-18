@@ -631,7 +631,8 @@ pub struct Conversation {
     /// `/add-dir` grants: absolute folders outside the workspace this
     /// conversation's agent may read (read-only). Passed to every provider
     /// session as `AgentOptions::session_read_folders`; persisted with the
-    /// conversation; cleared by `/reset`, `/clear` and `/handoff`.
+    /// conversation; kept across `/reset`, `/clear` and `/handoff`, removed
+    /// only by `/remove-dir`.
     pub session_read_folders: Vec<std::path::PathBuf>,
 }
 
@@ -2721,7 +2722,8 @@ impl AgentChatState {
                      /context mode <mode>     — Set bootstrap mode for this conversation (auto|minimal|manual|none)\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
-                     /add-dir [path]          — Let the agent read a folder outside the workspace (read-only) until /reset, /clear or /handoff; bare form lists the granted folders (desktop only)\n\
+                     /add-dir [path]          — Let the agent read a folder outside the workspace (read-only; survives /reset, /clear and /handoff); bare form lists the granted folders, numbered (desktop only)\n\
+                     /remove-dir [N]          — Remove the Nth /add-dir folder; bare form removes them all (desktop only)\n\
                      /keep [clear]            — List (or unmark) the exchanges marked to keep. Mark them in browse mode: Ctrl+C with nothing selected, ↑/↓, Space\n\
                      /handoff [to <tab|new>]  — Start a fresh session carrying only the kept exchanges, verbatim (detours left out). Default: this tab. `to <n|title>` seeds another tab (this one is left untouched), `to new` opens one\n\
                      /compact [text|N]        — Claude: compact the session natively (optional extra guidance). Other providers: keep the last N messages of the replayed transcript (default 6)\n\n\
@@ -3099,9 +3101,9 @@ impl AgentChatState {
         // A plain reset drops whatever an earlier `/handoff` carried;
         // `/handoff` sets its block again right after resetting.
         conv.carried_context = None;
-        // `/add-dir` grants last until `/reset`, `/clear` or `/handoff` —
-        // all three come through here.
-        conv.session_read_folders.clear();
+        // `/add-dir` grants deliberately survive `/reset`, `/clear` and
+        // `/handoff` (all three come through here): only `/remove-dir`
+        // drops them.
         // Host-side replay watermark: visible pre-reset turns stay in the
         // panel but must not re-enter `Turn.replay_history` once
         // `transcript_inline_mode` returns to `Auto`. `deepseek:` keeps
@@ -7598,28 +7600,28 @@ mod tests {
     }
 
     #[test]
-    fn reset_drops_add_dir_grants() {
+    fn reset_keeps_add_dir_grants() {
         let mut state = AgentChatState::new();
         let idx = state.active_conv;
-        state.conversations[idx]
-            .session_read_folders
-            .push(std::path::PathBuf::from("/srv/docs"));
+        let grant = std::path::PathBuf::from("/srv/docs");
+        state.conversations[idx].session_read_folders.push(grant.clone());
         state.reset_conversation_at(idx);
-        assert!(state.conversations[idx].session_read_folders.is_empty());
+        assert_eq!(state.conversations[idx].session_read_folders, vec![grant.clone()]);
+        assert!(state.apply_slash_line(idx, "/clear", SlashOrigin::Desktop));
+        assert_eq!(state.conversations[idx].session_read_folders, vec![grant]);
     }
 
     #[test]
-    fn handoff_in_place_drops_add_dir_grants() {
+    fn handoff_in_place_keeps_add_dir_grants() {
         let mut state = AgentChatState::new();
         let idx = session_with_detour(&mut state);
         state.active_conv = idx;
         state.conversations[idx].toggle_keep_exchange(1);
-        state.conversations[idx]
-            .session_read_folders
-            .push(std::path::PathBuf::from("/srv/docs"));
+        let grant = std::path::PathBuf::from("/srv/docs");
+        state.conversations[idx].session_read_folders.push(grant.clone());
         assert!(state.apply_slash_line(idx, "/handoff", SlashOrigin::Desktop));
         assert!(state.conversations[idx].carried_context.is_some(), "handoff ran");
-        assert!(state.conversations[idx].session_read_folders.is_empty());
+        assert_eq!(state.conversations[idx].session_read_folders, vec![grant]);
     }
 
     #[test]
