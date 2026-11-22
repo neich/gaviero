@@ -32,8 +32,28 @@ pub fn write_text(buf: &mut Buffer, x: u16, y: u16, x_max: u16, text: &str, styl
 /// - Respects Unicode display widths (CJK, emoji, etc.)
 /// - Prefers breaking at spaces; hard-breaks if no space found
 pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    wrap_rows(text, width).into_iter().map(|row| row.text).collect()
+}
+
+/// One row of [`wrap_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedRow {
+    pub text: String,
+    /// `Some(sep)` when the row continues the row above (a soft wrap). `sep`
+    /// is the whitespace the break dropped, and is empty for a hard break
+    /// inside a word. `None` when the row starts a line of the source text.
+    pub join: Option<String>,
+}
+
+/// [`word_wrap`], also reporting which rows are soft wraps, so copying the
+/// rows can rebuild the source line instead of inserting a newline at every
+/// visual break.
+pub fn wrap_rows(text: &str, width: usize) -> Vec<WrappedRow> {
     if width == 0 {
-        return vec![text.to_string()];
+        return vec![WrappedRow {
+            text: text.to_string(),
+            join: None,
+        }];
     }
 
     let text = text.replace('\t', "    ");
@@ -41,12 +61,16 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
 
     for physical_line in text.split('\n') {
         if physical_line.is_empty() {
-            lines.push(String::new());
+            lines.push(WrappedRow {
+                text: String::new(),
+                join: None,
+            });
             continue;
         }
 
         let chars: Vec<char> = physical_line.chars().collect();
         let mut start = 0;
+        let mut join = None;
         while start < chars.len() {
             let mut display_w = 0usize;
             let mut end = start;
@@ -72,8 +96,14 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
                 end
             };
 
-            let line: String = chars[start..break_at].iter().collect();
-            lines.push(line.trim_end().to_string());
+            let piece: String = chars[start..break_at].iter().collect();
+            let kept = piece.trim_end();
+            let dropped = piece[kept.len()..].to_string();
+            lines.push(WrappedRow {
+                text: kept.to_string(),
+                join: join.take(),
+            });
+            join = Some(dropped);
             start = break_at;
         }
     }
@@ -165,6 +195,30 @@ mod tests {
         let lines = word_wrap("日本語テスト", 6);
         assert_eq!(lines.len(), 2);
         assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 6);
+    }
+
+    /// Joining every soft-wrapped row with its `sep` gives the source line
+    /// back, whether the break fell on a space or inside a long word.
+    #[test]
+    fn wrap_rows_soft_wraps_rebuild_the_source_line() {
+        let source = "cargo test -p gaviero-core --features api-embedders C:\\very\\long\\path\\to\\file.rs";
+        let rows = wrap_rows(&format!("{source}\nnext line"), 12);
+        assert!(rows.len() > 3, "{rows:?}");
+        let mut rebuilt = String::new();
+        for (i, row) in rows.iter().enumerate() {
+            match &row.join {
+                Some(sep) => rebuilt.push_str(sep),
+                None if i > 0 => rebuilt.push('\n'),
+                None => {}
+            }
+            rebuilt.push_str(&row.text);
+        }
+        assert_eq!(rebuilt, format!("{source}\nnext line"));
+        assert_eq!(rows.last().unwrap().join, None, "a source newline is not a soft wrap");
+        assert_eq!(
+            word_wrap(source, 12),
+            rows.iter().take_while(|r| r.text != "next line").map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -103,6 +103,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |
 | Double-click (explorer) | On a file the editor cannot open as text (images, PDFs, archives, …): show it selected in the OS file manager (Explorer / Finder / the freedesktop file manager) so you can open it with another app |
+| Click `[copy]` (agent chat) | Every finished fenced code block in an agent reply has a header row with its language and a `[copy]` button: one click copies the block exactly as the agent wrote it (tabs kept, no screen wrapping or indent, no trailing newline). It appears once the closing fence has arrived, never on a half-streamed block. Drag-select copies also rejoin wrapped rows and leave the header out |
 | Ctrl+V (explorer) | Copy the files or folders copied in the OS file manager (Explorer / Finder / Files) into the selected folder — or the folder of the selected file — after a `y` confirmation. Dropping files on the terminal window works too where the terminal pastes their paths. Never overwrites: a taken name becomes `name (copy).ext`. Text that is not a list of existing paths copies nothing |
 | Alt+Left/Right (`--sessions` host) | Previous / next session |
 | Alt+Shift+Left/Right (`--sessions` host) | Move the current tab one place left / right (stops at the ends; the order is kept for the next start) |

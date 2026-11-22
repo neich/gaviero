@@ -411,6 +411,22 @@ pub(super) fn clipboard_copy(app: &mut App) {
     app.status_message = Some((msg, std::time::Instant::now()));
 }
 
+/// A code block's `[copy]` button in the chat was clicked: copy the block's
+/// source exactly and say so in the status bar.
+fn copy_chat_code_block(app: &mut App, text: &str) {
+    app.chat_state.clear_text_selection();
+    let lines = text.lines().count();
+    let noun = if lines == 1 { "line" } else { "lines" };
+    let msg = match app.set_clipboard(text) {
+        ClipboardResult::System => format!("Copied code block ({lines} {noun})"),
+        ClipboardResult::Osc52 => format!("Copied code block ({lines} {noun}, via terminal)"),
+        ClipboardResult::Unavailable => {
+            format!("Copied code block ({lines} {noun}) to the internal clipboard only")
+        }
+    };
+    app.status_message = Some((msg, std::time::Instant::now()));
+}
+
 pub(super) fn clipboard_cut(app: &mut App) {
     let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
         return;
@@ -1091,6 +1107,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         return;
                     }
 
+                    if let Some(text) = app.chat_state.copy_button_at(col, row).map(str::to_owned) {
+                        copy_chat_code_block(app, &text);
+                        return;
+                    }
+
                     if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
                         app.chat_state.start_text_selection(line, ci);
                     } else {
@@ -1713,6 +1734,10 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 if col == scrollbar_x {
                     app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
                     app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
+                    return;
+                }
+                if let Some(text) = app.chat_state.copy_button_at(col, row).map(str::to_owned) {
+                    copy_chat_code_block(app, &text);
                     return;
                 }
                 if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {

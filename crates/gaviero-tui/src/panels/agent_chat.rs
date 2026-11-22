@@ -1008,9 +1008,14 @@ impl Default for AgentSettings {
     }
 }
 
-/// One transcript row: styled segments plus the index of the message it
-/// belongs to (`None` for separators and the busy indicator).
-type TranscriptLine = (Vec<crate::panels::chat_markdown::StyledSegment>, Option<usize>);
+/// One transcript row: styled segments, the index of the message it belongs
+/// to (`None` for separators and the busy indicator), and how copy turns the
+/// row back into text.
+type TranscriptLine = (
+    Vec<crate::panels::chat_markdown::StyledSegment>,
+    Option<usize>,
+    crate::panels::chat_markdown::RowCopy,
+);
 
 /// A row's plain text, as mouse selection and copy see it.
 fn line_text(segments: &[crate::panels::chat_markdown::StyledSegment]) -> String {
@@ -3733,6 +3738,21 @@ impl AgentChatState {
         }
     }
 
+    /// What the code block `[copy]` button under `(col, row)` copies, if the
+    /// pointer is on one.
+    pub fn copy_button_at(&self, col: u16, row: u16) -> Option<&str> {
+        let area = self.conv_area_cache?;
+        if !area.contains((col, row).into()) {
+            return None;
+        }
+        let (line_idx, char_idx) = self.screen_to_text_pos(col, row)?;
+        let (_, _, copy) = self.line_cache.lines.get(line_idx)?;
+        let button = copy.button.as_ref()?;
+        (button.start..button.start + button.len)
+            .contains(&char_idx)
+            .then_some(button.text.as_str())
+    }
+
     /// Map screen coordinates to a position in the rendered lines cache.
     /// Returns (line_index, char_index) where char_index is the character offset.
     pub fn screen_to_text_pos(&self, col: u16, row: u16) -> Option<(usize, usize)> {
@@ -3830,37 +3850,56 @@ impl AgentChatState {
     }
 
     /// Extract the selected text from the cached rendered lines.
-    /// Each rendered line is separated by a newline, matching the visual layout
-    /// as the user sees it on screen.
+    ///
+    /// Gives back the source text, not the panel's layout: a soft-wrapped
+    /// row is rejoined to the row above with the whitespace the wrap dropped,
+    /// and screen-only indents (code block, hanging list indent) are left out.
+    /// Only real line breaks become newlines, so a long shell command wrapped
+    /// over several rows pastes as one line. Screen-only rows (a code block's
+    /// `[copy]` header) are left out.
     pub fn selected_chat_text(&self) -> Option<String> {
         let (sl, sc, el, ec) = self.text_selection_range()?;
         if sl == el && sc == ec {
             return None;
         }
         let mut result = String::new();
+        let mut started = false;
         for line_idx in sl..=el {
             if line_idx >= self.rendered_lines_cache.len() {
                 break;
             }
             let (ref line, _msg_idx) = self.rendered_lines_cache[line_idx];
+            // `line_cache.lines` and `rendered_lines_cache` are laid out together,
+            // row for row.
+            let copy = self.line_cache.lines.get(line_idx).map(|(_, _, copy)| copy);
+            if copy.is_some_and(|c| c.omit) {
+                continue;
+            }
             let chars: Vec<char> = line.chars().collect();
+            let skip = copy.map_or(0, |c| c.skip).min(chars.len());
             let start_c = if line_idx == sl {
                 sc.min(chars.len())
             } else {
                 0
-            };
+            }
+            .max(skip);
             let end_c = if line_idx == el {
                 ec.min(chars.len())
             } else {
                 chars.len()
             };
 
-            if line_idx > sl {
-                result.push('\n');
+            if started {
+                match copy.and_then(|c| c.join.as_deref()) {
+                    Some(sep) => result.push_str(sep),
+                    None => result.push('\n'),
+                }
             }
+            started = true;
 
-            let selected: String = chars[start_c..end_c].iter().collect();
-            result.push_str(&selected);
+            if start_c < end_c {
+                result.extend(&chars[start_c..end_c]);
+            }
         }
         if result.is_empty() {
             None
@@ -4971,7 +5010,7 @@ impl AgentChatState {
             self.rendered_lines_cache.extend(
                 cache.lines[first..]
                     .iter()
-                    .map(|(segments, mi)| (line_text(segments), *mi)),
+                    .map(|(segments, mi, _)| (line_text(segments), *mi)),
             );
             cache.entries.push(CachedMessage {
                 role: msg.role.clone(),
@@ -5054,6 +5093,7 @@ impl AgentChatState {
                     stream_style,
                 )],
                 None,
+                Default::default(),
             ));
             // Every background task of this turn: running ones with their
             // elapsed time, then the ones already done with how they ended.
@@ -5067,13 +5107,14 @@ impl AgentChatState {
                         agent_style,
                     )],
                     None,
+                    Default::default(),
                 ));
             }
         }
 
         // `sync_chat_lines` left both vectors holding the message lines only.
         self.rendered_lines_cache
-            .extend(tail.iter().map(|(segments, mi)| (line_text(segments), *mi)));
+            .extend(tail.iter().map(|(segments, mi, _)| (line_text(segments), *mi)));
         self.line_cache.lines.extend(tail);
         let lines = &self.line_cache.lines;
 
@@ -5084,10 +5125,10 @@ impl AgentChatState {
             // Find first and last line belonging to the browsed message
             let first_line = lines
                 .iter()
-                .position(|(_, mi)| *mi == Some(self.browsed_msg));
+                .position(|(_, mi, _)| *mi == Some(self.browsed_msg));
             let last_line = lines
                 .iter()
-                .rposition(|(_, mi)| *mi == Some(self.browsed_msg));
+                .rposition(|(_, mi, _)| *mi == Some(self.browsed_msg));
             if let (Some(first), Some(last)) = (first_line, last_line) {
                 if first < self.scroll_offset {
                     self.scroll_offset = first;
@@ -5142,7 +5183,7 @@ impl AgentChatState {
             }
 
             if line_idx < lines.len() {
-                let (ref segments, _) = lines[line_idx];
+                let (ref segments, _, _) = lines[line_idx];
                 let sel_style = Style::default().fg(theme::TAB_BG).bg(theme::ACCENT);
                 let mut cx = area.x;
                 let mut char_idx = 0usize;
@@ -5779,27 +5820,35 @@ fn layout_message(msg_idx: usize, msg: &ChatMessage, width: usize, out: &mut Vec
                 prefix, base_style,
             )],
             Some(msg_idx),
+            Default::default(),
         ));
-        let md_lines =
-            crate::panels::chat_markdown::format_chat_markdown(&display_content, width, base_style);
+        let md_lines = crate::panels::chat_markdown::format_chat_markdown_with_copy_buttons(
+            &display_content,
+            width,
+            base_style,
+        );
         for cl in md_lines {
-            out.push((cl.segments, Some(msg_idx)));
+            out.push((cl.segments, Some(msg_idx), cl.copy));
         }
     } else {
         // User/System: simple word-wrap (plain, no inline styling)
         let full_text = format!("{}{}", prefix, display_content);
-        for line in crate::widgets::render_utils::word_wrap(&full_text, width) {
+        for row in crate::widgets::render_utils::wrap_rows(&full_text, width) {
             out.push((
                 vec![crate::panels::chat_markdown::StyledSegment::new(
-                    line, base_style,
+                    row.text, base_style,
                 )],
                 Some(msg_idx),
+                crate::panels::chat_markdown::RowCopy {
+                    join: row.join,
+                    ..Default::default()
+                },
             ));
         }
     }
 
     // Blank line between messages
-    out.push((Vec::new(), None));
+    out.push((Vec::new(), None, Default::default()));
 }
 
 fn filter_file_blocks_for_display(text: &str) -> String {
@@ -8993,7 +9042,7 @@ mod tests {
         for (idx, msg) in state.messages().iter().enumerate() {
             layout_message(idx, msg, width, &mut lines);
         }
-        lines.iter().map(|(s, mi)| (line_text(s), *mi)).collect()
+        lines.iter().map(|(s, mi, _)| (line_text(s), *mi)).collect()
     }
 
     fn planted() -> Vec<crate::panels::chat_markdown::StyledSegment> {
@@ -9025,7 +9074,7 @@ mod tests {
         state.sync_chat_lines(30);
         assert_eq!(line_text(&state.line_cache.lines[0].0), "PLANTED");
         assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 30));
-        let styled: Vec<String> = state.line_cache.lines[1..].iter().map(|(s, _)| line_text(s)).collect();
+        let styled: Vec<String> = state.line_cache.lines[1..].iter().map(|(s, _, _)| line_text(s)).collect();
         let fresh: Vec<String> = fresh_transcript(&state, 30)[1..].iter().map(|(t, _)| t.clone()).collect();
         assert_eq!(styled, fresh, "styled rows must match a fresh layout");
 
@@ -9088,5 +9137,92 @@ mod tests {
         let mut buf = RataBuf::empty(area);
         state.render_conversation(area, &mut buf, &theme);
         assert_eq!(state.rendered_lines_cache, fresh_transcript(&state, 39));
+    }
+
+    /// Select every row of the active transcript and copy it.
+    fn copy_whole_transcript(state: &mut AgentChatState, width: usize) -> String {
+        state.sync_chat_lines(width);
+        let last = state.rendered_lines_cache.len() - 1;
+        let end = state.rendered_lines_cache[last].0.chars().count();
+        state.text_sel_anchor = Some((0, 0));
+        state.text_sel_end = Some((last, end));
+        state.selected_chat_text().unwrap()
+    }
+
+    /// A shell command the panel wraps over several rows copies as the one
+    /// line the agent wrote, without the code block's screen indent; real
+    /// line breaks between commands stay.
+    #[test]
+    fn copying_a_wrapped_command_gives_back_one_line() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        let command = "cargo test -p gaviero-core --features api-embedders -- --nocapture C:\\Users\\someone\\work\\repo";
+        state.append_stream_chunk_to(
+            &conv_id,
+            &format!("Run:\n\n```powershell\n{command}\ncargo build\n```\n"),
+        );
+        let copied = copy_whole_transcript(&mut state, 24);
+        assert!(
+            state.rendered_lines_cache.len() > 6,
+            "the command must wrap at this width: {:?}",
+            state.rendered_lines_cache
+        );
+        assert!(
+            copied.lines().any(|l| l == command),
+            "copied text lost the command as one line:\n{copied}"
+        );
+        assert!(copied.lines().any(|l| l == "cargo build"), "{copied}");
+    }
+
+    /// A click on any column of a code block's `[copy]` label yields the
+    /// block's source; a selection copy leaves the header row out.
+    #[test]
+    fn the_copy_button_copies_the_block_and_selection_copy_skips_it() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        let command = "cargo test -p gaviero-core --features api-embedders -- --nocapture";
+        state.append_stream_chunk_to(&conv_id, &format!("Run:\n\n```powershell\n{command}\n```\n"));
+        state.conv_area_cache = Some(Rect::new(0, 0, 25, 40));
+        state.scroll_offset = 0;
+        state.sync_chat_lines(24);
+        let (row, button) = state
+            .line_cache
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, (_, _, copy))| copy.button.clone().map(|b| (i, b)))
+            .expect("the code block has a copy button");
+        assert_eq!(button.text, command);
+        for col in button.start..button.start + button.len {
+            assert_eq!(state.copy_button_at(col as u16, row as u16), Some(command));
+        }
+        assert_eq!(state.copy_button_at(button.start as u16 - 1, row as u16), None);
+        assert_eq!(state.copy_button_at(button.start as u16, row as u16 + 1), None);
+
+        let copied = copy_whole_transcript(&mut state, 24);
+        assert!(
+            !copied.contains(crate::panels::chat_markdown::COPY_BUTTON_LABEL),
+            "{copied}"
+        );
+        assert!(copied.contains(&format!("Run:\n\n{command}")), "{copied}");
+    }
+
+    /// Wrapped prose and wrapped user prompts rejoin too.
+    #[test]
+    fn copying_wrapped_prose_rejoins_the_rows() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        let prompt = "please run the whole test suite and report what fails";
+        state.add_user_message(prompt);
+        state.append_stream_chunk_to(
+            &conv_id,
+            "- a list item long enough to wrap onto a hanging indent row",
+        );
+        let copied = copy_whole_transcript(&mut state, 20);
+        assert!(copied.contains(prompt), "{copied}");
+        assert!(
+            copied.contains("• a list item long enough to wrap onto a hanging indent row"),
+            "{copied}"
+        );
     }
 }
