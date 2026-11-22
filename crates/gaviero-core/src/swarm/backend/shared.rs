@@ -257,12 +257,25 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
     let retrieval_clause = retrieval_protocol_clause(&capabilities.retrieval);
 
     format!(
-        "You are a coding assistant working inside the gaviero editor.\n\n{}\n{}{retrieval_clause}{ann}",
+        "You are a coding assistant working inside the gaviero editor.\n\n{}\n{}{shell}{retrieval_clause}{ann}",
         tool_clause,
         file_clause,
+        shell = SHELL_COMMANDS_CONVENTION,
         ann = TURN_ANNOTATIONS_CONVENTION,
     )
 }
+
+/// How commands the user is meant to run are written, so they always survive
+/// copy and paste. A command split across lines (`\`, `` ` ``, `^`) runs as
+/// several broken commands once pasted, and each continuation character
+/// belongs to one shell only (`\` fails in PowerShell, `` ` `` in bash).
+/// Session-stable, so it sits inside the prompt cache boundary.
+pub const SHELL_COMMANDS_CONVENTION: &str = "SHELL COMMANDS — when you show the user commands to run, \
+     put them in a fenced code block with exactly one complete command per line. Never split a \
+     command across lines (no `\\`, `` ` `` or `^` line continuations), however long it is, and \
+     never prefix it with a prompt such as `$ ` or `PS>`. Give each step its own line, or chain \
+     steps on one line with the shell's own operator (`&&`; Windows PowerShell 5 has none, use `;`). \
+     The block must work when pasted as-is into the user's shell.\n\n";
 
 /// The retrieval-protocol ("pull") stanza for the system prompt.
 ///
@@ -873,6 +886,8 @@ mod tests {
         let none = default_editor_system_prompt(&caps);
         assert!(!none.contains("read-only repository tools"));
         assert!(!none.contains("node_doc"));
+        // Every provider gets the copy-paste-safe shell command rule.
+        assert!(none.contains(SHELL_COMMANDS_CONVENTION));
 
         // graph_and_memory live → stanza names node_doc/blast_radius/memory_search
         // but NOT the symbol tools (enrichment off).
