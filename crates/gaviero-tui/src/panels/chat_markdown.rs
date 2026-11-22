@@ -34,6 +34,41 @@ impl StyledSegment {
     }
 }
 
+/// How a rendered row goes back into copied text.
+///
+/// Copy must give back what the agent wrote, not the panel's layout: a long
+/// shell command wrapped over three rows has to paste as one line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowCopy {
+    /// Leading characters that only exist on screen (the code-block indent,
+    /// the hanging indent of a wrapped list item). Copy leaves them out.
+    pub skip: usize,
+    /// `Some(sep)` when the row is a soft wrap of the row above: copy joins
+    /// the two with `sep` (the whitespace the wrap dropped) instead of `\n`.
+    pub join: Option<String>,
+    /// The whole row only exists on screen (a code block's header): selection
+    /// copy leaves it out, newline included.
+    pub omit: bool,
+    /// A clickable `[copy]` button on this row.
+    pub button: Option<CopyButton>,
+}
+
+/// A code block's `[copy]` button: where its label sits in the row, and what
+/// it copies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyButton {
+    /// Char index of the label's first character in the row text.
+    pub start: usize,
+    /// Label length in chars.
+    pub len: usize,
+    /// The block's source lines, exactly as the agent wrote them (tabs kept,
+    /// the fence's own indent removed, no trailing newline).
+    pub text: String,
+}
+
+/// The button label drawn on a code block's header row.
+pub const COPY_BUTTON_LABEL: &str = "[copy]";
+
 /// A single rendered line for the chat panel.
 ///
 /// Holds one or more styled segments so a single visual line can mix inline
@@ -41,6 +76,7 @@ impl StyledSegment {
 #[derive(Clone)]
 pub struct ChatLine {
     pub segments: Vec<StyledSegment>,
+    pub copy: RowCopy,
 }
 
 impl ChatLine {
@@ -50,12 +86,19 @@ impl ChatLine {
         if text.is_empty() {
             Self {
                 segments: Vec::new(),
+                copy: RowCopy::default(),
             }
         } else {
             Self {
                 segments: vec![StyledSegment::new(text, style)],
+                copy: RowCopy::default(),
             }
         }
+    }
+
+    fn with_copy(mut self, copy: RowCopy) -> Self {
+        self.copy = copy;
+        self
     }
 
     /// Plain-text concatenation of all segments (no style information).
@@ -93,11 +136,34 @@ pub fn format_chat_markdown_mapped(
     width: usize,
     base_style: Style,
 ) -> (Vec<ChatLine>, Vec<usize>) {
+    format_markdown(text, width, base_style, false)
+}
+
+/// [`format_chat_markdown`] for the agent chat transcript: every closed fenced
+/// code block also gets a header row with a [`CopyButton`] that copies the
+/// block's source exactly — the reliable way to copy a shell command.
+pub fn format_chat_markdown_with_copy_buttons(
+    text: &str,
+    width: usize,
+    base_style: Style,
+) -> Vec<ChatLine> {
+    format_markdown(text, width, base_style, true).0
+}
+
+fn format_markdown(
+    text: &str,
+    width: usize,
+    base_style: Style,
+    copy_buttons: bool,
+) -> (Vec<ChatLine>, Vec<usize>) {
     let mut output = Vec::new();
     // Expand tabs to 4 spaces to prevent terminal rendering artifacts.
     // Tab characters in ratatui cells cause cursor jumps that corrupt display.
     let expanded_text = text.replace('\t', "    ");
     let src_lines: Vec<&str> = expanded_text.lines().collect();
+    // Same line split as `src_lines` (only tabs differ): what a copy button
+    // copies comes from here, so tabs survive.
+    let raw_lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     let mut in_code_block = false;
 
@@ -174,7 +240,13 @@ pub fn format_chat_markdown_mapped(
         }
 
         // Code block fences
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if is_fence(trimmed) {
+            if copy_buttons
+                && !in_code_block
+                && let Some(header) = code_block_header(&raw_lines, i, width)
+            {
+                output.push(header);
+            }
             in_code_block = !in_code_block;
             i += 1;
             continue;
@@ -182,8 +254,14 @@ pub fn format_chat_markdown_mapped(
 
         if in_code_block {
             let budget = width.saturating_sub(2).max(1);
-            for wl in crate::widgets::render_utils::word_wrap(line, budget) {
-                output.push(ChatLine::single(format!("  {}", wl), code_style));
+            for row in crate::widgets::render_utils::wrap_rows(line, budget) {
+                output.push(
+                    ChatLine::single(format!("  {}", row.text), code_style).with_copy(RowCopy {
+                        skip: 2,
+                        join: row.join,
+                        ..RowCopy::default()
+                    }),
+                );
             }
             i += 1;
             continue;
@@ -310,8 +388,11 @@ pub fn format_chat_markdown_mapped(
         // Style with dim color to visually distinguish from regular text
         if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains("](") {
             let marker_style = Style::default().fg(theme::TOOL_DIM);
-            for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", trimmed), width) {
-                output.push(ChatLine::single(wl, marker_style));
+            for row in crate::widgets::render_utils::wrap_rows(&format!("  {}", trimmed), width) {
+                output.push(ChatLine::single(row.text, marker_style).with_copy(RowCopy {
+                    join: row.join,
+                    ..RowCopy::default()
+                }));
             }
             i += 1;
             continue;
@@ -361,16 +442,125 @@ fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> (Vec<ChatLine>, 
             continue;
         }
         let style = line.primary_style();
-        for wrapped in word_wrap_segments(&line.segments, width, width) {
-            if wrapped.is_empty() {
-                out.push(ChatLine::single(String::new(), style));
+        for (j, (wrapped, sep)) in word_wrap_segments(&line.segments, width, width)
+            .into_iter()
+            .enumerate()
+        {
+            // The first piece keeps the row's own copy rule; the rest wrap it.
+            let copy = if j == 0 {
+                line.copy.clone()
             } else {
-                out.push(ChatLine { segments: wrapped });
+                RowCopy {
+                    join: Some(sep),
+                    ..RowCopy::default()
+                }
+            };
+            if wrapped.is_empty() {
+                out.push(ChatLine::single(String::new(), style).with_copy(copy));
+            } else {
+                out.push(ChatLine {
+                    segments: wrapped,
+                    copy,
+                });
             }
         }
     }
     index_map.push(out.len());
     (out, index_map)
+}
+
+/// A fenced-code-block fence (opening or closing), given the trimmed line.
+fn is_fence(trimmed: &str) -> bool {
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// The header row of the fenced code block opening at `lines[open]`: the
+/// fence's language and a `[copy]` button carrying the block's source.
+///
+/// `None` while the block has no closing fence — a reply still streaming,
+/// where copying half a command could run something else — for a block with
+/// no content, and when the panel is too narrow for the button.
+fn code_block_header(lines: &[&str], open: usize, width: usize) -> Option<ChatLine> {
+    let close = (open + 1..lines.len()).find(|&j| is_fence(lines[j].trim()))?;
+    let fence = lines[open];
+    // A fence nested in a list is indented; its content carries the same
+    // indent, which is layout, not part of the code.
+    let indent = fence.chars().take_while(|c| *c == ' ').count();
+    let body: Vec<&str> = lines[open + 1..close]
+        .iter()
+        .map(|line| strip_leading_spaces(line, indent))
+        .collect();
+    let first = body.iter().position(|l| !l.trim().is_empty())?;
+    let last = body.iter().rposition(|l| !l.trim().is_empty())?;
+    let text = body[first..=last].join("\n").trim_end().to_string();
+
+    let label_w = COPY_BUTTON_LABEL.chars().count();
+    if width < label_w + 1 {
+        return None;
+    }
+    let lang: String = fence
+        .trim()
+        .trim_start_matches(['`', '~'])
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect();
+    // `  lang ───── [copy]`, dropping the language, then the indent, when
+    // the panel is too narrow for them.
+    let candidates = [
+        if lang.is_empty() { None } else { Some(format!("  {lang} ")) },
+        Some("  ".to_string()),
+        Some(String::new()),
+    ];
+    let left = candidates
+        .into_iter()
+        .flatten()
+        .find(|left| UnicodeWidthStr::width(left.as_str()) + 1 + label_w <= width)?;
+    let fill = width - UnicodeWidthStr::width(left.as_str()) - 1 - label_w;
+
+    let mut segments = Vec::with_capacity(4);
+    if !left.is_empty() {
+        segments.push(StyledSegment::new(
+            left.clone(),
+            Style::default().fg(theme::TOOL_DIM),
+        ));
+    }
+    segments.push(StyledSegment::new(
+        format!("{} ", "─".repeat(fill)),
+        Style::default().fg(theme::BORDER_DIM),
+    ));
+    segments.push(StyledSegment::new(
+        COPY_BUTTON_LABEL,
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    Some(ChatLine {
+        segments,
+        copy: RowCopy {
+            omit: true,
+            button: Some(CopyButton {
+                start: left.chars().count() + fill + 1,
+                len: label_w,
+                text,
+            }),
+            ..RowCopy::default()
+        },
+    })
+}
+
+/// `line` without up to `n` leading spaces.
+fn strip_leading_spaces(line: &str, n: usize) -> &str {
+    let mut rest = line;
+    for _ in 0..n {
+        match rest.strip_prefix(' ') {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    rest
 }
 
 /// True for box-drawn table borders and data rows (already width-constrained).
@@ -413,17 +603,28 @@ fn push_inline_wrapped(
         return;
     }
 
-    for (j, wrapped_segments) in wrapped.into_iter().enumerate() {
+    for (j, (wrapped_segments, sep)) in wrapped.into_iter().enumerate() {
         let prefix = if j == 0 { first_prefix } else { cont_prefix };
+        // A continuation row's prefix is only the hanging indent: copy drops
+        // it and rejoins the row to the one above.
+        let copy = if j == 0 {
+            RowCopy::default()
+        } else {
+            RowCopy {
+                skip: cont_prefix.chars().count(),
+                join: Some(sep),
+                ..RowCopy::default()
+            }
+        };
         let mut segments: Vec<StyledSegment> = Vec::with_capacity(wrapped_segments.len() + 1);
         if !prefix.is_empty() {
             segments.push(StyledSegment::new(prefix.to_string(), base_style));
         }
         segments.extend(wrapped_segments);
         if segments.is_empty() {
-            output.push(ChatLine::single(String::new(), base_style));
+            output.push(ChatLine::single(String::new(), base_style).with_copy(copy));
         } else {
-            output.push(ChatLine { segments });
+            output.push(ChatLine { segments, copy });
         }
     }
 }
@@ -475,11 +676,14 @@ fn parse_inline_styled(text: &str, base_style: Style) -> Vec<StyledSegment> {
 /// characters that fit within the line budget. `first_width` is the budget for
 /// the first wrapped line and `cont_width` for subsequent continuation lines,
 /// so the caller can reserve room for prefix indents.
+///
+/// Each line comes with the whitespace the wrap dropped just before it (empty
+/// for the first line and for a break inside a word), so copy can rejoin it.
 fn word_wrap_segments(
     segments: &[StyledSegment],
     first_width: usize,
     cont_width: usize,
-) -> Vec<Vec<StyledSegment>> {
+) -> Vec<(Vec<StyledSegment>, String)> {
     // Flatten to (char, style, href) triples, expanding tabs to 4 spaces to match
     // `render_utils::word_wrap`'s behaviour. href rides along so two adjacent
     // links that share a style (both accent+underline) do not merge.
@@ -500,8 +704,9 @@ fn word_wrap_segments(
         return Vec::new();
     }
 
-    let mut result: Vec<Vec<StyledSegment>> = Vec::new();
+    let mut result: Vec<(Vec<StyledSegment>, String)> = Vec::new();
     let mut start = 0;
+    let mut sep = String::new();
     while start < chars.len() {
         let budget = if result.is_empty() {
             first_width
@@ -542,7 +747,11 @@ fn word_wrap_segments(
             }
         }
 
-        result.push(coalesce_segments(&chars[start..line_end]));
+        result.push((
+            coalesce_segments(&chars[start..line_end]),
+            std::mem::take(&mut sep),
+        ));
+        sep = chars[line_end..break_at].iter().map(|(c, _, _)| *c).collect();
         start = break_at;
     }
 
@@ -1005,6 +1214,61 @@ fn strip_inline_markers(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_button_carries_the_exact_block_source() {
+        let text = "Run:\n\n```powershell\n\tcargo build\ncargo test -p gaviero-core\n\n```\nafter";
+        let lines = format_chat_markdown_with_copy_buttons(text, 40, Style::default());
+        let headers: Vec<&ChatLine> = lines.iter().filter(|l| l.copy.button.is_some()).collect();
+        assert_eq!(headers.len(), 1);
+        let header = headers[0];
+        let button = header.copy.button.as_ref().unwrap();
+        // Tabs kept, trailing blank line dropped, no trailing newline.
+        assert_eq!(button.text, "\tcargo build\ncargo test -p gaviero-core");
+        assert!(header.copy.omit, "the header is never part of a selection copy");
+        let row: Vec<char> = header.text().chars().collect();
+        let label: String = row[button.start..button.start + button.len].iter().collect();
+        assert_eq!(label, COPY_BUTTON_LABEL);
+        assert!(header.text().starts_with("  powershell "), "{}", header.text());
+        assert_eq!(UnicodeWidthStr::width(header.text().as_str()), 40);
+
+        // The plain formatter (editor preview, code graph) draws no header.
+        let plain = format_chat_markdown(text, 40, Style::default());
+        assert_eq!(plain.len() + 1, lines.len());
+        assert!(plain.iter().all(|l| l.copy.button.is_none()));
+    }
+
+    #[test]
+    fn copy_button_waits_for_the_closing_fence_and_skips_empty_blocks() {
+        // Still streaming: copying half a command is how `rm -rf /tmp/build`
+        // becomes `rm -rf /`.
+        let streaming =
+            format_chat_markdown_with_copy_buttons("```sh\nrm -rf /tmp/bu", 40, Style::default());
+        assert!(streaming.iter().all(|l| l.copy.button.is_none()));
+        let empty = format_chat_markdown_with_copy_buttons("```\n\n```", 40, Style::default());
+        assert!(empty.iter().all(|l| l.copy.button.is_none()));
+    }
+
+    #[test]
+    fn copy_button_drops_the_indent_of_a_fence_nested_in_a_list() {
+        let text = "1. Build:\n   ```bash\n   cargo build --release\n     nested\n   ```";
+        let lines = format_chat_markdown_with_copy_buttons(text, 40, Style::default());
+        let button = lines.iter().find_map(|l| l.copy.button.as_ref()).unwrap();
+        assert_eq!(button.text, "cargo build --release\n  nested");
+    }
+
+    #[test]
+    fn copy_button_fits_a_narrow_panel() {
+        let text = "```a-very-long-language-name\nls\n```";
+        for width in 7..=20 {
+            let lines = format_chat_markdown_with_copy_buttons(text, width, Style::default());
+            let header = lines.iter().find(|l| l.copy.button.is_some()).unwrap();
+            assert!(UnicodeWidthStr::width(header.text().as_str()) <= width);
+            assert!(header.text().ends_with(COPY_BUTTON_LABEL));
+        }
+        let lines = format_chat_markdown_with_copy_buttons(text, 6, Style::default());
+        assert!(lines.iter().all(|l| l.copy.button.is_none()));
+    }
 
     #[test]
     fn test_strip_inline_markers() {
