@@ -126,6 +126,20 @@ struct Cli {
     #[arg(long)]
     resume: bool,
 
+    /// When a provider usage/rate limit stops agents, wait and resume the
+    /// run from its checkpoint once the limit clears. Each check sends one
+    /// short prompt to every limited model (see --limit-check-minutes).
+    #[arg(long = "wait-on-limit")]
+    wait_on_limit: bool,
+
+    /// Minutes between provider-limit checks with --wait-on-limit.
+    #[arg(
+        long = "limit-check-minutes",
+        default_value_t = 15,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    limit_check_minutes: u64,
+
     /// Ignore artefacts already present in a `loop` block's `OUT_DIR` and
     /// restart every loop at the `iter_start` its script declares.
     ///
@@ -1833,6 +1847,7 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
     let mut promoted = 0usize;
     let mut trust_adjusted = 0usize;
     let mut telemetry_pruned = 0usize;
+    let mut history_leaks_removed = 0usize;
     let mut last_run_id = String::new();
     for store in &targets {
         let report = gaviero_core::memory::run_sleeptime(store, &cfg, None).await?;
@@ -1842,6 +1857,7 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
         promoted += report.promoted;
         trust_adjusted += report.trust_adjusted;
         telemetry_pruned += report.telemetry_pruned;
+        history_leaks_removed += report.history_leaks_removed;
     }
     println!("─── Sleeptime report ────────────────────────────────");
     println!("run_id          : {last_run_id}");
@@ -1859,6 +1875,7 @@ async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> 
     println!("promoted        : {promoted}");
     println!("trust_adjusted  : {trust_adjusted}");
     println!("telemetry_pruned: {telemetry_pruned}");
+    println!("history_leaks   : {history_leaks_removed}");
     Ok(())
 }
 
@@ -4988,19 +5005,44 @@ async fn main() -> Result<()> {
     let live = start_live_run(&cli, &plan, &repo);
     let flusher = live.as_ref().map(LiveRunHandle::spawn_flusher);
     let swarm_observer = CliSwarmObserver { live: live.clone() };
-    let result = gaviero_core::swarm::pipeline::execute(
-        &plan,
-        &config,
-        initial_state,
-        memory,
-        &swarm_observer,
-        |agent_id| {
-            let verbose = cli.script.is_none();
-            Box::new(CliAcpObserver::new(agent_id, verbose).publishing(live.clone()))
-                as Box<dyn gaviero_core::observer::AcpObserver>
-        },
-    )
-    .await;
+    // `--wait-on-limit`: when a provider usage/rate limit stops agents, wait
+    // until it clears and resume from the checkpoint. One live record spans
+    // every attempt.
+    let mut initial_state = initial_state;
+    let result = loop {
+        let result = gaviero_core::swarm::pipeline::execute(
+            &plan,
+            &config,
+            initial_state.take(),
+            memory.clone(),
+            &swarm_observer,
+            |agent_id| {
+                let verbose = cli.script.is_none();
+                Box::new(CliAcpObserver::new(agent_id, verbose).publishing(live.clone()))
+                    as Box<dyn gaviero_core::observer::AcpObserver>
+            },
+        )
+        .await;
+        if !cli.wait_on_limit {
+            break result;
+        }
+        let Some((limited, models)) = limit_models(&result, &plan, &config) else {
+            break result;
+        };
+        wait_for_limits(limited, &models, &config, limit_check_interval(&cli)).await;
+        initial_state = match gaviero_core::swarm::execution_state::ExecutionState::load(
+            &config.workspace_root,
+            &plan.hash(),
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("[limit] could not reload the run checkpoint ({e:#}); stopping");
+                break result;
+            }
+        };
+    };
+    // The stores must be released before an isolated run deletes its state.
+    drop(memory);
     if let Some(flusher) = flusher {
         flusher.stop().await;
     }
@@ -5077,6 +5119,127 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("swarm execution reported failure")
     }
+}
+
+/// `--wait-on-limit`: the number of agents a provider usage/rate limit
+/// stopped and the distinct `provider:model` specs to check, or `None` when
+/// no limit stopped this attempt. A unit not in the compiled plan (a runtime
+/// `for` clone) and a limit that failed the whole run are checked against
+/// the run's model.
+fn limit_models(
+    result: &Result<gaviero_core::swarm::models::SwarmResult>,
+    plan: &gaviero_core::swarm::plan::CompiledPlan,
+    config: &gaviero_core::swarm::pipeline::SwarmConfig,
+) -> Option<(usize, Vec<String>)> {
+    use gaviero_core::swarm::provider_limit::{is_provider_limit, limited_unit_ids};
+    let limited = match result {
+        Ok(result) => limited_unit_ids(result),
+        Err(e) if is_provider_limit(&format!("{e:#}")) => {
+            return Some((1, vec![config.model.clone()]));
+        }
+        Err(_) => return None,
+    };
+    if limited.is_empty() {
+        return None;
+    }
+    let router = gaviero_core::swarm::pipeline::tier_router_for_model(
+        &config.model,
+        config.ollama_base_url.as_deref(),
+    );
+    let units = plan.work_units_ordered().unwrap_or_default();
+    let mut models: Vec<String> = Vec::new();
+    for id in &limited {
+        let spec = units
+            .iter()
+            .find(|u| &u.id == id)
+            .and_then(|u| router.resolve(u).model_spec())
+            .unwrap_or_else(|| config.model.clone());
+        if !models.contains(&spec) {
+            models.push(spec);
+        }
+    }
+    Some((limited.len(), models))
+}
+
+/// Time between limit checks: `--limit-check-minutes`, or the
+/// `GAVIERO_LIMIT_CHECK_SECS` test hook (seconds).
+fn limit_check_interval(cli: &Cli) -> std::time::Duration {
+    std::env::var("GAVIERO_LIMIT_CHECK_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(cli.limit_check_minutes * 60))
+}
+
+/// First line of a provider message, cut for one stderr line.
+fn limit_message_line(msg: &str) -> String {
+    let line = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let mut cut: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        cut.push('…');
+    }
+    cut
+}
+
+/// Block until no limited model still reports a limit: every `interval`,
+/// send each model one short prompt. A check that fails for another reason
+/// (network, auth) ends the wait too; the resumed run reports that failure.
+async fn wait_for_limits(
+    limited: usize,
+    models: &[String],
+    config: &gaviero_core::swarm::pipeline::SwarmConfig,
+    interval: std::time::Duration,
+) {
+    use gaviero_core::swarm::provider_limit::{ProbeOutcome, probe_model, wait_until_clear};
+    let every = if interval.as_secs() % 60 == 0 {
+        format!("{} min", interval.as_secs() / 60)
+    } else {
+        format!("{} s", interval.as_secs())
+    };
+    eprintln!(
+        "[limit] {limited} agent(s) stopped by a provider limit ({}); checking every {every} (Ctrl+C stops)",
+        models.join(", ")
+    );
+    let root = config.workspace_root.clone();
+    let ollama = config.ollama_base_url.clone();
+    wait_until_clear(
+        interval,
+        || {
+            let models = models.to_vec();
+            let root = root.clone();
+            let ollama = ollama.clone();
+            async move {
+                let mut unavailable: Option<String> = None;
+                for model in &models {
+                    match probe_model(model, ollama.as_deref(), &root).await {
+                        ProbeOutcome::Clear => {}
+                        ProbeOutcome::Limited(msg) => {
+                            return ProbeOutcome::Limited(format!("{model}: {msg}"));
+                        }
+                        ProbeOutcome::Unavailable(msg) => {
+                            unavailable.get_or_insert(format!("{model}: {msg}"));
+                        }
+                    }
+                }
+                match unavailable {
+                    Some(msg) => ProbeOutcome::Unavailable(msg),
+                    None => ProbeOutcome::Clear,
+                }
+            }
+        },
+        |n, outcome| match outcome {
+            ProbeOutcome::Limited(msg) => {
+                eprintln!("[limit] check {n}: still limited — {}", limit_message_line(msg));
+            }
+            ProbeOutcome::Unavailable(msg) => eprintln!(
+                "[limit] check {n}: check failed ({}) — resuming anyway",
+                limit_message_line(msg)
+            ),
+            ProbeOutcome::Clear => eprintln!("[limit] check {n}: limit cleared — resuming"),
+        },
+    )
+    .await;
 }
 
 /// Start the run's published record (`swarm::live_run`): every planned agent
@@ -5194,6 +5357,30 @@ mod tests {
         fs::create_dir_all(base.join(".gaviero")).unwrap();
         fs::write(base.join(".gaviero/settings.json"), settings_json).unwrap();
         base
+    }
+
+    #[test]
+    fn wait_on_limit_flags_parse() {
+        let cli = Cli::try_parse_from(["gaviero-cli", "--task", "x"]).unwrap();
+        assert!(!cli.wait_on_limit);
+        assert_eq!(cli.limit_check_minutes, 15);
+
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "x",
+            "--wait-on-limit",
+            "--limit-check-minutes",
+            "5",
+        ])
+        .unwrap();
+        assert!(cli.wait_on_limit);
+        assert_eq!(cli.limit_check_minutes, 5);
+
+        assert!(
+            Cli::try_parse_from(["gaviero-cli", "--task", "x", "--limit-check-minutes", "0"])
+                .is_err()
+        );
     }
 
     #[test]

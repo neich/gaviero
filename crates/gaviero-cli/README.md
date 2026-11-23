@@ -178,6 +178,8 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--test-first` | — | Generate failing tests before the edit loop (TDD) |
 | `--no-iterate` | — | Single pass only (overrides `--max-retries`) |
 | `--resume` | — | Resume from `.gaviero/state/<plan-hash>.json` |
+| `--wait-on-limit` | — | When a provider usage/rate limit stops agents, send each limited model a one-line test prompt every `--limit-check-minutes` and resume from the checkpoint once none still reports a limit (no cap; Ctrl+C stops) |
+| `--limit-check-minutes` | `<n>` | Minutes between those limit checks (default `15`, minimum `1`) |
 | `--fresh` | — | Ignore artefacts in a `loop` block's `OUT_DIR`; restart every loop at its script `iter_start` |
 | `--isolated` | — | Throwaway memory/graph/telemetry instead of the discovered workspace (see [Workspace state](#workspace-state)) |
 | `--run-timeout` | `<secs>` | Wall-clock cap on the whole run (default `0` = no cap) |
