@@ -1,6 +1,8 @@
 //! What the host remembers between runs: the sessions open when it last
-//! ended (reopened by `gaviero --sessions` with no path) and the recently
-//! opened paths offered by the new-session picker.
+//! ended (reopened by `gaviero --sessions` with no path), the recently
+//! opened paths offered by the new-session picker, and how each target was
+//! opened (a folder that holds a `.gaviero-workspace` file reopens as the
+//! workspace or as the plain folder, whichever the user chose last time).
 
 use super::target::Target;
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,12 @@ pub(crate) struct HostState {
     /// host never changes them: it re-reads them before every save.
     #[serde(default, rename = "sshHosts", skip_serializing_if = "BTreeMap::is_empty")]
     pub ssh_hosts: BTreeMap<String, SshHost>,
+    /// How each target was opened, keyed by its string form: the text of
+    /// the tab's launch-state file. Seeded back into the tab next time, so
+    /// a folder holding a workspace file opens the same way instead of
+    /// asking again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launches: BTreeMap<String, String>,
 }
 
 /// Settings for one SSH host (`sshHosts.<host>` in the state file).
@@ -132,6 +140,11 @@ fn local_openable(path: &Path) -> bool {
                 .is_some_and(|ext| ext == "gaviero-workspace"))
 }
 
+/// The key a target's launch answer is stored under: its string form.
+fn launch_key(target: &Target) -> String {
+    String::from(target.clone())
+}
+
 impl HostState {
     /// `target` was opened in a tab: first in `recent`, and in `open`.
     pub fn note_opened(&mut self, target: &Target) {
@@ -177,6 +190,29 @@ impl HostState {
             }
         }
         self.open = open;
+    }
+
+    /// The launch answer saved for `target`, if any.
+    pub fn launch_choice(&self, target: &Target) -> Option<&str> {
+        self.launches.get(&launch_key(target)).map(String::as_str)
+    }
+
+    /// Remember how `target` was opened; true when that changed the saved
+    /// answer (a target not seen before, or a different one).
+    pub fn remember_launch(&mut self, target: &Target, launch: String) -> bool {
+        let key = launch_key(target);
+        if self.launches.get(&key).is_some_and(|old| *old == launch) {
+            return false;
+        }
+        self.launches.insert(key, launch);
+        true
+    }
+
+    /// Drop launch answers for targets neither open nor recent, so the file
+    /// does not grow with every folder ever opened.
+    pub fn prune_launches(&mut self) {
+        let keep: Vec<String> = self.open.iter().chain(&self.recent).map(launch_key).collect();
+        self.launches.retain(|key, _| keep.contains(key));
     }
 
     /// The tab for `target` closed.
@@ -347,6 +383,51 @@ mod tests {
         // No hosts: the key is left out.
         save(&path, &HostState::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("sshHosts"));
+    }
+
+    #[test]
+    fn launch_answers_are_remembered_per_target() {
+        let mut state = HostState::default();
+        let folder = l("C:\\work\\proj");
+        let answer = "C:\\work\\proj\nworkspace\nC:\\work\\proj\\team.gaviero-workspace\n";
+        assert_eq!(state.launch_choice(&folder), None);
+        assert!(state.remember_launch(&folder, answer.into()));
+        assert_eq!(state.launch_choice(&folder), Some(answer));
+        assert!(
+            !state.remember_launch(&folder, answer.into()),
+            "the same answer is not written again"
+        );
+        assert!(state.remember_launch(&folder, "C:\\work\\proj\nfolder\n".into()));
+        assert_eq!(
+            state.launch_choice(&folder),
+            Some("C:\\work\\proj\nfolder\n")
+        );
+        assert_eq!(state.launch_choice(&l("C:\\work\\other")), None);
+    }
+
+    #[test]
+    fn launch_answers_round_trip_and_follow_open_and_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = HostState::default();
+        let answer = "C:\\work\\proj\nworkspace\nC:\\work\\proj\\team.gaviero-workspace\n";
+        state.note_opened(&l("C:\\work\\proj"));
+        state.remember_launch(&l("C:\\work\\proj"), answer.into());
+        state.remember_launch(&l("C:\\work\\gone"), "C:\\work\\gone\nfolder\n".into());
+        save(&path, &state).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"launches\""), "{text}");
+        assert_eq!(load(&path).launch_choice(&l("C:\\work\\proj")), Some(answer));
+
+        // A target neither open nor recent loses its answer; an open one
+        // keeps it.
+        state.prune_launches();
+        assert_eq!(state.launch_choice(&l("C:\\work\\proj")), Some(answer));
+        assert_eq!(state.launch_choice(&l("C:\\work\\gone")), None);
+
+        // No answers: the key is left out.
+        save(&path, &HostState::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("launches"));
     }
 
     #[test]

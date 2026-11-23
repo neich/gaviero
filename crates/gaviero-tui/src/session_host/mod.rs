@@ -347,13 +347,18 @@ impl Host {
     }
 
     /// [`Host::open`], with the tab's launch-state file seeded from `launch`
-    /// (what a restarting host recorded for it).
+    /// (what a restarting host recorded for it) or, on a normal start, from
+    /// the answer the host remembered for this target last time, so a folder
+    /// holding a workspace file is not asked about again.
     fn open_with(&mut self, target: Target, launch: Option<&str>) -> anyhow::Result<()> {
         let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
         let label = session::label_for(&target, &taken);
         let id = self.next_id;
         self.next_id += 1;
-        if let Some(text) = launch {
+        let launch = launch
+            .map(str::to_string)
+            .or_else(|| self.state.launch_choice(&target).map(str::to_string));
+        if let Some(text) = &launch {
             let file = session::launch_state_path(&self.state_dir, id);
             if let Err(e) = std::fs::write(&file, text) {
                 tracing::warn!(id, "could not restore the launch choice: {e}");
@@ -525,6 +530,9 @@ impl Host {
         self.sessions[i].feed(bytes);
         if let Some(path) = self.sessions[i].take_reported_path() {
             self.sessions[i].focus_ready = true;
+            // The child reports right before its event loop, after any
+            // launch question was answered: keep that answer for next time.
+            self.remember_launch_choice(i);
             self.adopt_reported_path(i, path);
         }
         let s = &mut self.sessions[i];
@@ -543,6 +551,18 @@ impl Host {
         }
         if active || changed {
             self.dirty = true;
+        }
+    }
+
+    /// A local tab's launch answer, once the child has written it: saved in
+    /// the host state so the next host reopens the target the same way
+    /// instead of asking again.
+    fn remember_launch_choice(&mut self, i: usize) {
+        let Some((target, text)) = launch_choice_of(&self.sessions[i]) else {
+            return;
+        };
+        if self.state.remember_launch(&target, text) {
+            self.save_state();
         }
     }
 
@@ -715,7 +735,12 @@ impl Host {
         if self.confirm == Some(Confirm::Close { id: old.id }) {
             self.confirm = None;
         }
-        // Launch answers are kept across restarts of a tab, not after it.
+        // The launch answer survives the tab in the host state, so
+        // reopening the target keeps the same mode; only the per-run file
+        // goes.
+        if let Some((target, text)) = launch_choice_of(&old) {
+            self.state.remember_launch(&target, text);
+        }
         let _ = std::fs::remove_file(&old.launch_state);
         self.state.note_tab_ended(&old.target, self.quitting());
         self.save_state();
@@ -832,6 +857,9 @@ impl Host {
         tracing::info!(sessions = self.sessions.len(), "quitting the host");
         self.quit_deadline = Some(Instant::now() + EXIT_GRACE);
         self.dirty = true;
+        // Every open tab keeps its launch answer (in `open` and `recent`);
+        // answers for targets the host has not seen for a while go.
+        self.state.prune_launches();
         self.save_state();
         for s in &mut self.sessions {
             if s.target.is_ssh() {
@@ -1177,6 +1205,16 @@ fn is_input(event: &HostEvent) -> bool {
         HostEvent::Term(e) => matches!(e, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)),
         _ => false,
     }
+}
+
+/// A local session's launch answer (the text of its launch-state file), when
+/// the child has written one. SSH tabs keep their answer on the remote.
+fn launch_choice_of(s: &Session) -> Option<(Target, String)> {
+    if !matches!(s.target, Target::Local(_)) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&s.launch_state).ok()?;
+    (!text.trim().is_empty()).then(|| (s.target.clone(), text))
 }
 
 /// Where the tab at `active` goes when moved by `step` among `len` tabs;
