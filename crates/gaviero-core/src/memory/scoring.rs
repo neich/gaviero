@@ -104,6 +104,9 @@ pub struct ScoredMemory {
     /// A3: per-memory trust multiplier in [0.0, 1.0]. Replaces the role
     /// of the coarse `Trust` enum in composite scoring.
     pub trust_score: f32,
+    /// C1 lifecycle class (`memory_kind`). Automatic injection admits
+    /// only `Record` (`retrieval::admit_auto_injection`).
+    pub kind: super::kind::MemoryKind,
 
     // Scoring components
     pub raw_similarity: f32,
@@ -562,6 +565,7 @@ mod tests {
             key: "k".into(),
             source: crate::memory::trust_defaults::MemorySource::UnknownLegacy,
             trust_score: 0.75,
+            kind: crate::memory::MemoryKind::Record,
             raw_similarity: 0.8,
             fts_rank: None,
             final_score: 0.75,

@@ -194,6 +194,7 @@ pub fn build_write_meta(ext: &ExtractedMemory, prompt_version: &str) -> WriteMet
             "llm_extracted:{}:{prompt_version}",
             ext.kind.to_ascii_lowercase()
         ))
+        .with_refs(ext.refs.clone())
 }
 
 /// Override `source_kind = MemorySource::LlmAnnotated` for Tier A1
@@ -203,6 +204,7 @@ pub fn build_annotated_write_meta(ext: &ExtractedMemory) -> WriteMeta {
         .with_type(resolve_memory_type(&ext.kind))
         .with_importance(ext.importance)
         .with_tag(format!("llm_annotated:{}", ext.kind.to_ascii_lowercase()))
+        .with_refs(ext.refs.clone())
 }
 
 /// Extract a single `{ ... }` JSON object from an LLM response that may

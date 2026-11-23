@@ -1362,6 +1362,9 @@ impl GavieroMcpServer {
                 tag: r.tag,
                 access_count: r.access_count,
                 accessed_at: r.accessed_at,
+                source: r.source.as_str().to_string(),
+                refs: r.refs,
+                source_turn: r.source_turn,
             }),
         };
         Ok(Json(out))
@@ -3811,6 +3814,7 @@ mod tests {
         assert_eq!(row.kind, "record");
         assert!(row.text.contains("lighthouses"), "{row:?}");
         assert_eq!(row.tag.as_deref(), Some("get-global"));
+        assert_eq!(row.source, "user_remember");
 
         let row = get(wid, "workspace")
             .await

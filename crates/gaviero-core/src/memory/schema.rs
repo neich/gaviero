@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 21;
 
 /// First schema version where the `memory_kind` discriminator exists.
 /// Used by [`needs_c1_backup`] to decide whether to take a one-shot
@@ -86,6 +86,18 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 17 {
         migrate_v17(conn).context("migration v17")?;
+    }
+    if version < 18 {
+        migrate_v18(conn).context("migration v18")?;
+    }
+    if version < 19 {
+        migrate_v19(conn).context("migration v19")?;
+    }
+    if version < 20 {
+        migrate_v20(conn).context("migration v20")?;
+    }
+    if version < 21 {
+        migrate_v21(conn).context("migration v21")?;
     }
 
     // Stamp the current version
@@ -190,6 +202,7 @@ fn migrate_v3(conn: &Connection, embedding_dims: usize) -> Result<()> {
     ))
     .context("creating vec_memories virtual table")?;
 
+    // Dropped in v18 (never used).
     // -- Episodes table for agent run tracking --
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS episodes (
@@ -222,6 +235,7 @@ fn migrate_v3(conn: &Connection, embedding_dims: usize) -> Result<()> {
     )
     .context("creating episodes table")?;
 
+    // Dropped in v18 (never used).
     // -- sqlite-vec virtual table for episode embeddings --
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
@@ -231,6 +245,7 @@ fn migrate_v3(conn: &Connection, embedding_dims: usize) -> Result<()> {
     ))
     .context("creating vec_episodes virtual table")?;
 
+    // Dropped in v18 (never used).
     // -- Graph state table for petgraph serialization --
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS graph_state (
@@ -499,11 +514,10 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
 /// v7 (Tier A / A1): session ledger for LLM-emitted `<turn_annotations>`.
 ///
 /// `session_thread` and `open_questions` from each turn's annotations
-/// block are stored here, keyed by `(session_id, turn_id)`. Tier B5's
-/// session consolidator reads the thread values to segment sessions
-/// thematically; Tier A4's panel surfaces `open_questions` as a follow-
-/// up list. They are **not** injected into prompts — chat injection
-/// only sees the memory table.
+/// block are stored here, keyed by `(session_id, turn_id)`. They are read
+/// only through `MemoryStore::session_ledger_for` (tests today); nothing
+/// consolidates them. They are **not** injected into prompts — chat
+/// injection only sees the memory table.
 ///
 /// Keeping these in their own table avoids bloating `memories` with
 /// session-scoped records that don't belong in retrieval.
@@ -607,9 +621,10 @@ fn migrate_v9(conn: &Connection) -> Result<()> {
 /// v10 (Tier C Phase 2 / C1): typed memory stores discriminator.
 ///
 /// Adds a `memory_kind` discriminator column to `memories` so the table
-/// can host three lifecycle classes — `record` (the workhorse, mutable,
-/// injected, dedup'd), `history` (immutable raw transcripts, never
-/// injected), and `summary` (consolidator output, semantic merge). The
+/// can host three lifecycle classes — `record` (the workhorse: mutable,
+/// dedup'd, the only kind automatic injection uses), `history` (immutable
+/// raw transcripts, never injected), and `summary` (consolidator output,
+/// archive-only). The
 /// column is `TEXT NOT NULL DEFAULT 'record'` with a `CHECK` constraint
 /// pinning the allowed values; existing rows take the default and so
 /// remain `record` after migration.
@@ -956,6 +971,112 @@ fn migrate_v17(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v18 — drop tables nothing reads or writes: `episodes`, its sqlite-vec
+/// table `vec_episodes` (with its shadow tables), and `graph_state` (all
+/// created in v3).
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS vec_episodes;
+         DROP TABLE IF EXISTS episodes;
+         DROP TABLE IF EXISTS graph_state;",
+    )
+    .context("dropping unused episodes / graph_state tables")?;
+    Ok(())
+}
+
+/// v19 — provenance. `refs_json`: JSON array of the `refs` an annotation flag
+/// or extraction cited (≤ 8 strings). `source_turn`: the History tag
+/// (`history:{session_id}:{turn_id}`) of the turn the row was derived from.
+/// A tag, not a row id, because derived rows can land in another DB.
+fn migrate_v19(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "memories", "refs_json", "TEXT")?;
+    add_column_if_missing(conn, "memories", "source_turn", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_source_turn
+             ON memories(source_turn) WHERE source_turn IS NOT NULL;",
+    )
+    .context("indexing memories.source_turn")?;
+    Ok(())
+}
+
+/// v20 — one row per chat turn / swarm unit outcome, keyed like the
+/// History tag; History rows themselves stay immutable. Timestamps carry
+/// milliseconds so the pattern maintainer's watermark is exact. The
+/// partial index serves the outcome → History join on `tag`.
+fn migrate_v20(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS turn_outcomes (
+            session_id     TEXT NOT NULL,
+            turn_id        TEXT NOT NULL,
+            origin         TEXT NOT NULL,
+            status         TEXT,
+            review         TEXT,
+            files_kept     INTEGER,
+            files_reverted INTEGER,
+            detail         TEXT,
+            created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            PRIMARY KEY (session_id, turn_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_outcomes_updated ON turn_outcomes(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_memories_history_tag
+            ON memories(tag) WHERE memory_kind = 'history';",
+    )
+    .context("creating turn_outcomes")?;
+    Ok(())
+}
+
+/// v21 — WikiSkill-style pattern pages (workspace DB). Separate tables,
+/// never injected automatically; reachable via `/patterns`,
+/// `gaviero-cli --patterns-*` and MCP `memory_search` kind "pattern_page".
+/// Every revision row snapshots the page after its op. Standalone FTS5 +
+/// triggers, the same style as `memories_fts` (v4).
+fn migrate_v21(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pattern_pages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT    NOT NULL UNIQUE,
+            index_line  TEXT    NOT NULL,
+            content     TEXT    NOT NULL,
+            revision    INTEGER NOT NULL DEFAULT 1,
+            retired_at  TEXT,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS pattern_page_revisions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id       INTEGER NOT NULL,
+            revision      INTEGER NOT NULL,
+            batch_id      TEXT    NOT NULL,
+            op            TEXT    NOT NULL,
+            index_line    TEXT    NOT NULL,
+            content       TEXT    NOT NULL,
+            retired_at    TEXT,
+            evidence_json TEXT,
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_pattern_revisions_page  ON pattern_page_revisions(page_id, revision);
+        CREATE INDEX IF NOT EXISTS idx_pattern_revisions_batch ON pattern_page_revisions(batch_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS pattern_pages_fts USING fts5(
+            name, index_line, content, tokenize='porter unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS pattern_pages_fts_ai AFTER INSERT ON pattern_pages BEGIN
+            INSERT INTO pattern_pages_fts(rowid, name, index_line, content)
+                VALUES (new.id, new.name, new.index_line, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS pattern_pages_fts_ad AFTER DELETE ON pattern_pages BEGIN
+            DELETE FROM pattern_pages_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS pattern_pages_fts_au AFTER UPDATE ON pattern_pages BEGIN
+            DELETE FROM pattern_pages_fts WHERE rowid = old.id;
+            INSERT INTO pattern_pages_fts(rowid, name, index_line, content)
+                VALUES (new.id, new.name, new.index_line, new.content);
+        END;",
+    )
+    .context("creating pattern page tables")?;
+    Ok(())
+}
+
 /// Drop the C1.3 immutability triggers. **Crate-private and only the
 /// C2.4 `RedactHistory` handler may call this**, inside a transaction
 /// that re-installs them before commit. Any other callsite is a bug
@@ -1024,6 +1145,8 @@ mod tests {
             "last_accessed_at",
             "source_file",
             "source_hash",
+            "refs_json",
+            "source_turn",
         ] {
             let has: bool = conn
                 .prepare(&format!(
@@ -1034,12 +1157,16 @@ mod tests {
             assert!(has, "missing column: {col}");
         }
 
-        // Verify episodes table exists
-        let has_episodes: bool = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='episodes'")
-            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
-            .unwrap_or(false);
-        assert!(has_episodes, "episodes table should exist");
+        // v18 dropped the unused v3 tables, including vec0 shadow tables.
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('episodes', 'graph_state') OR name LIKE 'vec_episodes%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "episodes / vec_episodes / graph_state must be gone");
 
         // v5: injection_manifests table exists
         let has_manifests: bool = conn
@@ -1049,6 +1176,24 @@ mod tests {
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         assert!(has_manifests, "injection_manifests table should exist");
+
+        // v20: turn_outcomes table exists
+        let has_outcomes: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='turn_outcomes'")
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_outcomes, "turn_outcomes table should exist");
+
+        // v21: pattern page tables exist
+        for table in ["pattern_pages", "pattern_page_revisions", "pattern_pages_fts"] {
+            let present: bool = conn
+                .prepare(&format!(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
+                ))
+                .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+                .unwrap_or(false);
+            assert!(present, "{table} table should exist");
+        }
     }
 
     #[test]
@@ -1282,7 +1427,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, CURRENT_VERSION);
     }
 
     #[test]

@@ -134,6 +134,8 @@ struct RawMemoryRow {
     last_accessed_at: Option<String>,
     access_count: i64,
     superseded_by: Option<i64>,
+    refs_json: Option<String>,
+    source_turn: Option<String>,
 }
 
 impl RawMemoryRow {
@@ -166,6 +168,8 @@ impl RawMemoryRow {
             last_accessed_at: r.get(24)?,
             access_count: r.get(25)?,
             superseded_by: r.get(26)?,
+            refs_json: r.get(27)?,
+            source_turn: r.get(28)?,
         })
     }
 
@@ -207,6 +211,8 @@ impl RawMemoryRow {
             "last_accessed_at": self.last_accessed_at,
             "access_count": self.access_count,
             "superseded_by": self.superseded_by,
+            "refs_json": self.refs_json,
+            "source_turn": self.source_turn,
         })
     }
 }
@@ -247,7 +253,7 @@ impl MemoryStore {
                     importance, privacy, source, trust_score,
                     memory_kind, compressed, content_blob,
                     created_at, updated_at, last_accessed_at, access_count,
-                    superseded_by
+                    superseded_by, refs_json, source_turn
                FROM memories WHERE id = ?1",
             rusqlite::params![memory_id],
             RawMemoryRow::from_query_row,
@@ -415,7 +421,7 @@ impl MemoryStore {
         )?;
         let sleep_n = conn.execute(
             "DELETE FROM deletions
-              WHERE deleted_by = 'sleeptime_prune'
+              WHERE deleted_by IN ('sleeptime_prune','sleeptime_history_leak')
                 AND deleted_at < datetime('now', ?1)",
             rusqlite::params![format!("-{} days", sleeptime_retention_days)],
         )?;
@@ -853,5 +859,7 @@ fn meta_from_payload(payload: &serde_json::Value) -> WriteMeta {
         source_kind,
         trust_score,
         kind,
+        refs: super::panel_ops::parse_refs_json(str_field("refs_json")),
+        source_turn: str_field("source_turn").map(|s| s.to_string()),
     }
 }

@@ -202,6 +202,7 @@ impl<'a> ContextPlanner<'a> {
                 Ok(out) => out
                     .items
                     .iter()
+                    .filter(|m| crate::memory::admit_auto_injection(m))
                     .map(crate::memory::store::MemoryCandidate::from_scored)
                     .collect::<Vec<_>>(),
                 Err(e) => {
@@ -238,7 +239,11 @@ impl<'a> ContextPlanner<'a> {
                 .await
                 {
                     Ok(out) => {
-                        for item in &out.items {
+                        for item in out
+                            .items
+                            .iter()
+                            .filter(|m| crate::memory::admit_auto_injection(m))
+                        {
                             let cand = crate::memory::store::MemoryCandidate::from_scored(item);
                             if seen_ids.insert(cand.id) {
                                 merged.push(cand);

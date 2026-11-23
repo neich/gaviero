@@ -46,6 +46,10 @@ pub struct MemoryRow {
     pub tag: Option<String>,
     pub access_count: i32,
     pub accessed_at: Option<String>,
+    /// Provenance (v19): refs cited by the producing flag / extraction.
+    pub refs: Vec<String>,
+    /// Provenance (v19): History tag of the originating turn.
+    pub source_turn: Option<String>,
 }
 
 impl MemoryStore {
@@ -70,7 +74,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories
                  WHERE created_at >= datetime('now', ?1)
                    AND memory_kind = ?2
@@ -105,6 +109,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,
@@ -129,7 +137,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories
                  WHERE created_at >= datetime('now', ?1)
                  ORDER BY id DESC
@@ -163,6 +171,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,
@@ -228,7 +240,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories
                  WHERE run_id = ?1
                    AND created_at >= datetime('now', ?2)
@@ -264,6 +276,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,
@@ -344,6 +360,22 @@ impl MemoryStore {
         }
     }
 
+    /// Provenance (v19): `(source_turn, refs)` of one row. A missing row
+    /// or unparsable `refs_json` reads as empty provenance.
+    pub async fn provenance_for(&self, memory_id: i64) -> Result<(Option<String>, Vec<String>)> {
+        let conn = self.conn.lock().await;
+        let row: Result<(Option<String>, Option<String>), rusqlite::Error> = conn.query_row(
+            "SELECT source_turn, refs_json FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        match row {
+            Ok((source_turn, refs_json)) => Ok((source_turn, parse_refs_json(refs_json.as_deref()))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, Vec::new())),
+            Err(e) => Err(anyhow!("reading provenance: {e}")),
+        }
+    }
+
     /// PR-4 (`memory_get`): fetch one full row by id. Returns `None`
     /// when the id does not exist in *this* store — the caller picks
     /// the owning store first (ids are only unique per physical DB).
@@ -364,11 +396,13 @@ impl MemoryStore {
             i32,
             Option<String>,
             String,
+            Option<String>,
+            Option<String>,
         );
         let row: Result<RawRow, rusqlite::Error> = conn.query_row(
             "SELECT id, scope_level, memory_kind, memory_type, content,
                     importance, trust_score, created_at, updated_at, tag,
-                    access_count, last_accessed_at, source
+                    access_count, last_accessed_at, source, refs_json, source_turn
              FROM memories WHERE id = ?1",
             rusqlite::params![memory_id],
             |r| {
@@ -386,6 +420,8 @@ impl MemoryStore {
                     r.get(10)?,
                     r.get(11)?,
                     r.get(12)?,
+                    r.get(13)?,
+                    r.get(14)?,
                 ))
             },
         );
@@ -404,6 +440,8 @@ impl MemoryStore {
                 access_count,
                 accessed_at,
                 source_str,
+                refs_json,
+                source_turn,
             )) => {
                 let kind = super::super::kind::MemoryKind::from_str(&kind_str)
                     .map_err(|e| anyhow!("invalid memory_kind '{kind_str}' on row {id}: {e}"))?;
@@ -421,6 +459,8 @@ impl MemoryStore {
                     tag,
                     access_count,
                     accessed_at,
+                    refs: parse_refs_json(refs_json.as_deref()),
+                    source_turn,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -623,6 +663,10 @@ impl MemoryStore {
             meta = meta.with_tag(t);
         }
 
+        // The re-inserted row keeps the original's provenance.
+        let (source_turn, refs) = self.provenance_for(memory_id).await?;
+        meta = meta.with_provenance(source_turn, refs);
+
         // Delete the old row first so dedup on the new scope doesn't
         // collapse into it. `delete_memory_by_id` acquires its own lock.
         self.delete_memory_by_id(memory_id).await?;
@@ -712,6 +756,9 @@ impl MemoryStore {
         if let Some(t) = tag {
             meta = meta.with_tag(t);
         }
+        // The re-inserted row keeps the original's provenance.
+        let (source_turn, refs) = self.provenance_for(memory_id).await?;
+        meta = meta.with_provenance(source_turn, refs);
 
         self.delete_memory_by_id(memory_id).await?;
         let result = self.store_scoped(&scope, new_text, &meta).await?;
@@ -720,4 +767,10 @@ impl MemoryStore {
             StoreResult::AlreadyCovered => Ok(memory_id),
         }
     }
+}
+
+/// Parse a `refs_json` column; anything but a JSON string array is empty.
+pub(crate) fn parse_refs_json(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
 }

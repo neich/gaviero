@@ -74,6 +74,10 @@ pub enum DeletedBy {
     /// consolidator created. Restorable like any other soft delete —
     /// rolling back a rollback is just a restore.
     ConsolidationRollback,
+    /// Sleeptime removal of a raw transcript that pre-fix run triage
+    /// promoted into a record. Restorable, but the next pass removes it
+    /// again unless its tag changes.
+    SleeptimeHistoryLeak,
 }
 
 impl DeletedBy {
@@ -85,6 +89,7 @@ impl DeletedBy {
             Self::SleeptimePrune => "sleeptime_prune",
             Self::UserRedaction => "user_redaction",
             Self::ConsolidationRollback => "consolidation_rollback",
+            Self::SleeptimeHistoryLeak => "sleeptime_history_leak",
         }
     }
 
@@ -96,6 +101,7 @@ impl DeletedBy {
             "sleeptime_prune" => Some(Self::SleeptimePrune),
             "user_redaction" => Some(Self::UserRedaction),
             "consolidation_rollback" => Some(Self::ConsolidationRollback),
+            "sleeptime_history_leak" => Some(Self::SleeptimeHistoryLeak),
             _ => None,
         }
     }
@@ -113,7 +119,7 @@ impl DeletedBy {
     /// enough to be auditable.
     pub fn default_retention_days(self) -> u32 {
         match self {
-            Self::SleeptimePrune => 14,
+            Self::SleeptimePrune | Self::SleeptimeHistoryLeak => 14,
             _ => 30,
         }
     }
@@ -132,6 +138,7 @@ mod tests {
             DeletedBy::SleeptimePrune,
             DeletedBy::UserRedaction,
             DeletedBy::ConsolidationRollback,
+            DeletedBy::SleeptimeHistoryLeak,
         ] {
             assert_eq!(DeletedBy::parse_str(v.as_str()), Some(v));
         }

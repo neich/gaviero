@@ -576,7 +576,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                     repo_id, module_path, memory_type, trust, importance,
                     access_count, created_at, updated_at, last_accessed_at,
-                    tag, namespace, key, source, trust_score
+                    tag, namespace, key, source, trust_score, memory_kind
              FROM memories WHERE id = ?1 AND superseded_by IS NULL",
             )?
             .query_row(rusqlite::params![memory_id], |row| {
@@ -636,6 +636,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source,
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity,
                     fts_rank: None,
                     final_score,
@@ -706,7 +710,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories WHERE scope_level = 0 LIMIT ?1",
                 vec![Box::new(limit as i64)],
             ),
@@ -714,7 +718,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories WHERE scope_level = 1 LIMIT ?1",
                 vec![Box::new(limit as i64)],
             ),
@@ -722,7 +726,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories WHERE scope_level = 2 AND repo_id = ?1 LIMIT ?2",
                 vec![Box::new(repo_id.clone()), Box::new(limit as i64)],
             ),
@@ -733,7 +737,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories WHERE scope_level = 3 AND repo_id = ?1 AND module_path = ?2 LIMIT ?3",
                 vec![
                     Box::new(repo_id.clone()),
@@ -745,7 +749,7 @@ impl MemoryStore {
                 "SELECT id, content, content_hash, scope_level, scope_path,
                         repo_id, module_path, memory_type, trust, importance,
                         access_count, created_at, updated_at, last_accessed_at,
-                        tag, namespace, key, source, trust_score
+                        tag, namespace, key, source, trust_score, memory_kind
                  FROM memories WHERE scope_level = 4 AND repo_id = ?1 AND run_id = ?2 LIMIT ?3",
                 vec![
                     Box::new(repo_id.clone()),
@@ -785,6 +789,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,

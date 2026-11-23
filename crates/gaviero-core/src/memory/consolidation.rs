@@ -193,6 +193,15 @@ impl Consolidator {
                         .clone()
                         .unwrap_or_else(|| format!("consolidation:run:{run_id}")),
                 );
+            // Run rows live in the workspace store (`query_by_run` above);
+            // the promoted copy keeps their provenance.
+            let (source_turn, refs) = self
+                .stores
+                .workspace()
+                .provenance_for(mem.id)
+                .await
+                .unwrap_or_default();
+            let meta = meta.with_provenance(source_turn, refs);
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining < MIN_ACK_BUDGET {
@@ -470,6 +479,64 @@ mod tests {
         assert_eq!(
             report.pruned, 2,
             "run rows should be pruned after promotion"
+        );
+    }
+
+    /// Regression: run triage read History rows through `query_by_run`
+    /// and promoted them into Records that kept their `history:` tag.
+    #[tokio::test]
+    async fn consolidate_run_never_promotes_history_rows() {
+        use crate::memory::kind::MemoryKind;
+        use crate::memory::trust_defaults::MemorySource;
+
+        let store = Arc::new(MemoryStore::in_memory(Arc::new(MockEmbedder)).unwrap());
+        let stores = MemoryStores::from_single_store(store.clone());
+        let writer = spawn_writer_task(WriterConfig {
+            stores: stores.clone(),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        let run_scope = WriteScope::Run {
+            repo_id: "repo1".to_string(),
+            run_id: "run1".to_string(),
+        };
+        let history_meta = WriteMeta::for_source(MemorySource::RawTranscript)
+            .with_kind(MemoryKind::History)
+            .with_importance(1.0)
+            .with_tag("history:run1:t-1");
+        store
+            .store_scoped(
+                &run_scope,
+                "USER: leak probe\nASSISTANT: transcript body",
+                &history_meta,
+            )
+            .await
+            .unwrap();
+        let normal_meta = WriteMeta::for_source(MemorySource::LlmExtracted).with_importance(0.8);
+        store
+            .store_scoped(&run_scope, "durable finding about parsers", &normal_meta)
+            .await
+            .unwrap();
+
+        let consolidator = Consolidator::with_stores_and_writer(stores, writer);
+        consolidator.consolidate_run("run1", "repo1").await.unwrap();
+
+        assert!(
+            store.history_leak_ids().await.unwrap().is_empty(),
+            "run triage must not copy History rows into records"
+        );
+        assert!(matches!(
+            store.find_memory_by_tag("history:run1:t-1").await.unwrap(),
+            Some((_, MemoryKind::History, _))
+        ));
+        assert!(
+            matches!(
+                store.find_memory_by_tag("consolidation:run:run1").await.unwrap(),
+                Some((_, MemoryKind::Record, _))
+            ),
+            "the normal run row must still be promoted"
         );
     }
 }

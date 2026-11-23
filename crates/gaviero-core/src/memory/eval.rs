@@ -1474,6 +1474,7 @@ mod tests {
             key: "k".into(),
             source: MemorySource::UnknownLegacy,
             trust_score: 0.75,
+            kind: crate::memory::MemoryKind::Record,
             raw_similarity: 0.8,
             fts_rank: None,
             final_score: 0.5,

@@ -94,6 +94,60 @@ impl MemoryStore {
         Ok(n)
     }
 
+    /// Record rows that are copies of History transcripts. Run triage used
+    /// to promote History rows (`query_by_run` returned them) and kept their
+    /// `history:` tag, so an `llm_consolidated` record carrying that tag can
+    /// only be such a leak. GLOB, not LIKE: the tag prefix is case-sensitive.
+    pub async fn history_leak_ids(&self) -> Result<Vec<i64>> {
+        let ids: Vec<i64> = {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM memories
+                  WHERE memory_kind = 'record'
+                    AND source = 'llm_consolidated'
+                    AND tag GLOB 'history:*'
+                  ORDER BY id ASC",
+            )?;
+            stmt.query_map([], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        Ok(ids)
+    }
+
+    /// Soft-delete every [`Self::history_leak_ids`] row, tagged
+    /// `DeletedBy::SleeptimeHistoryLeak` (restorable, sleeptime retention).
+    /// `dry_run = true` returns the would-be count without touching anything.
+    pub async fn sleeptime_remove_history_leaks(&self, dry_run: bool) -> Result<usize> {
+        let ids = self.history_leak_ids().await?;
+        if dry_run {
+            return Ok(ids.len());
+        }
+        let mut n = 0;
+        for id in ids {
+            match self
+                .soft_delete_memory(
+                    id,
+                    super::super::deletions::DeletedBy::SleeptimeHistoryLeak,
+                    Some("sleeptime: raw transcript promoted into a record by pre-fix run triage"),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => n += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "memory_sleeptime",
+                        memory_id = id,
+                        error = %e,
+                        "history-leak cleanup: soft-delete failed"
+                    );
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// B5 step 1: decay sweep. Walks every memory, computes recency
     /// under the current B4 floor, and returns
     /// [`SleeptimeOperation::DecayFlagged`] for rows at the floor.
@@ -328,6 +382,9 @@ impl MemoryStore {
                 .with_importance((mem.importance * 1.2).min(1.0))
                 .with_type(mem.memory_type)
                 .with_tag(format!("promotion:module_to_repo:{}", mem.id));
+            // The copy inherits the source row's provenance.
+            let (source_turn, refs) = self.provenance_for(mem.id).await.unwrap_or_default();
+            let meta = meta.with_provenance(source_turn, refs);
             match self
                 .store_scoped(&WriteScope::Repo { repo_id }, &mem.content, &meta)
                 .await
