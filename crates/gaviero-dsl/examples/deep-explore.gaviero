@@ -2,6 +2,8 @@
 //
 // What it does
 //
+//   Workflow `deep-explore`:
+//
 //   0. `scout` maps the actively researched field before any question is
 //      asked — what is settled, what the research front is working on now,
 //      and where it is not looking: a dozen reformulated searches, citation
@@ -11,11 +13,12 @@
 //      texts are ingested in the background while the loop runs.
 //
 //   Each pass N of the loop:
-//   1. `curator` folds pass N-1 (findings + the audit of them) into the
-//      frontier, generates new avenues with explicit operators (decompose,
-//      falsify, bridge, analogy, recency, gap, method transfer), scores
-//      them, and picks a portfolio: exploit / explore / falsify.
-//      Writes frontier-vN.json, assignments-vN.json, journal + archive.
+//   1. `curator` finishes the part of pass N-1's merge that needs judgment
+//      (narrowing, near-duplicates, parking), generates new avenues with
+//      explicit operators (decompose, falsify, bridge, analogy, recency,
+//      gap, method transfer), scores them, and picks a portfolio:
+//      exploit / explore / falsify. Writes (pass 1) or edits
+//      frontier-vN.json, writes assignments-vN.json, journal + archive.
 //   2. `for q in json "…assignments-vN.json"` clones `investigator` once
 //      per assignment (`investigator@<id>`). Each runs a fixed research
 //      protocol on the academic server: corpus passages first, then search,
@@ -26,18 +29,33 @@
 //      the pass against the source itself: the work resolves, it is not
 //      retracted, and a passage in its full text says what the claim says.
 //      It also checks task fidelity (did the lane answer the question it
-//      was given, or a nearby easier one?). Writes audit-vN.json.
-//   4. `stop_judge` (read-only, another family) ends the loop when the
-//      frontier is exhausted or saturated — never because lanes agree.
+//      was given, or a nearby easier one?) and records the resolved work
+//      of each claim. Writes audit-vN.json.
+//   4. The pass gate, `pass_gate.py` (a script, no model), rebuilds
+//      ledger.json (every claim with its verdict and resolved work),
+//      applies the mechanical merge and writes frontier-v(N+1).json and
+//      metrics-vN.json, and ends the loop by rule: no lanes left, the
+//      frontier exhausted, two saturated passes, or the core questions
+//      answered — never because lanes agree. Its report reaches the next
+//      pass's agents through the GATE_FEEDBACK placeholder.
 //
-//   Then `synthesize` writes the report from verified claims only, and
-//   `citation_check` resolves every reference in it once more.
+//   Workflow `deep-explore-report`:
 //
-// Why this shape (research/gaviero-dsl-autonomous-deep-research-2026-11-13-v2.md):
+//   `synthesize` writes report-draft.md from audited claims only, citing
+//   claim keys ([@q7-p2#0]). `report_gate.py` checks it (sections, unknown
+//   keys, where each verdict may be cited, uncited paragraphs, closed
+//   questions left out), numbers the works, prints the references from
+//   ledger.json and writes report.md + report-audit.md. A failing draft
+//   goes back to `synthesize` with the list of problems, at most 3 times.
+//
+// Why this shape:
 //   an archive/frontier with recorded failures, explicit generation
 //   operators and a selection rule, an external auditor that checks claims
-//   against artefacts, critique and judging by a different family than
-//   the generator, fresh-context units well under an hour, a budget.
+//   against artefacts, critique by a different family than the generator,
+//   fresh-context units well under an hour, a budget — and, as in
+//   PaperOrchestra (arXiv 2604.05018), everything that needs no model
+//   (bookkeeping, the stop rule, the reference list, citation checks) runs
+//   as a script.
 //
 // The academic MCP server
 //
@@ -74,11 +92,10 @@
 //   The script names no provider: every agent declares a tier and the
 //   model profile says what each one means — the `default` profile in
 //   .gaviero/dsl/profiles/ unless the run picks another (`--profile`).
-//   `verifier`, `stop_judge` and `citation_check` default to `medium`.
-//   Run them on a family different from the investigators', either with a
-//   profile whose `medium` is another provider (the shipped `mixed`
-//   profile: Codex against Claude lanes) or per run with `--tier`, e.g.
-//   `--tier verifier=medium-codex --tier stop_judge=medium-codex`.
+//   `verifier` defaults to `medium`. Run it on a family different from
+//   the investigators', either with a profile whose `medium` is another
+//   provider (the shipped `mixed` profile: Codex against Claude lanes) or
+//   per run with `--tier verifier=medium-codex`.
 //   Set FALSIFY_TIER to a tier of your profile on another provider (e.g.
 //   `high-codex` in the shipped default profile) and the curator puts each
 //   falsification lane on it, against the family that made the claim.
@@ -86,33 +103,50 @@
 // Inputs
 //
 //   The run's prompt is the research brief (SWARM form Prompt box, or
-//   `--prompt`). Name a document's path in it to build on that document.
+//   `--prompt`); give both workflows the same brief and the same OUT_DIR.
+//   Name a document's path in it to build on that document.
 //   OUT_DIR        where every artefact goes (one directory per run)
 //   COLLECTION     academic-server collection; empty = the scout picks
 //                  `explore-<slug>` and records it in landscape.json
 //   FALSIFY_TIER   tier for falsification lanes; empty = the
 //                  investigator's own tier
+//   TOOLS_DIR      the folder holding pass_gate.py and report_gate.py,
+//                  relative to the run root (a document run's root is the
+//                  current directory); give an absolute path when you run
+//                  from anywhere but the gaviero repository root
+//   PYTHON         a Python 3.10+ interpreter command (python3, py …)
 //
-//   gaviero-cli --script deep_explore.gaviero --prompt "<the research brief>"
-//   gaviero-cli --script deep_explore.gaviero --var OUT_DIR=research/explore-x \
-//       --tier verifier=medium-codex --tier stop_judge=medium-codex --prompt "…"
+//   From the gaviero repository root (a script with two workflows needs
+//   --workflow on every run):
+//
+//   gaviero-cli --script crates/gaviero-dsl/examples/deep-explore.gaviero --workflow deep-explore --prompt "<the research brief>" && gaviero-cli --script crates/gaviero-dsl/examples/deep-explore.gaviero --workflow deep-explore-report --prompt "<the research brief>"
+//   gaviero-cli --script crates/gaviero-dsl/examples/deep-explore.gaviero --workflow deep-explore --var OUT_DIR=research/explore-x --tier verifier=medium-codex --prompt "…"
+//
+//   `deep-explore-report` on its own rewrites the report of an existing
+//   OUT_DIR.
 //
 // Artefacts (all under OUT_DIR)
 //
 //   landscape.json / landscape.md         scout's field map (pass 0)
-//   frontier-vN.json                      every question: open / active / closed / dead / parked
+//   frontier-vN.json                      every question: open / active / closed / dead / parked;
+//                                         the highest N is the pass gate's merge after the last pass
 //   assignments-vN.json                   this pass's lanes (the `for` list)
 //   <id>-finding-vN.json                  one per lane, typed claims + search log
-//   audit-vN.json                         per-claim verification + pass metrics
+//   audit-vN.json                         per-claim verification, resolved work, pass metrics
+//   ledger.json                           every claim: verdict, citable class, resolved work
+//   metrics-vN.json                       pass gate: recounted metrics, merge log, stop rule
 //   journal.md                            curator's decisions, one section per pass
-//   archive.md                            dead ends and why (never re-explored)
-//   report-draft.md, report.md, report-audit.md
+//   archive.md                            dead ends and dropped claims, and why (never re-explored)
+//   report-draft.md                       synthesize's draft
+//   report.md, report-audit.md            report gate: numbered references, every check
 
 vars {
     OUT_DIR         "research/explore"
     COLLECTION      ""
-    ACADEMIC_SERVER "academic"
+    ACADEMIC_SERVER "academic-mcp"
     FALSIFY_TIER    ""
+    TOOLS_DIR       "crates/gaviero-dsl/examples/deep-explore"
+    PYTHON          "python"
 }
 
 // ── Scout ─────────────────────────────────────────────────────────────────────
@@ -220,34 +254,43 @@ prompt curate-body #"
     The research brief:
     {{PROMPT}}
 
+    Pass gate report on the previous pass (context, not an error; empty
+    on pass 1):
+    {{GATE_FEEDBACK}}
+
     Read, in this order:
       - {{OUT_DIR}}/landscape.json (the scout's map; it names the
         collection to use);
-      - {{OUT_DIR}}/frontier-v{{PREV_ITER}}.json,
-        {{OUT_DIR}}/audit-v{{PREV_ITER}}.json and every
-        {{OUT_DIR}}/*-finding-v{{PREV_ITER}}.json (none exist on pass 1;
-        seed the frontier from landscape.json instead);
+      - from pass 2 on: {{OUT_DIR}}/frontier-v{{ITER}}.json — the pass
+        gate already wrote it after pass {{PREV_ITER}}, with the
+        mechanical merge applied — and {{OUT_DIR}}/metrics-v{{PREV_ITER}}.json,
+        {{OUT_DIR}}/ledger.json, {{OUT_DIR}}/audit-v{{PREV_ITER}}.json and
+        every {{OUT_DIR}}/*-finding-v{{PREV_ITER}}.json;
       - {{OUT_DIR}}/archive.md and {{OUT_DIR}}/journal.md if they exist.
 
     Tools: the `{{ACADEMIC_SERVER}}` MCP server, about 25 calls.
 
-    A. Merge the previous pass.
-       - A question becomes `closed` only when the audit marks the claims
-         that answer it `supported`. `partial` keeps it open with a
-         narrower wording; `not_supported` or `cannot_verify` never close
-         anything. A lane the audit flags for task substitution did not
-         answer its question: reopen it.
-       - Unresolvable or retracted sources: drop their claims and log
-         them in archive.md.
-       - Add each finding's `children` as candidate questions, with the
-         finding as parent and depth = parent depth + 1.
-       - Move a question to `dead` (and append a line to archive.md:
-         question, why, evidence) when two lanes found nothing usable, or
-         the literature cannot answer it (it needs an experiment nobody
-         ran — mark it `parked` instead and keep it for the report).
-       - If landscape.json has a consensus_thread and pass 1 or 2 has not
+    A. Finish the merge. On pass 1 seed the frontier from landscape.json
+       instead. From pass 2 on, the pass gate has already applied every
+       mechanical rule to frontier-v{{ITER}}.json: audit verdicts closed
+       questions, substituted lanes were reopened, visits were counted, a
+       second empty visit moved a question to `dead` (with a line in
+       archive.md), children were added as open questions with parent and
+       depth, retracted or unresolvable claims were dropped, lost question
+       ids were restored, priorities recomputed and sizes trimmed. Do not
+       redo any of it. What is left needs judgment:
+       - narrow the wording of every question the gate report lists under
+         `narrow` (a partial answer); the old wording goes to journal.md;
+       - merge near-duplicate questions: keep one id, set the other to
+         `dead` and append a line to archive.md naming the kept id;
+       - park a question the literature cannot answer (it needs an
+         experiment nobody ran): status `parked`, `why` = the experiment
+         or data that would answer it;
+       - if landscape.json has a consensus_thread and pass 1 or 2 has not
          collected it yet, call get_review; when finished, mine it for
-         claims to check and questions to add.
+         claims to check and questions to add;
+       - set leading_claims from ledger.json claims whose `citable` is
+         `supported`.
 
     B. Generate new avenues. Novel directions do not appear by asking
        for "more questions"; apply each operator below to the current
@@ -274,7 +317,10 @@ prompt curate-body #"
        groups are already pursuing scores 0 — and from closed, dead and
        archived questions — near-duplicates are merged, not re-asked),
        and tractability (can literature answer it?).
-       priority = relevance + gain + novelty + tractability − depth.
+       priority = relevance + gain + novelty + tractability − depth (the
+       pass gate recomputes it after every pass; set it for each question
+       you score now). Children the gate added arrive with every score 0:
+       score them.
        Limits: depth ≤ 3; at most 40 questions ever created; each depth
        level gets at most half the new questions of the level above.
 
@@ -291,29 +337,20 @@ prompt curate-body #"
        when little is open. `[]` when nothing open is worth a lane.
        Never assign a question already in archive.md.
 
-    E. Keep the frontier small. It is read and written every pass, and
-       re-typing a large file by hand is slow and loses detail.
-       - From pass 2 on, never re-type the whole frontier. Copy
-         {{OUT_DIR}}/frontier-v{{PREV_ITER}}.json to
-         {{OUT_DIR}}/frontier-v{{ITER}}.json with a command or a short
-         script, then change only what this pass changed: edit those
-         entries, or load the JSON in a short Python script, apply the
-         changes and write it back. Then load the result as JSON to check
-         it parses and that no question id was lost.
-       - `question`: at most 250 characters. Narrowing a question replaces
-         its wording; the old wording goes to journal.md, not the field.
-       - `why`: at most 300 characters, the current evidence hook only.
-         Replace it, never append to it; its history belongs in
-         journal.md.
-       - closed and dead questions keep only id, question, status,
-         operator, parent, depth and supported_claims. A parked question
-         also keeps `why`: the experiment or data that would answer it.
-       - `leading_claims`: at most 5, each at most 200 characters.
-       - No top-level keys beyond the ones below.
-       A frontier already over these limits is brought within them this
-       pass, once, by script; say so in journal.md.
+    E. Edit, never recreate. On pass 1 write {{OUT_DIR}}/frontier-v1.json.
+       From pass 2 on {{OUT_DIR}}/frontier-v{{ITER}}.json already exists:
+       change only the entries this pass changes, with small edits; never
+       re-type the file. Stay within the limits the pass gate enforces:
+       `question` at most 250 characters (narrowing replaces the wording;
+       the old wording goes to journal.md); `why` at most 300 characters,
+       the current evidence hook only (replace it, never append; its
+       history belongs in journal.md); closed and dead questions keep only
+       id, question, kind, status, operator, parent, depth and
+       supported_claims, a parked one also `why`; at most 5
+       leading_claims of at most 200 characters; no top-level keys beyond
+       the ones below.
 
-    Write {{OUT_DIR}}/frontier-v{{ITER}}.json (kept small as in E):
+    The frontier ({{OUT_DIR}}/frontier-v{{ITER}}.json):
     {"pass": {{ITER}}, "collection": "<name>",
      "questions": [{"id": "q7", "question": "…", "kind": "core|mechanism|method|contrarian|adjacent|gap|bridge|blind_spot",
                     "operator": "seed|decompose|falsify|bridge|analogy|recency|gap|method_transfer|child",
@@ -361,6 +398,10 @@ prompt investigate-body #"
       start from: {{q.start_from}}
       avoid:      {{q.avoid}}
       done when:  {{q.done_when}}
+
+    Pass gate report on the previous pass (context only; it concerns your
+    lane only if it names your question):
+    {{GATE_FEEDBACK}}
 
     Read {{OUT_DIR}}/landscape.json for the collection name and the
     field map. Read other files under {{OUT_DIR}}/ only when you need them.
@@ -410,6 +451,10 @@ prompt investigate-body #"
     a number. Always write the file below, even if you found nothing —
     set "outcome": "blocked" and explain.
 
+    Give each claim's `title` and `year` as the source states them: the
+    pass gate compares them with the record the verifier resolves, and a
+    mismatch makes the claim uncitable in the report.
+
     Write {{OUT_DIR}}/{{q.id}}-finding-v{{ITER}}.json:
     {"assignment_id": "{{q.id}}", "question": "<as assigned>",
      "outcome": "answered|partial|nothing_found|blocked",
@@ -441,6 +486,9 @@ prompt verify-body #"
 
     The research brief: {{PROMPT}}
 
+    Pass gate report on the previous pass (context only):
+    {{GATE_FEEDBACK}}
+
     Read {{OUT_DIR}}/assignments-v{{ITER}}.json and every
     {{OUT_DIR}}/*-finding-v{{ITER}}.json listed there, plus
     {{OUT_DIR}}/landscape.json for the collection name. If the assignment
@@ -454,7 +502,14 @@ prompt verify-body #"
     For each claim:
     1. Existence: resolve_work on its work_id (or title + year). A work
        that does not resolve, or whose title/year differ materially, is
-       `not_supported` with reason "unresolvable".
+       `not_supported` with reason "unresolvable". Copy what resolve_work
+       returns into the claim's `work`: openalex = ids.openalex, doi =
+       ids.doi, arxiv = ids.arxiv, title = title.value, year = year.value,
+       venue = container.value.title, authors = the `name` of each entry
+       of authors.value (at most 10). Use "" / 0 / [] for what it does not
+       return, and {} when the work does not resolve. Never fill `work`
+       from the finding: the pass gate compares the two titles, and the
+       report's references are printed from `work`.
     2. Status: check_retraction. Retracted → `not_supported`.
     3. Support: find the passage. search_corpus (collection) with the
        claim's wording, or get_fulltext of the work at the claimed
@@ -488,7 +543,9 @@ prompt verify-body #"
     {"pass": {{ITER}},
      "claims": [{"finding": "<assignment id>", "index": 0, "verdict": "supported|partial|not_supported|cannot_verify",
                  "reason": "…", "passage": "<quote>", "checked_via": "corpus|fulltext|abstract|citations|web",
-                 "retracted": false, "resolved": true, "sampled": false}],
+                 "retracted": false, "resolved": true, "sampled": false,
+                 "work": {"openalex": "<W-id>", "doi": "", "arxiv": "", "title": "…", "year": 0,
+                          "venue": "…", "authors": ["…"]}}],
      "fidelity": [{"finding": "<id>", "verdict": "exact|narrowed|substituted", "note": "…"}],
      "contradictions": [{"a": "<id>#<i>", "b": "<id>#<i>", "note": "…"}],
      "metrics": {"claims": 0, "checked": 0, "supported": 0, "partial": 0, "not_supported": 0,
@@ -499,37 +556,6 @@ prompt verify-body #"
     questions already in {{OUT_DIR}}/frontier-v{{ITER}}.json or archive.md.
 "#
 
-// ── Stop judge ────────────────────────────────────────────────────────────────
-
-prompt stop-body #"
-    Decide whether an autonomous literature exploration should run another
-    pass. The research brief: {{PROMPT}}
-
-    Read {{OUT_DIR}}/frontier-v{{ITER}}.json (the questions as they stood
-    when this pass started), {{OUT_DIR}}/assignments-v{{ITER}}.json and
-    {{OUT_DIR}}/audit-v{{ITER}}.json (what this pass returned and how
-    much of it held up). Read findings only when the audit is ambiguous.
-    If {{OUT_DIR}}/audit-v{{PREV_ITER}}.json exists, compare the metrics.
-
-    Return pass (stop) only when one of these holds:
-      - exhausted: no open question has priority ≥ 6 that the literature
-        can answer, and this pass's children are not novel;
-      - saturated: this pass and the previous one each added fewer than 2
-        newly supported claims and fewer than 2 novel children;
-      - the brief's core questions all have supported answers and every
-        remaining open question is marginal to the brief.
-    Return fail (continue) otherwise — in particular when this pass opened
-    novel high-priority questions, or when key claims are still
-    cannot_verify and the next pass can check them.
-
-    Never stop because the lanes agree with each other: agreement between
-    language models is not evidence. Never continue only because questions
-    exist: some questions are parked for the report on purpose.
-
-    Reply with exactly one JSON object as your last output:
-    {"verdict": "pass" | "fail", "reason": "<one sentence citing the metrics>"}
-"#
-
 // ── Report ────────────────────────────────────────────────────────────────────
 
 prompt synth-body #"
@@ -538,56 +564,52 @@ prompt synth-body #"
     The research brief:
     {{PROMPT}}
 
-    Inputs under {{OUT_DIR}}/: landscape.md / landscape.json, the latest
-    frontier-v*.json, every *-finding-v*.json, every audit-v*.json,
+    If the report gate rejected your previous draft, its findings follow;
+    fix exactly those and keep every other passage unchanged:
+    {{GATE_FEEDBACK}}
+
+    Inputs under {{OUT_DIR}}/: ledger.json (every claim with its audit
+    verdict, its `citable` class and its resolved work), landscape.md /
+    landscape.json, the highest-numbered frontier-v*.json (the state after
+    the last pass), every *-finding-v*.json, every audit-v*.json,
     journal.md and archive.md.
 
-    Use only claims some audit marked `supported` (or `partial`, stated
-    at the strength the audit found). A claim with no audit verdict, or
-    `cannot_verify`, may appear only in the "Unverified leads" section,
-    labelled as such. Do not add sources the run did not find.
+    Citations. Cite claims, not works: write [@<claim key>], where the key
+    is a key of ledger.json `claims` (`<finding id>#<claim index>`, e.g.
+    [@q7-p2#0]); several at once as [@q7-p2#0; @q9-p3#1]. Never write a
+    numbered reference and never write a `## References` section: the
+    report gate numbers the works and prints the references from
+    ledger.json. Use a key according to its `citable` value:
+      supported, partial   anywhere (state a partial claim at the
+                           strength the audit found);
+      unverified           only under `### Unverified leads`;
+      forbidden            nowhere.
+    Do not add sources the run did not find.
 
-    Write {{OUT_DIR}}/report-draft.md with these sections:
+    Write {{OUT_DIR}}/report-draft.md with exactly these `##` sections, in
+    this order, and no other `##` heading:
       ## Answer — the direct answer to the brief, 1-3 paragraphs.
-      ## Findings — one subsection per closed question, ranked by
-         relevance to the brief: the claim, the evidence (strength:
-         replicated / single study / review / preprint), the counter-
-         evidence, and references as [n].
-      ## New avenues — the directions this run opened that neither the
-         brief nor the field's current research front (landscape.json)
-         names: where each came from (bridge, analogy, blind spot, gap…),
-         why active groups are not already on it,
-         what evidence makes it promising, and the first study or
-         analysis that would test it.
+      ## Findings — one `###` subsection per closed question of the latest
+         frontier that has a supported claim, ranked by relevance to the
+         brief: the claim, the evidence (strength: replicated / single
+         study / review / preprint), the counter-evidence. Every paragraph
+         and every bullet of this section cites at least one key.
+      ## New avenues — one `###` subsection per direction this run opened
+         that neither the brief nor the field's current research front
+         (landscape.json) names: where it came from (bridge, analogy, blind
+         spot, gap…), why active groups are not already on it, what cited
+         evidence makes it promising, and the first study or analysis that
+         would test it.
       ## Contested and open — live disputes, parked questions (what
-         experiment or data would answer them), and unverified leads.
-      ## How the field was explored — passes, lanes, operators used,
-         what was abandoned and why (from journal.md and archive.md).
-      ## Audit — claims checked, share supported / partial / not
-         supported / unverifiable, unresolvable or retracted sources,
-         task substitutions caught.
-      ## References — numbered; title, authors, venue, year, DOI or
-         OpenAlex id.
-"#
-
-prompt cite-body #"
-    You are the final citation check of an autonomous literature
-    exploration. Read {{OUT_DIR}}/report-draft.md and the audit files
-    {{OUT_DIR}}/audit-v*.json.
-
-    Tools: the `{{ACADEMIC_SERVER}}` MCP server.
-    1. resolve_work every entry of `## References`; fix wrong metadata,
-       remove entries that do not resolve and every sentence that relied
-       only on them.
-    2. check_retraction every entry.
-    3. For each sentence in Findings and New avenues that cites [n],
-       confirm an audit verdict supports it; when none does, move the
-       sentence to "Unverified leads" or soften it to what the audit
-       found.
-
-    Write {{OUT_DIR}}/report.md (the corrected report) and
-    {{OUT_DIR}}/report-audit.md (each change you made and why, plus
-    references checked / fixed / removed).
+         experiment or data would answer them), and a `### Unverified
+         leads` subsection for claims whose `citable` is `unverified`,
+         labelled as such.
+      ## How the field was explored — passes, lanes, operators used, what
+         was abandoned and why (from journal.md and archive.md).
+      ## Audit — claims checked, share supported / partial / not supported
+         / unverifiable, unresolvable or retracted sources, task
+         substitutions caught (from ledger.json and the audit-v*.json
+         files).
 "#
 
 // ── Agents ────────────────────────────────────────────────────────────────────
@@ -660,17 +682,9 @@ agent verifier {
     prompt verify-body
 }
 
-agent stop_judge {
-    description "Decide whether the frontier is exhausted"
-    tier medium
-    scope { read_only ["{{OUT_DIR}}/"] }
-    prompt stop-body
-}
-
 agent synthesize {
-    description "Write the report draft"
+    description "Write the report draft the report gate checks"
     tier top
-    depends_on [verifier]
     scope {
         owned ["{{OUT_DIR}}/report-draft.md"]
         read_only ["{{OUT_DIR}}/"]
@@ -678,25 +692,6 @@ agent synthesize {
     produces ["{{OUT_DIR}}/report-draft.md"]
     timeout 2400
     prompt synth-body
-}
-
-agent citation_check {
-    description "Resolve every reference of the report"
-    tier medium
-    depends_on [synthesize]
-    scope {
-        owned [
-            "{{OUT_DIR}}/report.md"
-            "{{OUT_DIR}}/report-audit.md"
-        ]
-        read_only ["{{OUT_DIR}}/"]
-    }
-    produces [
-        "{{OUT_DIR}}/report.md"
-        "{{OUT_DIR}}/report-audit.md"
-    ]
-    timeout 1800
-    prompt cite-body
 }
 
 workflow deep-explore {
@@ -709,12 +704,19 @@ workflow deep-explore {
             agents [curator verifier]
             for q in json "{{OUT_DIR}}/assignments-v{{ITER}}.json" parallel max 6 { investigator }
             max_iterations 6
-            irreconcilable_after 0
-            strict_judge false
-            judge_timeout 300
-            until agent stop_judge
+            until command "{{PYTHON}} -B {{TOOLS_DIR}}/pass_gate.py {{OUT_DIR}} {{ITER}}"
         }
-        synthesize
-        citation_check
+    ]
+}
+
+workflow deep-explore-report {
+    execution_mode document
+    budget { wall "2h" usd 10 }
+    steps [
+        loop {
+            agents [synthesize]
+            max_iterations 3
+            until command "{{PYTHON}} -B {{TOOLS_DIR}}/report_gate.py {{OUT_DIR}}"
+        }
     ]
 }

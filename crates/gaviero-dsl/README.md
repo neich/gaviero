@@ -83,7 +83,7 @@ Twelve workflow scripts and four model profiles live in `examples/`:
 | `pattern_map_reduce.gaviero` | `pattern map_reduce`; spawn-manifest workers name a `tier` |
 | `scientific_research.gaviero` | Literature-research consensus panel |
 | `for_loops.gaviero` | Explicit `for … parallel` / `for … sequential` over a list param |
-| `deep_explore.gaviero` | Autonomous literature explorer on the `academic` MCP server: scout → loop (curator → runtime `for … in json` investigators → cross-family verifier, stop judge) → report + citation check; `budget`, `produces json`; tiers from the profile |
+| `deep-explore.gaviero` | Autonomous literature explorer on the `academic` MCP server, in two workflows: `deep-explore` (scout → loop: curator → runtime `for … in json` investigators → cross-family verifier, ended by the `pass_gate.py` script) and `deep-explore-report` (synthesize until `report_gate.py` passes); helper scripts in `examples/deep-explore/`; `budget`, `produces json`, `until command`; tiers from the profile |
 
 **Model profiles** (`examples/profiles/`, see [below](#model-profiles)): `default.gaviero` (generic `low`…`top` tiers plus `<level>-claude` / `-codex` / `-cursor` and `high-deepseek`; copy it to `.gaviero/dsl/profiles/default.gaviero`), `claude.gaviero`, `codex.gaviero`, `mixed.gaviero`. The examples' rosters use the provider-pinned tiers, so they need a profile that defines them, such as `default.gaviero`.
 
@@ -312,7 +312,7 @@ for q in json "{{OUT_DIR}}/assignments-v{{ITER}}.json" parallel max 6 { investig
 
 `for <var> in json "<path>" parallel [max <N>] { <agent> }` reads its list
 from a JSON file when the step runs instead of from a list param. Example:
-[`examples/deep_explore.gaviero`](examples/deep_explore.gaviero).
+[`examples/deep-explore.gaviero`](examples/deep-explore.gaviero).
 
 - **Where:** a top-level step, or inside a loop that is not
   `branch_chain stacked`. The workflow must declare `execution_mode document`.

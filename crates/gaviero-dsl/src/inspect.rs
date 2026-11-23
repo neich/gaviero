@@ -614,13 +614,18 @@ mod tests {
     }
 
     #[test]
-    fn the_deep_explore_example_lists_every_agent_including_the_judge_and_the_for_body() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/deep_explore.gaviero");
+    fn the_deep_explore_example_lists_the_agents_of_each_workflow_including_the_for_body() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/deep-explore.gaviero");
         let info = inspect_file(&path).unwrap();
-        let names: Vec<String> = info.agent_tiers(0).into_iter().map(|(a, _)| a).collect();
-        for agent in ["scout", "curator", "investigator", "verifier", "stop_judge"] {
-            assert!(names.iter().any(|n| n == agent), "{agent} missing from {names:?}");
+        let names = |workflow: usize| -> Vec<String> {
+            info.agent_tiers(workflow).into_iter().map(|(a, _)| a).collect()
+        };
+        let explore = names(0);
+        for agent in ["scout", "curator", "investigator", "verifier"] {
+            assert!(explore.iter().any(|n| n == agent), "{agent} missing from {explore:?}");
         }
+        assert!(!explore.iter().any(|n| n == "synthesize"), "{explore:?}");
+        assert_eq!(names(1), ["synthesize"]);
     }
 
     #[test]

@@ -2252,7 +2252,7 @@ workflow w { steps [a] }
     assert_eq!(a.produces_json, vec!["research/x/frontier-v{{ITER}}.json"]);
 }
 
-// ── examples/deep_explore.gaviero ────────────────────────────────────────
+// ── examples/deep-explore.gaviero ────────────────────────────────────────
 
 /// The `{{name}}` placeholders of a text, without the braces.
 fn regex_lite_placeholders() -> impl Fn(&str) -> Vec<String> {
@@ -2276,97 +2276,86 @@ fn regex_lite_placeholders() -> impl Fn(&str) -> Vec<String> {
 #[test]
 fn example_deep_explore_compiles() {
     // The script names no provider: models come from the profile, here the
-    // shipped `mixed` one (high = claude:opus, medium = codex terra), the way
-    // a run's implicit `default` profile fills its tiers.
+    // shipped `mixed` one (high = claude:opus, top = claude:fable, medium =
+    // codex terra), the way a run's implicit `default` profile fills its tiers.
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
-    let script = dir.join("deep_explore.gaviero");
+    let script = dir.join("deep-explore.gaviero");
     let profile = gaviero_core::script_profiles::SelectedProfile {
         name: "default".into(),
         path: dir.join("profiles/mixed.gaviero"),
         precedence: gaviero_core::script_profiles::ProfilePrecedence::FillsGaps,
     };
-    let plan = gaviero_dsl::compile_file_with_profile(&script, Some(&profile), None, None, &[], &[], &[])
-        .unwrap_or_else(|e| panic!("compiling deep_explore.gaviero:\n{e:?}"));
+    let compile = |workflow: &str, prompt: Option<&str>, tiers: &[(String, String)]| {
+        gaviero_dsl::compile_file_with_profile(&script, Some(&profile), Some(workflow), prompt, &[], tiers, &[])
+            .unwrap_or_else(|e| panic!("compiling deep-explore.gaviero --workflow {workflow}:\n{e:?}"))
+    };
+    let plan = compile("deep-explore", None, &[]);
     // Without a profile no tier is bound: the script declares none of its own.
-    assert!(gaviero_dsl::compile_file(&script, None, None, &[], &[], &[]).is_err());
+    assert!(gaviero_dsl::compile_file(&script, Some("deep-explore"), None, &[], &[], &[]).is_err());
+    // Two workflows: a run must name one.
+    assert!(
+        gaviero_dsl::compile_file_with_profile(&script, Some(&profile), None, None, &[], &[], &[]).is_err()
+    );
 
     // The only input is the run prompt (SWARM form Prompt box / --prompt):
     // no file var for the form to ask for.
     let inspection = gaviero_dsl::inspect_file(&script).expect("inspect");
     assert!(inspection.requires_prompt);
     let vars: Vec<&str> = inspection.vars.iter().map(|v| v.name.as_str()).collect();
-    assert_eq!(vars, ["OUT_DIR", "COLLECTION", "ACADEMIC_SERVER", "FALSIFY_TIER"]);
+    assert_eq!(
+        vars,
+        ["OUT_DIR", "COLLECTION", "ACADEMIC_SERVER", "FALSIFY_TIER", "TOOLS_DIR", "PYTHON"]
+    );
     // Every agent declares its tier; the form learns which ones the profile
     // must define.
     assert_eq!(inspection.tiers, ["high", "top", "medium"]);
-    let with_prompt = gaviero_dsl::compile_file_with_profile(
-        &script, Some(&profile), None, Some("Map the failure modes of X."), &[], &[], &[],
-    )
-    .expect("compile with a prompt");
-    let curator_prompt = &with_prompt
-        .work_units_unordered()
-        .into_iter()
-        .find(|u| u.id == "curator")
-        .expect("curator")
-        .coordinator_instructions;
+    let workflows: Vec<&str> = inspection.workflows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(workflows, ["deep-explore", "deep-explore-report"]);
+
+    let with_prompt = compile("deep-explore", Some("Map the failure modes of X."), &[]);
+    let curator_prompt = &unit(&with_prompt, "curator").coordinator_instructions;
     assert!(curator_prompt.contains("Map the failure modes of X."), "{curator_prompt}");
-    // Every placeholder left after compiling is one the runtime fills:
-    // the loop pass or a runtime `for` item. A typo would reach the agent.
+    assert!(curator_prompt.contains("`academic-mcp` MCP server"), "{curator_prompt}");
+    // Every placeholder left after compiling is one the runtime fills: the
+    // loop pass, the gate's feedback or a runtime `for` item. A typo would
+    // reach the agent.
     let runtime_placeholder = regex_lite_placeholders();
+    let runtime_filled = |found: &str| {
+        found == "ITER" || found == "PREV_ITER" || found == "GATE_FEEDBACK" || found.starts_with("q.")
+    };
     for u in with_prompt
         .work_units_unordered()
         .into_iter()
         .chain(with_prompt.loop_judge_units.iter())
     {
         for found in runtime_placeholder(&u.coordinator_instructions) {
-            assert!(
-                found == "ITER" || found == "PREV_ITER" || found.starts_with("q."),
-                "unresolved {{{{{found}}}}} in {}",
-                u.id
-            );
+            assert!(runtime_filled(&found), "unresolved {{{{{found}}}}} in {}", u.id);
         }
     }
-    assert!(curator_prompt.contains("`academic` MCP server"), "{curator_prompt}");
 
+    // No model judges the loop: the pass gate script does.
+    assert!(plan.loop_judge_units.is_empty());
+    let ids: Vec<String> = plan.work_units_unordered().into_iter().map(|u| u.id.clone()).collect();
+    for gone in ["stop_judge", "citation_check", "synthesize"] {
+        assert!(!ids.iter().any(|id| id == gone), "{gone} in {ids:?}");
+    }
     let model = |id: &str| -> String {
-        plan.work_units_unordered()
-            .into_iter()
-            .chain(plan.loop_judge_units.iter())
-            .find(|u| u.id == id)
-            .and_then(|u| u.model.clone())
+        unit(&plan, id)
+            .model
+            .clone()
             .unwrap_or_else(|| panic!("no model for {id}"))
     };
     assert_eq!(model("scout"), "claude:opus", "tier high");
     assert_eq!(model("curator"), "claude:fable", "tier top");
     assert_eq!(model("investigator"), "claude:opus", "tier high");
-    assert_eq!(model("synthesize"), "claude:fable", "tier top");
-    // The auditors declare `tier medium`: another family than the
+    // The auditor declares `tier medium`: another family than the
     // investigators under this profile.
     assert_eq!(model("verifier"), "codex:gpt-6.1-terra", "tier medium");
-    assert_eq!(model("citation_check"), "codex:gpt-6.1-terra", "tier medium");
     assert!(plan.tier_bindings.contains_key("high"), "runtime items can name tier high");
 
-    // `--tier` moves one auditor for a run; the others keep their tier.
-    let moved = gaviero_dsl::compile_file_with_profile(
-        &script,
-        Some(&profile),
-        None,
-        None,
-        &[],
-        &[("verifier".to_string(), "top".to_string())],
-        &[],
-    )
-    .expect("compile with --tier verifier=top");
-    let verifier = moved
-        .work_units_unordered()
-        .into_iter()
-        .find(|u| u.id == "verifier")
-        .and_then(|u| u.model.clone());
-    assert_eq!(verifier.as_deref(), Some("claude:fable"));
-    assert_eq!(
-        moved.loop_judge_units[0].model.as_deref(),
-        Some("codex:gpt-6.1-terra")
-    );
+    // `--tier` moves the auditor for a run.
+    let moved = compile("deep-explore", None, &[("verifier".to_string(), "top".to_string())]);
+    assert_eq!(unit(&moved, "verifier").model.as_deref(), Some("claude:fable"));
 
     assert_eq!(plan.runtime_fors.len(), 1);
     let op = &plan.runtime_fors[0];
@@ -2377,6 +2366,16 @@ fn example_deep_explore_compiles() {
     let lc = plan.loop_configs.first().expect("loop config");
     // Dependency order inside every pass: curate → investigate → audit.
     assert_eq!(lc.agent_ids, vec!["curator", "investigator", "verifier"]);
+    assert_eq!(lc.max_iterations, 6);
+    assert!(
+        matches!(
+            &lc.until,
+            gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd)
+                if cmd == "python -B crates/gaviero-dsl/examples/deep-explore/pass_gate.py research/explore {{ITER}}"
+        ),
+        "{:?}",
+        lc.until
+    );
 
     let budget = plan.budget.as_ref().expect("budget");
     assert_eq!(budget.usd, Some(60.0));
@@ -2385,9 +2384,6 @@ fn example_deep_explore_compiles() {
         plan.execution_mode,
         gaviero_core::swarm::plan::ExecutionMode::Document
     );
-    // `tier medium`: a different family from the curator under this
-    // profile, and movable per run with --tier stop_judge=….
-    assert_eq!(model("stop_judge"), "codex:gpt-6.1-terra", "tier medium");
 
     let curator = unit(&plan, "curator");
     assert_eq!(curator.produces_json.len(), 2);
@@ -2411,4 +2407,42 @@ fn example_deep_explore_compiles() {
     );
     let errors = gaviero_core::swarm::validation::validate_scopes(&units, &groups);
     assert!(errors.is_empty(), "{errors:?}");
+
+    // The helper scripts TOOLS_DIR names (relative to the repository root).
+    let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/deep-explore");
+    for file in ["gate_common.py", "pass_gate.py", "report_gate.py"] {
+        assert!(tools.join(file).is_file(), "missing {file} in {}", tools.display());
+    }
+
+    // `deep-explore-report`: one loop, synthesize until the report gate passes.
+    let report = compile("deep-explore-report", Some("Map the failure modes of X."), &[]);
+    let report_ids: Vec<String> =
+        report.work_units_unordered().into_iter().map(|u| u.id.clone()).collect();
+    assert_eq!(report_ids, vec!["synthesize".to_string()]);
+    let synth = unit(&report, "synthesize");
+    assert!(synth.depends_on.is_empty(), "{:?}", synth.depends_on);
+    assert_eq!(synth.model.as_deref(), Some("claude:fable"), "tier top");
+    for found in runtime_placeholder(&synth.coordinator_instructions) {
+        assert!(runtime_filled(&found), "unresolved {{{{{found}}}}} in synthesize");
+    }
+    assert!(report.loop_judge_units.is_empty());
+    let rlc = report.loop_configs.first().expect("report loop");
+    assert_eq!(rlc.agent_ids, vec!["synthesize"]);
+    assert_eq!(rlc.max_iterations, 3);
+    assert!(
+        matches!(
+            &rlc.until,
+            gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd)
+                if cmd == "python -B crates/gaviero-dsl/examples/deep-explore/report_gate.py research/explore"
+        ),
+        "{:?}",
+        rlc.until
+    );
+    let report_budget = report.budget.as_ref().expect("report budget");
+    assert_eq!(report_budget.usd, Some(10.0));
+    assert_eq!(report_budget.wall_secs, Some(2 * 3600));
+    assert_eq!(
+        report.execution_mode,
+        gaviero_core::swarm::plan::ExecutionMode::Document
+    );
 }
