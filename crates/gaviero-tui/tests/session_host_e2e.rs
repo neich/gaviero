@@ -51,6 +51,13 @@ fn ctrl_e() -> String {
     tap(0x45, 0x12, 5, LEFT_CTRL)
 }
 
+/// The probe writes its `GAVIERO_PROBE_LAUNCH` answer as the tab's launch
+/// state and reports ready, as a real child does after answering the
+/// workspace/folder question.
+fn ctrl_l() -> String {
+    tap(0x4C, 0x26, 'l' as u16, LEFT_CTRL)
+}
+
 fn alt_left() -> String {
     tap(0x25, 0x4B, 0, LEFT_ALT)
 }
@@ -426,6 +433,85 @@ fn alt_shift_arrows_reorder_tabs_and_the_order_is_kept() {
     let mut pty = host(&[OsStr::new("--sessions")], &state, root.path());
     pty.wait_for("three tabs again", |_, _| bar_order(&pty, &[la, lb, lc]).len() == 3);
     assert_eq!(bar_order(&pty, &[la, lb, lc]), [lc, la, lb]);
+    pty.send(&ctrl_q());
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
+/// Poll the host state file until `launches.<key>` is `want`.
+fn wait_launch_answer(state: &Path, key: &str, want: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(state).unwrap_or_default();
+        let got = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|json| json["launches"][key].as_str().map(str::to_string));
+        if got.as_deref() == Some(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "launch answer for {key} not saved; state:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A tab that was opened from a folder holding a workspace file reopens the
+/// same way: the host seeds the answer it saved in `session-host.json` into
+/// the tab and keeps a newer one, so no launch question appears.
+#[test]
+fn a_tab_reopens_with_its_saved_launch_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let proj = root.path().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    let ws = proj.join("team.gaviero-workspace");
+    std::fs::write(&ws, "{}").unwrap();
+    // The answer saved by an earlier host run: this folder opened as the
+    // workspace file.
+    let workspace_answer = format!("{}\nworkspace\n{}\n", proj.display(), ws.display());
+    // A different answer the probe gives for the same tab.
+    let folder_answer = format!("{}\nfolder\n", proj.display());
+    let key = proj.to_string_lossy().into_owned();
+    let state = root.path().join("state.json");
+    let mut launches = serde_json::Map::new();
+    launches.insert(key.clone(), serde_json::json!(workspace_answer));
+    std::fs::write(
+        &state,
+        serde_json::json!({
+            "open": [proj.clone()],
+            "recent": [proj.clone()],
+            "launches": launches,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let envs: [(&str, &OsStr); 3] = [
+        ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+        ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ("GAVIERO_PROBE_LAUNCH", OsStr::new(&folder_answer)),
+    ];
+    let mut pty = Pty::spawn(&[OsStr::new("--sessions")], &envs, root.path());
+
+    // 1. The remembered answer reached the tab's launch state before it
+    //    started: the probe prints what the host seeded.
+    let seeded = format!("LAUNCH {}|workspace|{}|", proj.display(), ws.display());
+    pty.wait_text(&seeded);
+
+    // 2. The tab answers differently and reports ready: the host keeps that
+    //    answer for the next start.
+    pty.send(&ctrl_l());
+    pty.wait_text(&format!("LAUNCH {}|folder|", proj.display()));
+    wait_launch_answer(&state, &key, &folder_answer);
+
+    // 3. Quit and start again: the tab opens with the answer just given.
+    //    The probe prints the seeded state, so a real child would recall it
+    //    before its launch question and never ask.
+    pty.send(&ctrl_q());
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(pty);
+    let mut pty = Pty::spawn(&[OsStr::new("--sessions")], &envs, root.path());
+    pty.wait_text(&format!("LAUNCH {}|folder|", proj.display()));
     pty.send(&ctrl_q());
     assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
 }

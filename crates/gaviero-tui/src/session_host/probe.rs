@@ -12,6 +12,11 @@
 //! `GAVIERO_PROBE_ARGS` names a file that receives its arguments, one per
 //! line; Ctrl+K exits with 255 (a lost connection), Ctrl+O reports the
 //! folder `/srv/my proj` (OSC 7) and Ctrl+Y copies `probe-copy` (OSC 52).
+//!
+//! For the host's launch-answer memory: the probe prints the launch state
+//! the host seeded as one `LAUNCH <lines joined by |>` line at startup, and
+//! Ctrl+L writes `GAVIERO_PROBE_LAUNCH` there and reports OSC 7 (the host
+//! harvests the answer when a child reports ready).
 
 use crossterm::event::{
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -34,6 +39,7 @@ pub(crate) fn run_probe() -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
     crate::platform::enable_vt_mouse_passthrough(&mut stdout)?;
     stdout.write_all(b"\x1b]2;probe-ready\x07")?;
+    show_launch_state(&mut stdout)?;
     stdout.flush()?;
 
     let result = probe_loop(&mut stdout);
@@ -41,6 +47,23 @@ pub(crate) fn run_probe() -> anyhow::Result<()> {
     result?;
     restored?;
     Ok(())
+}
+
+/// The launch state the host seeded, on one line (`|` for a line break).
+fn show_launch_state(stdout: &mut impl Write) -> std::io::Result<()> {
+    let Some(path) = std::env::var_os("GAVIERO_LAUNCH_STATE") else {
+        return Ok(());
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    write!(stdout, "LAUNCH {}\r\n", one_line(&text))
+}
+
+/// `text` as one screen line, so a multi-line launch answer stays readable
+/// in the host's screen and in a test's assertion.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", "|").replace('\n', "|")
 }
 
 fn probe_loop(stdout: &mut std::io::Stdout) -> anyhow::Result<()> {
@@ -75,6 +98,16 @@ fn probe_loop(stdout: &mut std::io::Stdout) -> anyhow::Result<()> {
                 } else if ctrl && k.code == KeyCode::Char('o') {
                     stdout.write_all(b"\x1b]7;file:///srv/my%20proj\x07")?;
                     "STATUS osc7".to_string()
+                } else if ctrl && k.code == KeyCode::Char('l') {
+                    // A launch answer, as `main` writes it when the user
+                    // chose between a workspace and its folder; then report
+                    // ready (OSC 7), which makes the host keep the answer.
+                    let answer = std::env::var("GAVIERO_PROBE_LAUNCH").unwrap_or_default();
+                    if let Some(path) = std::env::var_os("GAVIERO_LAUNCH_STATE") {
+                        std::fs::write(path, &answer)?;
+                    }
+                    stdout.write_all(b"\x1b]7;file:///probe/ready\x07")?;
+                    format!("LAUNCH {}", one_line(&answer))
                 } else if ctrl && k.code == KeyCode::Char('y') {
                     use base64::Engine;
                     let data = base64::engine::general_purpose::STANDARD.encode("probe-copy");
