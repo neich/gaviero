@@ -1698,6 +1698,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
             session::maybe_persist_composer(app);
             super::restart::on_tick(app);
+            super::auto_consolidate::on_tick(app);
             app.poll_session_control();
         }
     }
@@ -2198,7 +2199,8 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     return;
                 }
                 if let Some(ref id) = closing_conv_id {
-                    super::chat_memory::consolidate_conversation(app, id);
+                    let session = super::auto_consolidate::on_close_request(app, id);
+                    super::chat_memory::consolidate_conversation(app, id, session);
                 }
                 app.chat_state.close_conversation();
             } else {

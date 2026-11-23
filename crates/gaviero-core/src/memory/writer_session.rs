@@ -331,8 +331,9 @@ pub(crate) async fn apply_session_consolidate(
 
     if !parsed.session_summary.trim().is_empty() {
         // C1: the consolidator's session-summary blob is the canonical
-        // Summary kind row — semantic merge across similar sessions,
-        // injected as session context when topically relevant.
+        // Summary kind row. Summaries are never injected automatically
+        // (`retrieval::admit_auto_injection`); agents reach them with MCP
+        // `memory_search` kind "summary".
         let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
             .with_importance(0.7)
             .with_type(super::scope::MemoryType::Factual)

@@ -29,6 +29,7 @@ use gaviero_core::workspace::Workspace;
 use gaviero_core::write_gate::{WriteGatePipeline, WriteMode};
 
 mod agent_writes;
+mod auto_consolidate;
 mod chat_memory;
 mod commands;
 mod controller;
@@ -259,6 +260,9 @@ pub struct App {
     /// `gaviero_core::memory::writer`. Populated alongside `memory` once the
     /// store is initialized.
     pub memory_writer: Option<WriterHandle>,
+    /// Automatic session consolidation bookkeeping (idle trigger, tab
+    /// close, manual `/consolidate-session`).
+    auto_consolidate: auto_consolidate::AutoConsolidateState,
     /// Tier B / B2: optional cross-encoder reranker. Populated on
     /// `Event::MemoryReady` only when both `memory.reranker.enabled` is
     /// true and the model file loaded successfully. Retrieval falls
@@ -586,6 +590,7 @@ impl App {
             acp_tasks: HashMap::new(),
             memory: None,
             memory_writer: None,
+            auto_consolidate: Default::default(),
             memory_reranker: None,
             memory_rerank_cfg: None,
             memory_sleeptime_scheduler: None,

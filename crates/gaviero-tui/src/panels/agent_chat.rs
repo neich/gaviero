@@ -2744,7 +2744,7 @@ impl AgentChatState {
                      /remember-module <text>  — Store at module scope (current file's dir)\n\
                      /remember-workspace <text>\n                              — Store at workspace scope\n\
                      /remember-global <text>  — Store at global scope\n\
-                     /consolidate-session     — Run end-of-session consolidator over the active conversation\n\
+                     /consolidate-session     — Run end-of-session consolidator over the active conversation\n                              (also on tab close / idle with memory.session.consolidateOnClose / idleTimeoutSec)\n\
                      /consolidate history [n] — List recent consolidator runs and whether they were rolled back\n\
                      /consolidate rollback <batch_id>\n                              — Undo a consolidator run's memory changes\n\
                      /sleep [--dry-run]       — Trigger the sleeptime maintenance pass\n\

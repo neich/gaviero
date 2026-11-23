@@ -198,6 +198,74 @@ fn resolve_remember_scope(
     }
 }
 
+/// One session-consolidator invocation, gathered on the event loop and
+/// run off it. Shared by `/consolidate-session` and the automatic
+/// triggers (`app/auto_consolidate.rs`, tab close). `run` resolves when
+/// the writer has read the run rows and started the model call
+/// (`WriteResult::Queued`); the operations land later.
+pub(crate) struct SessionConsolidation {
+    writer: gaviero_core::memory::WriterHandle,
+    conv_id: String,
+    repo_id: String,
+    module_path: Option<String>,
+    transcript: String,
+}
+
+impl SessionConsolidation {
+    pub(crate) async fn run(self) -> anyhow::Result<gaviero_core::memory::WriteResult> {
+        self.writer
+            .session_consolidate(
+                self.conv_id.clone(),
+                self.repo_id,
+                self.module_path,
+                self.conv_id,
+                self.transcript,
+            )
+            .await
+    }
+}
+
+/// Build the request for `conv_id`: its whole visible transcript, landing
+/// at `repo_id` / `module_path`. `None` without a memory writer or when the
+/// conversation no longer exists.
+pub(crate) fn session_consolidation_for(
+    app: &App,
+    conv_id: &str,
+    repo_id: String,
+    module_path: Option<String>,
+) -> Option<SessionConsolidation> {
+    let writer = app.memory_writer.clone()?;
+    let idx = app.chat_state.find_conv_idx(conv_id)?;
+    // Concat the conversation's visible turn texts as a coarse transcript.
+    let transcript: String = app.chat_state.conversations[idx]
+        .messages
+        .iter()
+        .map(|m| format!("{:?}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(SessionConsolidation {
+        writer,
+        conv_id: conv_id.to_string(),
+        repo_id,
+        module_path,
+        transcript,
+    })
+}
+
+/// The automatic triggers' request: Repo scope of the primary root (the
+/// same rule as `chat_memory::consolidate_conversation`'s run triage).
+pub(crate) fn auto_session_consolidation(
+    app: &App,
+    conv_id: &str,
+) -> Option<SessionConsolidation> {
+    let root = app
+        .graph_workspace_root
+        .clone()
+        .or_else(|| app.workspace.roots().first().map(|p| p.to_path_buf()))?;
+    let repo_id = gaviero_core::memory::hash_path(&root);
+    session_consolidation_for(app, conv_id, repo_id, None)
+}
+
 /// Tier B / B5: `/consolidate-session` — manual end-of-session
 /// consolidator trigger. Pulls the last N turns of transcript out of
 /// the active conversation, stamps the session's repo + run ids, and
@@ -250,30 +318,35 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
         }
     };
 
-    // Concat the conversation's visible turn texts as a coarse
-    // transcript. Good enough for an explicit /consolidate-session
-    // trigger; the idle-trigger path (Tier B5 follow-up) uses the same
-    // helper.
-    let transcript: String = app
+    // The conversation's visible turn texts are a coarse transcript. Good
+    // enough for an explicit /consolidate-session trigger; the automatic
+    // triggers (`app/auto_consolidate.rs`, tab close) use
+    // `session_consolidation_for` too.
+    drop(writer);
+    let Some(req) = session_consolidation_for(app, &conv_id, repo_id, module_path) else {
+        app.chat_state
+            .add_system_message("Active conversation not found; cannot consolidate.");
+        return;
+    };
+    // Tell the automatic triggers these replies are covered.
+    if let Some(seq) = app
         .chat_state
-        .active_conversation()
-        .messages
+        .conversations
         .iter()
-        .map(|m| format!("{:?}: {}", m.role, m.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .find(|c| c.id == conv_id)
+        .map(super::auto_consolidate::last_assistant_seq)
+    {
+        super::auto_consolidate::mark_consolidated(
+            &mut app.auto_consolidate,
+            &conv_id,
+            seq,
+            std::time::Instant::now(),
+        );
+    }
 
     let tx = app.event_tx.clone();
     tokio::spawn(async move {
-        let res = writer
-            .session_consolidate(
-                conv_id.clone(),
-                repo_id,
-                module_path,
-                conv_id.clone(),
-                transcript,
-            )
-            .await;
+        let res = req.run().await;
         // The model call runs off the writer task, so `Queued` is the
         // honest synchronous answer — the operations land minutes later.
         // `Skipped` used to render as "queued" too, which is how a run

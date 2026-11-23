@@ -3396,6 +3396,24 @@ pub(crate) fn dispatch_prompt_core(
             .await;
             match ended {
                 Ok(Ok(end)) => {
+                    // A clean turn that changed nothing gets its review
+                    // label here: no TURN REVIEW will ever finish for it.
+                    // (A set emptied by sensitive auto-revert counts too.)
+                    if end.set.is_empty()
+                        && !cancelled
+                        && send_error.is_none()
+                        && let Some(writer) = memory_writer.as_ref()
+                    {
+                        use gaviero_core::memory::{OutcomeLabel, OutcomeOrigin, OutcomeReview};
+                        let _ = writer.outcome_label(OutcomeLabel::review(
+                            OutcomeOrigin::Chat,
+                            &conv_id,
+                            &turn_id_clone,
+                            OutcomeReview::NoChanges,
+                            Some(0),
+                            Some(0),
+                        ));
+                    }
                     history.push(
                         &turn_id_clone,
                         gaviero_core::history::HistoryKind::FilesChanged(files_changed_record(
@@ -3454,6 +3472,26 @@ pub(crate) fn dispatch_prompt_core(
             });
         } else {
             tracing::info!("No deferred proposals — skipping AcpTaskCompleted");
+        }
+
+        // How the turn ended, for the memory outcome labels. Write-Gate
+        // fallback turns (no capture) get only this status label.
+        if let Some(writer) = memory_writer.as_ref() {
+            use gaviero_core::memory::{OutcomeLabel, OutcomeOrigin, OutcomeStatus};
+            let status = if cancelled {
+                OutcomeStatus::Cancelled
+            } else if send_error.is_some() {
+                OutcomeStatus::Error
+            } else {
+                OutcomeStatus::Completed
+            };
+            let _ = writer.outcome_label(OutcomeLabel::status(
+                OutcomeOrigin::Chat,
+                &conv_id_clone,
+                &turn_id_clone,
+                status,
+                send_error.clone(),
+            ));
         }
 
         // Ends *this* turn by id: the conversation may already have started

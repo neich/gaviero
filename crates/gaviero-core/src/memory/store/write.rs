@@ -508,6 +508,12 @@ impl MemoryStore {
         // only against same-kind rows so a record's hash does not
         // collide with a history row carrying the same body.
         let skip_dedup = meta.kind == crate::memory::kind::MemoryKind::History;
+        // Provenance (v19): serialised before the lock.
+        let refs_json: Option<String> = if meta.refs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&meta.refs).context("serialising refs")?)
+        };
 
         // Compute embedding outside the lock
         let embedding = self
@@ -617,8 +623,9 @@ impl MemoryStore {
                 namespace, key, content, embedding, model_id,
                 scope_level, scope_path, repo_id, module_path, run_id,
                 content_hash, memory_type, trust, tag,
-                importance, privacy, source, trust_score, memory_kind
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'public', ?16, ?17, ?18)",
+                importance, privacy, source, trust_score, memory_kind,
+                refs_json, source_turn
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'public', ?16, ?17, ?18, ?19, ?20)",
             rusqlite::params![
                 namespace,
                 key,
@@ -641,6 +648,8 @@ impl MemoryStore {
                 meta.source_kind.as_str(),
                 meta.trust_score,
                 meta.kind.as_str(),
+                refs_json.as_deref(),
+                meta.source_turn.as_deref(),
             ],
         )
         .context("inserting scoped memory")?;

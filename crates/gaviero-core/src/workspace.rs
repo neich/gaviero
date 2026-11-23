@@ -259,7 +259,11 @@ pub mod settings {
     pub const MEMORY_RETRIEVAL_MAX_MERGED_POOL: &str = "memory.retrieval.maxMergedPool";
 
     // Tier B / B5 — session consolidator + sleeptime
+    /// Run the session consolidator when a chat tab closes (TUI; opt-in;
+    /// costs one LLM call).
     pub const MEMORY_SESSION_CONSOLIDATE_ON_CLOSE: &str = "memory.session.consolidateOnClose";
+    /// Seconds without a new assistant reply before the TUI runs the
+    /// session consolidator on that conversation; 0 = off.
     pub const MEMORY_SESSION_IDLE_TIMEOUT_SEC: &str = "memory.session.idleTimeoutSec";
     pub const MEMORY_SLEEPTIME_ENABLED: &str = "memory.sleeptime.enabled";
     pub const MEMORY_SLEEPTIME_MIN_IDLE_MINUTES: &str = "memory.sleeptime.minIdleMinutes";
@@ -1851,8 +1855,8 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::NOTIFICATIONS_AGENT_WAITING_STATUS_BAR => serde_json::json!(true),
 
         // Tier B / B5 — session consolidator + sleeptime
-        settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),
-        settings::MEMORY_SESSION_IDLE_TIMEOUT_SEC => serde_json::json!(90),
+        settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(false),
+        settings::MEMORY_SESSION_IDLE_TIMEOUT_SEC => serde_json::json!(0),
         settings::MEMORY_SLEEPTIME_ENABLED => serde_json::json!(true),
         settings::MEMORY_SLEEPTIME_MIN_IDLE_MINUTES => serde_json::json!(10),
         settings::MEMORY_SLEEPTIME_WEEKLY_FORCE_RUN => serde_json::json!(true),

@@ -610,6 +610,7 @@ fn finish(app: &mut App) {
     app.turn_review_view = TurnReviewView::default();
 
     record_history(app, &reviewed);
+    record_outcome(app, &reviewed);
     let resolved = report(app, &reviewed);
     // Writing the archive and collecting unreferenced blobs walks the whole
     // store: never on the event loop.
@@ -654,6 +655,41 @@ fn record_history(app: &App, reviewed: &ReviewedTurn) {
         &reviewed.set.turn_id,
         HistoryKind::TurnReview(TurnReview { decisions }),
     );
+}
+
+/// `(kept, reverted)` file counts for the turn's outcome label. Counts the
+/// user's intent: `Failed` is a revert that could not be applied and
+/// `RevertedHunks` a partial revert; both mean the user rejected the
+/// change. `finish` itself only produces `Kept` / `Reverted` today.
+fn review_counts(resolved: &std::collections::BTreeMap<String, ResolvedDecision>) -> (u32, u32) {
+    let mut kept = 0;
+    let mut reverted = 0;
+    for decision in resolved.values() {
+        match decision {
+            ResolvedDecision::Kept => kept += 1,
+            ResolvedDecision::Reverted
+            | ResolvedDecision::RevertedHunks(_)
+            | ResolvedDecision::Failed(_) => reverted += 1,
+        }
+    }
+    (kept, reverted)
+}
+
+/// Label the turn's outcome in memory (`turn_outcomes`) from its review.
+fn record_outcome(app: &App, reviewed: &ReviewedTurn) {
+    use gaviero_core::memory::{OutcomeLabel, OutcomeOrigin, OutcomeReview};
+    let (Some(writer), Some(conv)) = (&app.memory_writer, reviewed.set.conv_id.as_deref()) else {
+        return;
+    };
+    let (kept, reverted) = review_counts(&reviewed.resolved);
+    let _ = writer.outcome_label(OutcomeLabel::review(
+        OutcomeOrigin::Chat,
+        conv,
+        &reviewed.set.turn_id,
+        OutcomeReview::from_counts(kept, reverted),
+        Some(kept),
+        Some(reverted),
+    ));
 }
 
 fn report(app: &mut App, reviewed: &ReviewedTurn) -> gaviero_remote::envelope::TurnReviewResolved {
@@ -766,6 +802,17 @@ pub(super) fn undo_reviewed_turn(app: &mut App, turn_id: &str) -> String {
                 source: "turn undo",
             },
         );
+        if let (Some(writer), Some(conv)) = (&app.memory_writer, reviewed.set.conv_id.as_deref()) {
+            use gaviero_core::memory::{OutcomeLabel, OutcomeOrigin, OutcomeReview};
+            let _ = writer.outcome_label(OutcomeLabel::review(
+                OutcomeOrigin::Chat,
+                conv,
+                &reviewed.set.turn_id,
+                OutcomeReview::Undone,
+                None,
+                None,
+            ));
+        }
     }
     let mut msg = format!("Undid turn: {} file(s) restored", restored.len());
     if !skipped.is_empty() {
@@ -1279,6 +1326,16 @@ pub(super) fn click_row(app: &mut App, relative_row: usize) -> Option<(usize, bo
 mod tests {
     use super::*;
     use gaviero_core::turn_capture::CaptureScope;
+
+    #[test]
+    fn review_counts_classifies_decisions() {
+        let mut resolved = std::collections::BTreeMap::new();
+        resolved.insert("a".to_string(), ResolvedDecision::Kept);
+        resolved.insert("b".to_string(), ResolvedDecision::Reverted);
+        resolved.insert("c".to_string(), ResolvedDecision::RevertedHunks(2));
+        resolved.insert("d".to_string(), ResolvedDecision::Failed("x".into()));
+        assert_eq!(review_counts(&resolved), (1, 3));
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,

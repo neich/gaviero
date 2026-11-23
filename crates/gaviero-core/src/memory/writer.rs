@@ -176,6 +176,11 @@ pub enum WriterMessage {
         session_id: String,
         payload: JsonValue,
     },
+    /// Record how a turn ended. Fire-and-forget; persisted to
+    /// `turn_outcomes` in the workspace store.
+    OutcomeLabel {
+        label: crate::memory::outcome::OutcomeLabel,
+    },
     /// Sleeptime consolidation / pruning job (Tier B5). `payload` is
     /// retained for forward-compat with bespoke configs the CLI may
     /// send; defaults are resolved from settings inside the writer
@@ -345,6 +350,7 @@ impl WriterMessage {
             WriterMessage::DeleteRun { .. } => "DeleteRun",
             WriterMessage::PanelEdit { .. } => "PanelEdit",
             WriterMessage::InjectionManifest { .. } => "InjectionManifest",
+            WriterMessage::OutcomeLabel { .. } => "OutcomeLabel",
             WriterMessage::Sleeptime { .. } => "Sleeptime",
             WriterMessage::SessionConsolidate { .. } => "SessionConsolidate",
             WriterMessage::SessionConsolidateApply { .. } => "SessionConsolidateApply",
@@ -827,6 +833,12 @@ impl WriterHandle {
         })
     }
 
+    /// Record how a chat turn or swarm unit ended (`turn_outcomes`).
+    /// Fire-and-forget; never blocks the caller.
+    pub fn outcome_label(&self, label: crate::memory::outcome::OutcomeLabel) -> Result<()> {
+        self.enqueue(WriterMessage::OutcomeLabel { label })
+    }
+
     /// Current in-flight queue depth (enqueued minus drained). Exposed for
     /// Phase 2–4 load monitoring.
     pub fn queue_depth(&self) -> u64 {
@@ -1122,6 +1134,16 @@ async fn process_message(
                 .await
                 .map_err(|e| anyhow!("persist injection_manifests: {e}"))?;
             Ok(WriteResult::Inserted(id))
+        }
+        WriterMessage::OutcomeLabel { label } => {
+            // Outcome labels live in the workspace store next to the
+            // History rows they are keyed to.
+            stores
+                .workspace()
+                .upsert_outcome_label(&label)
+                .await
+                .map_err(|e| anyhow!("persist turn_outcomes: {e}"))?;
+            Ok(WriteResult::Skipped)
         }
         WriterMessage::Sleeptime { payload } => {
             let cfg = parse_sleeptime_payload(&payload);
@@ -1612,13 +1634,16 @@ async fn process_turn_complete(
             "history row persisted"
         );
     }
+    // Provenance (v19): every row derived from this turn points back at
+    // its History row by tag — only when that row exists.
+    let source_turn = history_id.map(|_| history_tag(&session_id, &turn_id));
 
     // ── A1: persist session-ledger row + annotated flags ─────────────
     //
     // `annotations` is `Some(serde_json::Value)` when the chat path
     // parsed a `<turn_annotations>` block. The writer task:
     //   1. persists `session_thread` + `open_questions` to
-    //      `session_ledger_turns` (for B5 consolidation + A4 panel),
+    //      `session_ledger_turns` (audit only; read by `session_ledger_for`),
     //   2. inserts each flag as an `LlmAnnotated` memory through
     //      `store_scoped` (SHA-256 + cosine dedup lives inside the
     //      store, so same-content-at-broader-scope is still a no-op).
@@ -1667,7 +1692,10 @@ async fn process_turn_complete(
                         module_path.as_deref(),
                         &run_id,
                     );
-                    let meta = super::extractor::build_annotated_write_meta(&ext_shape);
+                    let mut meta = super::extractor::build_annotated_write_meta(&ext_shape);
+                    if let Some(t) = &source_turn {
+                        meta = meta.with_source_turn(t.clone());
+                    }
                     match stores.store_scoped(&scope, &f.text, &meta).await {
                         Ok(super::scope::StoreResult::Inserted(id)) => {
                             annotated_ids.push(id);
@@ -1718,7 +1746,14 @@ async fn process_turn_complete(
                     error = %e,
                     "extractor failed — writing Run-scope fallback"
                 );
-                return fallback_raw_turn(stores.workspace(), &repo_id, &run_id, &transcript).await;
+                return fallback_raw_turn(
+                    stores.workspace(),
+                    &repo_id,
+                    &run_id,
+                    &transcript,
+                    source_turn.clone(),
+                )
+                .await;
             }
         },
         None => {
@@ -1727,7 +1762,14 @@ async fn process_turn_complete(
                 turn_id = %turn_id,
                 "no ConsolidationLlm configured — writing Run-scope fallback"
             );
-            return fallback_raw_turn(stores.workspace(), &repo_id, &run_id, &transcript).await;
+            return fallback_raw_turn(
+                stores.workspace(),
+                &repo_id,
+                &run_id,
+                &transcript,
+                source_turn.clone(),
+            )
+            .await;
         }
     };
 
@@ -1746,7 +1788,10 @@ async fn process_turn_complete(
     for ext in extractions {
         let scope =
             extractor::resolve_scope(&ext.scope_hint, &repo_id, module_path.as_deref(), &run_id);
-        let meta = extractor::build_write_meta(&ext, extractor::PROMPT_VERSION);
+        let mut meta = extractor::build_write_meta(&ext, extractor::PROMPT_VERSION);
+        if let Some(t) = &source_turn {
+            meta = meta.with_source_turn(t.clone());
+        }
         match stores.store_scoped(&scope, &ext.text, &meta).await {
             Ok(res) => {
                 if matches!(res, super::scope::StoreResult::Inserted(_)) {
@@ -1775,6 +1820,12 @@ async fn process_turn_complete(
     );
 
     Ok(last_result)
+}
+
+/// The History tag of one turn: `history:{session_id}:{turn_id}`. Derived
+/// rows store it as `source_turn`; outcome labels are keyed the same way.
+pub(crate) fn history_tag(session_id: &str, turn_id: &str) -> String {
+    format!("history:{session_id}:{turn_id}")
 }
 
 /// C1: write a `kind = history` row carrying the verbatim transcript
@@ -1809,7 +1860,7 @@ async fn write_history_row(
         .with_kind(MemoryKind::History)
         .with_type(MemoryType::Factual)
         .with_importance(1.0)
-        .with_tag(format!("history:{session_id}:{turn_id}"));
+        .with_tag(history_tag(session_id, turn_id));
 
     let res = store
         .store_scoped(&scope, transcript, &meta)
@@ -1834,6 +1885,7 @@ async fn fallback_raw_turn(
     repo_id: &str,
     run_id: &str,
     transcript: &str,
+    source_turn: Option<String>,
 ) -> Result<WriteResult> {
     use super::scope::{MemoryType, WriteMeta, WriteScope};
     use super::trust_defaults::MemorySource;
@@ -1848,6 +1900,10 @@ async fn fallback_raw_turn(
         .with_type(MemoryType::Factual)
         .with_importance(0.4)
         .with_tag("turn_fallback");
+    let meta = match source_turn {
+        Some(t) => meta.with_source_turn(t),
+        None => meta,
+    };
     let trimmed = truncate_transcript(transcript, 2000);
     let res = store
         .store_scoped(&scope, &trimmed, &meta)
@@ -2039,6 +2095,59 @@ mod tests {
             annotations: None,
         };
         assert_eq!(m.kind(), "TurnComplete");
+        let m = WriterMessage::OutcomeLabel {
+            label: crate::memory::outcome::OutcomeLabel::status(
+                crate::memory::outcome::OutcomeOrigin::Chat,
+                "s",
+                "t",
+                crate::memory::outcome::OutcomeStatus::Completed,
+                None,
+            ),
+        };
+        assert_eq!(m.kind(), "OutcomeLabel");
+    }
+
+    #[tokio::test]
+    async fn outcome_label_message_upserts() {
+        use crate::memory::outcome::{OutcomeLabel, OutcomeOrigin, OutcomeReview, OutcomeStatus};
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store.clone()),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        handle
+            .outcome_label(OutcomeLabel::status(
+                OutcomeOrigin::Chat,
+                "conv-o",
+                "t-o",
+                OutcomeStatus::Completed,
+                None,
+            ))
+            .unwrap();
+        handle
+            .outcome_label(OutcomeLabel::review(
+                OutcomeOrigin::Chat,
+                "conv-o",
+                "t-o",
+                OutcomeReview::Reverted,
+                Some(0),
+                Some(2),
+            ))
+            .unwrap();
+        handle.flush().await.unwrap();
+
+        let row = store
+            .outcome_label("conv-o", "t-o")
+            .await
+            .unwrap()
+            .expect("outcome row");
+        assert_eq!(row.status.as_deref(), Some("completed"));
+        assert_eq!(row.review.as_deref(), Some("reverted"));
+        assert_eq!(row.files_reverted, Some(2));
     }
 
     #[tokio::test]
@@ -2269,6 +2378,51 @@ mod tests {
         // get_memory_kind matches.
         let by_id = store.get_memory_kind(id).await.unwrap();
         assert_eq!(by_id, Some(super::super::kind::MemoryKind::History));
+    }
+
+    /// Provenance (v19): an annotated flag keeps its `refs` and points
+    /// back at the turn's History row through `source_turn`.
+    #[tokio::test]
+    async fn turn_complete_persists_refs_and_source_turn() {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store.clone()),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        handle
+            .turn_complete(
+                "conv-p",
+                "t-p",
+                "repo-p",
+                None,
+                "conv-p",
+                "USER: q\nASSISTANT: a",
+                Some(serde_json::json!({
+                    "v": 1,
+                    "flags": [{
+                        "type": "decision",
+                        "importance": 0.8,
+                        "scope": "repo",
+                        "text": "provenance probe: cache keys are sha256",
+                        "refs": ["src/a.rs:L1", "src/b.rs:L2"]
+                    }]
+                })),
+            )
+            .unwrap();
+        handle.flush().await.unwrap();
+
+        let (id, _, _) = store
+            .find_memory_by_tag("llm_annotated:decision")
+            .await
+            .unwrap()
+            .expect("annotated flag row");
+        let row = store.get_memory_row(id).await.unwrap().expect("row");
+        assert_eq!(row.refs, ["src/a.rs:L1", "src/b.rs:L2"]);
+        assert_eq!(row.source_turn.as_deref(), Some("history:conv-p:t-p"));
     }
 
     /// C1.2: PanelEdit operations refuse to mutate history rows. The
