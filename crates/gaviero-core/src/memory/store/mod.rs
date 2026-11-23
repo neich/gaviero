@@ -9,6 +9,7 @@ pub mod compression_ops;
 pub mod consolidation_ops;
 pub mod deletions_ops;
 pub mod manifest;
+pub mod outcome_ops;
 pub mod panel_ops;
 pub mod search;
 pub mod search_legacy;
@@ -18,6 +19,7 @@ pub mod write;
 
 pub use deletions_ops::{BulkForgetReport, ForgetFilter, RestoreOutcome};
 pub use manifest::InjectionManifestRow;
+pub use outcome_ops::OutcomeLabelRow;
 pub use panel_ops::MemoryRow;
 pub use telemetry_ops::{MemoryUtilization, RETRIEVAL_USE_LEGACY, RETRIEVAL_USE_ROUTED};
 
@@ -533,8 +535,8 @@ impl MemoryStore {
     /// Persist a session-ledger row for a chat turn's annotations.
     ///
     /// Called by the writer task after parsing a `<turn_annotations>`
-    /// block. `session_thread` and `open_questions` are surfaced in the
-    /// TUI panel (A4) and fed to Tier B5 session consolidation.
+    /// block. `session_thread` and `open_questions` are kept for audit;
+    /// only `session_ledger_for` reads them.
     pub async fn store_session_ledger_turn(
         &self,
         session_id: &str,
@@ -688,6 +690,9 @@ impl MemoryStore {
     }
 
     /// Query all memories for a given run (for consolidation).
+    ///
+    /// History rows are excluded: they are append-only provenance and must
+    /// never be promoted (mirrors `delete_by_run`).
     pub async fn query_by_run(&self, run_id: &str) -> Result<Vec<ScoredMemory>> {
         let conn = self.conn.lock().await;
 
@@ -695,8 +700,8 @@ impl MemoryStore {
             "SELECT id, content, content_hash, scope_level, scope_path,
                     repo_id, module_path, memory_type, trust, importance,
                     access_count, created_at, updated_at, last_accessed_at,
-                    tag, namespace, key, source, trust_score
-             FROM memories WHERE run_id = ?1",
+                    tag, namespace, key, source, trust_score, memory_kind
+             FROM memories WHERE run_id = ?1 AND memory_kind != 'history'",
         )?;
 
         let results: Vec<ScoredMemory> = stmt
@@ -728,6 +733,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: super::trust_defaults::MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,
@@ -752,7 +761,7 @@ impl MemoryStore {
             "SELECT m.id, m.content, m.content_hash, m.scope_level, m.scope_path,
                     m.repo_id, m.module_path, m.memory_type, m.trust, m.importance,
                     m.access_count, m.created_at, m.updated_at, m.last_accessed_at,
-                    m.tag, m.namespace, m.key, m.source, m.trust_score,
+                    m.tag, m.namespace, m.key, m.source, m.trust_score, m.memory_kind,
                     COUNT(DISTINCT a.module_path) as cross_module_hits
              FROM memories m
              JOIN memory_access_log a ON a.memory_id = m.id
@@ -788,6 +797,10 @@ impl MemoryStore {
                     key: row.get(16)?,
                     source: super::trust_defaults::MemorySource::parse_str(&source_str),
                     trust_score,
+                    kind: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .unwrap_or(crate::memory::kind::MemoryKind::Record),
                     raw_similarity: 0.0,
                     fts_rank: None,
                     final_score: 0.0,
@@ -3244,5 +3257,162 @@ mod tests {
         );
         assert!(!backup.ends_with(".db"));
         assert!(backup.contains(".bak."));
+    }
+
+    fn inserted_id(result: StoreResult) -> i64 {
+        match result {
+            StoreResult::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+    }
+
+    /// Step 9 of sleeptime removes only `llm_consolidated` records that
+    /// carry a `history:` tag — the copies pre-fix run triage leaked.
+    #[tokio::test]
+    async fn sleeptime_removes_history_leaks_only() {
+        use crate::memory::kind::MemoryKind;
+
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let run_scope = WriteScope::Run {
+            repo_id: "r".into(),
+            run_id: "s".into(),
+        };
+        let repo_scope = WriteScope::Repo {
+            repo_id: "r".into(),
+        };
+
+        let history_id = inserted_id(
+            store
+                .store_scoped(
+                    &run_scope,
+                    "USER: x\nASSISTANT: y",
+                    &WriteMeta::for_source(MemorySource::RawTranscript)
+                        .with_kind(MemoryKind::History)
+                        .with_tag("history:s:t"),
+                )
+                .await
+                .unwrap(),
+        );
+        let leak_id = inserted_id(
+            store
+                .store_scoped(
+                    &repo_scope,
+                    "USER: x\nASSISTANT: y",
+                    &WriteMeta::for_source(MemorySource::LlmConsolidated).with_tag("history:s:t"),
+                )
+                .await
+                .unwrap(),
+        );
+        let normal_id = inserted_id(
+            store
+                .store_scoped(
+                    &repo_scope,
+                    "normal finding",
+                    &WriteMeta::for_source(MemorySource::LlmExtracted)
+                        .with_tag("llm_extracted:decision:s3.v1"),
+                )
+                .await
+                .unwrap(),
+        );
+        let user_id = inserted_id(
+            store
+                .store_scoped(
+                    &repo_scope,
+                    "user note",
+                    &WriteMeta::user_remember().with_tag("history:s:u"),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(store.sleeptime_remove_history_leaks(true).await.unwrap(), 1);
+        assert_eq!(
+            store.get_memory_kind(leak_id).await.unwrap(),
+            Some(MemoryKind::Record),
+            "dry run deletes nothing"
+        );
+
+        assert_eq!(store.sleeptime_remove_history_leaks(false).await.unwrap(), 1);
+        assert_eq!(store.get_memory_kind(leak_id).await.unwrap(), None);
+        assert_eq!(
+            store.get_memory_kind(history_id).await.unwrap(),
+            Some(MemoryKind::History)
+        );
+        assert_eq!(
+            store.get_memory_kind(normal_id).await.unwrap(),
+            Some(MemoryKind::Record)
+        );
+        assert_eq!(
+            store.get_memory_kind(user_id).await.unwrap(),
+            Some(MemoryKind::Record)
+        );
+    }
+
+    fn provenance_probe_meta() -> WriteMeta {
+        WriteMeta::for_source(MemorySource::LlmAnnotated)
+            .with_tag("prov-probe")
+            .with_refs(vec!["src/x.rs:L9".into()])
+            .with_source_turn("history:s:t")
+    }
+
+    fn expected_provenance() -> (Option<String>, Vec<String>) {
+        (Some("history:s:t".into()), vec!["src/x.rs:L9".to_string()])
+    }
+
+    #[tokio::test]
+    async fn soft_delete_restore_keeps_provenance() {
+        use crate::memory::deletions::DeletedBy;
+
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo {
+            repo_id: "r".into(),
+        };
+        let id = inserted_id(
+            store
+                .store_scoped(&scope, "provenance probe", &provenance_probe_meta())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(store.provenance_for(id).await.unwrap(), expected_provenance());
+
+        let deletion_id = store
+            .soft_delete_memory(id, DeletedBy::UserCommand, None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.get_memory_kind(id).await.unwrap(), None);
+        store.restore_deletion(deletion_id).await.unwrap();
+
+        let (new_id, _, _) = store
+            .find_memory_by_tag("prov-probe")
+            .await
+            .unwrap()
+            .expect("restored row");
+        assert_eq!(
+            store.provenance_for(new_id).await.unwrap(),
+            expected_provenance()
+        );
+    }
+
+    #[tokio::test]
+    async fn change_scope_keeps_provenance() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo {
+            repo_id: "r".into(),
+        };
+        let id = inserted_id(
+            store
+                .store_scoped(&scope, "provenance probe", &provenance_probe_meta())
+                .await
+                .unwrap(),
+        );
+        let new_id = store
+            .change_memory_scope(id, &WriteScope::Workspace)
+            .await
+            .unwrap();
+        assert_ne!(new_id, id);
+        assert_eq!(
+            store.provenance_for(new_id).await.unwrap(),
+            expected_provenance()
+        );
     }
 }

@@ -110,6 +110,13 @@ impl ChatInjectionConfig {
     }
 }
 
+/// Automatic injection (chat first turn and `/inject`, planner, swarm
+/// bundle) admits only `Record` rows. History is audit data; Summaries are
+/// archive-only and reachable through MCP `memory_search` kind "summary".
+pub fn admit_auto_injection(m: &ScoredMemory) -> bool {
+    m.kind.injects_into_chat_by_default()
+}
+
 /// Constitution admission (D1). Used by chat injection and the swarm bundle.
 pub fn admit_constitution(m: &ScoredMemory, cfg: &ChatInjectionConfig) -> bool {
     if !cfg.constitution_only {
@@ -540,6 +547,10 @@ pub async fn retrieve_for_chat_with_reranker(
     let mut kept: Vec<ScoredMemory> = Vec::with_capacity(ranked.len());
     let mut filter_reasons: HashMap<i64, &'static str> = HashMap::new();
     for m in ranked {
+        if !admit_auto_injection(&m) {
+            filter_reasons.insert(m.id, "kind_filter");
+            continue;
+        }
         if !config.scopes.admits(m.scope_level) {
             filter_reasons.insert(m.id, "scope_filter");
             continue;
@@ -740,10 +751,24 @@ mod tests {
             key: format!("k{id}"),
             source,
             trust_score: 0.8,
+            kind: crate::memory::MemoryKind::Record,
             raw_similarity: 0.9,
             fts_rank: None,
             final_score: 0.9,
         }
+    }
+
+    #[test]
+    fn admit_auto_injection_admits_only_records() {
+        let mut record = scored(1, MemoryType::Decision, MemorySource::LlmAnnotated, "r");
+        record.kind = crate::memory::MemoryKind::Record;
+        let mut history = scored(2, MemoryType::Decision, MemorySource::RawTranscript, "h");
+        history.kind = crate::memory::MemoryKind::History;
+        let mut summary = scored(3, MemoryType::Decision, MemorySource::LlmConsolidated, "s");
+        summary.kind = crate::memory::MemoryKind::Summary;
+        assert!(admit_auto_injection(&record));
+        assert!(!admit_auto_injection(&history));
+        assert!(!admit_auto_injection(&summary));
     }
 
     #[test]
@@ -880,5 +905,63 @@ mod tests {
             "kill switch false keeps extracted factual"
         );
         assert!(!open.block.contains(CONSTITUTION_ARCHIVE_HINT.trim_end()));
+    }
+
+    /// Summaries are archive-only: even a Decision-typed Summary (which
+    /// the constitution filter would admit) never reaches chat injection.
+    #[tokio::test]
+    async fn retrieve_for_chat_excludes_summary_rows() {
+        use crate::memory::{MemoryServices, WriteMeta, WriteScope, hash_path};
+
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::Path::new("/tmp/ws-summary");
+        let repo_id = hash_path(root);
+        let scope = WriteScope::Repo {
+            repo_id: repo_id.clone(),
+        };
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "we decided caching uses lru",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "session summary: caching discussion decided lru eviction",
+                &WriteMeta::for_source(MemorySource::LlmConsolidated)
+                    .with_type(MemoryType::Decision)
+                    .with_kind(crate::memory::MemoryKind::Summary),
+            )
+            .await
+            .unwrap();
+
+        let memory_scope = crate::memory::MemoryScope::from_context(root, Some(root), None, None);
+        let cfg = ChatInjectionConfig {
+            min_similarity: 0.0,
+            ..ChatInjectionConfig::default()
+        };
+        let injection = retrieve_for_chat(&services.stores, &memory_scope, "caching", &cfg)
+            .await
+            .unwrap()
+            .expect("enabled retrieval returns Some");
+        assert!(
+            injection
+                .items
+                .iter()
+                .any(|m| m.content == "we decided caching uses lru"),
+            "the Decision record must be injected"
+        );
+        assert!(
+            injection
+                .items
+                .iter()
+                .all(|m| !m.content.starts_with("session summary")),
+            "Summary rows must never be injected automatically"
+        );
     }
 }

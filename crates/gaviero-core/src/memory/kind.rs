@@ -8,7 +8,7 @@
 //!
 //! Defaults across the system:
 //! - SQL column default: `'record'` (legacy rows migrate to record).
-//! - Retrieval / chat-injection default: record only.
+//! - Automatic injection: record only (`retrieval::admit_auto_injection`).
 //! - MCP `memory_search`: kind="record" by default, with explicit
 //!   "history" | "summary" | "any" allowed.
 
@@ -48,9 +48,9 @@ impl MemoryKind {
         matches!(self, MemoryKind::History)
     }
 
-    /// True for kinds eligible for the chat-auto-inject path by default.
-    /// History is audit data, never injected. Summaries inject only when
-    /// a session_thread topic matches (handled by retrieval, not here).
+    /// True for the kinds automatic injection (chat, planner, swarm bundle)
+    /// may use; enforced by `retrieval::admit_auto_injection`. History is
+    /// audit data; Summaries are archive-only (MCP `memory_search` kind "summary").
     pub fn injects_into_chat_by_default(self) -> bool {
         matches!(self, MemoryKind::Record)
     }

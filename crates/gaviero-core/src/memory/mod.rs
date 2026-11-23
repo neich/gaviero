@@ -10,6 +10,8 @@ pub mod kind;
 pub mod model_manager;
 pub mod observer;
 pub mod onnx_embedder;
+pub mod outcome;
+pub mod patterns;
 pub mod reembed_migration;
 pub mod reranker;
 pub mod retrieval;
@@ -35,6 +37,7 @@ pub use consolidation_llm::{BackendConsolidationLlm, ConsolidationLlm, NoopConso
 pub use deletions::DeletedBy;
 pub use embedder::{DualEmbedder, Embedder, EmbeddingPurpose, NullEmbedder};
 pub use kind::MemoryKind;
+pub use outcome::{OutcomeLabel, OutcomeOrigin, OutcomeReview, OutcomeStatus};
 pub use model_manager::ModelManager;
 pub use observer::MemoryObserver;
 pub use reranker::{
@@ -43,8 +46,8 @@ pub use reranker::{
 };
 pub use retrieval::{
     CONSTITUTION_ARCHIVE_HINT, CandidatePoolEntry, ChatInjection, ChatInjectionConfig,
-    RetrievalConfig, RetrievalMode, RetrievalOutput, ScopeMix, admit_constitution,
-    retrieve_for_chat, retrieve_for_chat_with_reranker, retrieve_ranked,
+    RetrievalConfig, RetrievalMode, RetrievalOutput, ScopeMix, admit_auto_injection,
+    admit_constitution, retrieve_for_chat, retrieve_for_chat_with_reranker, retrieve_ranked,
     retrieve_ranked_with_levels,
 };
 pub use scope::{

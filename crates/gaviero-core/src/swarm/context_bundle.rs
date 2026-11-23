@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::context_planner::types::MemoryCandidate;
 use crate::memory::{
     CONSTITUTION_ARCHIVE_HINT, ChatInjectionConfig, MemoryScope, MemoryStores, RetrievalConfig,
-    admit_constitution, retrieve_ranked,
+    admit_auto_injection, admit_constitution, retrieve_ranked,
 };
 use crate::repo_map::store::ImpactSummary;
 
@@ -120,7 +120,7 @@ pub async fn build_bundle(
                 Ok(out) => out
                     .items
                     .iter()
-                    .filter(|m| admit_constitution(m, injection))
+                    .filter(|m| admit_auto_injection(m) && admit_constitution(m, injection))
                     .take(memory_limit)
                     .map(MemoryCandidate::from_scored)
                     .collect(),

@@ -420,6 +420,12 @@ pub struct MemoryGetRow {
     pub access_count: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accessed_at: Option<String>,
+    /// Write origin, e.g. `llm_annotated`.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn: Option<String>,
 }
 
 /// `memory` is `None` on an id/scope miss — a miss is an empty result,

@@ -45,8 +45,14 @@ pub(crate) fn build_turn_transcript(
 ///
 /// Mirrors the post-swarm consolidation pass: promotes durable turns up-scope
 /// and deletes the conversation's run-scope rows (unpromoted rows are
-/// discarded). Fires when a conversation is closed.
-pub(crate) fn consolidate_conversation(app: &App, conv_id: &str) {
+/// discarded). Fires when a conversation is closed. `session` is the
+/// opt-in session-consolidator request (`memory.session.consolidateOnClose`),
+/// run first so it reads the run rows before triage deletes them.
+pub(crate) fn consolidate_conversation(
+    app: &App,
+    conv_id: &str,
+    session: Option<super::commands::SessionConsolidation>,
+) {
     let Some(ref memory) = app.memory else {
         return;
     };
@@ -71,6 +77,15 @@ pub(crate) fn consolidate_conversation(app: &App, conv_id: &str) {
     );
 
     tokio::spawn(async move {
+        // The ack (`Queued`) arrives after the session consolidator's prep
+        // has read the run rows; its later apply works on content
+        // snapshots, so the triage below may delete them.
+        if let Some(s) = session {
+            match s.run().await {
+                Ok(r) => tracing::info!("session consolidation on close: {r:?}"),
+                Err(e) => tracing::warn!("session consolidation on close failed: {e}"),
+            }
+        }
         let consolidator = Consolidator::with_stores_and_writer(mem.clone(), writer);
         match consolidator.consolidate_run(&run_id, &repo_id).await {
             Ok(report) => {

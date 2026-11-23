@@ -120,6 +120,9 @@ pub struct SleeptimeReport {
     /// C2.5: number of stale Summary rows routed through the audit
     /// table this pass (`deleted_by = sleeptime_prune`).
     pub summaries_pruned: usize,
+    /// Records that were copies of History transcripts, soft-deleted
+    /// this pass (dry-run: would be).
+    pub history_leaks_removed: usize,
 }
 
 /// Per-operation observer. Implementations forward to the TUI panel
@@ -479,6 +482,19 @@ pub async fn run_sleeptime(
                 );
             }
         }
+    }
+
+    // Step 9 — remove History copies leaked by pre-fix run triage
+    // (`query_by_run` used to return History rows, so `consolidate_run`
+    // promoted transcripts into records). No config flag: the rows are
+    // unambiguous (`history_leak_ids`) and restorable.
+    match store.sleeptime_remove_history_leaks(cfg.dry_run).await {
+        Ok(n) => report.history_leaks_removed = n,
+        Err(e) => tracing::warn!(
+            target: "memory_sleeptime",
+            error = %e,
+            "history-leak cleanup failed"
+        ),
     }
 
     if let Some(o) = observer {

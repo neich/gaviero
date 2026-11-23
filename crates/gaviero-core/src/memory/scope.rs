@@ -608,6 +608,11 @@ pub enum StoreResult {
 
 use super::trust_defaults::{MemorySource, clamp_trust};
 
+/// Provenance: at most this many `refs` are kept per memory.
+pub const MAX_REFS: usize = 8;
+/// Provenance: each ref is cut to this many chars.
+pub const MAX_REF_CHARS: usize = 200;
+
 /// Metadata for a scoped memory write.
 ///
 /// Tier A3 added `source_kind: MemorySource` (typed write origin) and
@@ -635,6 +640,11 @@ pub struct WriteMeta {
     /// summaries (`process_session_consolidate`) override via
     /// [`WriteMeta::with_kind`].
     pub kind: super::kind::MemoryKind,
+    /// Provenance: file/line refs cited by the producing flag or
+    /// extraction (sanitised, ≤ MAX_REFS).
+    pub refs: Vec<String>,
+    /// Provenance: History tag of the originating turn.
+    pub source_turn: Option<String>,
 }
 
 impl Default for WriteMeta {
@@ -648,6 +658,8 @@ impl Default for WriteMeta {
             source_kind: MemorySource::UnknownLegacy,
             trust_score: MemorySource::UnknownLegacy.default_trust(),
             kind: super::kind::MemoryKind::Record,
+            refs: Vec::new(),
+            source_turn: None,
         }
     }
 }
@@ -675,6 +687,8 @@ impl WriteMeta {
             source_kind,
             trust_score,
             kind: super::kind::MemoryKind::Record,
+            refs: Vec::new(),
+            source_turn: None,
         }
     }
 
@@ -710,6 +724,43 @@ impl WriteMeta {
         self
     }
 
+    /// Trim, drop empties, cut each to MAX_REF_CHARS chars, drop duplicates
+    /// (first wins), keep the first MAX_REFS.
+    pub fn with_refs(mut self, refs: Vec<String>) -> Self {
+        let mut kept: Vec<String> = Vec::new();
+        for r in refs {
+            let trimmed = r.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let cut: String = trimmed.chars().take(MAX_REF_CHARS).collect();
+            if kept.contains(&cut) {
+                continue;
+            }
+            kept.push(cut);
+            if kept.len() == MAX_REFS {
+                break;
+            }
+        }
+        self.refs = kept;
+        self
+    }
+
+    /// Provenance: History tag of the turn this row derives from.
+    pub fn with_source_turn(mut self, tag: impl Into<String>) -> Self {
+        self.source_turn = Some(tag.into());
+        self
+    }
+
+    /// Re-apply provenance read back from a stored row (`provenance_for`).
+    pub fn with_provenance(self, source_turn: Option<String>, refs: Vec<String>) -> Self {
+        let meta = self.with_refs(refs);
+        match source_turn {
+            Some(t) => meta.with_source_turn(t),
+            None => meta,
+        }
+    }
+
     /// Convenience: metadata for an agent observation during a swarm run.
     pub fn agent_observation(agent_id: &str) -> Self {
         Self::for_source(MemorySource::SwarmConsolidated)
@@ -734,6 +785,23 @@ impl WriteMeta {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn with_refs_sanitises() {
+        let mut input = vec![
+            "  src/a.rs:L1  ".to_string(),
+            "src/a.rs:L1".to_string(),
+            "  ".to_string(),
+            "x".repeat(300),
+        ];
+        input.extend((1..=7).map(|i| format!("r{i}")));
+        assert_eq!(input.len(), 11);
+        let meta = WriteMeta::default().with_refs(input);
+        assert_eq!(meta.refs.len(), MAX_REFS);
+        assert_eq!(meta.refs[0], "src/a.rs:L1");
+        assert_eq!(meta.refs[1].chars().count(), MAX_REF_CHARS);
+        assert_eq!(meta.refs.last().map(String::as_str), Some("r6"));
+    }
 
     #[test]
     fn test_module_path_uses_nearest_package_manifest() {

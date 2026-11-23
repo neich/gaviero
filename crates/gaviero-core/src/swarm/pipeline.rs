@@ -744,6 +744,7 @@ pub async fn execute(
             success: agent_completed && verification_passed,
             pre_swarm_sha,
         };
+        record_swarm_outcomes(&memory_writer, &run_id, &swarm_result).await;
         observer.on_phase_changed("completed");
         observer.on_completed(&swarm_result);
         return Ok(swarm_result);
@@ -2767,6 +2768,7 @@ pub async fn execute(
         pre_swarm_sha,
     };
 
+    record_swarm_outcomes(&memory_writer, &run_id, &result).await;
     observer.on_phase_changed("completed");
     observer.on_completed(&result);
 
@@ -4859,6 +4861,56 @@ fn fanout_wave_pending(plan: &CompiledPlan, discover: &str, exec_state: &Executi
     recorded.any(|worker| exec_state.status(worker) != NodeStatus::Completed)
 }
 
+/// One label per finished unit, keyed like its History row
+/// (`session_id = run_id`, `turn_id = swarm:{run_id}:{unit}`; see the
+/// `extract_findings` block in `store_agent_result`). Failed units have no
+/// History row; their labels are stored but never sampled.
+pub(crate) fn swarm_outcome_labels(
+    run_id: &str,
+    result: &SwarmResult,
+) -> Vec<crate::memory::OutcomeLabel> {
+    use crate::memory::{OutcomeLabel, OutcomeOrigin, OutcomeReview, OutcomeStatus};
+    result
+        .manifests
+        .iter()
+        .filter_map(|m| {
+            let (status, detail) = match &m.status {
+                AgentStatus::Completed => (OutcomeStatus::Completed, None),
+                AgentStatus::Failed(msg) => (OutcomeStatus::Failed, Some(msg.clone())),
+                AgentStatus::Pending | AgentStatus::Running => return None,
+            };
+            let turn_id = format!("swarm:{run_id}:{}", m.work_unit_id);
+            let mut label =
+                OutcomeLabel::status(OutcomeOrigin::Swarm, run_id, &turn_id, status, detail);
+            label.review = result
+                .merge_results
+                .iter()
+                .find(|r| r.work_unit_id == m.work_unit_id)
+                .map(|r| {
+                    if r.success {
+                        OutcomeReview::Merged
+                    } else {
+                        OutcomeReview::MergeConflict
+                    }
+                });
+            Some(label)
+        })
+        .collect()
+}
+
+/// Send [`swarm_outcome_labels`] through the writer and wait for them to
+/// land: `execute` may own a private writer that a CLI process would
+/// otherwise exit before draining.
+async fn record_swarm_outcomes(writer: &Option<WriterHandle>, run_id: &str, result: &SwarmResult) {
+    let Some(writer) = writer else {
+        return;
+    };
+    for label in swarm_outcome_labels(run_id, result) {
+        let _ = writer.outcome_label(label);
+    }
+    let _ = writer.flush().await;
+}
+
 /// Store an agent's execution result to memory (best-effort, never fails the pipeline).
 ///
 /// Writes one aggregate entry for the agent's run, plus one sentinel entry per
@@ -5213,6 +5265,52 @@ mod tests {
     use super::*;
     use crate::types::{FileScope, ModelTier, PrivacyLevel};
     use std::collections::HashMap;
+
+    #[test]
+    fn swarm_outcome_labels_map_status_and_merge() {
+        use crate::memory::{OutcomeOrigin, OutcomeReview, OutcomeStatus};
+        let manifest = |id: &str, status: AgentStatus| AgentManifest {
+            work_unit_id: id.to_string(),
+            status,
+            modified_files: vec![],
+            branch: None,
+            summary: None,
+            output: None,
+            cost_usd: 0.0,
+        };
+        let merge = |id: &str, success: bool| MergeResult {
+            work_unit_id: id.to_string(),
+            success,
+            conflicts: vec![],
+        };
+        let result = SwarmResult {
+            manifests: vec![
+                manifest("a", AgentStatus::Completed),
+                manifest("b", AgentStatus::Completed),
+                manifest("c", AgentStatus::Failed("boom".into())),
+                manifest("d", AgentStatus::Pending),
+            ],
+            merge_results: vec![merge("a", true), merge("b", false)],
+            success: false,
+            pre_swarm_sha: String::new(),
+        };
+        let labels = swarm_outcome_labels("run9", &result);
+        assert_eq!(labels.len(), 3);
+        assert!(labels.iter().all(|l| l.origin == OutcomeOrigin::Swarm));
+        assert!(labels.iter().all(|l| l.session_id == "run9"));
+
+        assert_eq!(labels[0].turn_id, "swarm:run9:a");
+        assert_eq!(labels[0].status, Some(OutcomeStatus::Completed));
+        assert_eq!(labels[0].review, Some(OutcomeReview::Merged));
+
+        assert_eq!(labels[1].turn_id, "swarm:run9:b");
+        assert_eq!(labels[1].review, Some(OutcomeReview::MergeConflict));
+
+        assert_eq!(labels[2].turn_id, "swarm:run9:c");
+        assert_eq!(labels[2].status, Some(OutcomeStatus::Failed));
+        assert_eq!(labels[2].detail.as_deref(), Some("boom"));
+        assert_eq!(labels[2].review, None);
+    }
 
     #[test]
     fn run_limits_usd_exhaustion() {

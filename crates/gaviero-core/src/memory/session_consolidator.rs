@@ -1,7 +1,9 @@
 //! Tier B / B5: per-session consolidator.
 //!
-//! Runs at session close (or 90-second idle, or explicit
-//! `/consolidate-session`). Pulls the session's transcript + recent
+//! Runs on explicit `/consolidate-session`, and — when enabled — when a
+//! TUI chat tab closes (`memory.session.consolidateOnClose`) or after
+//! `memory.session.idleTimeoutSec` idle seconds (`app/auto_consolidate.rs`).
+//! Pulls the session's transcript + recent
 //! `TurnComplete`-extracted memories, asks a medium-tier LLM to emit
 //! ADD / MERGE / SUPERSEDE / DROP operations + a session summary,
 //! parses the response, and applies the operations through the

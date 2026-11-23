@@ -17,6 +17,7 @@ pub mod plan;
 pub mod plan_document;
 pub mod planner;
 pub mod privacy;
+pub mod provider_limit;
 pub mod replanner;
 pub mod router;
 pub mod run_history;
