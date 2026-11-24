@@ -2268,6 +2268,15 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
                 super::swarm_run::handle_paste(app, &paste_body);
             } else {
                 app.chat_state.insert_str(&paste_body);
+                // The pasted text may carry an `@` token and the start of its
+                // path — a burst of fast typing on Windows arrives here too.
+                // Completing from that text is the whole point of the popup:
+                // fill the list for it instead of showing the one that was
+                // open before (usually the unfiltered first page). A
+                // conversation title has nothing to reference.
+                if !app.chat_state.renaming {
+                    app.refresh_chat_autocomplete();
+                }
             }
             note_text_paste(app);
         }
@@ -3016,6 +3025,41 @@ mod tests {
             app.diff_review.is_none(),
             "the turn's set is applied as a whole"
         );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn pasted_text_after_an_at_sign_completes_from_that_text() {
+        // A bracketed paste (and a burst of fast typing on Windows, which the
+        // coalescer turns into one) must seed the `@` popup with the text it
+        // carries — not leave the list the lone `@` had already opened.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        app.focus = Focus::SidePanel;
+
+        app.handle_paste("look at @");
+        assert_eq!(app.chat_state.autocomplete.query, "");
+        let unfiltered = app.chat_state.autocomplete.matches.clone();
+        assert!(
+            unfiltered.len() >= 2,
+            "a lone @ lists the workspace from the top: {unfiltered:?}"
+        );
+
+        // Two pastes in the same tick: the split-chunk duplicate guard is not
+        // what this test is about.
+        app.last_text_paste = None;
+        app.handle_paste("src/m");
+        assert_eq!(app.chat_state.autocomplete.query, "src/m");
+        assert_eq!(
+            app.chat_state.autocomplete.matches,
+            ["src/main.rs"],
+            "the text after @ filters the list"
+        );
+        assert!(app.chat_state.autocomplete.is_open());
 
         cleanup_session(dir.path());
     }

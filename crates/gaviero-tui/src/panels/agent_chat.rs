@@ -3361,6 +3361,24 @@ impl AgentChatState {
         self.update_autocomplete();
     }
 
+    /// Forward-delete, undo and redo change the text under the popup too, so
+    /// the `@`/`$` query it completes follows the new text instead of keeping
+    /// the list computed for the old one.
+    pub fn delete(&mut self) {
+        self.text_input.delete();
+        self.update_autocomplete();
+    }
+
+    pub fn undo(&mut self) {
+        self.text_input.undo();
+        self.update_autocomplete();
+    }
+
+    pub fn redo(&mut self) {
+        self.text_input.redo();
+        self.update_autocomplete();
+    }
+
     // ── Input layout + vertical cursor movement ─────────────────
 
     /// Text to write into the session as the unsent prompt.
