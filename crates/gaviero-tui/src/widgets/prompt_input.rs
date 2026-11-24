@@ -133,11 +133,16 @@ impl FileAutocomplete {
     }
 
     /// Show the popup for `query`, anchored at `at_pos`, from the first match.
+    ///
+    /// The previous query's matches are dropped: a list computed for another
+    /// query must never be drawn (or accepted) for this one. The caller fills
+    /// the new list from [`matches`](Self::matches) for the text now typed.
     pub fn open(&mut self, mode: AutocompleteMode, at_pos: usize, query: &str) {
         self.active = true;
         self.mode = mode;
         self.at_pos = at_pos;
         self.query = query.to_string();
+        self.matches.clear();
         self.selected = 0;
         self.scroll = 0;
     }
@@ -1121,6 +1126,28 @@ mod tests {
         accept_autocomplete(&mut input, &mut ac);
 
         assert_eq!(input.text, "a=low");
+    }
+
+    #[test]
+    fn a_new_query_never_keeps_the_previous_match_list() {
+        let mut ac = FileAutocomplete::new();
+        ac.open(AutocompleteMode::FileRef, 0, "");
+        ac.matches = vec!["docs/a.md".to_string(), "src/b.rs".to_string()];
+        assert!(ac.is_open());
+
+        // The text after `@` changed: the list must be computed from it, not
+        // left over from the empty query (which would look like an unfiltered
+        // list that ignored what was typed).
+        ac.open(AutocompleteMode::FileRef, 0, "sr");
+        assert!(
+            ac.matches.is_empty(),
+            "the previous query's matches survived: {:?}",
+            ac.matches
+        );
+        assert!(!ac.is_open(), "nothing is offered until matches are filled");
+
+        set_file_matches(&mut ac, &["docs/a.md".to_string(), "src/b.rs".to_string()]);
+        assert_eq!(ac.matches, ["src/b.rs"]);
     }
 
     fn long_popup(count: usize) -> FileAutocomplete {
