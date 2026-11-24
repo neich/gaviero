@@ -135,7 +135,7 @@ vars {
 
 A run is refused before it starts if a `file` var names nothing on disk. Use a plain string or `dir` for a path the run will create. A `file` or `dir` with no default and no `--var` fails compilation. Agent-level `vars` take no type.
 
-A `file` outside the run root is copied in, and an uncommitted one is copied into agent worktrees. `dir` has one effect only: the SWARM form completes the field with folders. At run time it is a string, so a folder need not exist and is never copied.
+A `file` outside the run root is copied in, whatever it holds (a PDF works). In a repo run an uncommitted `file` is also copied into agent worktrees, but only when it is UTF-8 text: any other file is skipped with a warning and the run goes on, so an agent in a worktree does not get it. A document run has no worktrees and skips this step. `dir` has one effect only: the SWARM form completes the field with folders. At run time it is a string, so a folder need not exist and is never copied.
 
 In the TUI's SWARM form `file` and `dir` vars complete as you type: `file` from the same list as `@` in chat, `dir` from the workspace's folders. The popup shows eight rows and scrolls through every match (Up/Down, PageUp/PageDown, wheel). List `param` items complete the tier after `id=` from the profile selected on the form.
 
