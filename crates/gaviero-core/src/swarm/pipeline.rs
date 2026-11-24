@@ -519,7 +519,9 @@ pub async fn execute(
 
     // CLI-referenced context files (outside --repo or uncommitted) are absent
     // from git worktrees checked out at HEAD — inject copies and rewrite paths.
-    let read_only_prep = super::worktree_context::prepare_worktree_read_only_context(
+    // Repo runs only: a document run has no worktrees and reads files in place.
+    let read_only_prep = super::worktree_context::prepare_for_execution_mode(
+        config.execution_mode,
         &config.workspace_root,
         &config.worktree_context_paths,
     )?;

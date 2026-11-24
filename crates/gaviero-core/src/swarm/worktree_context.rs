@@ -11,6 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use super::models::WorkUnit;
+use super::plan::ExecutionMode;
 
 /// Result of [`prepare_worktree_read_only_context`].
 #[derive(Debug, Default)]
@@ -19,6 +20,9 @@ pub struct WorktreeReadOnlyPrep {
     pub injections: Vec<(String, String)>,
     /// Rewrite occurrences of the left path with the right (prompts + scopes).
     pub path_rewrites: HashMap<String, String>,
+    /// Host files left out because they are not UTF-8 text (a PDF, an
+    /// image). Each one was already logged as a warning.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Resolve a scope `read_only` entry to a host filesystem path.
@@ -53,16 +57,34 @@ pub fn read_only_file_is_outside_workspace(workspace_root: &Path, path_pattern: 
     !host_canon.starts_with(&ws)
 }
 
+/// [`prepare_worktree_read_only_context`] for a run in `mode`. Only a repo
+/// run checks agents out into git worktrees; a document run shares one
+/// workspace and reads every file where it is, so it gets an empty prep and
+/// no file is read.
+pub fn prepare_for_execution_mode(
+    mode: ExecutionMode,
+    workspace_root: &Path,
+    explicit_paths: &[String],
+) -> Result<WorktreeReadOnlyPrep> {
+    if mode != ExecutionMode::Repo {
+        return Ok(WorktreeReadOnlyPrep::default());
+    }
+    prepare_worktree_read_only_context(workspace_root, explicit_paths)
+}
+
 /// Collect injections and path rewrites for an explicit list of file paths.
 ///
 /// `explicit_paths` is typically built by the CLI from `--var` values and
-/// `--prompt-file`. Directory paths and missing files are skipped.
+/// `--prompt-file`. Directory paths and missing files are skipped. A file
+/// that is not UTF-8 text is skipped with a warning: it gets no injection and
+/// no path rewrite, and the run goes on.
 pub fn prepare_worktree_read_only_context(
     workspace_root: &Path,
     explicit_paths: &[String],
 ) -> Result<WorktreeReadOnlyPrep> {
     let mut prep = WorktreeReadOnlyPrep::default();
     let mut seen_dest: HashSet<String> = HashSet::new();
+    let mut skipped_dest: HashSet<String> = HashSet::new();
     let ws_canon = canonical_dir(workspace_root);
 
     for pattern in explicit_paths {
@@ -100,10 +122,24 @@ pub fn prepare_worktree_read_only_context(
             }
         }
 
+        if skipped_dest.contains(&dest_rel) {
+            continue;
+        }
         if seen_dest.insert(dest_rel.clone()) {
-            let content = std::fs::read_to_string(&host)
+            let bytes = std::fs::read(&host)
                 .with_context(|| format!("reading worktree context file {}", host.display()))?;
-            prep.injections.push((dest_rel.clone(), content));
+            match String::from_utf8(bytes) {
+                Ok(content) => prep.injections.push((dest_rel.clone(), content)),
+                Err(_) => {
+                    tracing::warn!(
+                        "worktree context file {} is not UTF-8 text; skipped, so agent worktrees get no copy of it",
+                        host.display()
+                    );
+                    skipped_dest.insert(dest_rel);
+                    prep.skipped.push(host);
+                    continue;
+                }
+            }
         }
 
         if outside {
@@ -182,6 +218,79 @@ mod tests {
         assert_eq!(prep.injections.len(), 1);
         assert!(prep.injections[0].0.starts_with(".gaviero/injected/"));
         assert!(!prep.path_rewrites.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_file_is_skipped_and_the_rest_still_injected() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // A PDF header followed by bytes that are not valid UTF-8.
+        let pdf = outside.path().join("paper.pdf");
+        fs::write(&pdf, b"%PDF-1.7\n\xe2\xe3\xcf\xd3\x9d\xff").unwrap();
+        let plan = outside.path().join("plan.md");
+        fs::write(&plan, "# outside plan").unwrap();
+        let pdf_spec = pdf.to_str().unwrap().to_string();
+
+        let prep = prepare_worktree_read_only_context(
+            ws.path(),
+            &[
+                pdf_spec.clone(),
+                pdf_spec.clone(),
+                plan.to_str().unwrap().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(prep.skipped, vec![pdf.clone()]);
+        assert_eq!(prep.injections.len(), 1);
+        assert_eq!(prep.injections[0].0, ".gaviero/injected/plan.md");
+        assert!(!prep.path_rewrites.contains_key(&pdf_spec));
+        assert!(
+            prep.path_rewrites
+                .values()
+                .all(|to| to != ".gaviero/injected/paper.pdf")
+        );
+    }
+
+    #[test]
+    fn non_utf8_file_inside_the_workspace_is_skipped() {
+        let ws = tempdir().unwrap();
+        let injected = ws.path().join(".gaviero/injected");
+        fs::create_dir_all(&injected).unwrap();
+        fs::write(injected.join("paper.pdf"), b"%PDF-1.4\n\x9d\xff").unwrap();
+
+        let prep = prepare_worktree_read_only_context(
+            ws.path(),
+            &[".gaviero/injected/paper.pdf".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(prep.skipped.len(), 1);
+        assert!(prep.injections.is_empty());
+        assert!(prep.path_rewrites.is_empty());
+    }
+
+    #[test]
+    fn only_a_repo_run_prepares_worktree_context() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let pdf = outside.path().join("paper.pdf");
+        fs::write(&pdf, b"%PDF-1.7\n\x9d\xff").unwrap();
+        let plan = outside.path().join("plan.md");
+        fs::write(&plan, "# outside plan").unwrap();
+        let paths = [
+            pdf.to_str().unwrap().to_string(),
+            plan.to_str().unwrap().to_string(),
+        ];
+
+        let doc = prepare_for_execution_mode(ExecutionMode::Document, ws.path(), &paths).unwrap();
+        assert!(doc.injections.is_empty());
+        assert!(doc.path_rewrites.is_empty());
+        assert!(doc.skipped.is_empty());
+
+        let repo = prepare_for_execution_mode(ExecutionMode::Repo, ws.path(), &paths).unwrap();
+        assert_eq!(repo.injections.len(), 1);
+        assert_eq!(repo.skipped, vec![pdf]);
     }
 
     #[test]
