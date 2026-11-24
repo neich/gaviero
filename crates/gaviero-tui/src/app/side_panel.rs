@@ -431,9 +431,18 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             app.chat_state.backspace();
             app.refresh_chat_autocomplete();
         }
-        Action::Delete => app.chat_state.text_input.delete(),
-        Action::Undo => app.chat_state.text_input.undo(),
-        Action::Redo => app.chat_state.text_input.redo(),
+        Action::Delete => {
+            app.chat_state.delete();
+            app.refresh_chat_autocomplete();
+        }
+        Action::Undo => {
+            app.chat_state.undo();
+            app.refresh_chat_autocomplete();
+        }
+        Action::Redo => {
+            app.chat_state.redo();
+            app.refresh_chat_autocomplete();
+        }
         Action::SelectAll => app.chat_state.text_input.select_all(),
         Action::DeleteWordBack => {
             app.chat_state.delete_word_back();
