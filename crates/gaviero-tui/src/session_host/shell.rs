@@ -190,6 +190,22 @@ fn cwd_from_url(url: &str) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+/// A mouse event over a shell tab, the same from both input paths (crossterm
+/// events on Unix, console records on Windows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pointer {
+    /// A vertical wheel notch.
+    Wheel { up: bool },
+    /// The left button went down.
+    Press,
+    /// The pointer moved with the left button held.
+    Drag,
+    /// The left button came up.
+    Release,
+    /// Anything else (other buttons, bare motion).
+    Other,
+}
+
 /// What a mouse event over a shell tab's screen does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellMouse {
@@ -200,18 +216,34 @@ pub(crate) enum ShellMouse {
     /// Wheel over a full-screen program that takes no mouse (a pager):
     /// these arrow keys, the way terminals' alternate scroll mode does.
     Keys(Vec<u8>),
+    /// Left button over a screen that takes no mouse: start a text
+    /// selection, extend it, end it (and copy it).
+    SelectStart,
+    SelectExtend,
+    SelectEnd,
     Drop,
 }
 
-/// Decide a mouse event over a shell tab. `wheel`: `Some(up)` for a
-/// vertical wheel notch, `None` for anything else. A shell at its prompt
-/// takes no mouse reports, so clicks there would arrive as typed garbage.
-pub(crate) fn mouse(screen: &vt100::Screen, wheel: Option<bool>) -> ShellMouse {
+/// Decide a mouse event over a shell tab. A shell at its prompt takes no
+/// mouse reports, so clicks there would arrive as typed garbage: there the
+/// left button selects text instead, as in any terminal. `selecting`: a
+/// selection drag is under way — it ends as one, whatever the program asked
+/// for meanwhile.
+pub(crate) fn mouse(screen: &vt100::Screen, pointer: Pointer, selecting: bool) -> ShellMouse {
+    if selecting {
+        match pointer {
+            Pointer::Drag => return ShellMouse::SelectExtend,
+            Pointer::Release => return ShellMouse::SelectEnd,
+            _ => {}
+        }
+    }
     if !matches!(screen.mouse_protocol_mode(), vt100::MouseProtocolMode::None) {
         return ShellMouse::Forward;
     }
-    let Some(up) = wheel else {
-        return ShellMouse::Drop;
+    let up = match pointer {
+        Pointer::Wheel { up } => up,
+        Pointer::Press => return ShellMouse::SelectStart,
+        Pointer::Drag | Pointer::Release | Pointer::Other => return ShellMouse::Drop,
     };
     if !screen.alternate_screen() {
         return ShellMouse::Scroll { up };
@@ -340,19 +372,45 @@ mod tests {
 
     #[test]
     fn the_mouse_goes_to_programs_that_ask_and_scrolls_otherwise() {
+        let wheel = |up| Pointer::Wheel { up };
         let prompt = screen(b"$ ");
-        assert_eq!(mouse(prompt.screen(), None), ShellMouse::Drop);
-        assert_eq!(mouse(prompt.screen(), Some(true)), ShellMouse::Scroll { up: true });
-        assert_eq!(mouse(prompt.screen(), Some(false)), ShellMouse::Scroll { up: false });
+        assert_eq!(mouse(prompt.screen(), Pointer::Other, false), ShellMouse::Drop);
+        assert_eq!(mouse(prompt.screen(), wheel(true), false), ShellMouse::Scroll { up: true });
+        assert_eq!(mouse(prompt.screen(), wheel(false), false), ShellMouse::Scroll { up: false });
         // A program with mouse reporting on gets everything.
         let tui = screen(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(mouse(tui.screen(), None), ShellMouse::Forward);
-        assert_eq!(mouse(tui.screen(), Some(true)), ShellMouse::Forward);
+        assert_eq!(mouse(tui.screen(), Pointer::Other, false), ShellMouse::Forward);
+        assert_eq!(mouse(tui.screen(), wheel(true), false), ShellMouse::Forward);
+        assert_eq!(mouse(tui.screen(), Pointer::Press, false), ShellMouse::Forward);
         // A pager on the alternate screen without mouse: arrow keys.
         let pager = screen(b"\x1b[?1049h");
-        assert_eq!(mouse(pager.screen(), Some(true)), ShellMouse::Keys(b"\x1b[A".repeat(WHEEL_LINES)));
+        assert_eq!(mouse(pager.screen(), wheel(true), false), ShellMouse::Keys(b"\x1b[A".repeat(WHEEL_LINES)));
         let app_cursor = screen(b"\x1b[?1049h\x1b[?1h");
-        assert_eq!(mouse(app_cursor.screen(), Some(false)), ShellMouse::Keys(b"\x1bOB".repeat(WHEEL_LINES)));
-        assert_eq!(mouse(pager.screen(), None), ShellMouse::Drop);
+        assert_eq!(mouse(app_cursor.screen(), wheel(false), false), ShellMouse::Keys(b"\x1bOB".repeat(WHEEL_LINES)));
+        assert_eq!(mouse(pager.screen(), Pointer::Other, false), ShellMouse::Drop);
+    }
+
+    #[test]
+    fn the_left_button_selects_where_no_program_takes_the_mouse() {
+        let prompt = screen(b"$ ls");
+        assert_eq!(mouse(prompt.screen(), Pointer::Press, false), ShellMouse::SelectStart);
+        assert_eq!(mouse(prompt.screen(), Pointer::Drag, true), ShellMouse::SelectExtend);
+        assert_eq!(mouse(prompt.screen(), Pointer::Release, true), ShellMouse::SelectEnd);
+        // No selection under way: a stray drag or release does nothing.
+        assert_eq!(mouse(prompt.screen(), Pointer::Drag, false), ShellMouse::Drop);
+        assert_eq!(mouse(prompt.screen(), Pointer::Release, false), ShellMouse::Drop);
+        // The wheel still scrolls while selecting.
+        assert_eq!(
+            mouse(prompt.screen(), Pointer::Wheel { up: true }, true),
+            ShellMouse::Scroll { up: true }
+        );
+        // A pager without mouse: selectable too.
+        let pager = screen(b"\x1b[?1049h");
+        assert_eq!(mouse(pager.screen(), Pointer::Press, false), ShellMouse::SelectStart);
+        // A selection started before the program asked for the mouse ends
+        // as a selection.
+        let tui = screen(b"\x1b[?1000h");
+        assert_eq!(mouse(tui.screen(), Pointer::Drag, true), ShellMouse::SelectExtend);
+        assert_eq!(mouse(tui.screen(), Pointer::Release, true), ShellMouse::SelectEnd);
     }
 }

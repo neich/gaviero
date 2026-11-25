@@ -425,8 +425,11 @@ impl Host {
         self.sessions.iter().position(|s| s.id == id)
     }
 
-    /// Make tab `i` current. Its circles stay as they were; the tab being
-    /// left has been seen, so its "finished" marks clear.
+    /// Make tab `i` current. The tab being left has been seen, so its
+    /// "finished" marks clear. The tab made current keeps its agent one
+    /// until it is left, but not its shell one: a finished command's output
+    /// is on screen with the prompt back, so a lingering `S` would read as a
+    /// command still running.
     fn switch_to(&mut self, i: usize) {
         if i >= self.sessions.len() {
             return;
@@ -438,6 +441,7 @@ impl Host {
             left.shell_done_unseen = false;
         }
         self.active = i;
+        self.sessions[i].shell_done_unseen = false;
         self.dirty = true;
     }
 
@@ -506,14 +510,23 @@ impl Host {
         self.active_session().is_some_and(|s| s.shell.is_some())
     }
 
+    /// The active tab is a shell tab with a mouse selection being dragged:
+    /// the pointer over the tab bar then still belongs to it.
+    fn shell_selecting(&self) -> bool {
+        self.active_session()
+            .is_some_and(|s| s.shell.is_some() && s.selection.dragging)
+    }
+
     /// A mouse event over the active shell tab's screen (`shell::mouse`):
     /// `reports` are its SGR reports, sent only when the program running
-    /// asked for mouse input; the wheel otherwise scrolls the tab's history.
-    fn shell_mouse(&mut self, wheel: Option<bool>, reports: Vec<String>) {
+    /// asked for mouse input; the wheel otherwise scrolls the tab's history
+    /// and the left button selects text, copied when it comes up. `row` is
+    /// the screen row, `None` over the tab bar (a selection dragged there).
+    fn shell_mouse(&mut self, pointer: shell::Pointer, row: Option<u16>, col: u16, reports: Vec<String>) {
         let Some(s) = self.sessions.get_mut(self.active) else {
             return;
         };
-        match shell::mouse(s.parser.screen(), wheel) {
+        match shell::mouse(s.parser.screen(), pointer, s.selection.dragging) {
             shell::ShellMouse::Forward => {
                 for report in reports {
                     s.send_input(report.into_bytes());
@@ -524,6 +537,22 @@ impl Host {
                 self.dirty = true;
             }
             shell::ShellMouse::Keys(bytes) => s.send_input(bytes),
+            shell::ShellMouse::SelectStart => {
+                if let Some(row) = row {
+                    s.select_start(row, col);
+                    self.dirty = true;
+                }
+            }
+            shell::ShellMouse::SelectExtend => {
+                s.select_extend(row, col);
+                self.dirty = true;
+            }
+            shell::ShellMouse::SelectEnd => {
+                if let Some(text) = s.select_end() {
+                    clipboard::set_text(&text);
+                }
+                self.dirty = true;
+            }
             shell::ShellMouse::Drop => {}
         }
     }
@@ -1139,7 +1168,8 @@ impl Host {
         if self.modal_open() {
             return;
         }
-        if m.row == 0 {
+        let selecting = self.shell_selecting();
+        if m.row == 0 && !selecting {
             let press = m.flags == 0 && m.buttons & 1 != 0;
             if press {
                 self.click_tab_bar(m.col);
@@ -1152,7 +1182,8 @@ impl Host {
         // Translated even when not sent, so the button state stays right.
         let reports = self.mouse.translate(&m, 1);
         if self.active_shell() {
-            self.shell_mouse(encode::wheel_up(&m), reports);
+            let pointer = record_pointer(&m, selecting);
+            self.shell_mouse(pointer, m.row.checked_sub(1), m.col, reports);
             return;
         }
         for report in reports {
@@ -1244,7 +1275,7 @@ impl Host {
         if self.modal_open() {
             return;
         }
-        if m.row == 0 {
+        if m.row == 0 && !self.shell_selecting() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.click_tab_bar(m.column);
             }
@@ -1255,12 +1286,8 @@ impl Host {
         }
         let report = term_mouse_report(&m, 1);
         if self.active_shell() {
-            let wheel = match m.kind {
-                MouseEventKind::ScrollUp => Some(true),
-                MouseEventKind::ScrollDown => Some(false),
-                _ => None,
-            };
-            self.shell_mouse(wheel, report.into_iter().collect());
+            let pointer = term_pointer(&m);
+            self.shell_mouse(pointer, m.row.checked_sub(1), m.column, report.into_iter().collect());
             return;
         }
         if let Some(report) = report {
@@ -1316,6 +1343,39 @@ fn term_mouse_report(m: &MouseEvent, row_offset: u16) -> Option<String> {
         m.row - row_offset,
         press,
     ))
+}
+
+/// A crossterm mouse event as a shell tab reads it (`shell::mouse`).
+fn term_pointer(m: &MouseEvent) -> shell::Pointer {
+    match m.kind {
+        MouseEventKind::ScrollUp => shell::Pointer::Wheel { up: true },
+        MouseEventKind::ScrollDown => shell::Pointer::Wheel { up: false },
+        MouseEventKind::Down(MouseButton::Left) => shell::Pointer::Press,
+        MouseEventKind::Drag(MouseButton::Left) => shell::Pointer::Drag,
+        MouseEventKind::Up(MouseButton::Left) => shell::Pointer::Release,
+        _ => shell::Pointer::Other,
+    }
+}
+
+/// A console mouse record as a shell tab reads it (`shell::mouse`).
+/// Windows reports the button *state*, so `left_held` says whether the left
+/// button was down before: the host's own selection drag, the only time it
+/// needs to know.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn record_pointer(m: &encode::MouseRecord, left_held: bool) -> shell::Pointer {
+    if let Some(up) = encode::wheel_up(m) {
+        return shell::Pointer::Wheel { up };
+    }
+    if encode::is_any_wheel(m) {
+        return shell::Pointer::Other;
+    }
+    let left = m.buttons & 1 != 0;
+    match (left_held, left) {
+        (false, true) if !encode::is_move(m) => shell::Pointer::Press,
+        (true, true) if encode::is_move(m) => shell::Pointer::Drag,
+        (true, false) => shell::Pointer::Release,
+        _ => shell::Pointer::Other,
+    }
 }
 
 /// Keyboard and mouse events: the user is working in the host.
@@ -1689,6 +1749,53 @@ mod tests {
         assert!(z.end_due(t0 + len * 2));
         // Closed: nothing more to resume.
         assert!(!z.end_due(t0 + len * 3));
+    }
+
+    #[test]
+    fn console_records_read_as_shell_pointer_events() {
+        use shell::Pointer;
+        let rec = |buttons: u32, flags: u32| encode::MouseRecord {
+            col: 3,
+            row: 4,
+            buttons,
+            ctrl_state: 0,
+            flags,
+        };
+        // Left down (flags 0, or 2 = double click), moved while held, up.
+        assert_eq!(record_pointer(&rec(1, 0), false), Pointer::Press);
+        assert_eq!(record_pointer(&rec(1, 2), false), Pointer::Press);
+        assert_eq!(record_pointer(&rec(1, 1), true), Pointer::Drag);
+        assert_eq!(record_pointer(&rec(0, 0), true), Pointer::Release);
+        // Not selecting: a held move or a release is nothing to the shell.
+        assert_eq!(record_pointer(&rec(1, 1), false), Pointer::Other);
+        assert_eq!(record_pointer(&rec(0, 0), false), Pointer::Other);
+        // Bare motion, other buttons, a horizontal wheel.
+        assert_eq!(record_pointer(&rec(0, 1), false), Pointer::Other);
+        assert_eq!(record_pointer(&rec(2, 0), false), Pointer::Other);
+        assert_eq!(record_pointer(&rec(120 << 16, 8), false), Pointer::Other);
+        // A wheel notch, held button or not.
+        assert_eq!(record_pointer(&rec(120 << 16, 4), true), Pointer::Wheel { up: true });
+        assert_eq!(
+            record_pointer(&rec((-120i16 as u16 as u32) << 16, 4), false),
+            Pointer::Wheel { up: false }
+        );
+    }
+
+    #[test]
+    fn crossterm_events_read_as_shell_pointer_events() {
+        use shell::Pointer;
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(term_pointer(&ev(MouseEventKind::Down(MouseButton::Left))), Pointer::Press);
+        assert_eq!(term_pointer(&ev(MouseEventKind::Drag(MouseButton::Left))), Pointer::Drag);
+        assert_eq!(term_pointer(&ev(MouseEventKind::Up(MouseButton::Left))), Pointer::Release);
+        assert_eq!(term_pointer(&ev(MouseEventKind::ScrollUp)), Pointer::Wheel { up: true });
+        assert_eq!(term_pointer(&ev(MouseEventKind::Down(MouseButton::Right))), Pointer::Other);
+        assert_eq!(term_pointer(&ev(MouseEventKind::Moved)), Pointer::Other);
     }
 
     #[test]

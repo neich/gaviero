@@ -3,7 +3,7 @@
 
 use super::Host;
 use super::session::Activity;
-use crate::panels::terminal::vt100_style_to_ratatui;
+use crate::panels::terminal::{TerminalSelectionState, selection_style, vt100_style_to_ratatui};
 use crate::widgets::tabs::{HOST_PALETTE, TabBadge, TabBadges, TabBar, TabKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -33,21 +33,25 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
 
 /// Badge palette, shared by both badges: green = working, yellow = waiting
 /// for the user, blue = finished (a turn whose review is pending, or work
-/// that ended while the tab was out of view). Pure hues at 80% brightness
-/// (204/255), so the three tell apart at a glance.
+/// that ended while the tab was out of view). Green and yellow are pure hues
+/// at 80% brightness (204/255); blue is lifted towards azure, because a pure
+/// blue cell barely stands out on the dark tab backgrounds (on the active
+/// tab, almost no contrast). The three tell apart at a glance.
 const GREEN: Color = Color::Rgb(0, 204, 0);
 const YELLOW: Color = Color::Rgb(204, 204, 0);
-const BLUE: Color = Color::Rgb(0, 0, 204);
-/// Agent badge (`A`): an agent or swarm is running / waits for the user (a
-/// permission, a question) / finished, its turn review included.
-const AGENT_LETTER: char = 'A';
+const BLUE: Color = Color::Rgb(51, 136, 255);
+/// Agent badge (`A`, drawn as the small capital `ᴀ` so it sits lower than
+/// the label, about 75% of a capital): an agent or swarm is running / waits
+/// for the user (a permission, a question) / finished, its turn review
+/// included.
+const AGENT_LETTER: char = '\u{1D00}';
 const AGENT_RUNNING: Color = GREEN;
 const AGENT_WAITING: Color = YELLOW;
 const AGENT_DONE: Color = BLUE;
-/// Shell badge (`S`): a command is running / seems to wait for the user (a
-/// bell, a notification, or a quiet prompt line) / finished while out of
-/// view.
-const SHELL_LETTER: char = 'S';
+/// Shell badge (`S`, drawn as the small capital `ꜱ`): a command is running /
+/// seems to wait for the user (a bell, a notification, or a quiet prompt
+/// line) / finished while out of view.
+const SHELL_LETTER: char = '\u{A731}';
 const SHELL_RUNNING: Color = GREEN;
 const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
@@ -65,8 +69,9 @@ pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
 }
 
 /// The colours of a tab's two badges: the agent one, then the shell one.
-/// The current tab shows them too; its "finished" marks stay until the user
-/// leaves it. A pending turn review is finished, not waiting: the turn is
+/// The current tab shows them too; its agent "finished" mark stays until the
+/// user leaves it (its shell one clears on arrival, `Host::switch_to`). A
+/// pending turn review is finished, not waiting: the turn is
 /// over, so it is blue like work that ended out of view (a running agent
 /// still wins, the tab being busy).
 pub(crate) fn badges(
@@ -109,7 +114,8 @@ pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
 }
 
 /// The host's tab bar: every tab has a close button and two activity
-/// badges (`A` agent, `S` shell — a shell tab only ever shows `S`), drawn in
+/// badges, a small capital on a cell of the state colour (`ᴀ` agent, `ꜱ`
+/// shell — a shell tab only ever shows `ꜱ`), drawn in
 /// the host's own palette so it never looks like the editor's tab row inside
 /// the session below it; shell tabs in their own teal.
 pub(crate) fn tab_bar<'a>(
@@ -164,6 +170,9 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
     if let Some(session) = host.sessions.get(host.active) {
         let screen = session.parser.screen();
         render_screen(screen, body, frame.buffer_mut());
+        if session.shell.is_some() && session.selection.has_selection() {
+            draw_selection(screen, &session.selection, body, frame.buffer_mut());
+        }
         let scrolled = screen.scrollback();
         if scrolled > 0 {
             // A shell tab's history view: the live cursor is not on it.
@@ -242,6 +251,25 @@ fn draw_confirm(title: &str, lines: &[String], area: Rect, buf: &mut Buffer) {
     }
 }
 
+/// A shell tab's mouse selection, over its screen: the selected cells take
+/// the embedded terminal's selection colours; their text stays.
+fn draw_selection(
+    screen: &vt100::Screen,
+    selection: &TerminalSelectionState,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let style = selection_style();
+    let (rows, cols) = screen.size();
+    for row in 0..rows.min(area.height) {
+        for col in 0..cols.min(area.width) {
+            if selection.is_selected(row, col, screen) {
+                buf[(area.x + col, area.y + row)].set_style(style);
+            }
+        }
+    }
+}
+
 /// How far back a shell tab's history view is, at the top right of the
 /// screen, and how to leave it.
 fn draw_history_mark(lines: usize, body: Rect, buf: &mut Buffer) {
@@ -284,6 +312,15 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), "a");
         assert_eq!(buf[(1, 0)].symbol(), "\u{4e2d}");
         assert_eq!(buf[(3, 0)].symbol(), "b");
+    }
+
+    #[test]
+    fn badge_letters_take_one_cell() {
+        // The tab bar keeps fixed 2-cell slots (blank, letter).
+        use unicode_width::UnicodeWidthChar;
+        for letter in [AGENT_LETTER, SHELL_LETTER] {
+            assert_eq!(letter.width(), Some(1), "{letter:?}");
+        }
     }
 
     #[test]

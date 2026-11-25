@@ -223,6 +223,13 @@ impl TerminalSelectionState {
     }
 }
 
+/// How selected terminal text is drawn: here and in a session-host shell tab.
+pub(crate) fn selection_style() -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme::TAB_BG)
+        .bg(theme::FOCUS_BORDER)
+}
+
 /// Render terminal content (no border) from a vt100 screen into a ratatui buffer.
 pub fn render_terminal_screen(
     screen: &vt100::Screen,
@@ -231,9 +238,7 @@ pub fn render_terminal_screen(
     focused: bool,
     selection: &TerminalSelectionState,
 ) {
-    let sel_style = ratatui::style::Style::default()
-        .fg(theme::TAB_BG)
-        .bg(theme::FOCUS_BORDER);
+    let sel_style = selection_style();
 
     for row in 0..area.height {
         for col in 0..area.width {

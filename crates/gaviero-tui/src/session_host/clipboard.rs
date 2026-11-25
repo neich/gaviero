@@ -1,6 +1,6 @@
-//! The local clipboard, as the session host uses it for SSH tabs: text a
-//! remote gaviero copies (OSC 52) lands here, and Ctrl+V in an SSH tab
-//! pastes from here.
+//! The local clipboard, as the session host uses it: text a tab copies
+//! (OSC 52) and text selected with the mouse in a shell tab land here, and
+//! Ctrl+V in an SSH tab pastes from here.
 //!
 //! `GAVIERO_SESSION_HOST_CLIPBOARD` (tests) names a file used instead of
 //! the system clipboard.

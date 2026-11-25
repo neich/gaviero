@@ -197,13 +197,13 @@ impl Pty {
             .to_string()
     }
 
-    /// Symbol and foreground colour of the cell at `row`, `col`.
+    /// Symbol and background colour of the cell at `row`, `col`.
     pub fn cell(&self, row: u16, col: u16) -> (String, vt100::Color) {
         let parser = self.parser.lock().unwrap();
         parser
             .screen()
             .cell(row, col)
-            .map(|c| (c.contents().to_string(), c.fgcolor()))
+            .map(|c| (c.contents().to_string(), c.bgcolor()))
             .unwrap_or_else(|| (String::new(), vt100::Color::Default))
     }
 

@@ -168,6 +168,19 @@ pub fn sgr_mouse(code: u8, col0: u16, row0: u16, press: bool) -> String {
 /// `dwEventFlags` bits.
 const MOUSE_MOVED: u32 = 1;
 const MOUSE_WHEELED: u32 = 4;
+const MOUSE_HWHEELED: u32 = 8;
+
+/// A record of the pointer moving (with or without a button held).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_move(rec: &MouseRecord) -> bool {
+    rec.flags & MOUSE_MOVED != 0
+}
+
+/// A record of either wheel, vertical or horizontal.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_any_wheel(rec: &MouseRecord) -> bool {
+    rec.flags & (MOUSE_WHEELED | MOUSE_HWHEELED) != 0
+}
 
 /// Whether a raw console record is the outer terminal's font-zoom gesture
 /// (Ctrl+wheel, vertical wheel only). The record form of
