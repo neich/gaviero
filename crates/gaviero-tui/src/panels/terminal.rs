@@ -331,11 +331,17 @@ fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf) {
 /// `application_cursor` is the DECCKM mode the foreground app negotiated
 /// (`screen().application_cursor()`): full-screen apps like vim/less expect
 /// SS3 (`ESC O _`) cursor sequences in that mode, CSI (`ESC [ _`) otherwise.
+///
+/// Shift / Alt / Ctrl on a cursor, editing or function key go in the xterm
+/// form a real terminal sends (`CSI 1;<m> A`, `CSI 3;<m> ~`): the Unix
+/// session host forwards every key to its gaviero tabs through here, and a
+/// dropped modifier turned Alt+Up (panel resize) into plain Up.
 pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     // CSI vs SS3 introducer for unmodified cursor keys (DECCKM).
     let cursor_intro = if application_cursor { b'O' } else { b'[' };
+    let modifier = xterm_modifier(key.modifiers);
 
     // AltGr text reaches here as a plain character (`platform::normalize_key`),
     // so the Ctrl arm below never mangles it into a control byte.
@@ -361,43 +367,62 @@ pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, cursor_intro, b'A'],
-        KeyCode::Down => vec![0x1b, cursor_intro, b'B'],
-        // Ctrl+Left / Ctrl+Right → xterm modifier-5 arrow sequences so the
-        // shell's line editor (readline / PSReadLine) performs backward-word /
-        // forward-word instead of single-char motion. Must precede the plain
-        // arrow arms; always CSI-form regardless of DECCKM (xterm behavior
-        // for modified cursor keys). (Ctrl+Up/Down never reach here —
-        // is_terminal_escape_key routes them to panel resize.)
-        KeyCode::Right if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'C'],
-        KeyCode::Left if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'D'],
-        KeyCode::Right => vec![0x1b, cursor_intro, b'C'],
-        KeyCode::Left => vec![0x1b, cursor_intro, b'D'],
-        KeyCode::Home => vec![0x1b, cursor_intro, b'H'],
-        KeyCode::End => vec![0x1b, cursor_intro, b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::F(n) => f_key_bytes(n),
+        // Ctrl+Left / Ctrl+Right go as `CSI 1;5 D/C`, which readline /
+        // PSReadLine read as backward-word / forward-word.
+        KeyCode::Up => cursor_key(b'A', cursor_intro, modifier),
+        KeyCode::Down => cursor_key(b'B', cursor_intro, modifier),
+        KeyCode::Right => cursor_key(b'C', cursor_intro, modifier),
+        KeyCode::Left => cursor_key(b'D', cursor_intro, modifier),
+        KeyCode::Home => cursor_key(b'H', cursor_intro, modifier),
+        KeyCode::End => cursor_key(b'F', cursor_intro, modifier),
+        KeyCode::PageUp => tilde_key(5, modifier),
+        KeyCode::PageDown => tilde_key(6, modifier),
+        KeyCode::Insert => tilde_key(2, modifier),
+        KeyCode::Delete => tilde_key(3, modifier),
+        KeyCode::F(n) => f_key_bytes(n, modifier),
         _ => vec![],
     }
 }
 
-fn f_key_bytes(n: u8) -> Vec<u8> {
+/// The xterm modifier parameter, `1 + Shift + 2·Alt + 4·Ctrl`, or `None`
+/// when none of the three is held.
+fn xterm_modifier(mods: KeyModifiers) -> Option<u8> {
+    let m = u8::from(mods.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(mods.contains(KeyModifiers::ALT))
+        + 4 * u8::from(mods.contains(KeyModifiers::CONTROL));
+    (m != 0).then_some(m + 1)
+}
+
+/// `ESC <intro> <final>`, or `CSI 1;<m> <final>` when modified — always CSI
+/// then, whatever DECCKM says (what xterm sends).
+fn cursor_key(final_byte: u8, intro: u8, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(m) => format!("\x1b[1;{m}{}", final_byte as char).into_bytes(),
+        None => vec![0x1b, intro, final_byte],
+    }
+}
+
+/// `CSI <n> ~`, or `CSI <n>;<m> ~` when modified.
+fn tilde_key(n: u8, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
+        None => format!("\x1b[{n}~").into_bytes(),
+    }
+}
+
+/// F1–F4 are SS3 keys (`ESC O P`…, `CSI 1;<m> P` modified), F5–F12 tilde
+/// keys.
+fn f_key_bytes(n: u8, modifier: Option<u8>) -> Vec<u8> {
     match n {
-        1 => b"\x1bOP".to_vec(),
-        2 => b"\x1bOQ".to_vec(),
-        3 => b"\x1bOR".to_vec(),
-        4 => b"\x1bOS".to_vec(),
-        5 => b"\x1b[15~".to_vec(),
-        6 => b"\x1b[17~".to_vec(),
-        7 => b"\x1b[18~".to_vec(),
-        8 => b"\x1b[19~".to_vec(),
-        9 => b"\x1b[20~".to_vec(),
-        10 => b"\x1b[21~".to_vec(),
-        11 => b"\x1b[23~".to_vec(),
-        12 => b"\x1b[24~".to_vec(),
+        1..=4 => cursor_key(b'P' + (n - 1), b'O', modifier),
+        5 => tilde_key(15, modifier),
+        6 => tilde_key(17, modifier),
+        7 => tilde_key(18, modifier),
+        8 => tilde_key(19, modifier),
+        9 => tilde_key(20, modifier),
+        10 => tilde_key(21, modifier),
+        11 => tilde_key(23, modifier),
+        12 => tilde_key(24, modifier),
         _ => vec![],
     }
 }
@@ -576,6 +601,41 @@ mod tests {
         let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(key_event_to_bytes(&end, false), b"\x1b[F".to_vec());
         assert_eq!(key_event_to_bytes(&end, true), b"\x1bOF".to_vec());
+    }
+
+    /// The Unix session host forwards keys to its gaviero tabs through
+    /// `key_event_to_bytes`; Alt+Up/Down (panel resize) reached them as plain
+    /// Up/Down. Modified special keys go in xterm form, CSI in both DECCKM
+    /// modes.
+    #[test]
+    fn modified_special_keys_keep_their_modifiers() {
+        let (shift, alt, ctrl) = (KeyModifiers::SHIFT, KeyModifiers::ALT, KeyModifiers::CONTROL);
+        let cases: [(KeyCode, KeyModifiers, &[u8]); 11] = [
+            (KeyCode::Up, alt, b"\x1b[1;3A"),
+            (KeyCode::Down, alt, b"\x1b[1;3B"),
+            (KeyCode::Up, ctrl, b"\x1b[1;5A"),
+            (KeyCode::Down, ctrl, b"\x1b[1;5B"),
+            (KeyCode::Left, ctrl | alt, b"\x1b[1;7D"),
+            (KeyCode::Right, shift, b"\x1b[1;2C"),
+            (KeyCode::End, shift | ctrl, b"\x1b[1;6F"),
+            (KeyCode::PageUp, shift, b"\x1b[5;2~"),
+            (KeyCode::Delete, ctrl, b"\x1b[3;5~"),
+            (KeyCode::F(1), ctrl, b"\x1b[1;5P"),
+            (KeyCode::F(10), shift, b"\x1b[21;2~"),
+        ];
+        for app_cursor in [false, true] {
+            for (code, mods, expected) in cases {
+                let key = KeyEvent::new(code, mods);
+                assert_eq!(key_event_to_bytes(&key, app_cursor), expected.to_vec(), "{key:?}");
+            }
+        }
+        // Unmodified keys are unchanged.
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&f1, false), b"\x1bOP".to_vec());
+        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&f5, false), b"\x1b[15~".to_vec());
+        let pgdn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&pgdn, true), b"\x1b[6~".to_vec());
     }
 
     #[test]
