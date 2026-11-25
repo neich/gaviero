@@ -29,24 +29,46 @@ pub fn create_init_file(
     tab_id: &TerminalId,
     histfile: &Path,
 ) -> Result<PathBuf> {
+    write_init_file(shell_type, &tab_id.to_string(), Some(histfile))
+}
+
+/// An init script with the same integration for a shell that keeps the
+/// user's own history file (the session host's shell tabs), saved as
+/// `gaviero-init-<name>.<ext>`. Every such shell of one type gets the same
+/// script, so it is only rewritten when its content changed: shells opened
+/// at the same time never race on it.
+pub fn create_init_file_with_own_history(shell_type: &ShellType, name: &str) -> Result<PathBuf> {
+    write_init_file(shell_type, name, None)
+}
+
+/// The script for `shell_type`, setting `histfile` as the shell's history
+/// file when given, written as `gaviero-init-<name>.<ext>` unless the file
+/// already holds exactly that.
+fn write_init_file(shell_type: &ShellType, name: &str, histfile: Option<&Path>) -> Result<PathBuf> {
     let dir = shell_integration_dir()?;
-    let content = match shell_type {
-        ShellType::Bash => generate_bash_init(histfile),
-        ShellType::Zsh => generate_zsh_init(histfile),
-        ShellType::Fish => generate_fish_init(histfile),
-        ShellType::PowerShell => generate_pwsh_init(histfile),
-        ShellType::Unknown(_) => return Err(anyhow::anyhow!("unsupported shell for integration")),
-    };
+    let content = init_script(shell_type, histfile)?;
 
     // pwsh only dot-sources scripts with a `.ps1` extension.
     let extension = match shell_type {
         ShellType::PowerShell => "ps1",
         _ => "sh",
     };
-    let filename = format!("gaviero-init-{}.{}", tab_id, extension);
-    let path = dir.join(filename);
-    std::fs::write(&path, content).context("writing shell init script")?;
+    let path = dir.join(format!("gaviero-init-{name}.{extension}"));
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
+        std::fs::write(&path, content).context("writing shell init script")?;
+    }
     Ok(path)
+}
+
+/// The init script's text; `histfile` points the shell's history there.
+fn init_script(shell_type: &ShellType, histfile: Option<&Path>) -> Result<String> {
+    Ok(match shell_type {
+        ShellType::Bash => generate_bash_init(histfile),
+        ShellType::Zsh => generate_zsh_init(histfile),
+        ShellType::Fish => generate_fish_init(histfile),
+        ShellType::PowerShell => generate_pwsh_init(histfile),
+        ShellType::Unknown(_) => return Err(anyhow::anyhow!("unsupported shell for integration")),
+    })
 }
 
 /// Modify the shell config to inject the init file at spawn time.
@@ -121,7 +143,14 @@ fi
 }
 
 /// Generate bash init script content.
-fn generate_bash_init(histfile: &Path) -> String {
+fn generate_bash_init(histfile: Option<&Path>) -> String {
+    let history = match histfile {
+        Some(path) => format!(
+            "# Save original HISTFILE, set gaviero per-tab history\nexport HISTFILE=\"{}\"",
+            path.to_string_lossy()
+        ),
+        None => "# The user's own HISTFILE is kept.".to_string(),
+    };
     format!(
         r#"#!/bin/bash
 # Gaviero shell integration for bash
@@ -131,8 +160,7 @@ fn generate_bash_init(histfile: &Path) -> String {
 # replicate the login-shell startup chain here to ensure PATH and other
 # environment setup from those files is preserved.
 
-# Save original HISTFILE, set gaviero per-tab history
-export HISTFILE="{histfile}"
+{history}
 
 # Shadow tmux/screen during RC sourcing to prevent auto-launch hijack
 __gaviero_real_tmux="$(command -v tmux 2>/dev/null)"
@@ -189,19 +217,21 @@ PS1="${{PS1}}\[\e]133;B\a\]"
 
 # Emit initial prompt markers
 printf '\e]133;A\a'
-"#,
-        histfile = histfile.to_string_lossy()
+"#
     )
 }
 
 /// Generate zsh init script content.
-fn generate_zsh_init(histfile: &Path) -> String {
+fn generate_zsh_init(histfile: Option<&Path>) -> String {
+    let history = match histfile {
+        Some(path) => format!("# Per-tab history\nexport HISTFILE=\"{}\"", path.to_string_lossy()),
+        None => "# The user's own HISTFILE is kept.".to_string(),
+    };
     format!(
         r#"#!/bin/zsh
 # Gaviero shell integration for zsh
 
-# Per-tab history
-export HISTFILE="{histfile}"
+{history}
 setopt INC_APPEND_HISTORY
 
 # --- OSC 133 shell integration ---
@@ -234,18 +264,20 @@ PS1="${{PS1}}%{{$(printf '\e]133;B\a')%}}"
 
 # Emit initial prompt markers
 printf '\e]133;A\a'
-"#,
-        histfile = histfile.to_string_lossy()
+"#
     )
 }
 
 /// Generate fish init script content.
-fn generate_fish_init(histfile: &Path) -> String {
+fn generate_fish_init(histfile: Option<&Path>) -> String {
+    let history = match histfile {
+        Some(path) => format!("# Per-tab history\nset -gx HISTFILE \"{}\"", path.to_string_lossy()),
+        None => "# The user's own history is kept.".to_string(),
+    };
     format!(
         r#"# Gaviero shell integration for fish
 
-# Per-tab history
-set -gx HISTFILE "{histfile}"
+{history}
 
 # --- OSC 133 shell integration ---
 
@@ -268,8 +300,7 @@ end
 
 # Emit initial prompt markers
 printf '\e]133;A\a'
-"#,
-        histfile = histfile.to_string_lossy()
+"#
     )
 }
 
@@ -280,15 +311,22 @@ printf '\e]133;A\a'
 /// is wrapped, not replaced; OSC 133;C (command execution start) comes
 /// from wrapping `PSConsoleHostReadLine`, which PSReadLine invokes
 /// after the user submits a line.
-fn generate_pwsh_init(histfile: &Path) -> String {
-    // Single-quoted PowerShell strings escape `'` by doubling it.
-    let histfile_ps = histfile.to_string_lossy().replace('\'', "''");
+fn generate_pwsh_init(histfile: Option<&Path>) -> String {
+    let history = match histfile {
+        Some(path) => {
+            // Single-quoted PowerShell strings escape `'` by doubling it.
+            let histfile_ps = path.to_string_lossy().replace('\'', "''");
+            format!(
+                "# Per-tab command history\nSet-PSReadLineOption -HistorySavePath '{histfile_ps}' -ErrorAction SilentlyContinue"
+            )
+        }
+        None => "# The user's own PSReadLine history is kept.".to_string(),
+    };
     format!(
         r#"# Gaviero shell integration for PowerShell 7.2+
 # Dot-sourced at spawn via: pwsh -NoExit -NoLogo -ExecutionPolicy Bypass -Command ". '<this file>'"
 
-# Per-tab command history
-Set-PSReadLineOption -HistorySavePath '{histfile_ps}' -ErrorAction SilentlyContinue
+{history}
 
 # --- OSC 133 / OSC 7 shell integration ---
 
@@ -324,4 +362,38 @@ function global:PSConsoleHostReadLine {{
 [Console]::Write("`e]133;A`a")
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHELLS: [ShellType; 4] = [
+        ShellType::Bash,
+        ShellType::Zsh,
+        ShellType::Fish,
+        ShellType::PowerShell,
+    ];
+
+    #[test]
+    fn a_per_tab_history_file_is_set_only_when_given() {
+        let histfile = Path::new("/tmp/gaviero-history/tab-7");
+        for shell in SHELLS {
+            let with = init_script(&shell, Some(histfile)).unwrap();
+            assert!(with.contains("tab-7"), "{shell:?}: {with}");
+            let own = init_script(&shell, None).unwrap();
+            assert!(!own.contains("tab-7"), "{shell:?}");
+            assert!(!own.contains("HISTFILE \"") && !own.contains("HISTFILE=\""), "{shell:?}");
+            assert!(!own.contains("HistorySavePath"), "{shell:?}");
+            // The integration itself is the same either way.
+            for marker in ["133;A", "133;C", "133;D", "]7;file://"] {
+                assert!(own.contains(marker), "{shell:?} lacks {marker}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_shells_get_no_script() {
+        assert!(init_script(&ShellType::Unknown("tcsh".into()), None).is_err());
+    }
 }

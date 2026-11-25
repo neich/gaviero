@@ -61,8 +61,10 @@ pub fn spawn_pty(config: &ShellConfig, cwd: &Path, rows: u16, cols: u16) -> Resu
     })
 }
 
-/// Build a `CommandBuilder` from the shell config.
-fn build_command(config: &ShellConfig, cwd: &Path) -> CommandBuilder {
+/// Build a `CommandBuilder` from the shell config. Public for callers that
+/// run the shell in a pseudo-terminal of their own (the session host's shell
+/// tabs).
+pub fn build_command(config: &ShellConfig, cwd: &Path) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(&config.shell_path);
     for arg in &config.shell_args {
         cmd.arg(arg);
