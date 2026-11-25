@@ -261,6 +261,7 @@ pub(crate) fn chord(key: &HostKey) -> Option<Chord> {
         KeyCode::Left => Some(Chord::Prev),
         KeyCode::Right => Some(Chord::Next),
         KeyCode::Char('n') if !shift => Some(Chord::New),
+        KeyCode::Char('t') if !shift => Some(Chord::NewShell),
         KeyCode::Char('q') => Some(Chord::Close),
         _ => None,
     }
@@ -343,6 +344,8 @@ mod tests {
         assert_eq!(chord(&rec(0x25, 0, LEFT_ALT)), Some(Chord::Prev));
         assert_eq!(chord(&rec(0x27, 0, RIGHT_ALT)), Some(Chord::Next));
         assert_eq!(chord(&rec(0x4E, 'n' as u16, LEFT_ALT)), Some(Chord::New));
+        assert_eq!(chord(&rec(0x54, 't' as u16, LEFT_ALT)), Some(Chord::NewShell));
+        assert_eq!(chord(&rec(0x54, 'T' as u16, LEFT_ALT | SHIFT)), None);
         assert_eq!(chord(&rec(0x51, 'q' as u16, LEFT_ALT)), Some(Chord::Close));
         assert_eq!(chord(&rec(0x51, 'Q' as u16, LEFT_ALT | SHIFT)), Some(Chord::Close));
         assert_eq!(chord(&rec(0x51, 17, LEFT_CTRL)), Some(Chord::QuitAll));
@@ -383,6 +386,7 @@ mod tests {
             (rec(0x27, 0, LEFT_ALT | SHIFT), ev(KeyCode::Right, alt | shift)),
             (rec(0x4E, 'n' as u16, LEFT_ALT), ev(KeyCode::Char('n'), alt)),
             (rec(0x4E, 'N' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('N'), alt)),
+            (rec(0x54, 't' as u16, LEFT_ALT), ev(KeyCode::Char('t'), alt)),
             (rec(0x51, 'Q' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('Q'), alt)),
             (rec(0x51, 17, LEFT_CTRL), ev(KeyCode::Char('q'), ctrl)),
             (rec(0x58, 'x' as u16, LEFT_ALT), ev(KeyCode::Char('x'), alt)),

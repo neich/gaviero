@@ -16,6 +16,9 @@ pub enum TabKind {
     /// gaviero instance: violet, so an edit there is never mistaken for a
     /// workspace one.
     Global,
+    /// A session-host shell tab: teal on a teal-tinted background, active
+    /// or not, so it never reads as a gaviero session.
+    Shell,
 }
 
 /// One activity badge: a letter on a rounded pill of `colour`.
@@ -30,7 +33,8 @@ pub struct TabBadge {
 pub type TabBadges = [Option<TabBadge>; 2];
 
 /// Colours of a tab bar's `Normal` tabs, bar background and chrome.
-/// `DiffView` and `Global` tabs keep their own colours on any palette.
+/// `DiffView`, `Global` and `Shell` tabs keep their own colours on any
+/// palette.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabPalette {
     /// The bar row behind and after the tabs.
@@ -115,6 +119,12 @@ const DIFF_VIEW_FG: Color = Color::Rgb(214, 134, 50);
 const GLOBAL_FG: Color = Color::Rgb(198, 146, 233);
 const GLOBAL_BG: Color = Color::Rgb(52, 40, 66);
 const GLOBAL_ACTIVE_BG: Color = Color::Rgb(78, 56, 102);
+/// Teal for shell tabs, tinted even when inactive. No pure green, yellow or
+/// blue in it, so the activity badges stay readable on it.
+const SHELL_FG: Color = Color::Rgb(120, 200, 190);
+const SHELL_ACTIVE_FG: Color = Color::Rgb(210, 245, 238);
+const SHELL_BG: Color = Color::Rgb(18, 44, 46);
+const SHELL_ACTIVE_BG: Color = Color::Rgb(26, 82, 86);
 
 /// The rendered label for a tab and its display width in terminal cells.
 /// Width must be unicode-aware (`'●'` is 3 bytes / 1 cell, CJK chars are
@@ -186,6 +196,15 @@ impl<'a> TabBar<'a> {
                     s = s.add_modifier(Modifier::BOLD);
                 }
                 s
+            } else if *kind == TabKind::Shell {
+                if is_active {
+                    Style::default()
+                        .fg(SHELL_ACTIVE_FG)
+                        .bg(SHELL_ACTIVE_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(SHELL_FG).bg(SHELL_BG)
+                }
             } else if is_active {
                 Style::default()
                     .fg(p.active_fg)
@@ -387,6 +406,37 @@ mod tests {
             ..bar
         };
         assert_eq!(plain.close_at_x(8, 0), Some(1));
+    }
+
+    #[test]
+    fn shell_tabs_keep_their_own_colours_active_or_not() {
+        let titles = vec![
+            ("gav".to_string(), false, TabKind::Normal),
+            (">_ sh".to_string(), false, TabKind::Shell),
+        ];
+        let draw = |active| {
+            let bar = TabBar {
+                titles: &titles,
+                active,
+                closable: false,
+                badges: None,
+                palette: HOST_PALETTE,
+            };
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            bar.render(Rect::new(0, 0, 20, 1), &mut buf);
+            buf
+        };
+        // " gav " (0..5), separator at 5, " >_ sh " from 6.
+        let inactive = draw(0);
+        assert_eq!(inactive[(7, 0)].symbol(), ">");
+        assert_eq!(inactive[(7, 0)].bg, SHELL_BG);
+        assert_eq!(inactive[(7, 0)].fg, SHELL_FG);
+        assert_ne!(SHELL_BG, HOST_PALETTE.inactive_bg, "tinted even when inactive");
+        let active = draw(1);
+        assert_eq!(active[(7, 0)].bg, SHELL_ACTIVE_BG);
+        assert_eq!(active[(7, 0)].fg, SHELL_ACTIVE_FG);
+        // The gaviero tab is drawn in the palette as before.
+        assert_eq!(active[(1, 0)].bg, HOST_PALETTE.inactive_bg);
     }
 
     #[test]

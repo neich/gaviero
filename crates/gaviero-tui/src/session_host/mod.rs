@@ -1,5 +1,6 @@
 //! Session host (`gaviero --sessions`): several gaviero sessions in one
-//! terminal, each an unmodified `gaviero` child in a pseudo-terminal.
+//! terminal, each an unmodified `gaviero` child in a pseudo-terminal, plus
+//! plain shell tabs (`shell`).
 
 pub(crate) mod clipboard;
 pub(crate) mod encode;
@@ -13,6 +14,7 @@ pub(crate) mod probe;
 pub(crate) mod render;
 pub(crate) mod restart;
 pub(crate) mod session;
+pub(crate) mod shell;
 pub(crate) mod state;
 pub(crate) mod target;
 
@@ -138,6 +140,8 @@ pub(crate) enum Chord {
     MoveRight,
     /// Alt+N: open the new-session picker.
     New,
+    /// Alt+T: open a shell tab in the current tab's folder.
+    NewShell,
     /// Alt+Q: close the active tab and end its session (asks first).
     Close,
     /// Ctrl+Q: quit the host, keeping every tab for the next start (asks
@@ -336,6 +340,18 @@ impl Host {
         }
     }
 
+    /// Alt+T: a shell tab in the current tab's folder.
+    fn open_shell_here(&mut self) {
+        let target = Target::Shell(shell_start_dir(
+            self.active_session().map(|s| &s.target),
+            &self.cwd,
+        ));
+        if let Err(e) = self.open(target.clone()) {
+            tracing::error!(target = %target.display(), "opening the shell failed: {e:#}");
+            self.notify(format!("could not open a shell: {e}"));
+        }
+    }
+
     /// Rows available to a session: everything under the tab bar.
     fn session_rows(&self) -> u16 {
         self.rows.saturating_sub(1)
@@ -478,9 +494,37 @@ impl Host {
         self.sessions.get(self.active)
     }
 
-    fn send_active(&self, bytes: Vec<u8>) {
-        if let Some(s) = self.active_session() {
-            s.send(bytes);
+    /// The user's input (keys, a paste, mouse reports) to the active tab.
+    fn send_active(&mut self, bytes: Vec<u8>) {
+        if let Some(s) = self.sessions.get_mut(self.active) {
+            s.send_input(bytes);
+        }
+    }
+
+    /// The active tab is a shell tab.
+    fn active_shell(&self) -> bool {
+        self.active_session().is_some_and(|s| s.shell.is_some())
+    }
+
+    /// A mouse event over the active shell tab's screen (`shell::mouse`):
+    /// `reports` are its SGR reports, sent only when the program running
+    /// asked for mouse input; the wheel otherwise scrolls the tab's history.
+    fn shell_mouse(&mut self, wheel: Option<bool>, reports: Vec<String>) {
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        match shell::mouse(s.parser.screen(), wheel) {
+            shell::ShellMouse::Forward => {
+                for report in reports {
+                    s.send_input(report.into_bytes());
+                }
+            }
+            shell::ShellMouse::Scroll { up } => {
+                s.scroll_history(up);
+                self.dirty = true;
+            }
+            shell::ShellMouse::Keys(bytes) => s.send_input(bytes),
+            shell::ShellMouse::Drop => {}
         }
     }
 
@@ -525,7 +569,6 @@ impl Host {
         let Some(i) = self.index_of(id) else {
             return;
         };
-        let active = i == self.active;
         let before = self.sessions[i].activity;
         self.sessions[i].feed(bytes);
         if let Some(path) = self.sessions[i].take_reported_path() {
@@ -535,23 +578,72 @@ impl Host {
             self.remember_launch_choice(i);
             self.adopt_reported_path(i, path);
         }
+        if let Some(dir) = self.sessions[i].take_shell_cwd() {
+            self.follow_shell_cwd(i, dir);
+        }
+        self.note_activity(i, before);
+        if i == self.active {
+            self.dirty = true;
+        }
+    }
+
+    /// Tab `i`'s activity was `before` and may have changed: work that
+    /// ended in a background tab is marked finished until the user has made
+    /// the tab current and left it again; any change in the current tab,
+    /// which is in view, means its earlier finish has been seen.
+    fn note_activity(&mut self, i: usize, before: session::Activity) {
+        let active = i == self.active;
         let s = &mut self.sessions[i];
-        let changed = s.activity != before;
-        if changed && !active {
-            // Work that ends in a background tab is marked finished until
-            // the user has made the tab current and left it again.
+        if s.activity == before {
+            return;
+        }
+        if active {
+            s.agent_done_unseen = false;
+            s.shell_done_unseen = false;
+        } else {
             let (agent, shell) = session::finished(before, s.activity);
             s.agent_done_unseen |= agent;
             s.shell_done_unseen |= shell;
-        } else if changed {
-            // The current tab is in view: any change there means its earlier
-            // finish has been seen.
-            s.agent_done_unseen = false;
-            s.shell_done_unseen = false;
         }
-        if active || changed {
-            self.dirty = true;
+        self.dirty = true;
+    }
+
+    /// Loop: a shell tab's "waits for the user" guess turns on after a quiet
+    /// time with no output at all, so every shell tab is looked at again.
+    fn refresh_shells(&mut self) {
+        for i in 0..self.sessions.len() {
+            if self.sessions[i].shell.is_none() {
+                continue;
+            }
+            let before = self.sessions[i].activity;
+            self.sessions[i].refresh_shell_activity();
+            self.note_activity(i, before);
         }
+    }
+
+    /// A shell tab changed folder (`cd`): it is named after the new one and
+    /// reopens there next time.
+    fn follow_shell_cwd(&mut self, i: usize, dir: PathBuf) {
+        let new = Target::Shell(dir);
+        if self.sessions[i].target == new {
+            return;
+        }
+        let taken: Vec<String> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.label.clone())
+            .collect();
+        let s = &mut self.sessions[i];
+        s.label = session::label_for(&new, &taken);
+        s.target = new;
+        if !self.quitting() {
+            let tabs: Vec<Target> = self.sessions.iter().map(|s| s.target.clone()).collect();
+            self.state.set_open(&tabs);
+            self.save_state();
+        }
+        self.dirty = true;
     }
 
     /// A local tab's launch answer, once the child has written it: saved in
@@ -622,7 +714,11 @@ impl Host {
             self.notify(format!("{label}: connection lost"));
             return;
         }
-        if code == crate::supervisor::RESTART_EXIT_CODE as u32 && !self.quitting() {
+        // A shell's exit code is the user's (`exit 75`), never a restart.
+        if code == crate::supervisor::RESTART_EXIT_CODE as u32
+            && !self.sessions[i].target.is_shell()
+            && !self.quitting()
+        {
             let s = &mut self.sessions[i];
             if s.started.elapsed() < crate::supervisor::MIN_RUN {
                 // Same back-off as the supervisor: a build that asks for a
@@ -715,9 +811,9 @@ impl Host {
             self.notify("Nothing to paste: only text reaches an SSH tab".to_string());
             return;
         };
-        if let Some(s) = self.active_session() {
+        if let Some(s) = self.sessions.get_mut(self.active) {
             let bracketed = s.parser.screen().bracketed_paste();
-            s.send(crate::panels::terminal::paste_bytes(bracketed, &text));
+            s.send_input(crate::panels::terminal::paste_bytes(bracketed, &text));
         }
     }
 
@@ -742,7 +838,11 @@ impl Host {
             self.state.remember_launch(&target, text);
         }
         let _ = std::fs::remove_file(&old.launch_state);
-        self.state.note_tab_ended(&old.target, self.quitting());
+        // Another tab on the same target (two shells in one folder) keeps
+        // it open.
+        if !self.sessions.iter().any(|s| s.target == old.target) {
+            self.state.note_tab_ended(&old.target, self.quitting());
+        }
         self.save_state();
         self.active = previous_active(self.active, i, self.sessions.len());
         let active = self.active;
@@ -772,7 +872,7 @@ impl Host {
         }
         let old = self.remove_tab(i);
         tracing::info!(id = old.id, "session closed by the user");
-        if !old.target.is_ssh()
+        if matches!(old.target, Target::Local(_))
             && let Err(e) = std::fs::write(&old.control, "exit")
         {
             tracing::warn!(id = old.id, "could not ask the session to exit: {e}");
@@ -829,10 +929,10 @@ impl Host {
                 .map(|s| restart::RestartTab {
                     path: s.target.clone(),
                     // Launch answers belong to local tabs; an SSH tab's
-                    // remote gaviero keeps its own.
+                    // remote gaviero keeps its own, and a shell has none.
                     launch: match s.target {
                         Target::Local(_) => std::fs::read_to_string(&s.launch_state).ok(),
-                        Target::Ssh { .. } => None,
+                        Target::Ssh { .. } | Target::Shell(_) => None,
                     },
                 })
                 .collect(),
@@ -862,9 +962,10 @@ impl Host {
         self.state.prune_launches();
         self.save_state();
         for s in &mut self.sessions {
-            if s.target.is_ssh() {
+            if !matches!(s.target, Target::Local(_)) {
                 // No control file reaches the remote: ending `ssh` hangs up
-                // the remote gaviero, which saves and exits (SIGHUP).
+                // the remote gaviero, which saves and exits (SIGHUP). A
+                // shell has nothing to save.
                 s.kill();
             } else if let Err(e) = std::fs::write(&s.control, "exit") {
                 tracing::warn!(id = s.id, "could not ask the session to exit: {e}");
@@ -902,6 +1003,8 @@ impl Host {
             Chord::MoveRight => self.move_active(1),
             Chord::New if !self.quitting() => self.open_picker(),
             Chord::New => {}
+            Chord::NewShell if !self.quitting() => self.open_shell_here(),
+            Chord::NewShell => {}
             Chord::Close => self.request_close(self.active),
             Chord::QuitAll if !self.quitting() => self.request_quit(),
             Chord::QuitAll => {}
@@ -1046,7 +1149,13 @@ impl Host {
         if self.active_disconnected() {
             return;
         }
-        for report in self.mouse.translate(&m, 1) {
+        // Translated even when not sent, so the button state stays right.
+        let reports = self.mouse.translate(&m, 1);
+        if self.active_shell() {
+            self.shell_mouse(encode::wheel_up(&m), reports);
+            return;
+        }
+        for report in reports {
             self.send_active(report.into_bytes());
         }
     }
@@ -1094,10 +1203,10 @@ impl Host {
                     ..keys::HostView::default()
                 };
                 if keys::paste_goes_to_session(&view)
-                    && let Some(s) = self.active_session()
+                    && let Some(s) = self.sessions.get_mut(self.active)
                 {
                     let bracketed = s.parser.screen().bracketed_paste();
-                    s.send(crate::panels::terminal::paste_bytes(bracketed, &text));
+                    s.send_input(crate::panels::terminal::paste_bytes(bracketed, &text));
                 }
             }
             _ => {}
@@ -1106,22 +1215,24 @@ impl Host {
 
     /// Unix input path: a crossterm key event. Decided by [`take_key`];
     /// forwarded as VT bytes, with Shift+Enter / Alt+Enter kept apart from
-    /// Enter ([`keys::vt_override`]).
+    /// Enter for gaviero ([`keys::vt_override`]); a shell gets what a plain
+    /// terminal sends.
     fn on_term_key(&mut self, k: KeyEvent) {
         if !self.take_key(&keys::HostKey::from_event(&k)) {
             return;
         }
-        if let Some(s) = self.active_session() {
-            let bytes = match keys::vt_override(&k) {
-                Some(bytes) => bytes.to_vec(),
-                None => {
-                    let app_cursor = s.parser.screen().application_cursor();
-                    crate::panels::terminal::key_event_to_bytes(&k, app_cursor)
-                }
-            };
-            if !bytes.is_empty() {
-                s.send(bytes);
+        let Some(s) = self.active_session() else {
+            return;
+        };
+        let bytes = match keys::vt_override(&k).filter(|_| s.shell.is_none()) {
+            Some(bytes) => bytes.to_vec(),
+            None => {
+                let app_cursor = s.parser.screen().application_cursor();
+                crate::panels::terminal::key_event_to_bytes(&k, app_cursor)
             }
+        };
+        if !bytes.is_empty() {
+            self.send_active(bytes);
         }
     }
 
@@ -1142,7 +1253,17 @@ impl Host {
         if self.active_disconnected() {
             return;
         }
-        if let Some(report) = term_mouse_report(&m, 1) {
+        let report = term_mouse_report(&m, 1);
+        if self.active_shell() {
+            let wheel = match m.kind {
+                MouseEventKind::ScrollUp => Some(true),
+                MouseEventKind::ScrollDown => Some(false),
+                _ => None,
+            };
+            self.shell_mouse(wheel, report.into_iter().collect());
+            return;
+        }
+        if let Some(report) = report {
             self.send_active(report.into_bytes());
         }
     }
@@ -1238,12 +1359,27 @@ fn previous_active(active: usize, removed: usize, len: usize) -> usize {
 /// How long a closed tab's child gets to exit on its own before it is
 /// killed. A local gaviero was asked to exit through its control file; an
 /// SSH tab has no such channel, and ending `ssh` at once is what tells the
-/// remote gaviero to save and exit (it gets SIGHUP).
+/// remote gaviero to save and exit (it gets SIGHUP). A shell has nothing to
+/// save: a command it ran was confirmed by the close guard.
 fn close_grace(target: &Target) -> Duration {
     match target {
         Target::Local(_) => EXIT_GRACE,
-        Target::Ssh { .. } => Duration::ZERO,
+        Target::Ssh { .. } | Target::Shell(_) => Duration::ZERO,
     }
+}
+
+/// Where Alt+T starts a shell: the current tab's folder — a gaviero tab's
+/// folder (a workspace file's own folder), a shell tab's working directory
+/// — else, with an SSH tab or none, the folder the host was started in.
+fn shell_start_dir(active: Option<&Target>, host_cwd: &std::path::Path) -> PathBuf {
+    let dir = match active {
+        Some(Target::Local(path)) if path.is_dir() => Some(path.clone()),
+        Some(Target::Local(path)) => path.parent().map(PathBuf::from),
+        Some(Target::Shell(dir)) => Some(dir.clone()),
+        Some(Target::Ssh { .. }) | None => None,
+    };
+    dir.filter(|d| d.is_dir())
+        .unwrap_or_else(|| host_cwd.to_path_buf())
 }
 
 /// End a closed session off the host loop: give its child `grace` to exit
@@ -1501,6 +1637,7 @@ async fn host_loop(
         host.maybe_end_zoom();
         if last_poll.elapsed() >= EXIT_POLL_EVERY {
             host.poll_exits();
+            host.refresh_shells();
             host.expire_message();
             host.check_new_build();
             last_poll = Instant::now();
@@ -1556,6 +1693,28 @@ mod tests {
             path: None,
         };
         assert_eq!(close_grace(&ssh), Duration::ZERO);
+        assert_eq!(close_grace(&Target::Shell(PathBuf::from("a"))), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_new_shell_starts_in_the_current_tabs_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let ws = proj.join("team.gaviero-workspace");
+        std::fs::write(&ws, "{}").unwrap();
+        let host_cwd = dir.path();
+        let start = |t: Option<Target>| shell_start_dir(t.as_ref(), host_cwd);
+        assert_eq!(start(Some(Target::Local(proj.clone()))), proj);
+        // A workspace file: its folder.
+        assert_eq!(start(Some(Target::Local(ws))), proj);
+        // A shell tab: where it is now.
+        assert_eq!(start(Some(Target::Shell(proj.clone()))), proj);
+        // An SSH tab, no tab, or a folder gone: where the host started.
+        let ssh = Target::Ssh { host: "vps".into(), path: Some("/srv".into()) };
+        assert_eq!(start(Some(ssh)), host_cwd);
+        assert_eq!(start(None), host_cwd);
+        assert_eq!(start(Some(Target::Local(dir.path().join("gone")))), host_cwd);
     }
 
     #[test]

@@ -9,7 +9,7 @@ homepage.workspace = true
 
 [[bin]]
 name = "fake_acp_agent"
-path = "src/bin/fake_acp_agent.rs"
+path = "src/test_bins/fake_acp_agent.rs"
 test = false
 doc = false
 

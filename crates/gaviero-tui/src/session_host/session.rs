@@ -1,6 +1,7 @@
 //! One session: a `gaviero` child in a pseudo-terminal, its emulated screen,
 //! and the status it reports through its window title.
 
+use super::shell::{self, ShellWatch};
 use super::target::Target;
 use super::{CONTROL_ENV, HOST_ENV, HOST_RESTARTS_ENV, HostEvent, encode};
 use anyhow::{Context, Result};
@@ -118,11 +119,13 @@ fn status_fields(title: Option<&str>) -> Option<(&str, &str)> {
     Some(rest.split_once(':').unwrap_or((rest, "")))
 }
 
-/// The tab label for `path`: a workspace file's stem, a folder's name;
-/// ` (2)`, ` (3)`, … when `taken` already holds that label.
+/// The tab label for `path`: a workspace file's stem, a folder's name
+/// (after [`shell::SHELL_MARK`] for a shell); ` (2)`, ` (3)`, … when `taken`
+/// already holds that label.
 pub(crate) fn label_for(target: &Target, taken: &[String]) -> String {
     let base = match target {
         Target::Local(path) => local_label(path),
+        Target::Shell(dir) => format!("{} {}", shell::SHELL_MARK, local_label(dir)),
         Target::Ssh { host, path } => {
             let name = path
                 .as_deref()
@@ -186,6 +189,9 @@ pub(crate) struct Session {
     /// The focus report last sent (`true` = gained), so each change is
     /// sent once.
     focus_sent: Option<bool>,
+    /// A shell tab's command state; `None` for a gaviero session, whose
+    /// activity comes from its status title instead.
+    pub shell: Option<ShellWatch>,
 }
 
 /// The largest copy taken from a session (OSC 52), decoded.
@@ -261,7 +267,8 @@ pub(crate) fn launch_state_path(state_dir: &Path, id: u64) -> PathBuf {
 
 /// Start a session in a `rows` × `cols` pseudo-terminal: `gaviero <path>`
 /// for a local target, the system `ssh` running gaviero on the remote for
-/// an SSH one. Output and end-of-output arrive on `tx` as
+/// an SSH one, the user's shell for a shell tab ([`shell::command`]).
+/// Output and end-of-output arrive on `tx` as
 /// [`HostEvent::Output`] / [`HostEvent::Exited`].
 /// `host_restarts`: the host restarts this child onto a new build, so the
 /// child must not do it itself ([`HOST_RESTARTS_ENV`]).
@@ -287,7 +294,11 @@ pub(crate) fn spawn(
     let cmd = match target {
         Target::Local(path) => local_command(path, &launch_state, &control, host_restarts)?,
         Target::Ssh { host, .. } => ssh_command(target, host, gaviero_override)?,
+        Target::Shell(dir) => shell::command(dir)?,
     };
+    // A gaviero session draws its own history; a shell's scrolls off the
+    // top and is kept here for the wheel.
+    let scrollback = if target.is_shell() { shell::scrollback_lines() } else { 0 };
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -356,7 +367,7 @@ pub(crate) fn spawn(
         id,
         target: target.clone(),
         label,
-        parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TitleCb::default()),
+        parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, TitleCb::default()),
         master: pair.master,
         input,
         child,
@@ -371,6 +382,7 @@ pub(crate) fn spawn(
         disconnected: false,
         focus_ready: false,
         focus_sent: None,
+        shell: target.is_shell().then(|| ShellWatch::new(Instant::now())),
     })
 }
 
@@ -380,15 +392,41 @@ impl Session {
         let _ = self.input.send(bytes);
     }
 
+    /// Queue what the user typed, pasted or clicked. A shell tab notes it
+    /// (the command's question is answered) and leaves its history view.
+    pub fn send_input(&mut self, bytes: Vec<u8>) {
+        if let Some(watch) = &mut self.shell {
+            watch.note_input(Instant::now());
+            self.parser.screen_mut().set_scrollback(0);
+        }
+        self.send(bytes);
+    }
+
+    /// Scroll a shell tab's history view by one wheel notch.
+    pub fn scroll_history(&mut self, up: bool) {
+        let screen = self.parser.screen_mut();
+        let now = screen.scrollback();
+        screen.set_scrollback(if up {
+            now + shell::WHEEL_LINES
+        } else {
+            now.saturating_sub(shell::WHEEL_LINES)
+        });
+    }
+
     /// Tell a local child whether its tab is the one shown (`ESC[I` /
     /// `ESC[O`, which ConPTY turns into focus events). Every hidden tab's
     /// gaviero would otherwise believe it has focus and act on input it
     /// detects outside its own console: a Ctrl+V anywhere attached the
     /// clipboard image in every idle local chat. Sent only once the child
     /// is ready (before that it may be on a setup screen reading keys), and
-    /// never to an SSH tab, whose remote end may be a shell.
+    /// never to an SSH tab, whose remote end may be a shell, nor to a shell
+    /// tab, which would read the reports as typed text.
     pub fn sync_focus(&mut self, focused: bool) {
-        if self.target.is_ssh() || !self.focus_ready || self.focus_sent == Some(focused) {
+        if self.target.is_ssh()
+            || self.shell.is_some()
+            || !self.focus_ready
+            || self.focus_sent == Some(focused)
+        {
             return;
         }
         self.focus_sent = Some(focused);
@@ -397,21 +435,53 @@ impl Session {
     }
 
     /// Feed child output into the screen, answer its terminal queries, and
-    /// update its activity from its title.
+    /// update its activity: a gaviero session's from its title, a shell
+    /// tab's from its shell integration (taken out of the output first).
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        match &mut self.shell {
+            Some(watch) => {
+                let clean = watch.filter(bytes, Instant::now());
+                self.parser.process(&clean);
+            }
+            None => self.parser.process(bytes),
+        }
         let replies = encode::query_replies(bytes, self.parser.screen().cursor_position());
         if !replies.is_empty() {
             self.send(replies);
         }
-        let title = self.parser.callbacks().title.as_deref();
-        self.activity = parse_activity(title);
-        self.work = parse_work(title);
+        if self.shell.is_some() {
+            self.refresh_shell_activity();
+        } else {
+            let title = self.parser.callbacks().title.as_deref();
+            self.activity = parse_activity(title);
+            self.work = parse_work(title);
+        }
         if let Some(data) = self.parser.callbacks_mut().copied.take()
             && let Some(text) = copied_text(&data)
         {
             super::clipboard::set_text(&text);
         }
+    }
+
+    /// A shell tab's activity and work, now: its "waits for the user" guess
+    /// changes with time alone, so the host also calls this between outputs.
+    /// The guess reads the live screen, not the history the user may have
+    /// scrolled to.
+    pub fn refresh_shell_activity(&mut self) {
+        let Some(watch) = &self.shell else {
+            return;
+        };
+        let screen = self.parser.screen_mut();
+        let scrolled = screen.scrollback();
+        screen.set_scrollback(0);
+        self.activity = watch.activity(screen, Instant::now());
+        screen.set_scrollback(scrolled);
+        self.work = watch.work();
+    }
+
+    /// The working directory a shell tab reported since the last call.
+    pub fn take_shell_cwd(&mut self) -> Option<PathBuf> {
+        self.shell.as_mut()?.take_cwd()
     }
 
     /// The folder the child reported since the last call (OSC 7), if any.
@@ -552,6 +622,15 @@ mod tests {
         assert_eq!(label_for(&folder, &[]), "alpha");
         let ws = Target::Local(Path::new("C:\\work").join("team.gaviero-workspace"));
         assert_eq!(label_for(&ws, &[]), "team");
+    }
+
+    #[test]
+    fn shell_labels_carry_the_shell_mark() {
+        let shell = Target::Shell(Path::new("C:\\work").join("alpha"));
+        assert_eq!(label_for(&shell, &[]), ">_ alpha");
+        // A gaviero tab on the same folder is no clash.
+        assert_eq!(label_for(&shell, &["alpha".to_string()]), ">_ alpha");
+        assert_eq!(label_for(&shell, &[">_ alpha".to_string()]), ">_ alpha (2)");
     }
 
     #[test]

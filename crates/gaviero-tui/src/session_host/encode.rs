@@ -180,6 +180,13 @@ pub fn is_zoom_gesture(rec: &MouseRecord, ctrl_held: impl FnOnce() -> bool) -> b
     rec.flags & MOUSE_WHEELED != 0 && (rec.ctrl_state & ANY_CTRL != 0 || ctrl_held())
 }
 
+/// A vertical wheel record's direction: `Some(true)` up (away from the
+/// user), `Some(false)` down; `None` for any other record.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn wheel_up(rec: &MouseRecord) -> Option<bool> {
+    (rec.flags & MOUSE_WHEELED != 0).then_some((rec.buttons >> 16) as u16 as i16 > 0)
+}
+
 /// Button bits of `dwButtonState` and their SGR button codes, in the order
 /// the reports are emitted: left (0), middle (1), right (2).
 const BUTTONS: [(u32, u8); 3] = [(1, 0), (4, 1), (2, 2)];
@@ -431,6 +438,10 @@ mod tests {
             t.translate(&mouse(3, 3, down, 0, MOUSE_WHEELED), 0),
             vec!["\x1b[<65;4;4M"]
         );
+        assert_eq!(wheel_up(&mouse(3, 3, up, 0, MOUSE_WHEELED)), Some(true));
+        assert_eq!(wheel_up(&mouse(3, 3, down, 0, MOUSE_WHEELED)), Some(false));
+        assert_eq!(wheel_up(&mouse(3, 3, 1, 0, 0)), None, "a click is no wheel");
+        assert_eq!(wheel_up(&mouse(3, 3, up, 0, 8)), None, "nor a horizontal one");
     }
 
     #[test]

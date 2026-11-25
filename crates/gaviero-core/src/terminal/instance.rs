@@ -163,12 +163,7 @@ impl TerminalInstance {
         if now.saturating_duration_since(quiet_since) < INPUT_WAIT_QUIET {
             return false;
         }
-        let screen = self.parser.screen();
-        if screen.alternate_screen() {
-            return true;
-        }
-        let (row, col) = screen.cursor_position();
-        col > 0 && !screen.contents_between(row, 0, row, col).trim().is_empty()
+        screen_awaits_input(self.parser.screen())
     }
 
     /// Answer terminal status queries the application sends us — we ARE
@@ -345,6 +340,19 @@ impl Drop for TerminalInstance {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Whether the screen of a command that has been quiet for
+/// [`INPUT_WAIT_QUIET`] looks like it waits for the user: a full-screen
+/// program (alternate screen), or the cursor left after text on its line,
+/// like `Password: ` or `[y/N] `. Shared with the session host's shell tabs,
+/// which track their own running command and quiet time.
+pub fn screen_awaits_input(screen: &vt100::Screen) -> bool {
+    if screen.alternate_screen() {
+        return true;
+    }
+    let (row, col) = screen.cursor_position();
+    col > 0 && !screen.contents_between(row, 0, row, col).trim().is_empty()
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
