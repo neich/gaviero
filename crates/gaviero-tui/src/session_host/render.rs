@@ -40,18 +40,17 @@ pub(crate) fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer
 const GREEN: Color = Color::Rgb(0, 204, 0);
 const YELLOW: Color = Color::Rgb(204, 204, 0);
 const BLUE: Color = Color::Rgb(51, 136, 255);
-/// Agent badge (`A`, drawn as the small capital `ᴀ` so it sits lower than
-/// the label, about 75% of a capital): an agent or swarm is running / waits
-/// for the user (a permission, a question) / finished, its turn review
-/// included.
-const AGENT_LETTER: char = '\u{1D00}';
+/// Agent badge (`A`, a plain capital the size of the label's text): an
+/// agent or swarm is running / waits for the user (a permission, a
+/// question) / finished, its turn review included.
+const AGENT_LETTER: char = 'A';
 const AGENT_RUNNING: Color = GREEN;
 const AGENT_WAITING: Color = YELLOW;
 const AGENT_DONE: Color = BLUE;
-/// Shell badge (`S`, drawn as the small capital `ꜱ`): a command is running /
-/// seems to wait for the user (a bell, a notification, or a quiet prompt
-/// line) / finished while out of view.
-const SHELL_LETTER: char = '\u{A731}';
+/// Shell badge (`S`): a command is running / seems to wait for the user (a
+/// bell, a notification, or a quiet prompt line) / finished while out of
+/// view.
+const SHELL_LETTER: char = 'S';
 const SHELL_RUNNING: Color = GREEN;
 const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
@@ -114,8 +113,8 @@ pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
 }
 
 /// The host's tab bar: every tab has a close button and two activity
-/// badges, a small capital on a square of the state colour (`ᴀ` agent, `ꜱ`
-/// shell — a shell tab only ever shows `ꜱ`), drawn in
+/// badges, a capital on a square of the state colour (`A` agent, `S` shell —
+/// a shell tab only ever shows `S`), drawn in
 /// the host's own palette so it never looks like the editor's tab row inside
 /// the session below it; shell tabs in their own teal.
 pub(crate) fn tab_bar<'a>(

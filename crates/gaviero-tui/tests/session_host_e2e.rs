@@ -287,22 +287,26 @@ fn two_sessions_switch_close_and_quit() {
 /// The host's badge colours (`session_host/render.rs`).
 const RUNNING: vt100::Color = vt100::Color::Rgb(0, 204, 0);
 const DONE: vt100::Color = vt100::Color::Rgb(51, 136, 255);
-/// The badges' letters, small capitals (`session_host/render.rs`).
-const AGENT: &str = "\u{1D00}";
-const SHELL: &str = "\u{A731}";
-/// Whether the tab bar `row` shows any badge.
-fn has_badge(row: &str) -> bool {
-    row.contains(AGENT) || row.contains(SHELL)
+/// The badges' letters (`session_host/render.rs`).
+const AGENT: &str = "A";
+const SHELL: &str = "S";
+/// Whether any of the tabs `labels` shows a badge. Read from the badge
+/// cells, not the whole row: the letters are plain capitals, which a label
+/// or a notice on the bar may hold too.
+fn has_badge(pty: &Pty, labels: &[&str]) -> bool {
+    labels
+        .iter()
+        .any(|label| circles(pty, label).iter().any(|(letter, _)| !letter.trim().is_empty()))
 }
 
-/// The two badges after `label` on the tab bar, each a 2-cell slot (blank,
-/// letter on the badge colour): (letter, its cell's background) each; a
-/// blank letter when unset.
+/// The two badges after `label` on the tab bar (a blank, then two 3-cell
+/// slots: half block, letter on the badge colour, half block): (letter, its
+/// cell's background) each; a blank letter when unset.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
-    let col = (bar[..at].chars().count() + label.chars().count() + 1) as u16;
-    [pty.cell(0, col), pty.cell(0, col + 2)]
+    let col = (bar[..at].chars().count() + label.chars().count() + 2) as u16;
+    [pty.cell(0, col), pty.cell(0, col + 3)]
 }
 
 #[test]
@@ -363,12 +367,12 @@ fn background_tabs_show_agent_and_shell_activity() {
     // leaves no finished mark.
     pty.send(&ctrl_e());
     pty.wait_for("B's second run ended", |s, _| {
-        s.matches("STATUS idle (later)").count() == 2 && !has_badge(&pty.row(0))
+        s.matches("STATUS idle (later)").count() == 2 && !has_badge(&pty, &[la.as_str(), lb.as_str()])
     });
     pty.send(&alt_left());
     pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));
     pty.wait_text("KEY Char('z')");
-    assert!(!has_badge(&pty.row(0)), "row 0: {}", pty.row(0));
+    assert!(!has_badge(&pty, &[la.as_str(), lb.as_str()]), "row 0: {}", pty.row(0));
 
     // Nothing in progress: Ctrl+Q quits at once.
     pty.send(&ctrl_q());
