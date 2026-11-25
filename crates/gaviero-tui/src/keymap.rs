@@ -132,6 +132,11 @@ pub struct Keymap;
 
 impl Keymap {
     /// Resolve a key event to an action based on the current focus.
+    ///
+    /// The `--sessions` host takes these first (`session_host::keys::chord`),
+    /// so under it they never reach gaviero: Alt+Left/Right,
+    /// Alt+Shift+Left/Right, Alt+J/K, Alt+N, Alt+T, Alt+Q and Ctrl+Q. Keep
+    /// new bindings off them (Ctrl+Q quits either way).
     pub fn resolve(key: &KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
