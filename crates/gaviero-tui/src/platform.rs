@@ -467,23 +467,40 @@ pub const CTRL_V_IMAGE_FALLBACK_MS: u64 = 50;
 /// restore path pops exactly what was pushed.
 static KEYS_DISAMBIGUATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The kitty keyboard flags gaviero asks for when it reads the keys itself.
+pub const EDITOR_KEY_FLAGS: crossterm::event::KeyboardEnhancementFlags =
+    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// The Unix session host's flags: [`EDITOR_KEY_FLAGS`] plus the shifted
+/// character on Alt+Shift / Ctrl+Shift keys. The host re-encodes every key as
+/// legacy VT for its tabs, and without it Alt+Shift+1 arrives as Alt+Shift
+/// and `1` — the layout's `!` is lost, and the tab would get Alt+1.
+pub const HOST_KEY_FLAGS: crossterm::event::KeyboardEnhancementFlags = EDITOR_KEY_FLAGS
+    .union(crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
 /// Launch-terminal normalization, Unix side: ask the terminal to report the
 /// keys its legacy encoding cannot tell apart — Shift+Enter and Ctrl+Enter
 /// (a bare `\r`, i.e. Enter), Esc vs an Alt prefix — with the kitty keyboard
-/// protocol's *disambiguate* flag, when the terminal answers the protocol
-/// query (kitty, foot, WezTerm, Ghostty, Alacritty ≥ 0.13, Windows Terminal
-/// ≥ 1.25 through SSH). Text, Enter, Tab and Backspace keep their legacy
-/// bytes, and no key-up / repeat events are asked for. Terminals that do not
-/// answer (VTE, xterm, tmux) keep legacy keys; Alt+Enter and Ctrl+J insert
-/// the chat newline there. Under the session host the host is the terminal:
-/// its emulator has no kitty protocol and it sends Shift+Enter as Alt+Enter
-/// itself (`session_host::keys::vt_override`), so nothing is asked.
+/// protocol's *disambiguate* flag (`flags`: [`EDITOR_KEY_FLAGS`] or
+/// [`HOST_KEY_FLAGS`]), when the terminal answers the protocol query (kitty,
+/// foot, WezTerm, Ghostty, Alacritty ≥ 0.13, Konsole 26.08 with its profile's
+/// "Kitty keyboard protocol" option, Windows Terminal ≥ 1.25 through SSH).
+/// Text, Enter, Tab and Backspace keep their legacy bytes, and no key-up /
+/// repeat events are asked for. Terminals that do not answer (VTE, xterm,
+/// tmux) keep legacy keys; Alt+Enter and Ctrl+J insert the chat newline
+/// there. A session-host tab asks nothing: the host is its terminal, whose
+/// emulator has no kitty protocol. The Unix host asks the outer terminal
+/// itself and sends Shift+Enter on as Alt+Enter
+/// (`session_host::keys::vt_override`).
 ///
 /// Windows: nothing to do — keys arrive as console records with every
 /// modifier, and crossterm cannot push the flags there. Call after
 /// `EnterAlternateScreen` (kitty keeps one flag stack per screen) and before
 /// the input reader starts (the query reads the reply from stdin).
-pub fn enable_key_disambiguation(w: &mut impl Write) -> std::io::Result<()> {
+pub fn enable_key_disambiguation(
+    w: &mut impl Write,
+    flags: crossterm::event::KeyboardEnhancementFlags,
+) -> std::io::Result<()> {
     if !cfg!(unix) || std::env::var_os(crate::session_host::HOST_ENV).is_some() {
         return Ok(());
     }
@@ -492,12 +509,7 @@ pub fn enable_key_disambiguation(w: &mut impl Write) -> std::io::Result<()> {
     if !wants_disambiguation(supported) {
         return Ok(());
     }
-    crossterm::execute!(
-        w,
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        )
-    )?;
+    crossterm::execute!(w, crossterm::event::PushKeyboardEnhancementFlags(flags))?;
     KEYS_DISAMBIGUATED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }

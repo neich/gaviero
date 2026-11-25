@@ -35,23 +35,57 @@ impl vt100::Callbacks for TitleCb {
 pub struct Pty {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser<TitleCb>>>,
+    raw: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
+}
+
+/// Which terminal queries the test terminal answers, beyond the cursor
+/// position (DSR), which it always answers.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Answers {
+    /// Nothing else.
+    DsrOnly,
+    /// Primary device attributes (`CSI c`), as every real terminal does.
+    Legacy,
+    /// That plus the kitty keyboard protocol query (`CSI ? u`, flags 0).
+    Kitty,
 }
 
 impl Pty {
     /// Start the `gaviero` binary with `args` and extra `envs` in a
     /// `ROWS` × `COLS` pseudo console.
     pub fn spawn(args: &[&OsStr], envs: &[(&str, &OsStr)], cwd: &Path) -> Pty {
+        Pty::spawn_answering(args, envs, cwd, Answers::DsrOnly)
+    }
+
+    /// [`Pty::spawn`] in a terminal that answers `answers`.
+    pub fn spawn_answering(
+        args: &[&OsStr],
+        envs: &[(&str, &OsStr)],
+        cwd: &Path,
+        answers: Answers,
+    ) -> Pty {
         // Never let the binary under test become a supervisor.
         let mut envs = envs.to_vec();
         envs.push(("GAVIERO_NO_SUPERVISOR", OsStr::new("1")));
-        Pty::spawn_exe(Path::new(env!("CARGO_BIN_EXE_gaviero")), args, &envs, cwd)
+        let exe = Path::new(env!("CARGO_BIN_EXE_gaviero"));
+        Pty::start(exe, args, &envs, cwd, answers)
     }
 
     /// Start `exe` (a copy of the binary, say) as is: it supervises itself
     /// unless `envs` opt out.
     pub fn spawn_exe(exe: &Path, args: &[&OsStr], envs: &[(&str, &OsStr)], cwd: &Path) -> Pty {
+        Pty::start(exe, args, envs, cwd, Answers::DsrOnly)
+    }
+
+    fn start(
+        exe: &Path,
+        args: &[&OsStr],
+        envs: &[(&str, &OsStr)],
+        cwd: &Path,
+        answers: Answers,
+    ) -> Pty {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -79,8 +113,10 @@ impl Pty {
         )));
         let mut reader = pair.master.try_clone_reader().expect("pty reader");
         let writer = Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
+        let raw = Arc::new(Mutex::new(Vec::new()));
         let feed = Arc::clone(&parser);
         let answer = Arc::clone(&writer);
+        let record = Arc::clone(&raw);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -88,6 +124,7 @@ impl Pty {
                     break;
                 }
                 let chunk = &buf[..n];
+                record.lock().unwrap().extend_from_slice(chunk);
                 let cursor = {
                     let mut parser = feed.lock().unwrap();
                     parser.process(chunk);
@@ -95,13 +132,21 @@ impl Pty {
                 };
                 // We are the terminal: ConPTY itself asks for the cursor
                 // position (DSR) at startup and waits for the answer.
-                let dsr = chunk.windows(4).filter(|w| *w == b"\x1b[6n").count();
-                if dsr > 0 {
-                    let report = format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1);
+                let mut reply = String::new();
+                for _ in 0..count(chunk, b"\x1b[6n") {
+                    reply += &format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1);
+                }
+                // crossterm's protocol query: `CSI ? u` then `CSI c`; the
+                // flags answer must come first.
+                if answers == Answers::Kitty {
+                    reply += &"\x1b[?0u".repeat(count(chunk, b"\x1b[?u"));
+                }
+                if answers != Answers::DsrOnly {
+                    reply += &"\x1b[?62;22c".repeat(count(chunk, b"\x1b[c"));
+                }
+                if !reply.is_empty() {
                     let mut w = answer.lock().unwrap();
-                    for _ in 0..dsr {
-                        let _ = w.write_all(report.as_bytes());
-                    }
+                    let _ = w.write_all(reply.as_bytes());
                     let _ = w.flush();
                 }
             }
@@ -109,9 +154,15 @@ impl Pty {
         Pty {
             writer,
             parser,
+            raw,
             child,
             _master: pair.master,
         }
+    }
+
+    /// Every byte the child has written so far.
+    pub fn raw(&self) -> Vec<u8> {
+        self.raw.lock().unwrap().clone()
     }
 
     pub fn send(&mut self, bytes: &str) {
@@ -211,6 +262,11 @@ impl Pty {
         }
         None
     }
+}
+
+/// How many times `needle` occurs in `hay`.
+pub fn count(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 impl Drop for Pty {

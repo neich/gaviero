@@ -532,7 +532,8 @@ async fn run(cli: Cli) -> Result<bool> {
     // Unix terminals that speak the kitty keyboard protocol report
     // Shift+Enter apart from Enter. Before the input reader starts: the
     // query reads its answer from stdin.
-    platform::enable_key_disambiguation(&mut stdout).context("asking for unambiguous keys")?;
+    platform::enable_key_disambiguation(&mut stdout, platform::EDITOR_KEY_FLAGS)
+        .context("asking for unambiguous keys")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
     // is still restored when `_guard` is dropped.
