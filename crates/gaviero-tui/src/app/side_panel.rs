@@ -1464,7 +1464,7 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
         Action::PageDown | Action::InsertChar('J') => panel.scroll_section(10),
         Action::Tab | Action::CycleTabForward => panel.set_section(panel.section.next()),
         Action::CycleTabBack => panel.set_section(panel.section.prev()),
-        Action::InsertChar(c @ '1'..='6') => {
+        Action::InsertChar(c @ '1'..='7') => {
             if let Some(section) = HistorySection::from_digit(c) {
                 panel.set_section(section);
             }
@@ -1508,13 +1508,13 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
             ));
         }
         Action::InsertChar('y') => {
-            // `y` is the human-readable counterpart to `c`'s NDJSON: on PROMPT it
-            // is the prompt verbatim, so it can be re-sent or pasted elsewhere.
-            // Everything about the section is read off `panel` before the
-            // clipboard is touched, because `set_clipboard` needs all of `app`.
+            // `y` is the human-readable counterpart to `c`'s NDJSON: on PROMPT /
+            // RESPONSE it is that text verbatim, so it can be re-sent or pasted
+            // elsewhere. Everything about the section is read off `panel` before
+            // the clipboard is touched, because `set_clipboard` needs all of `app`.
             let text = panel.focused_text();
             let label = panel.section.label();
-            let truncated = panel.section == HistorySection::Prompt && panel.prompt_is_truncated();
+            let truncated = panel.focused_text_is_truncated();
             let Some(text) = text else {
                 app.status_message = Some((
                     "History: nothing to copy in this section".to_string(),
@@ -1531,9 +1531,9 @@ pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
                 format!(
                     "History: copied {lines} {label} line(s) to the {where_to}{}",
                     if truncated {
-                        " (stored prompt is truncated)"
+                        format!(" (stored {} is truncated)", label.to_lowercase())
                     } else {
-                        ""
+                        String::new()
                     }
                 ),
                 std::time::Instant::now(),
