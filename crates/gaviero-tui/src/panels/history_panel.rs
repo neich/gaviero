@@ -50,6 +50,11 @@ const COLOR_OK: Color = Color::Rgb(152, 195, 121);
 /// sitting beside it.
 const TWO_COLUMN_MIN_WIDTH: u16 = 90;
 
+/// Blank columns between the turn list and the detail beside it. A turn's
+/// meta line is clipped at the list's edge, so without a gap it runs straight
+/// into the detail's text.
+const LIST_DETAIL_GAP: u16 = 1;
+
 /// Screen rows one turn occupies in the turn list (title + meta).
 const ROWS_PER_TURN: usize = 2;
 
@@ -383,10 +388,15 @@ impl HistoryPanelState {
 
     /// The focused section's body plus the body-line index of each FILES row —
     /// the map [`Self::hit_test_file`] turns a screen row back into a file.
-    pub fn body_with_rows(&self, turn: &TurnRecords) -> (Vec<Line<'static>>, Vec<usize>) {
+    /// `width` is the detail's width, as `render_detail` lays the body out.
+    pub fn body_with_rows(
+        &self,
+        turn: &TurnRecords,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
         let cursor = (self.section == HistorySection::Files).then_some(self.file_selected);
         let mut rows = Vec::new();
-        let lines = section_lines_with_rows(turn, self.section, cursor, &mut rows);
+        let lines = section_lines_with_rows(turn, self.section, cursor, width, &mut rows);
         (lines, rows)
     }
 
@@ -418,10 +428,10 @@ impl HistoryPanelState {
             return None;
         }
         let turn = self.selected_turn()?;
-        let (body, file_rows) = self.body_with_rows(turn);
+        let width = geo.detail.width.max(1) as usize;
+        let (body, file_rows) = self.body_with_rows(turn, width);
         let header = self.detail_header_height(turn, geo.expanded, geo.detail.height);
         let screen = row.checked_sub(geo.detail.y.saturating_add(header))? as usize;
-        let width = geo.detail.width.max(1) as usize;
         // `Paragraph::scroll` counts *wrapped* rows, so a file row that is too
         // wide for the panel occupies several of them.
         let target = screen + self.body_scroll(&body, width);
@@ -483,7 +493,13 @@ impl HistoryPanelState {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
                 .split(body);
-            (cols[0], cols[1])
+            // The gap comes off the list, so the detail keeps its width and
+            // `hit_test_turn` (which reads this rect) never lands in the gap.
+            let list = Rect {
+                width: cols[0].width.saturating_sub(LIST_DETAIL_GAP),
+                ..cols[0]
+            };
+            (list, cols[1])
         } else {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
@@ -582,7 +598,9 @@ impl HistoryPanelState {
             }
             _ => {}
         }
-        let text = section_lines_with_cursor(turn, self.section, None)
+        // Only RESPONSE lays its body out to a width, and it returned above:
+        // the copy is never wrapped to the panel.
+        let text = section_lines_with_cursor(turn, self.section, None, usize::MAX)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -747,7 +765,8 @@ impl HistoryPanelState {
             detail_header_lines(turn, self.section)
         };
         let header_len = lines.len();
-        lines.extend(self.section_body(turn));
+        let width = area.width.max(1) as usize;
+        lines.extend(self.section_body(turn, width));
         // Keep the header pinned: scroll only the section body.
         let header: Vec<Line> = lines.drain(..header_len).collect();
         let header_height = (header.len() as u16).min(area.height);
@@ -756,7 +775,7 @@ impl HistoryPanelState {
             .constraints([Constraint::Length(header_height), Constraint::Min(0)])
             .areas(area);
         Paragraph::new(header).render(head, buf);
-        let scroll = self.body_scroll(&lines, area.width.max(1) as usize);
+        let scroll = self.body_scroll(&lines, width);
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
@@ -764,10 +783,11 @@ impl HistoryPanelState {
     }
 
     /// The focused section's body, with the FILES cursor marked when the panel
-    /// has one. Shared by the side-by-side and the expanded layouts.
-    fn section_body(&self, turn: &TurnRecords) -> Vec<Line<'static>> {
+    /// has one, laid out for a detail `width` columns wide. Shared by the
+    /// side-by-side and the expanded layouts.
+    fn section_body(&self, turn: &TurnRecords, width: usize) -> Vec<Line<'static>> {
         let cursor = (self.section == HistorySection::Files).then_some(self.file_selected);
-        section_lines_with_cursor(turn, self.section, cursor)
+        section_lines_with_cursor(turn, self.section, cursor, width)
     }
 }
 
@@ -1063,12 +1083,15 @@ fn tools_absent_reason(provider: Option<&str>) -> &'static str {
 
 /// The focused section's body, with the FILES list's cursor marked (the panel
 /// passes its own `file_selected`; callers with no cursor pass `None`).
+/// `width` is the detail's width; only RESPONSE, rendered as markdown, lays
+/// itself out to it (every other body is wrapped by the `Paragraph`).
 pub fn section_lines_with_cursor(
     turn: &TurnRecords,
     section: HistorySection,
     file_selected: Option<usize>,
+    width: usize,
 ) -> Vec<Line<'static>> {
-    section_lines_with_rows(turn, section, file_selected, &mut Vec::new())
+    section_lines_with_rows(turn, section, file_selected, width, &mut Vec::new())
 }
 
 /// What the `y` key does for a section, as the panel's own help spells it.
@@ -1095,6 +1118,7 @@ pub fn section_lines_with_rows(
     turn: &TurnRecords,
     section: HistorySection,
     file_selected: Option<usize>,
+    width: usize,
     rows: &mut Vec<usize>,
 ) -> Vec<Line<'static>> {
     let provider = turn
@@ -1123,7 +1147,7 @@ pub fn section_lines_with_rows(
                 "No turn_start record (the log starts mid-turn, e.g. after rotation).".into(),
             )),
         },
-        HistorySection::Response => response_lines(turn, &mut lines, &muted),
+        HistorySection::Response => response_lines(turn, width, &mut lines, &muted),
         HistorySection::Tools => {
             let calls: Vec<(u32, &ToolCall)> = turn
                 .records
@@ -1328,6 +1352,26 @@ fn text_lines(text: &str, style: Style, out: &mut Vec<Line<'static>>) {
     }
 }
 
+/// An assistant `text` as the chat shows it: filtered for display, then
+/// formatted as markdown to `width` columns, each rendered row one `Line`
+/// (already wrapped, so the body's `Paragraph` wrap leaves it alone).
+fn markdown_lines(text: &str, width: usize, out: &mut Vec<Line<'static>>) {
+    let shown = crate::panels::agent_chat::filter_assistant_for_display(text);
+    if shown.trim().is_empty() {
+        text_lines("", Style::default(), out);
+        return;
+    }
+    let base = Style::default().fg(crate::theme::TEXT_FG);
+    for row in crate::panels::chat_markdown::format_chat_markdown(&shown, width.max(1), base) {
+        out.push(Line::from(
+            row.segments
+                .into_iter()
+                .map(|s| Span::styled(s.text, s.style))
+                .collect::<Vec<_>>(),
+        ));
+    }
+}
+
 fn json_lines(value: &serde_json::Value, out: &mut Vec<Line<'static>>) {
     let text = match value {
         // A capped payload is stored as the head of its serialization.
@@ -1375,8 +1419,14 @@ fn prompt_lines(start: &TurnStart, out: &mut Vec<Line<'static>>) {
 /// a size line, the `y` hint, the text, then a truncation marker when the
 /// stored text is only a head (the cap, or an 8 KiB head on lines written
 /// before the cap was raised).
+///
+/// The text is drawn as rendered markdown, `width` columns wide, the way the
+/// chat draws the assistant's bubble: the same display filter (`<file>`
+/// blocks collapsed, the `<turn_annotations>` sidecar dropped) and the same
+/// formatter and base colour. Display only — `y` copies the stored text.
 fn response_lines(
     turn: &TurnRecords,
+    width: usize,
     out: &mut Vec<Line<'static>>,
     muted: &dyn Fn(String) -> Line<'static>,
 ) {
@@ -1407,7 +1457,7 @@ fn response_lines(
     )));
     // Display only, like PROMPT's hint: `focused_text` copies the stored text.
     out.push(muted(copy_text_help(HistorySection::Response).into()));
-    text_lines(text, Style::default().fg(COLOR_TEXT), out);
+    markdown_lines(text, width, out);
     if end.assistant_truncated {
         out.push(Line::from(Span::styled(
             format!(
@@ -2072,7 +2122,7 @@ mod tests {
     // ── RESPONSE: the agent's answer, kept per turn ────────────────────────
 
     fn body_of(turn: &TurnRecords, section: HistorySection) -> String {
-        section_lines_with_cursor(turn, section, None)
+        section_lines_with_cursor(turn, section, None, 80)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -2124,6 +2174,53 @@ mod tests {
     }
 
     #[test]
+    fn response_section_renders_markdown_like_the_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        let r = HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
+        let raw = "## Findings\n\nThe **estimator** lives in `tokens.rs`.\n\n\
+                   ```rust\nfn estimate() {}\n```\n\n\
+                   <turn_annotations>\n{\"v\":1,\"flags\":[]}\n</turn_annotations>";
+        r.begin_turn("c1", "c1-1", start("explain", "md"), false);
+        r.note_assistant_output("c1-1", raw);
+        r.end_turn("c1-1", TurnEnd::new(false, None, 0));
+        let mut state = HistoryPanelState::new();
+        state.apply_load(load_history(&path));
+        state.set_section(HistorySection::Response);
+        let turn = state.selected_turn().unwrap();
+
+        let lines = section_lines_with_cursor(turn, HistorySection::Response, None, 60);
+        let body = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        // The words are there, the markup is not.
+        assert!(body.contains("Findings"), "{body}");
+        assert!(body.contains("estimator"), "{body}");
+        assert!(body.contains("fn estimate() {}"), "{body}");
+        assert!(!body.contains("**"), "{body}");
+        assert!(!body.contains("## "), "{body}");
+        assert!(!body.contains("```"), "{body}");
+        assert!(!body.contains('`'), "{body}");
+        // The memory sidecar never shows, as in the chat bubble.
+        assert!(!body.contains("turn_annotations"), "{body}");
+        assert!(!body.contains("\"flags\""), "{body}");
+        // `**estimator**` is drawn bold, in the chat's own formatting.
+        let bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("estimator"))
+            .expect("the bold run");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD), "{bold:?}");
+        // Laid out to the width it was given.
+        assert!(
+            lines.iter().all(|l| l.width() <= 60),
+            "{:?}",
+            lines.iter().map(|l| l.width()).collect::<Vec<_>>()
+        );
+
+        // `y` still copies what the agent wrote, markup and all.
+        assert_eq!(state.focused_text().as_deref(), Some(raw));
+    }
+
+    #[test]
     fn a_long_response_is_shown_whole_and_an_oversized_one_says_it_was_cut() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("turns.ndjson");
@@ -2166,7 +2263,7 @@ mod tests {
         state.select_next();
         let turn = state.selected_turn().unwrap();
         let text = |section| {
-            section_lines_with_cursor(turn, section, None)
+            section_lines_with_cursor(turn, section, None, 80)
                 .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>()
@@ -2206,6 +2303,36 @@ mod tests {
             assert!(text.contains("~ est:"), "{text}");
             assert!(text.contains("unreadable lines skipped"), "{text}");
         }
+    }
+
+    #[test]
+    fn side_by_side_list_and_detail_are_separated_by_a_blank_column() {
+        let (_dir, mut state) = loaded();
+        state.select_next(); // c1-1: its meta line is wider than the list
+        let area = Rect::new(0, 0, 120, 20);
+        let geo = state.panel_geometry(area).unwrap();
+        let list = geo.list.expect("side by side at this width");
+        assert!(
+            list.right() + LIST_DETAIL_GAP <= geo.detail.x,
+            "list {list:?} detail {:?}",
+            geo.detail
+        );
+        let mut buf = Buffer::empty(area);
+        state.render(area, &mut buf, true);
+        let gap = list.right();
+        // The premise: the list's text really reaches its last column, so a
+        // missing gap would show.
+        assert!(
+            (list.y..list.bottom()).any(|y| buf[(gap - 1, y)].symbol() != " "),
+            "{}",
+            buffer_text(&buf)
+        );
+        for y in list.y..list.bottom() {
+            assert_eq!(buf[(gap, y)].symbol(), " ", "row {y}:\n{}", buffer_text(&buf));
+        }
+        // A click in the gap picks no turn.
+        assert_eq!(state.hit_test_turn(area, gap, list.y), None);
+        assert_eq!(state.hit_test_turn(area, gap - 1, list.y), Some(0));
     }
 
     #[test]
@@ -2259,7 +2386,7 @@ mod tests {
     }
 
     fn section_text(turn: &TurnRecords, selected: Option<usize>) -> String {
-        section_lines_with_cursor(turn, HistorySection::Files, selected)
+        section_lines_with_cursor(turn, HistorySection::Files, selected, 80)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()

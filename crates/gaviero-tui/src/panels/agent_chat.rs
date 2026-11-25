@@ -5899,7 +5899,9 @@ fn filter_file_blocks_for_display(text: &str) -> String {
 /// Assistant display filter: collapse `<file>` blocks and strip a trailing
 /// `<turn_annotations>` sidecar so the memory JSON never reaches the user,
 /// even if finalize missed the bubble (interleaved system messages).
-fn filter_assistant_for_display(text: &str) -> String {
+/// The HISTORY panel's RESPONSE section shows a stored response through it
+/// too, so it reads like the chat bubble it came from.
+pub(crate) fn filter_assistant_for_display(text: &str) -> String {
     let collapsed = filter_file_blocks_for_display(text);
     gaviero_core::memory::parse_and_strip(&collapsed).stripped
 }
