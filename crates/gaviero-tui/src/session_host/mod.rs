@@ -1582,6 +1582,12 @@ async fn host_loop(
     // The sessions own the keyboard; Ctrl+C must never end the host.
     crate::platform::ignore_console_interrupts();
     let _guard = crate::TerminalGuard;
+    // Unix: a terminal that speaks the kitty keyboard protocol tells the
+    // host Shift+Enter apart from Enter, which the tabs then get as Alt+Enter
+    // (`keys::vt_override`). Before the input reader starts: the query reads
+    // its answer from stdin. The guard pops the flags on every exit path.
+    crate::platform::enable_key_disambiguation(&mut stdout, crate::platform::HOST_KEY_FLAGS)
+        .context("asking for unambiguous keys")?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))
         .context("creating terminal")?;
 

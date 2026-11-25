@@ -336,9 +336,15 @@ fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf) {
 /// form a real terminal sends (`CSI 1;<m> A`, `CSI 3;<m> ~`): the Unix
 /// session host forwards every key to its gaviero tabs through here, and a
 /// dropped modifier turned Alt+Up (panel resize) into plain Up.
+///
+/// Ctrl and Alt characters leave as the bytes a legacy terminal sends, also
+/// when the key was read through the kitty keyboard protocol (the Unix host
+/// asks for it): there Ctrl+[ is `[` + Ctrl, not the Esc byte, and Alt+Shift+a
+/// can be `a` + Alt + Shift.
 pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // CSI vs SS3 introducer for unmodified cursor keys (DECCKM).
     let cursor_intro = if application_cursor { b'O' } else { b'[' };
     let modifier = xterm_modifier(key.modifiers);
@@ -346,13 +352,15 @@ pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     // AltGr text reaches here as a plain character (`platform::normalize_key`),
     // so the Ctrl arm below never mangles it into a control byte.
     match key.code {
-        KeyCode::Char(c) if ctrl => {
-            let byte = (c.to_ascii_lowercase() as u8)
-                .wrapping_sub(b'a')
-                .wrapping_add(1);
-            vec![byte]
-        }
+        KeyCode::Char(c) if ctrl => match ctrl_byte(c) {
+            Some(byte) => vec![byte],
+            None => {
+                let mut char_buf = [0u8; 4];
+                c.encode_utf8(&mut char_buf).as_bytes().to_vec()
+            }
+        },
         KeyCode::Char(c) if alt => {
+            let c = if shift { c.to_ascii_uppercase() } else { c };
             let mut bytes = vec![0x1b];
             let mut char_buf = [0u8; 4];
             bytes.extend_from_slice(c.encode_utf8(&mut char_buf).as_bytes());
@@ -381,6 +389,23 @@ pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
         KeyCode::Delete => tilde_key(3, modifier),
         KeyCode::F(n) => f_key_bytes(n, modifier),
         _ => vec![],
+    }
+}
+
+/// The C0 byte xterm sends for Ctrl+`c`, or `None` where Ctrl leaves the
+/// character alone (Ctrl+1, Ctrl+., Ctrl+ñ). Digits 2–8 are the US-layout
+/// spellings of the same bytes: a legacy 0x1C reads back as Ctrl+4.
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        c @ 'a'..='z' => Some(c as u8 - b'a' + 1),
+        '@' | ' ' | '2' => Some(0x00),
+        '[' | '3' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '/' | '7' => Some(0x1f),
+        '?' | '8' => Some(0x7f),
+        _ => None,
     }
 }
 
@@ -574,6 +599,41 @@ mod tests {
     fn ctrl_char_maps_to_control_byte() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(key_event_to_bytes(&key, false), vec![0x03]);
+    }
+
+    /// What a legacy terminal sends, whichever way the key was read: the Unix
+    /// session host reads kitty-protocol keys (Ctrl+[ as `[` + Ctrl, Alt+Shift+a
+    /// as `a` + Alt + Shift when the terminal reports no shifted key) and
+    /// forwards them through here.
+    #[test]
+    fn ctrl_and_alt_chars_leave_as_legacy_bytes() {
+        let (shift, alt, ctrl) = (KeyModifiers::SHIFT, KeyModifiers::ALT, KeyModifiers::CONTROL);
+        let cases: [(char, KeyModifiers, &[u8]); 20] = [
+            ('a', ctrl, b"\x01"),
+            ('A', ctrl | shift, b"\x01"),
+            ('[', ctrl, b"\x1b"),
+            ('3', ctrl, b"\x1b"),
+            ('\\', ctrl, b"\x1c"),
+            ('4', ctrl, b"\x1c"),
+            (']', ctrl, b"\x1d"),
+            ('^', ctrl, b"\x1e"),
+            ('_', ctrl, b"\x1f"),
+            ('/', ctrl, b"\x1f"),
+            (' ', ctrl, b"\x00"),
+            ('@', ctrl, b"\x00"),
+            ('?', ctrl, b"\x7f"),
+            ('1', ctrl, b"1"),
+            ('.', ctrl, b"."),
+            ('ñ', ctrl, "ñ".as_bytes()),
+            ('a', alt, b"\x1ba"),
+            ('a', alt | shift, b"\x1bA"),
+            ('A', alt | shift, b"\x1bA"),
+            ('!', alt, b"\x1b!"),
+        ];
+        for (c, mods, expected) in cases {
+            let key = KeyEvent::new(KeyCode::Char(c), mods);
+            assert_eq!(key_event_to_bytes(&key, false), expected.to_vec(), "{key:?}");
+        }
     }
 
     #[test]
