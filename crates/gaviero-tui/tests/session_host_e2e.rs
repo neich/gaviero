@@ -699,6 +699,93 @@ fn tabs_get_focus_reports_once_ready() {
     assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
 }
 
+/// The host's "waits for the user" badge colour (`session_host/render.rs`).
+const WAITING: vt100::Color = vt100::Color::Rgb(204, 204, 0);
+
+fn enter() -> String {
+    tap(0x0D, 0x1C, 13, 0)
+}
+
+/// Type `line` into the shell and run it.
+fn run_line(pty: &mut Pty, line: &str) {
+    type_text(pty, line);
+    pty.send(&enter());
+}
+
+/// The shell badge after `label`: its letter (blank when unset) and colour.
+fn shell_badge(pty: &Pty, label: &str) -> (String, vt100::Color) {
+    let [_, shell] = circles(pty, label);
+    (shell.0.trim().to_string(), shell.1)
+}
+
+/// A shell tab (Alt+T) runs the user's own pwsh with shell integration: its
+/// label carries the shell mark and follows `cd`, its `S` badge shows a
+/// running command, one that waits for the user, and one that finished out
+/// of view, and it reopens in its last folder.
+#[test]
+#[ignore = "runs the user's own pwsh 7 (profile and all)"]
+fn a_shell_tab_shows_its_commands_on_the_s_badge() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    std::fs::create_dir_all(a.join("sub-dir")).unwrap();
+    let la = name_of(&a);
+    let state = root.path().join("state.json");
+    let mut pty = host(&[OsStr::new("--sessions"), a.as_os_str()], &state, root.path());
+    pty.wait_for("A's tab", |_, _| pty.row(0).contains(&la));
+
+    // Alt+T: a shell in A's folder, marked as one, made current.
+    pty.send(&tap(0x54, 0x14, 't' as u16, LEFT_ALT));
+    let shell = format!(">_ {la}");
+    pty.wait_for("the shell tab", |_, _| pty.row(0).contains(&shell));
+    // The user's history stays untouched by this test (`secret` keeps the
+    // line itself out of the file). The concatenation keeps the typed line
+    // from matching the output.
+    run_line(&mut pty, "Set-PSReadLineOption -HistorySaveStyle SaveNothing # secret");
+    run_line(&mut pty, "echo ('shell' + '-ready')");
+    pty.wait_text_within("shell-ready", Duration::from_secs(30));
+    assert_eq!(shell_badge(&pty, &shell).0, "", "nothing runs at the prompt");
+
+    // A command runs: green S. It ends out of view: blue S, and no A.
+    run_line(&mut pty, "Start-Sleep 3; echo ('slept' + '-done')");
+    pty.wait_for("the running badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), RUNNING));
+    pty.send(&alt_left());
+    pty.wait_for("the finished badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), DONE));
+    let [agent, _] = circles(&pty, &shell);
+    assert_eq!(agent.0.trim(), "", "a shell has no agent badge");
+    pty.send(&alt_right());
+    pty.wait_text("slept-done");
+
+    // A command that asks and then sits quiet: yellow S until answered.
+    run_line(&mut pty, "Read-Host 'your name'");
+    pty.wait_for("the waiting badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), WAITING));
+    run_line(&mut pty, "x");
+    pty.wait_for("the prompt back", |_, _| shell_badge(&pty, &shell).0.is_empty());
+
+    // `cd`: the tab is named after the new folder.
+    run_line(&mut pty, "cd sub-dir");
+    pty.wait_for("the label following cd", |_, _| pty.row(0).contains(">_ sub-dir"));
+
+    // Nothing in progress: Ctrl+Q quits at once; the shell is kept, in the
+    // folder it was in, and never listed as a recent target.
+    pty.send(&ctrl_q());
+    let code = pty.wait_exit(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "screen:\n{}", pty.contents());
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    let open: Vec<&str> = json["open"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(
+        open[1].starts_with("shell://") && open[1].ends_with("sub-dir"),
+        "{open:?}"
+    );
+    assert!(!json["recent"].to_string().contains("shell://"), "{json}");
+}
+
 /// Alt+N, the full path of `dir`, Enter.
 fn open_in_picker(pty: &mut Pty, dir: &Path) {
     pty.send(&tap(0x4E, 0x31, 'n' as u16, LEFT_ALT));

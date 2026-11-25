@@ -1,5 +1,6 @@
 //! New-session picker (Alt+N): a folder browser over the whole disk, or —
-//! switched with Ctrl+T — an SSH destination (`host` or `host:/path`).
+//! switched with Ctrl+T — an SSH destination (`host` or `host:/path`), or
+//! the same folder browser opening a shell tab in the chosen folder.
 //!
 //! An empty path box shows the *places* — recently opened paths, the folder
 //! the host was started in, the home folder and every filesystem root (each
@@ -27,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 const WORKSPACE_SUFFIX: &str = ".gaviero-workspace";
 const NOT_OPENABLE: &str = "Not a folder or .gaviero-workspace file";
+const NOT_A_FOLDER: &str = "Not a folder";
 
 /// A key the picker understands, from either input path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,15 +44,28 @@ pub(crate) enum PickerKey {
     Tab,
     Enter,
     Esc,
-    /// Ctrl+T: switch between local folders and SSH.
+    /// Ctrl+T: the next mode — local folders, SSH, shell.
     ToggleMode,
 }
 
-/// What the picker offers: local folders or SSH destinations.
+/// What the picker offers: local folders or SSH destinations to open
+/// gaviero on, or a local folder to open a shell in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PickerMode {
     Local,
     Ssh,
+    Shell,
+}
+
+impl PickerMode {
+    /// The mode Ctrl+T switches to.
+    fn next(self) -> PickerMode {
+        match self {
+            PickerMode::Local => PickerMode::Ssh,
+            PickerMode::Ssh => PickerMode::Shell,
+            PickerMode::Shell => PickerMode::Local,
+        }
+    }
 }
 
 /// What the host does after a picker key.
@@ -70,9 +85,9 @@ pub(crate) struct Picker {
     places: Vec<PathBuf>,
     pub error: Option<String>,
     pub mode: PickerMode,
-    /// Ctrl+T may switch to SSH (the session host's picker, not
+    /// Ctrl+T may switch to SSH and Shell (the session host's picker, not
     /// `gaviero --pick`).
-    allow_ssh: bool,
+    allow_modes: bool,
     /// `Host` aliases from `~/.ssh/config`, offered in SSH mode.
     ssh_hosts: Vec<String>,
 }
@@ -84,12 +99,13 @@ impl Picker {
     }
 
     /// The session host's picker: local folders, or SSH destinations after
-    /// Ctrl+T, offering `ssh_hosts` and the recent SSH targets.
+    /// Ctrl+T, offering `ssh_hosts` and the recent SSH targets, or a folder
+    /// for a shell tab after another Ctrl+T.
     pub fn new_with_ssh(recents: Vec<Target>, ssh_hosts: Vec<String>, cwd: &Path) -> Self {
         Self::build(recents, ssh_hosts, cwd, true)
     }
 
-    fn build(recents: Vec<Target>, ssh_hosts: Vec<String>, cwd: &Path, allow_ssh: bool) -> Self {
+    fn build(recents: Vec<Target>, ssh_hosts: Vec<String>, cwd: &Path, allow_modes: bool) -> Self {
         let mut places = Vec::new();
         places.push(gaviero_core::util::fs::canonicalize_simplified(cwd).unwrap_or_else(|_| cwd.to_path_buf()));
         places.extend(dirs::home_dir());
@@ -101,7 +117,7 @@ impl Picker {
             places,
             error: None,
             mode: PickerMode::Local,
-            allow_ssh,
+            allow_modes,
             ssh_hosts,
         };
         picker.refresh(cwd);
@@ -178,12 +194,14 @@ impl Picker {
     /// (no separator): matching recents, then folders and workspace files in
     /// `cwd`. A path: the listed folder itself when the text ends with a
     /// separator, then its folders and workspace files. A match that is
-    /// exactly the typed path goes to the very top.
+    /// exactly the typed path goes to the very top. Shell mode lists the
+    /// same without workspace files: a shell opens in a folder.
     pub fn refresh(&mut self, cwd: &Path) {
         if self.mode == PickerMode::Ssh {
             self.refresh_ssh();
             return;
         }
+        let shell = self.mode == PickerMode::Shell;
         let query = self.input.text.clone();
         let mut matches: Vec<String> = Vec::new();
         let push = |m: String, matches: &mut Vec<String>| {
@@ -191,14 +209,18 @@ impl Picker {
                 matches.push(m);
             }
         };
+        let recents: Vec<&PathBuf> = self
+            .local_recents()
+            .filter(|p| !shell || p.is_dir())
+            .collect();
         if query.is_empty() {
-            for p in self.local_recents().chain(self.places.iter()) {
+            for p in recents.iter().copied().chain(self.places.iter()) {
                 push(dir_label(p), &mut matches);
             }
         } else {
             if !query.contains(['/', '\\']) {
                 let needle = query.to_lowercase();
-                for p in self.local_recents() {
+                for p in &recents {
                     let label = dir_label(p);
                     if label.to_lowercase().contains(&needle) {
                         push(label, &mut matches);
@@ -211,7 +233,7 @@ impl Picker {
             let base = (!is_filesystem_query(&query)).then_some(cwd);
             let listed = list_filesystem_entries(&query, base, usize::MAX)
                 .into_iter()
-                .filter(|m| ends_with_separator(m) || m.ends_with(WORKSPACE_SUFFIX));
+                .filter(|m| ends_with_separator(m) || (!shell && m.ends_with(WORKSPACE_SUFFIX)));
             for m in listed {
                 push(m, &mut matches);
             }
@@ -236,11 +258,8 @@ impl Picker {
             return PickerOutcome::Close;
         }
         if key == PickerKey::ToggleMode {
-            if self.allow_ssh {
-                self.mode = match self.mode {
-                    PickerMode::Local => PickerMode::Ssh,
-                    PickerMode::Ssh => PickerMode::Local,
-                };
+            if self.allow_modes {
+                self.mode = self.mode.next();
                 self.input = TextInput::new();
                 self.error = None;
                 self.refresh(cwd);
@@ -283,20 +302,25 @@ impl Picker {
             PickerKey::Enter => {
                 let typed = self.input.text.clone();
                 let target = self.selected().map(str::to_string).unwrap_or(typed);
-                match resolve(&target, cwd) {
-                    Some(path) => return PickerOutcome::Open(Target::Local(path)),
-                    None => self.error = Some(NOT_OPENABLE.to_string()),
+                match (resolve(&target, cwd), self.mode) {
+                    (Some(dir), PickerMode::Shell) if dir.is_dir() => {
+                        return PickerOutcome::Open(Target::Shell(dir));
+                    }
+                    (_, PickerMode::Shell) => self.error = Some(NOT_A_FOLDER.to_string()),
+                    (Some(path), _) => return PickerOutcome::Open(Target::Local(path)),
+                    (None, _) => self.error = Some(NOT_OPENABLE.to_string()),
                 }
             }
         }
         PickerOutcome::Stay
     }
 
-    /// The recent local paths (SSH recents are listed in SSH mode).
+    /// The recent local paths (SSH recents are listed in SSH mode; shells
+    /// are never recent).
     fn local_recents(&self) -> impl Iterator<Item = &PathBuf> {
         self.recents.iter().filter_map(|t| match t {
             Target::Local(path) => Some(path),
-            Target::Ssh { .. } => None,
+            Target::Ssh { .. } | Target::Shell(_) => None,
         })
     }
 
@@ -336,7 +360,7 @@ impl Picker {
     /// A centered box over `area`: title, path box, error line, match list.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let width = area.width.saturating_sub(4).min(100);
-        let mode_rows = u16::from(self.allow_ssh);
+        let mode_rows = u16::from(self.allow_modes);
         let height = area
             .height
             .saturating_sub(2)
@@ -357,7 +381,7 @@ impl Picker {
             .style(Style::default().fg(Color::White).bg(Color::Rgb(35, 39, 46)));
         let mut inner = block.inner(rect);
         block.render(rect, buf);
-        if self.allow_ssh && inner.height > 2 {
+        if self.allow_modes && inner.height > 2 {
             self.render_mode_row(inner, buf);
             inner.y += 1;
             inner.height -= 1;
@@ -380,6 +404,9 @@ impl Picker {
                         "Enter open · → into folder · ← parent · Tab complete · Esc cancel"
                     }
                     PickerMode::Ssh => "Enter open · Tab complete · Esc cancel · host or host:/path",
+                    PickerMode::Shell => {
+                        "Enter open a shell here · → into folder · ← parent · Tab complete · Esc cancel"
+                    }
                 },
                 Style::default().fg(Color::Rgb(99, 109, 131)),
             ),
@@ -398,7 +425,8 @@ impl Picker {
 }
 
 impl Picker {
-    /// The ` Local   SSH ` switch, the active one reversed, then the key.
+    /// The ` Local   SSH   Shell ` switch, the active one reversed, then
+    /// the key.
     fn render_mode_row(&self, inner: Rect, buf: &mut Buffer) {
         let dim = Style::default().fg(Color::Rgb(99, 109, 131));
         let active = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
@@ -407,6 +435,8 @@ impl Picker {
             (" Local ", style(PickerMode::Local)),
             (" ", Style::default()),
             (" SSH ", style(PickerMode::Ssh)),
+            (" ", Style::default()),
+            (" Shell ", style(PickerMode::Shell)),
             ("   Ctrl+T: switch", dim),
         ];
         let mut x = inner.x;
@@ -480,7 +510,7 @@ pub(crate) fn run_standalone(start: &Path) -> anyhow::Result<Option<PathBuf>> {
             PickerOutcome::Close => break None,
             PickerOutcome::Open(Target::Local(path)) => break Some(path),
             // A local-only picker never offers anything else.
-            PickerOutcome::Open(Target::Ssh { .. }) => {}
+            PickerOutcome::Open(Target::Ssh { .. } | Target::Shell(_)) => {}
         }
     };
     drop(terminal);
@@ -544,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_switches_to_ssh_and_back() {
+    fn ctrl_t_cycles_local_ssh_and_shell() {
         let dir = fixture();
         let mut picker = ssh_picker(dir.path());
         assert_eq!(picker.mode, PickerMode::Local);
@@ -552,7 +582,40 @@ mod tests {
         assert_eq!(picker.mode, PickerMode::Ssh);
         assert_eq!(picker.list.matches, vec!["old:/srv/x", "vps", "box"]);
         picker.on_key(PickerKey::ToggleMode, dir.path());
+        assert_eq!(picker.mode, PickerMode::Shell);
+        picker.on_key(PickerKey::ToggleMode, dir.path());
         assert_eq!(picker.mode, PickerMode::Local);
+    }
+
+    fn shell_picker(dir: &Path) -> Picker {
+        let mut picker = ssh_picker(dir);
+        picker.on_key(PickerKey::ToggleMode, dir);
+        picker.on_key(PickerKey::ToggleMode, dir);
+        assert_eq!(picker.mode, PickerMode::Shell);
+        picker
+    }
+
+    #[test]
+    fn shell_mode_opens_a_shell_in_a_folder() {
+        let dir = fixture();
+        let mut picker = shell_picker(dir.path());
+        typed(&mut picker, "al", dir.path());
+        assert_eq!(
+            picker.on_key(PickerKey::Enter, dir.path()),
+            PickerOutcome::Open(Target::Shell(canon(&dir.path().join("alpha"))))
+        );
+    }
+
+    #[test]
+    fn shell_mode_lists_folders_only_and_refuses_a_workspace_file() {
+        let dir = fixture();
+        let mut picker = shell_picker(dir.path());
+        typed(&mut picker, "w", dir.path());
+        assert!(picker.list.matches.is_empty(), "{:?}", picker.list.matches);
+        // Typed out in full it is still no folder.
+        typed(&mut picker, ".gaviero-workspace", dir.path());
+        assert_eq!(picker.on_key(PickerKey::Enter, dir.path()), PickerOutcome::Stay);
+        assert_eq!(picker.error.as_deref(), Some(NOT_A_FOLDER));
     }
 
     #[test]

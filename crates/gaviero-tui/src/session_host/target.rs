@@ -1,10 +1,12 @@
 //! What a session-host tab runs: gaviero on a local folder or workspace
-//! file, or gaviero on a remote machine reached with the system `ssh`.
+//! file, gaviero on a remote machine reached with the system `ssh`, or a
+//! plain shell in a local folder.
 //!
 //! Saved (state file, restart record) as a string: a local target is its
-//! path, exactly as before SSH tabs existed, and an SSH target is
+//! path, exactly as before SSH tabs existed, an SSH target is
 //! `ssh://<host>` or `ssh://<host><path>` (`ssh://<host>/~/…` for a path
-//! under the remote home).
+//! under the remote home), and a shell is `shell://<folder>`. An older build
+//! reads a shell as a local path that does not exist and skips it.
 //!
 //! An SSH tab runs [`ssh_program`] with [`ssh_args`]: the remote command
 //! starts the user's login shell (so `~/.local/bin` and the like are on
@@ -17,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const SSH_PREFIX: &str = "ssh://";
+const SHELL_PREFIX: &str = "shell://";
 
 /// Characters never accepted in a host, a remote path or a remote gaviero
 /// path: they would break out of the remote command's quoting.
@@ -32,12 +35,16 @@ pub(crate) enum Target {
     /// workspace file (absolute, or `~`-relative); `None` lets the user pick
     /// it on the remote (`gaviero --pick`).
     Ssh { host: String, path: Option<String> },
+    /// The user's own shell (`session_host::shell`), started in this local
+    /// folder; it follows the shell's working directory (OSC 7).
+    Shell(PathBuf),
 }
 
 impl From<Target> for String {
     fn from(target: Target) -> String {
         match target {
             Target::Local(path) => path.to_string_lossy().into_owned(),
+            Target::Shell(dir) => format!("{SHELL_PREFIX}{}", dir.to_string_lossy()),
             Target::Ssh { host, path: None } => format!("{SSH_PREFIX}{host}"),
             Target::Ssh {
                 host,
@@ -57,6 +64,9 @@ impl TryFrom<String> for Target {
     type Error = String;
 
     fn try_from(text: String) -> Result<Target, String> {
+        if let Some(dir) = text.strip_prefix(SHELL_PREFIX) {
+            return Ok(Target::Shell(PathBuf::from(dir)));
+        }
         let Some(rest) = text.strip_prefix(SSH_PREFIX) else {
             return Ok(Target::Local(PathBuf::from(text)));
         };
@@ -84,18 +94,24 @@ impl Target {
         matches!(self, Target::Ssh { .. })
     }
 
+    /// A shell tab rather than a gaviero session.
+    pub fn is_shell(&self) -> bool {
+        matches!(self, Target::Shell(_))
+    }
+
     pub fn host(&self) -> Option<&str> {
         match self {
             Target::Ssh { host, .. } => Some(host),
-            Target::Local(_) => None,
+            Target::Local(_) | Target::Shell(_) => None,
         }
     }
 
-    /// How the picker and messages show it: the local path, or `host` /
-    /// `host:path`.
+    /// How the picker and messages show it: the local path, `host` /
+    /// `host:path`, or `shell in <folder>`.
     pub fn display(&self) -> String {
         match self {
             Target::Local(path) => path.display().to_string(),
+            Target::Shell(dir) => format!("shell in {}", dir.display()),
             Target::Ssh { host, path: None } => host.clone(),
             Target::Ssh {
                 host,
@@ -272,6 +288,18 @@ mod tests {
         );
         assert_eq!(round_trip(ssh("vps", Some("~/proj"))), "ssh://vps/~/proj");
         assert_eq!(round_trip(ssh("vps", Some("~"))), "ssh://vps/~");
+    }
+
+    #[test]
+    fn shell_targets_round_trip_and_are_neither_local_nor_ssh() {
+        let shell = Target::Shell(PathBuf::from("C:\\work\\a b"));
+        assert_eq!(round_trip(shell.clone()), "shell://C:\\work\\a b");
+        assert_eq!(round_trip(Target::Shell(PathBuf::from("/srv/x"))), "shell:///srv/x");
+        assert!(shell.is_shell() && !shell.is_ssh());
+        assert_eq!(shell.host(), None);
+        assert_eq!(shell.display(), "shell in C:\\work\\a b");
+        assert!(shell.remote_command(None).is_err());
+        assert!(!Target::Local(PathBuf::from("x")).is_shell());
     }
 
     #[test]

@@ -52,10 +52,15 @@ const SHELL_RUNNING: Color = GREEN;
 const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
 
+/// Every tab's label; a shell tab (its label already starts with
+/// `shell::SHELL_MARK`) is drawn in its own teal, not the host palette.
 pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
     host.sessions
         .iter()
-        .map(|s| (s.label.clone(), false, TabKind::Normal))
+        .map(|s| {
+            let kind = if s.shell.is_some() { TabKind::Shell } else { TabKind::Normal };
+            (s.label.clone(), false, kind)
+        })
         .collect()
 }
 
@@ -104,8 +109,9 @@ pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
 }
 
 /// The host's tab bar: every tab has a close button and two activity
-/// badges (`A` agent, `S` shell), drawn in the host's own palette so it never looks like the
-/// editor's tab row inside the session below it.
+/// badges (`A` agent, `S` shell — a shell tab only ever shows `S`), drawn in
+/// the host's own palette so it never looks like the editor's tab row inside
+/// the session below it; shell tabs in their own teal.
 pub(crate) fn tab_bar<'a>(
     host: &Host,
     titles: &'a [(String, bool, TabKind)],
@@ -158,7 +164,11 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
     if let Some(session) = host.sessions.get(host.active) {
         let screen = session.parser.screen();
         render_screen(screen, body, frame.buffer_mut());
-        if session.disconnected {
+        let scrolled = screen.scrollback();
+        if scrolled > 0 {
+            // A shell tab's history view: the live cursor is not on it.
+            draw_history_mark(scrolled, body, frame.buffer_mut());
+        } else if session.disconnected {
             let host_name = session.target.host().unwrap_or_default();
             draw_confirm(
                 " Disconnected ",
@@ -230,6 +240,21 @@ fn draw_confirm(title: &str, lines: &[String], area: Rect, buf: &mut Buffer) {
             style,
         );
     }
+}
+
+/// How far back a shell tab's history view is, at the top right of the
+/// screen, and how to leave it.
+fn draw_history_mark(lines: usize, body: Rect, buf: &mut Buffer) {
+    use unicode_width::UnicodeWidthStr;
+    if body.height == 0 {
+        return;
+    }
+    let text = format!(" ↑ {lines} lines · type or wheel down to return ");
+    let width = (text.as_str().width() as u16).min(body.width);
+    let style = Style::default()
+        .fg(Color::Rgb(210, 245, 238))
+        .bg(Color::Rgb(26, 82, 86));
+    buf.set_stringn(body.x + body.width - width, body.y, &text, width as usize, style);
 }
 
 /// A message or question right-aligned on the tab bar row.

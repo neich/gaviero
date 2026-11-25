@@ -40,7 +40,7 @@ pub const RESTART_EXIT_CODE: i32 = 75;
 
 /// Set on the TUI child so it knows a supervisor will relaunch it (and so it
 /// never supervises itself).
-const CHILD_ENV: &str = "GAVIERO_SUPERVISED";
+pub(crate) const CHILD_ENV: &str = "GAVIERO_SUPERVISED";
 
 /// Run the TUI directly, without a supervisor parent.
 const OPT_OUT_ENV: &str = "GAVIERO_NO_SUPERVISOR";
@@ -48,7 +48,7 @@ const OPT_OUT_ENV: &str = "GAVIERO_NO_SUPERVISOR";
 /// Set on the TUI child: a file, private to this supervisor, where the child
 /// records answers to launch prompts so a restart reuses them instead of
 /// stopping at the prompt again ([`recall_launch_choice`]).
-const LAUNCH_STATE_ENV: &str = "GAVIERO_LAUNCH_STATE";
+pub(crate) const LAUNCH_STATE_ENV: &str = "GAVIERO_LAUNCH_STATE";
 
 /// How long to wait for the executable to reappear: an installer moves the
 /// old file aside before the new one is in place.

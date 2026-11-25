@@ -123,11 +123,12 @@ pub(crate) fn lock_instance(state: &Path) -> std::io::Result<Option<InstanceLock
 }
 
 /// A saved target that can still be opened: a folder, or a
-/// `.gaviero-workspace` file. SSH targets cannot be checked from here and
-/// always count as openable.
+/// `.gaviero-workspace` file; a shell's folder. SSH targets cannot be
+/// checked from here and always count as openable.
 pub(crate) fn still_openable(target: &Target) -> bool {
     match target {
         Target::Local(path) => local_openable(path),
+        Target::Shell(dir) => dir.is_dir(),
         Target::Ssh { .. } => true,
     }
 }
@@ -146,13 +147,29 @@ fn launch_key(target: &Target) -> String {
 }
 
 impl HostState {
-    /// `target` was opened in a tab: first in `recent`, and in `open`.
+    /// `target` was opened in a tab: first in `recent`, and in `open`. A
+    /// shell goes in `open` only: the recents are the picker's gaviero
+    /// targets, and a shell's folder changes with every `cd`.
     pub fn note_opened(&mut self, target: &Target) {
-        self.recent.retain(|p| p != target);
-        self.recent.insert(0, target.clone());
-        self.recent.truncate(RECENT_CAP);
+        if !target.is_shell() {
+            self.recent.retain(|p| p != target);
+            self.recent.insert(0, target.clone());
+            self.recent.truncate(RECENT_CAP);
+        }
         if !self.open.iter().any(|p| p == target) {
             self.open.push(target.clone());
+        }
+    }
+
+    /// `open` becomes exactly the tabs' targets, in tab order, each once —
+    /// after a tab's target changed while another tab may share its old one
+    /// (a shell that changed folder).
+    pub fn set_open(&mut self, tabs: &[Target]) {
+        self.open.clear();
+        for target in tabs {
+            if !self.open.contains(target) {
+                self.open.push(target.clone());
+            }
         }
     }
 
@@ -428,6 +445,30 @@ mod tests {
         // No answers: the key is left out.
         save(&path, &HostState::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("launches"));
+    }
+
+    #[test]
+    fn shells_are_reopened_but_never_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = Target::Shell(dir.path().to_path_buf());
+        let mut state = HostState::default();
+        state.note_opened(&l("a"));
+        state.note_opened(&shell);
+        assert_eq!(state.open, vec![l("a"), shell.clone()]);
+        assert_eq!(state.recent, vec![l("a")]);
+        assert!(still_openable(&shell));
+        assert!(!still_openable(&Target::Shell(dir.path().join("gone"))));
+    }
+
+    #[test]
+    fn the_open_set_follows_the_tabs_once_each() {
+        let mut state = HostState::default();
+        let (s1, s2) = (Target::Shell("/a".into()), Target::Shell("/b".into()));
+        state.note_opened(&l("x"));
+        state.note_opened(&s1);
+        // Two shells were in `/a`; one moved to `/b`: both stay open.
+        state.set_open(&[l("x"), s2.clone(), s1.clone(), s2.clone()]);
+        assert_eq!(state.open, vec![l("x"), s2, s1]);
     }
 
     #[test]
