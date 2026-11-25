@@ -286,18 +286,23 @@ fn two_sessions_switch_close_and_quit() {
 
 /// The host's badge colours (`session_host/render.rs`).
 const RUNNING: vt100::Color = vt100::Color::Rgb(0, 204, 0);
-const DONE: vt100::Color = vt100::Color::Rgb(0, 0, 204);
-/// A badge's left cap (`widgets/tabs.rs`).
-const PILL_LEFT: char = '\u{E0B6}';
+const DONE: vt100::Color = vt100::Color::Rgb(51, 136, 255);
+/// The badges' letters, small capitals (`session_host/render.rs`).
+const AGENT: &str = "\u{1D00}";
+const SHELL: &str = "\u{A731}";
+/// Whether the tab bar `row` shows any badge.
+fn has_badge(row: &str) -> bool {
+    row.contains(AGENT) || row.contains(SHELL)
+}
 
-/// The two badges after `label` on the tab bar, each a 3-cell pill (cap,
-/// letter, cap): (letter, the cap's colour) each; a blank letter when unset.
+/// The two badges after `label` on the tab bar, each a 2-cell slot (blank,
+/// letter on the badge colour): (letter, its cell's background) each; a
+/// blank letter when unset.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
     let col = (bar[..at].chars().count() + label.chars().count() + 1) as u16;
-    let badge = |cap: u16| (pty.cell(0, cap + 1).0, pty.cell(0, cap).1);
-    [badge(col), badge(col + 3)]
+    [pty.cell(0, col), pty.cell(0, col + 2)]
 }
 
 #[test]
@@ -326,14 +331,14 @@ fn background_tabs_show_agent_and_shell_activity() {
     pty.wait_text("STATUS busy");
     pty.wait_for("B's running circles while current", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("A".to_string(), RUNNING) && shell == ("S".to_string(), RUNNING)
+        agent == (AGENT.to_string(), RUNNING) && shell == (SHELL.to_string(), RUNNING)
     });
 
     // Seen from A, B still shows both running.
     pty.send(&alt_left());
     pty.wait_for("B's running circles", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("A".to_string(), RUNNING) && shell == ("S".to_string(), RUNNING)
+        agent == (AGENT.to_string(), RUNNING) && shell == (SHELL.to_string(), RUNNING)
     });
     let [a_agent, a_shell] = circles(&pty, &la);
     assert_eq!((a_agent.0.trim(), a_shell.0.trim()), ("", ""), "A has none");
@@ -341,28 +346,29 @@ fn background_tabs_show_agent_and_shell_activity() {
     // The work ends while B is out of view: both turn to finished.
     pty.wait_for("B's finished circles", |_, _| {
         let [agent, shell] = circles(&pty, &lb);
-        agent == ("A".to_string(), DONE) && shell == ("S".to_string(), DONE)
+        agent == (AGENT.to_string(), DONE) && shell == (SHELL.to_string(), DONE)
     });
 
-    // Making B current keeps them.
+    // Making B current keeps the agent's; the shell's clears, its output
+    // being in view with the prompt back.
     pty.send(&alt_right());
-    pty.wait_for("B current, finished circles kept", |s, _| {
+    pty.wait_for("B current, agent finished circle kept", |s, _| {
         let [agent, shell] = circles(&pty, &lb);
         s.contains("STATUS idle (later)")
-            && agent == ("A".to_string(), DONE)
-            && shell == ("S".to_string(), DONE)
+            && agent == (AGENT.to_string(), DONE)
+            && shell.0.trim().is_empty()
     });
 
     // New work on the current tab replaces them; when it ends in view it
     // leaves no finished mark.
     pty.send(&ctrl_e());
     pty.wait_for("B's second run ended", |s, _| {
-        s.matches("STATUS idle (later)").count() == 2 && !pty.row(0).contains(PILL_LEFT)
+        s.matches("STATUS idle (later)").count() == 2 && !has_badge(&pty.row(0))
     });
     pty.send(&alt_left());
     pty.send(&tap(0x5A, 0x2C, 'z' as u16, 0));
     pty.wait_text("KEY Char('z')");
-    assert!(!pty.row(0).contains(PILL_LEFT), "row 0: {}", pty.row(0));
+    assert!(!has_badge(&pty.row(0)), "row 0: {}", pty.row(0));
 
     // Nothing in progress: Ctrl+Q quits at once.
     pty.send(&ctrl_q());
@@ -747,9 +753,9 @@ fn a_shell_tab_shows_its_commands_on_the_s_badge() {
 
     // A command runs: green S. It ends out of view: blue S, and no A.
     run_line(&mut pty, "Start-Sleep 3; echo ('slept' + '-done')");
-    pty.wait_for("the running badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), RUNNING));
+    pty.wait_for("the running badge", |_, _| shell_badge(&pty, &shell) == (SHELL.into(), RUNNING));
     pty.send(&alt_left());
-    pty.wait_for("the finished badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), DONE));
+    pty.wait_for("the finished badge", |_, _| shell_badge(&pty, &shell) == (SHELL.into(), DONE));
     let [agent, _] = circles(&pty, &shell);
     assert_eq!(agent.0.trim(), "", "a shell has no agent badge");
     pty.send(&alt_right());
@@ -757,7 +763,7 @@ fn a_shell_tab_shows_its_commands_on_the_s_badge() {
 
     // A command that asks and then sits quiet: yellow S until answered.
     run_line(&mut pty, "Read-Host 'your name'");
-    pty.wait_for("the waiting badge", |_, _| shell_badge(&pty, &shell) == ("S".into(), WAITING));
+    pty.wait_for("the waiting badge", |_, _| shell_badge(&pty, &shell) == (SHELL.into(), WAITING));
     run_line(&mut pty, "x");
     pty.wait_for("the prompt back", |_, _| shell_badge(&pty, &shell).0.is_empty());
 

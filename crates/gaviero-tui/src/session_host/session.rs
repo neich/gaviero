@@ -4,6 +4,7 @@
 use super::shell::{self, ShellWatch};
 use super::target::Target;
 use super::{CONTROL_ENV, HOST_ENV, HOST_RESTARTS_ENV, HostEvent, encode};
+use crate::panels::terminal::TerminalSelectionState;
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -173,8 +174,9 @@ pub(crate) struct Session {
     /// What closing this session now would cut off (`parse_work`).
     pub work: Vec<&'static str>,
     /// An agent turn / a shell command ended while this tab was not
-    /// current; cleared when the user leaves the tab after making it
-    /// current, or when its activity changes while it is current.
+    /// current. The agent mark clears when the user leaves the tab after
+    /// making it current, the shell mark as soon as the tab is made current;
+    /// both when its activity changes while it is current.
     pub agent_done_unseen: bool,
     pub shell_done_unseen: bool,
     /// Exited for a restart too soon after starting; a delayed
@@ -192,6 +194,10 @@ pub(crate) struct Session {
     /// A shell tab's command state; `None` for a gaviero session, whose
     /// activity comes from its status title instead.
     pub shell: Option<ShellWatch>,
+    /// A shell tab's mouse selection (the embedded terminal's): drawn over
+    /// the screen, copied when the button comes up, cleared by input, a new
+    /// click or a resize. A gaviero session selects for itself.
+    pub selection: TerminalSelectionState,
 }
 
 /// The largest copy taken from a session (OSC 52), decoded.
@@ -383,6 +389,7 @@ pub(crate) fn spawn(
         focus_ready: false,
         focus_sent: None,
         shell: target.is_shell().then(|| ShellWatch::new(Instant::now())),
+        selection: TerminalSelectionState::default(),
     })
 }
 
@@ -398,6 +405,7 @@ impl Session {
         if let Some(watch) = &mut self.shell {
             watch.note_input(Instant::now());
             self.parser.screen_mut().set_scrollback(0);
+            self.selection.clear();
         }
         self.send(bytes);
     }
@@ -411,6 +419,41 @@ impl Session {
         } else {
             now.saturating_sub(shell::WHEEL_LINES)
         });
+    }
+
+    /// The left button went down at screen `row`, `col`: a new selection
+    /// starts there (any earlier one goes).
+    pub fn select_start(&mut self, row: u16, col: u16) {
+        let row = row.min(self.parser.screen().size().0.saturating_sub(1));
+        self.selection.start(row, col, self.parser.screen());
+    }
+
+    /// The pointer moved to `row`, `col` with the button held; `row` is
+    /// `None` above the screen (over the tab bar), where the history
+    /// scrolls back one line per move so a selection can reach past the top.
+    pub fn select_extend(&mut self, row: Option<u16>, col: u16) {
+        let row = match row {
+            Some(row) => row.min(self.parser.screen().size().0.saturating_sub(1)),
+            None => {
+                let screen = self.parser.screen_mut();
+                let now = screen.scrollback();
+                screen.set_scrollback(now + 1);
+                0
+            }
+        };
+        self.selection.extend(row, col, self.parser.screen());
+    }
+
+    /// The button came up: the selected text, kept highlighted until the
+    /// next click or input. A click without a drag selects nothing and
+    /// clears the selection.
+    pub fn select_end(&mut self) -> Option<String> {
+        let text = self.selection.extract_text(self.parser.screen_mut());
+        if text.is_none() {
+            self.selection.clear();
+        }
+        self.selection.dragging = false;
+        text
     }
 
     /// Tell a local child whether its tab is the one shown (`ESC[I` /
@@ -499,6 +542,8 @@ impl Session {
             pixel_height: 0,
         });
         self.parser.screen_mut().set_size(rows, cols);
+        // The text moves under it: a selection would no longer mark it.
+        self.selection.clear();
     }
 
     /// The child's exit code once it has exited; `None` while it runs.

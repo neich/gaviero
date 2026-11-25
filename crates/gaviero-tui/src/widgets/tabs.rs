@@ -21,7 +21,7 @@ pub enum TabKind {
     Shell,
 }
 
-/// One activity badge: a letter on a rounded pill of `colour`.
+/// One activity badge: `letter` on a cell of `colour`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabBadge {
     pub letter: char,
@@ -81,16 +81,17 @@ pub struct TabBar<'a> {
     pub palette: TabPalette,
 }
 
-/// A badge's rounded ends: the Powerline half circles, drawn in the badge
-/// colour on the tab's background so they cap the letter's coloured cell.
-/// Windows Terminal draws these itself (built-in glyphs), whatever the font.
-const PILL_LEFT: &str = "\u{E0B6}";
-const PILL_RIGHT: &str = "\u{E0B4}";
-/// Cells per badge: left cap, letter, right cap.
-const BADGE_WIDTH: u16 = 3;
-/// Blank cells a badged label ends in, before the trailing pad: a gap and
-/// two badge slots.
-const BADGE_SLOTS: &str = "       ";
+/// Cells per badge: a blank before it, then the letter on a cell of the
+/// badge colour. Square, and on purpose nothing round: the terminal fills a
+/// cell's background as a whole-pixel rectangle, while a shape glyph set
+/// against a coloured cell leaves a hairline where its edge falls between
+/// pixels (Konsole drew the old Powerline half-circle caps U+E0B6 / U+E0B4
+/// from a fallback font, with a dark line between the left cap and the
+/// letter).
+const BADGE_WIDTH: u16 = 2;
+/// Blank cells a badged label ends in, before the trailing pad: two badge
+/// slots.
+const BADGE_SLOTS: &str = "    ";
 /// Letter colours on a badge: dark on light colours, light on dark ones.
 const BADGE_DARK_FG: Color = Color::Rgb(20, 20, 20);
 const BADGE_LIGHT_FG: Color = Color::Rgb(245, 245, 245);
@@ -129,8 +130,8 @@ const SHELL_ACTIVE_BG: Color = Color::Rgb(26, 82, 86);
 /// The rendered label for a tab and its display width in terminal cells.
 /// Width must be unicode-aware (`'●'` is 3 bytes / 1 cell, CJK chars are
 /// 2 cells) or rendering and mouse hit-testing desync.
-/// With `badges`, the label ends in `BADGE_SLOTS` blank cells (a gap and the
-/// two badge slots, drawn over by `render`).
+/// With `badges`, the label ends in `BADGE_SLOTS` blank cells (the two badge
+/// slots, drawn over by `render`).
 fn tab_label(title: &str, modified: bool, closable: bool, badges: bool) -> (String, u16) {
     use unicode_width::UnicodeWidthStr;
     let close = if closable { CLOSE_MARK } else { "" };
@@ -230,17 +231,13 @@ impl<'a> TabBar<'a> {
                     .set_style(Style::default().fg(fg));
             }
             if let Some(badges) = self.badges.and_then(|b| b.get(i)) {
-                // The two slots sit before the trailing pad. The caps keep
-                // the tab's background; only the letter's cell takes the
-                // badge colour.
+                // The two slots sit before the trailing pad; only the
+                // letter's cell takes the badge colour.
                 let first = x + label_len - 1 - 2 * BADGE_WIDTH;
                 for (slot, badge) in badges.iter().enumerate() {
                     let Some(badge) = badge else { continue };
-                    let left = first + slot as u16 * BADGE_WIDTH;
-                    buf[(left, area.y)]
-                        .set_symbol(PILL_LEFT)
-                        .set_fg(badge.colour);
-                    buf[(left + 1, area.y)]
+                    let letter = first + slot as u16 * BADGE_WIDTH + 1;
+                    buf[(letter, area.y)]
                         .set_char(badge.letter)
                         .set_style(
                             Style::default()
@@ -248,9 +245,6 @@ impl<'a> TabBar<'a> {
                                 .bg(badge.colour)
                                 .add_modifier(Modifier::BOLD),
                         );
-                    buf[(left + 2, area.y)]
-                        .set_symbol(PILL_RIGHT)
-                        .set_fg(badge.colour);
                 }
             }
 
@@ -310,8 +304,8 @@ mod tests {
         assert_eq!(tab_label("日本", false, false, false).1, 6);
         // The close button adds "x ": " x a " = 5 cells.
         assert_eq!(tab_label("a", false, true, false).1, 5);
-        // Badge slots add a gap and two 3-cell pills: " x a" + 7 + " " = 12.
-        assert_eq!(tab_label("a", false, true, true).1, 12);
+        // Badge slots add two 2-cell badges: " x a" + 4 + " " = 9.
+        assert_eq!(tab_label("a", false, true, true).1, 9);
     }
 
     #[test]
@@ -367,39 +361,37 @@ mod tests {
             badges: Some(&badges),
             palette: HOST_PALETTE,
         };
-        // Tab 0: " x ab" + gap + two 3-cell slots + pad (cols 0..13),
-        // separator at 13; tab 1 starts at 14.
+        // Tab 0: " x ab" + two 2-cell slots + pad (cols 0..10), separator
+        // at 10; tab 1 starts at 11.
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
         bar.render(Rect::new(0, 0, 30, 1), &mut buf);
-        assert_eq!(buf[(5, 0)].symbol(), " ", "the gap after the label");
-        // The pill: caps in the badge colour on the tab background, the
-        // letter on the badge colour.
-        assert_eq!(buf[(6, 0)].symbol(), PILL_LEFT);
-        assert_eq!(buf[(6, 0)].fg, yellow);
-        assert_eq!(buf[(6, 0)].bg, HOST_PALETTE.active_bg);
-        assert_eq!(buf[(7, 0)].symbol(), "A");
-        assert_eq!(buf[(7, 0)].bg, yellow);
-        assert_eq!(buf[(7, 0)].fg, BADGE_DARK_FG);
-        assert_eq!(buf[(8, 0)].symbol(), PILL_RIGHT);
-        assert_eq!(buf[(8, 0)].fg, yellow);
-        for col in 9..12 {
+        assert_eq!(buf[(5, 0)].symbol(), " ", "the blank before the badge");
+        assert_eq!(buf[(5, 0)].bg, HOST_PALETTE.active_bg);
+        // The letter on a cell of the badge colour, dark on a light one.
+        assert_eq!(buf[(6, 0)].symbol(), "A");
+        assert_eq!(buf[(6, 0)].bg, yellow);
+        assert_eq!(buf[(6, 0)].fg, BADGE_DARK_FG);
+        assert!(buf[(6, 0)].modifier.contains(Modifier::BOLD));
+        for col in 7..10 {
             assert_eq!(buf[(col, 0)].symbol(), " ", "an unset badge is blank");
+            assert_eq!(buf[(col, 0)].bg, HOST_PALETTE.active_bg);
         }
-        assert_eq!(buf[(13, 0)].symbol(), "│");
-        for col in 19..22 {
+        assert_eq!(buf[(10, 0)].symbol(), "│");
+        for col in 15..18 {
             assert_eq!(buf[(col, 0)].symbol(), " ", "an unset badge is blank");
+            assert_eq!(buf[(col, 0)].bg, HOST_PALETTE.inactive_bg);
         }
-        assert_eq!(buf[(22, 0)].symbol(), PILL_LEFT);
-        assert_eq!(buf[(23, 0)].symbol(), "S");
-        assert_eq!(buf[(23, 0)].bg, blue);
-        assert_eq!(buf[(23, 0)].fg, BADGE_LIGHT_FG);
-        assert_eq!(buf[(24, 0)].symbol(), PILL_RIGHT);
-        assert_eq!(buf[(24, 0)].bg, HOST_PALETTE.inactive_bg);
-        assert_eq!(buf[(26, 0)].symbol(), "│");
+        // Light on a dark one.
+        assert_eq!(buf[(18, 0)].symbol(), "S");
+        assert_eq!(buf[(18, 0)].bg, blue);
+        assert_eq!(buf[(18, 0)].fg, BADGE_LIGHT_FG);
+        assert_eq!(buf[(19, 0)].symbol(), " ", "the trailing pad");
+        assert_eq!(buf[(19, 0)].bg, HOST_PALETTE.inactive_bg);
+        assert_eq!(buf[(20, 0)].symbol(), "│");
         // Hit-testing counts the slots.
-        assert_eq!(bar.close_at_x(15, 0), Some(1));
-        assert_eq!(bar.tab_at_x(12, 0), Some(0));
-        assert_eq!(bar.tab_at_x(14, 0), Some(1));
+        assert_eq!(bar.close_at_x(12, 0), Some(1));
+        assert_eq!(bar.tab_at_x(10, 0), Some(0));
+        assert_eq!(bar.tab_at_x(11, 0), Some(1));
         // A bar with no badges is as before.
         let plain = TabBar {
             badges: None,
