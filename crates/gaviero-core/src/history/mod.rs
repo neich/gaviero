@@ -86,8 +86,11 @@ pub const HISTORY_MAX_JSON_BYTES: usize = 64 * 1024;
 /// Cap on the rendered `<project_memory>` response block.
 pub const HISTORY_MAX_BLOCK_BYTES: usize = 64 * 1024;
 
-/// Cap on the stored head of the assistant's output.
-pub const HISTORY_MAX_ASSISTANT_BYTES: usize = 8 * 1024;
+/// Cap on the stored assistant response. The same as the prompt's, so a
+/// turn's response is kept whole for the HISTORY panel's RESPONSE section;
+/// only a pathological one is cut (and flagged `assistant_truncated`). The
+/// **estimate** is still computed from the untruncated text.
+pub const HISTORY_MAX_ASSISTANT_BYTES: usize = 256 * 1024;
 
 /// The history log path for a workspace root.
 pub fn history_path(workspace_root: &Path) -> PathBuf {

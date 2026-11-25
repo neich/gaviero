@@ -277,8 +277,8 @@ impl HistoryRecorder {
     }
 
     /// Latch assistant output for the turn's `turn_end`. Several messages
-    /// accumulate; the estimate covers all of them, the stored excerpt only
-    /// the head.
+    /// accumulate, newline-joined; the estimate covers all of them, the
+    /// stored text everything up to `HISTORY_MAX_ASSISTANT_BYTES`.
     pub fn note_assistant_output(&self, turn_id: &str, text: &str) {
         let mut st = self.lock();
         let Some(turn) = st.open.get_mut(turn_id) else {
@@ -609,6 +609,9 @@ fn normalize(payload: HistoryKind) -> HistoryKind {
         }
         HistoryKind::TurnEnd(mut e) => {
             if let Some(text) = e.assistant_excerpt.take() {
+                // Same rule as tool records: the response often quotes what the
+                // agent read, and the log must not become a plaintext copy of it.
+                let text = crate::secret_scan::redact(&text).0;
                 let (head, cut) = truncate_bytes(&text, HISTORY_MAX_ASSISTANT_BYTES);
                 e.assistant_excerpt = Some(head);
                 e.assistant_truncated = e.assistant_truncated || cut;
@@ -997,10 +1000,30 @@ mod tests {
     }
 
     #[test]
-    fn long_assistant_output_keeps_a_capped_head_and_a_full_estimate() {
+    fn a_long_response_is_kept_whole_across_messages() {
+        // The HISTORY panel's RESPONSE section shows this text, so an ordinary
+        // long answer (here 40 KB over two messages) must not be cut to a head.
         let (_dir, r) = rec();
         r.begin_turn("c1", "c1-1", start("a"), false);
-        let text = "word ".repeat(4_000); // 20 KB > 8 KB
+        let first = "alpha ".repeat(3_500);
+        let second = "omega ".repeat(3_500);
+        r.note_assistant_output("c1-1", &first);
+        r.note_assistant_output("c1-1", &second);
+        r.end_turn("c1-1", end());
+        let e = &turn_ends(&r)[0];
+        assert!(!e.assistant_truncated);
+        assert_eq!(
+            e.assistant_excerpt.as_deref(),
+            Some(format!("{first}\n{second}").as_str())
+        );
+        assert_eq!(e.assistant_bytes, first.len() + second.len());
+    }
+
+    #[test]
+    fn an_oversized_response_keeps_a_capped_head_and_a_full_estimate() {
+        let (_dir, r) = rec();
+        r.begin_turn("c1", "c1-1", start("a"), false);
+        let text = "word ".repeat(60_000); // 300 KB > 256 KB
         r.note_assistant_output("c1-1", &text);
         r.end_turn("c1-1", end());
         let e = &turn_ends(&r)[0];
@@ -1008,6 +1031,24 @@ mod tests {
         assert!(e.assistant_excerpt.as_ref().unwrap().len() <= HISTORY_MAX_ASSISTANT_BYTES);
         assert_eq!(e.assistant_bytes, text.len());
         assert_eq!(e.output_tokens_est, estimate_text_tokens(&text));
+    }
+
+    #[test]
+    fn history_redacts_secrets_in_the_response() {
+        let (_dir, r) = rec();
+        let token = format!("ghp_{}", "b".repeat(36)); // pragma: allowlist secret
+        r.begin_turn("c1", "c1-1", start("a"), false);
+        r.note_assistant_output("c1-1", &format!("The token is {token}."));
+        r.end_turn("c1-1", end());
+        let raw = std::fs::read_to_string(r.path()).unwrap();
+        assert!(!raw.contains(&token), "history kept the secret");
+        let e = &turn_ends(&r)[0];
+        assert!(
+            e.assistant_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("[REDACTED:github-token]")
+        );
     }
 
     #[test]

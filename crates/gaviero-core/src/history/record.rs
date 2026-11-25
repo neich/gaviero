@@ -315,7 +315,11 @@ pub struct TurnEnd {
     pub assistant_bytes: usize,
     #[serde(default)]
     pub assistant_truncated: bool,
-    /// Head of the assistant's output, capped at `HISTORY_MAX_ASSISTANT_BYTES`.
+    /// The assistant's response for the turn — every assistant message,
+    /// newline-joined — with secret-looking values redacted. Whole unless it
+    /// exceeds `HISTORY_MAX_ASSISTANT_BYTES` (then `assistant_truncated`).
+    /// Lines written before that cap was raised hold an 8 KiB head. The name
+    /// stays `excerpt` so old lines keep parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_excerpt: Option<String>,
     pub output_tokens_est: usize,

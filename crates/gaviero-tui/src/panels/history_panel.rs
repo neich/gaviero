@@ -2,9 +2,9 @@
 //!
 //! Reads `<workspace>/.gaviero/history/turns.ndjson` (written by the single
 //! `gaviero_core::history::HistoryRecorder`) and shows, per turn, the full
-//! prompt, every tool call with its arguments and result, every MCP call with
-//! its request and response, the memory call with its response, and the
-//! token totals.
+//! prompt, the agent's full response, every tool call with its arguments and
+//! result, every MCP call with its request and response, the memory call with
+//! its response, and the token totals.
 //!
 //! Rules this panel keeps:
 //! * **Read-only.** No key writes to `memory.db` or the workspace. The file is
@@ -73,10 +73,12 @@ pub struct PanelGeometry {
     pub expanded: bool,
 }
 
-/// The six detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`6` jump.
+/// The seven detail sections. `Tab` / `Alt+O` / `Alt+I` cycle; `1`–`7` jump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistorySection {
     Prompt,
+    /// The agent's response for the turn, from its `turn_end` record.
+    Response,
     Tools,
     Mcp,
     Memory,
@@ -86,8 +88,9 @@ pub enum HistorySection {
 }
 
 impl HistorySection {
-    pub const ALL: [HistorySection; 6] = [
+    pub const ALL: [HistorySection; 7] = [
         HistorySection::Prompt,
+        HistorySection::Response,
         HistorySection::Tools,
         HistorySection::Mcp,
         HistorySection::Memory,
@@ -107,7 +110,7 @@ impl HistorySection {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
-    /// `'1'`..`'6'` → section.
+    /// `'1'`..`'7'` → section.
     pub fn from_digit(c: char) -> Option<Self> {
         let n = c.to_digit(10)? as usize;
         (1..=Self::ALL.len()).contains(&n).then(|| Self::ALL[n - 1])
@@ -116,6 +119,7 @@ impl HistorySection {
     pub fn label(self) -> &'static str {
         match self {
             Self::Prompt => "PROMPT",
+            Self::Response => "RESPONSE",
             Self::Tools => "TOOLS",
             Self::Mcp => "MCP",
             Self::Memory => "MEMORY",
@@ -558,19 +562,25 @@ impl HistoryPanelState {
     ///
     /// Deliberately not [`Self::focused_records_ndjson`]: this is the
     /// human-readable form, so it can be pasted into an editor or sent again.
-    /// On PROMPT it is the prompt **verbatim** — no `turn_start` JSON, and none
-    /// of the panel's own decoration (byte count, estimator, workspace root) —
-    /// which is the point of the key. Every other section copies the body the
-    /// panel draws for it, line for line, minus the FILES row cursor and the
-    /// pinned header (turn identity plus the six section summaries), both of
-    /// which belong to the panel rather than to the section.
+    /// On PROMPT it is the prompt **verbatim** and on RESPONSE the agent's
+    /// response verbatim — no record JSON, and none of the panel's own
+    /// decoration (byte count, estimator, workspace root) — which is the point
+    /// of the key. Every other section copies the body the panel draws for it,
+    /// line for line, minus the FILES row cursor and the pinned header (turn
+    /// identity plus the per-section summaries), both of which belong to the
+    /// panel rather than to the section.
     ///
-    /// `None` when there is nothing to copy: no selected turn, or a PROMPT
-    /// section whose turn carries no `turn_start` (an unattributed turn).
+    /// `None` when there is nothing to copy: no selected turn, a PROMPT
+    /// section whose turn carries no `turn_start` (an unattributed turn), or a
+    /// RESPONSE section whose turn recorded no response text.
     pub fn focused_text(&self) -> Option<String> {
         let turn = self.selected_turn()?;
-        if self.section == HistorySection::Prompt {
-            return find_start(turn).map(|start| start.prompt.clone());
+        match self.section {
+            HistorySection::Prompt => return find_start(turn).map(|start| start.prompt.clone()),
+            HistorySection::Response => {
+                return find_end(turn).and_then(|end| end.assistant_excerpt.clone());
+            }
+            _ => {}
         }
         let text = section_lines_with_cursor(turn, self.section, None)
             .iter()
@@ -591,12 +601,26 @@ impl HistoryPanelState {
             .is_some_and(|s| s.prompt_truncated)
     }
 
+    /// Whether what `y` copies for the focused section is a truncated head of
+    /// the real text — true only on PROMPT or RESPONSE, the two sections whose
+    /// copy is a stored payload rather than the drawn body.
+    pub fn focused_text_is_truncated(&self) -> bool {
+        match self.section {
+            HistorySection::Prompt => self.prompt_is_truncated(),
+            HistorySection::Response => self
+                .selected_turn()
+                .and_then(find_end)
+                .is_some_and(|e| e.assistant_excerpt.is_some() && e.assistant_truncated),
+            _ => false,
+        }
+    }
+
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         // The focused title is this panel's key help, so it states what `y` does
         // for the *focused* section: "copy prompt" is true on PROMPT only.
         let title = if focused {
             format!(
-                "HISTORY (Tab/1-6: section · / filter · a scope · r reload · c copy json · {} · Enter expand)",
+                "HISTORY (Tab/1-7: section · / filter · a scope · r reload · c copy json · {} · Enter expand)",
                 copy_text_help(self.section)
             )
         } else {
@@ -754,6 +778,7 @@ fn turn_matches(turn: &TurnRecords, needle: &str) -> bool {
         || s.turn_id.as_deref().is_some_and(hay)
         || turn.records.iter().any(|e| match &e.record.payload {
             HistoryKind::TurnStart(start) => hay(&start.prompt),
+            HistoryKind::TurnEnd(end) => end.assistant_excerpt.as_deref().is_some_and(hay),
             HistoryKind::ToolCall(c) => hay(&c.tool),
             HistoryKind::McpCall(m) => hay(&m.tool),
             _ => false,
@@ -764,6 +789,7 @@ fn record_in_section(record: &HistoryRecord, section: HistorySection) -> bool {
     matches!(
         (section, &record.payload),
         (HistorySection::Prompt, HistoryKind::TurnStart(_))
+            | (HistorySection::Response, HistoryKind::TurnEnd(_))
             | (HistorySection::Tools, HistoryKind::ToolCall(_))
             | (HistorySection::Mcp, HistoryKind::McpCall(_))
             | (HistorySection::Memory, HistoryKind::MemoryInjection(_))
@@ -884,7 +910,7 @@ pub fn turn_list_lines(turn: &TurnRecords, selected: bool) -> Vec<Line<'static>>
 /// focused one marked.
 pub fn detail_header_lines(turn: &TurnRecords, focused: HistorySection) -> Vec<Line<'static>> {
     let s = &turn.summary;
-    let mut lines = Vec::with_capacity(7);
+    let mut lines = Vec::with_capacity(HistorySection::ALL.len() + 2);
     if turn.attributed {
         let (glyph, color) = status_glyph(s.status);
         lines.push(Line::from(vec![
@@ -915,6 +941,21 @@ pub fn detail_header_lines(turn: &TurnRecords, focused: HistorySection) -> Vec<L
                 fmt_bytes(s.prompt_bytes),
                 compact_count(s.in_tokens_est)
             ),
+            HistorySection::Response => match find_end(turn) {
+                Some(end) if end.assistant_excerpt.is_some() => format!(
+                    "{} · ~{} tok{}",
+                    fmt_bytes(end.assistant_bytes),
+                    compact_count(end.output_tokens_est),
+                    if end.assistant_truncated {
+                        " · truncated"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(_) => "no text this turn".to_string(),
+                None if turn.attributed => "not recorded (no turn_end)".to_string(),
+                None => "none".to_string(),
+            },
             HistorySection::Tools => {
                 if s.tool_count == 0 {
                     tools_absent_reason(s.provider.as_deref()).to_string()
@@ -996,7 +1037,7 @@ pub fn detail_header_lines(turn: &TurnRecords, focused: HistorySection) -> Vec<L
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "{} {} {:<7} {}",
+                "{} {} {:<8} {}",
                 if is_focused { "▸" } else { " " },
                 section.index() + 1,
                 section.label(),
@@ -1032,13 +1073,15 @@ pub fn section_lines_with_cursor(
 
 /// What the `y` key does for a section, as the panel's own help spells it.
 ///
-/// PROMPT is the one section where the plain-text copy is the prompt itself, so
-/// the help says "copy prompt" there and "copy text" everywhere else (those
-/// sections copy the body the panel draws). One source of truth for both help
-/// surfaces: the focused title and the PROMPT body's hint line.
+/// On PROMPT and RESPONSE the plain-text copy is the stored text itself, so
+/// the help says "copy prompt" / "copy response" there and "copy text"
+/// everywhere else (those sections copy the body the panel draws). One source
+/// of truth for both help surfaces: the focused title and the hint line above
+/// the PROMPT / RESPONSE text.
 pub fn copy_text_help(section: HistorySection) -> &'static str {
     match section {
         HistorySection::Prompt => "y: copy prompt",
+        HistorySection::Response => "y: copy response",
         _ => "y: copy text",
     }
 }
@@ -1080,6 +1123,7 @@ pub fn section_lines_with_rows(
                 "No turn_start record (the log starts mid-turn, e.g. after rotation).".into(),
             )),
         },
+        HistorySection::Response => response_lines(turn, &mut lines, &muted),
         HistorySection::Tools => {
             let calls: Vec<(u32, &ToolCall)> = turn
                 .records
@@ -1322,6 +1366,56 @@ fn prompt_lines(start: &TurnStart, out: &mut Vec<Line<'static>>) {
                 fmt_bytes(start.prompt_bytes)
             ),
             Style::default().fg(COLOR_WARN),
+        )));
+    }
+}
+
+/// RESPONSE: the agent's response for the turn, as the `turn_end` record
+/// stored it (every assistant message, newline-joined). Laid out like PROMPT —
+/// a size line, the `y` hint, the text, then a truncation marker when the
+/// stored text is only a head (the cap, or an 8 KiB head on lines written
+/// before the cap was raised).
+fn response_lines(
+    turn: &TurnRecords,
+    out: &mut Vec<Line<'static>>,
+    muted: &dyn Fn(String) -> Line<'static>,
+) {
+    let Some(end) = find_end(turn) else {
+        out.push(muted(if turn.attributed {
+            "No response recorded — no turn_end (still streaming, or the process exited mid-turn)."
+                .into()
+        } else {
+            "Unattributed records carry no response.".into()
+        }));
+        return;
+    };
+    let warn = Style::default().fg(COLOR_WARN);
+    if let Some(err) = &end.error {
+        out.push(Line::from(Span::styled(format!("error: {err}"), warn)));
+    } else if end.cancelled {
+        out.push(Line::from(Span::styled("turn cancelled", warn)));
+    }
+    let Some(text) = &end.assistant_excerpt else {
+        out.push(muted("The agent produced no text this turn.".into()));
+        return;
+    };
+    out.push(muted(format!(
+        "{} · ~{} tok ({})",
+        fmt_bytes(end.assistant_bytes),
+        compact_count(end.output_tokens_est),
+        end.estimator.label(),
+    )));
+    // Display only, like PROMPT's hint: `focused_text` copies the stored text.
+    out.push(muted(copy_text_help(HistorySection::Response).into()));
+    text_lines(text, Style::default().fg(COLOR_TEXT), out);
+    if end.assistant_truncated {
+        out.push(Line::from(Span::styled(
+            format!(
+                "── truncated: stored {} of {} ──",
+                fmt_bytes(text.len()),
+                fmt_bytes(end.assistant_bytes)
+            ),
+            warn,
         )));
     }
 }
@@ -1606,13 +1700,12 @@ fn totals_lines(
                     Style::default().fg(COLOR_WARN),
                 )));
             }
-            if let Some(excerpt) = &end.assistant_excerpt {
-                out.push(muted(if end.assistant_truncated {
-                    "assistant output (head):".into()
-                } else {
-                    "assistant output:".into()
-                }));
-                text_lines(excerpt, Style::default().fg(COLOR_TEXT), out);
+            if end.assistant_excerpt.is_some() {
+                out.push(muted(format!(
+                    "the response itself: section {} {}",
+                    HistorySection::Response.index() + 1,
+                    HistorySection::Response.label()
+                )));
             }
         }
         None => out.push(muted(
@@ -1625,7 +1718,8 @@ fn totals_lines(
 mod tests {
     use super::*;
     use gaviero_core::history::{
-        HISTORY_MAX_PROMPT_BYTES, HistoryRecorder, ProviderUsage, TurnEnd, tool_call_record,
+        HISTORY_MAX_ASSISTANT_BYTES, HISTORY_MAX_PROMPT_BYTES, HistoryRecorder, ProviderUsage,
+        TurnEnd, tool_call_record,
     };
 
     fn start(prompt: &str, title: &str) -> TurnStart {
@@ -1772,6 +1866,12 @@ mod tests {
         assert_eq!(state.visible().len(), 1);
         state.filter = "read".into(); // tool name
         assert_eq!(state.visible().len(), 1);
+        state.filter = "MULTIPLIES".into(); // response text
+        assert_eq!(
+            state.selected_turn().unwrap().turn_id.as_deref(),
+            Some("c1-1")
+        );
+        assert_eq!(state.visible().len(), 1);
         state.filter = "other".into(); // conversation title
         assert_eq!(
             state.selected_turn().unwrap().turn_id.as_deref(),
@@ -1786,12 +1886,18 @@ mod tests {
 
     #[test]
     fn sections_cycle_and_jump() {
+        assert_eq!(HistorySection::Prompt.next(), HistorySection::Response);
+        assert_eq!(HistorySection::Response.next(), HistorySection::Tools);
         assert_eq!(HistorySection::Totals.next(), HistorySection::Files);
         assert_eq!(HistorySection::Files.next(), HistorySection::Prompt);
         assert_eq!(HistorySection::Prompt.prev(), HistorySection::Files);
-        assert_eq!(HistorySection::from_digit('3'), Some(HistorySection::Mcp));
-        assert_eq!(HistorySection::from_digit('6'), Some(HistorySection::Files));
-        assert_eq!(HistorySection::from_digit('7'), None);
+        assert_eq!(
+            HistorySection::from_digit('2'),
+            Some(HistorySection::Response)
+        );
+        assert_eq!(HistorySection::from_digit('4'), Some(HistorySection::Mcp));
+        assert_eq!(HistorySection::from_digit('7'), Some(HistorySection::Files));
+        assert_eq!(HistorySection::from_digit('8'), None);
         let mut state = HistoryPanelState::new();
         state.section_scroll = 9;
         state.set_section(HistorySection::Tools);
@@ -1847,6 +1953,10 @@ mod tests {
     #[test]
     fn copy_text_help_names_the_key_for_the_focused_section() {
         assert_eq!(copy_text_help(HistorySection::Prompt), "y: copy prompt");
+        assert_eq!(
+            copy_text_help(HistorySection::Response),
+            "y: copy response"
+        );
         // Every other section copies the body the panel draws, so the help must
         // not promise the prompt there.
         for section in [
@@ -1955,7 +2065,99 @@ mod tests {
         let empty = HistoryPanelState::new();
         assert!(empty.focused_text().is_none());
         assert!(!empty.prompt_is_truncated());
+        assert!(!empty.focused_text_is_truncated());
         assert!(empty.focused_records_ndjson().is_none());
+    }
+
+    // ── RESPONSE: the agent's answer, kept per turn ────────────────────────
+
+    fn body_of(turn: &TurnRecords, section: HistorySection) -> String {
+        section_lines_with_cursor(turn, section, None)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn response_section_shows_and_copies_the_response_verbatim() {
+        let (_dir, mut state) = loaded();
+        state.select_next(); // c1-1
+        state.set_section(HistorySection::Response);
+        {
+            let turn = state.selected_turn().unwrap();
+            let body = body_of(turn, HistorySection::Response);
+            assert!(body.contains("It multiplies words by 1.3."), "{body}");
+            assert!(body.contains("y: copy response"), "{body}");
+            // TOTALS points at the section instead of repeating the text.
+            let totals = body_of(turn, HistorySection::Totals);
+            assert!(!totals.contains("It multiplies"), "{totals}");
+            assert!(totals.contains("2 RESPONSE"), "{totals}");
+            // The pinned header summarises it like the other sections.
+            let header: String = detail_header_lines(turn, HistorySection::Response)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(header.contains("▸ 2 RESPONSE"), "{header}");
+        }
+        // `y` copies the stored response alone: no size line, no hint.
+        assert_eq!(
+            state.focused_text().as_deref(),
+            Some("It multiplies words by 1.3.")
+        );
+        assert!(!state.focused_text_is_truncated());
+        // `c` copies the record it came from.
+        assert!(
+            state
+                .focused_records_ndjson()
+                .unwrap()
+                .contains("\"kind\":\"turn_end\"")
+        );
+
+        // A cancelled turn that produced no text says so and copies nothing.
+        state.select_prev(); // c2-1
+        let body = body_of(state.selected_turn().unwrap(), HistorySection::Response);
+        assert!(body.contains("turn cancelled"), "{body}");
+        assert!(body.contains("no text"), "{body}");
+        assert!(state.focused_text().is_none());
+    }
+
+    #[test]
+    fn a_long_response_is_shown_whole_and_an_oversized_one_says_it_was_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        let r = HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
+        // Well past the old 8 KiB head: kept whole now.
+        let long = format!("{}THE END", "line of the answer\n".repeat(1_000));
+        r.begin_turn("c1", "c1-1", start("long answer", "long"), false);
+        r.note_assistant_output("c1-1", &long);
+        r.end_turn("c1-1", TurnEnd::new(false, None, 0));
+        // Past the cap: stored as a head, flagged.
+        let huge = "x".repeat(HISTORY_MAX_ASSISTANT_BYTES + 4096);
+        r.begin_turn("c1", "c1-2", start("huge answer", "long"), false);
+        r.note_assistant_output("c1-2", &huge);
+        r.end_turn("c1-2", TurnEnd::new(false, None, 0));
+
+        let mut state = HistoryPanelState::new();
+        state.apply_load(load_history(&path));
+        state.set_section(HistorySection::Response);
+
+        // Newest first: c1-2.
+        assert!(state.focused_text_is_truncated());
+        assert_eq!(
+            state.focused_text().unwrap().len(),
+            HISTORY_MAX_ASSISTANT_BYTES
+        );
+        let body = body_of(state.selected_turn().unwrap(), HistorySection::Response);
+        assert!(body.contains("── truncated: stored"), "truncation marker");
+
+        state.select_next(); // c1-1
+        assert!(!state.focused_text_is_truncated());
+        assert_eq!(state.focused_text().as_deref(), Some(long.as_str()));
+        let body = body_of(state.selected_turn().unwrap(), HistorySection::Response);
+        assert!(body.contains("THE END"));
+        assert!(!body.contains("truncated"));
     }
 
     #[test]
@@ -1999,6 +2201,7 @@ mod tests {
             assert!(text.contains("HISTORY"), "{text}");
             assert!(text.contains("estimator"), "{text}");
             assert!(text.contains("PROMPT"), "{text}");
+            assert!(text.contains("RESPONSE"), "{text}");
             assert!(text.contains("TOTALS"), "{text}");
             assert!(text.contains("~ est:"), "{text}");
             assert!(text.contains("unreadable lines skipped"), "{text}");
@@ -2194,7 +2397,7 @@ mod tests {
         state.render(area, &mut buf, true);
         let text = buffer_text(&buf);
         // The ordinary panel title: no diff mode of its own.
-        assert!(text.contains("HISTORY (Tab/1-6: section"), "{text}");
+        assert!(text.contains("HISTORY (Tab/1-7: section"), "{text}");
         assert!(text.contains("MODIFIED (1)"), "{text}");
         assert!(text.contains("ADDED (1)"), "{text}");
         assert!(text.contains("DELETED (1)"), "{text}");

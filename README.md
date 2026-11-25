@@ -122,7 +122,7 @@ review src/auth/session.rs for race conditions
 /lite
 ```
 
-**Inspect a turn** (history panel, `Alt+H`): the full prompt, every tool call with arguments and result, every MCP request/response, the memory call and its injected block, and token totals (`~` estimates, `exact` provider usage). `c` copies the focused section's records as NDJSON; `y` copies it as plain text — on PROMPT, the prompt verbatim, ready to paste or send again. Headless: `gaviero-cli --history`.
+**Inspect a turn** (history panel, `Alt+H`): the full prompt, the agent's full response, every tool call with arguments and result, every MCP request/response, the memory call and its injected block, and token totals (`~` estimates, `exact` provider usage). `c` copies the focused section's records as NDJSON; `y` copies it as plain text — on PROMPT / RESPONSE, that text verbatim, ready to paste or send again. Headless: `gaviero-cli --history`.
 
 **DSL workflow** (`review.gaviero`):
 
