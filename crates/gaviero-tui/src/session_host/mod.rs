@@ -134,9 +134,9 @@ pub(crate) enum Chord {
     Prev,
     /// Alt+Right: next session.
     Next,
-    /// Alt+Shift+Left: move the current tab one place left.
+    /// Alt+Shift+Left or Alt+J: move the current tab one place left.
     MoveLeft,
-    /// Alt+Shift+Right: move the current tab one place right.
+    /// Alt+Shift+Right or Alt+K: move the current tab one place right.
     MoveRight,
     /// Alt+N: open the new-session picker.
     New,
@@ -1011,7 +1011,7 @@ impl Host {
         }
     }
 
-    /// Alt+Shift+Left/Right: the current tab trades places with its
+    /// Alt+Shift+Left/Right or Alt+J/K: the current tab trades places with its
     /// neighbour and stays current; nothing happens at either end. The new
     /// order is saved, so the next start reopens the tabs in it.
     fn move_active(&mut self, step: isize) {

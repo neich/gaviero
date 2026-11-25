@@ -55,7 +55,7 @@ struct Cli {
     folder: bool,
 
     /// Run a session host: several gaviero sessions in this terminal,
-    /// switched with Alt+Left/Right (Alt+Shift+Left/Right moves a tab,
+    /// switched with Alt+Left/Right (Alt+Shift+Left/Right or Alt+J/K moves a tab,
     /// Alt+N opens one, Alt+Q closes one, Ctrl+Q quits all and reopens
     /// them next time).
     /// With PATH, opens only PATH; without, reopens the last set.

@@ -244,6 +244,12 @@ pub(crate) fn paste_goes_to_session(view: &HostView) -> bool {
 /// The host chord a key-down is, if any. Ctrl+Q is Ctrl without Alt and the
 /// rest Alt without Ctrl, so AltGr chords stay text. Alt+X is never a chord:
 /// Windows keeps it for itself.
+///
+/// A tab moves with Alt+Shift+Left/Right or Alt+J/K. Alt+J/K are there for
+/// when Alt+Shift never arrives: an XKB Alt+Shift layout toggle
+/// (`grp:alt_shift_toggle`) turns the second of the two into "next layout",
+/// and Konsole keeps Ctrl+Alt+Left/Right and Ctrl+PageUp/PageDown for its own
+/// tabs. Shift is ignored on J/K (Caps Lock reads as Shift on Unix).
 pub(crate) fn chord(key: &HostKey) -> Option<Chord> {
     if !key.down {
         return None;
@@ -258,6 +264,8 @@ pub(crate) fn chord(key: &HostKey) -> Option<Chord> {
     match key.code {
         KeyCode::Left if shift => Some(Chord::MoveLeft),
         KeyCode::Right if shift => Some(Chord::MoveRight),
+        KeyCode::Char('j') => Some(Chord::MoveLeft),
+        KeyCode::Char('k') => Some(Chord::MoveRight),
         KeyCode::Left => Some(Chord::Prev),
         KeyCode::Right => Some(Chord::Next),
         KeyCode::Char('n') if !shift => Some(Chord::New),
@@ -352,6 +360,14 @@ mod tests {
         assert_eq!(chord(&rec(0x51, 17, RIGHT_CTRL)), Some(Chord::QuitAll));
         assert_eq!(chord(&rec(0x25, 0, LEFT_ALT | SHIFT)), Some(Chord::MoveLeft));
         assert_eq!(chord(&rec(0x27, 0, RIGHT_ALT | SHIFT)), Some(Chord::MoveRight));
+        // Alt+J/K move the tab too, with or without Shift (Caps Lock).
+        assert_eq!(chord(&rec(0x4A, 'j' as u16, LEFT_ALT)), Some(Chord::MoveLeft));
+        assert_eq!(chord(&rec(0x4B, 'k' as u16, RIGHT_ALT)), Some(Chord::MoveRight));
+        assert_eq!(chord(&rec(0x4A, 'J' as u16, LEFT_ALT | SHIFT)), Some(Chord::MoveLeft));
+        assert_eq!(chord(&rec(0x4B, 'K' as u16, LEFT_ALT | SHIFT)), Some(Chord::MoveRight));
+        assert_eq!(chord(&rec(0x4A, 'j' as u16, 0)), None);
+        assert_eq!(chord(&rec(0x4B, 11, LEFT_CTRL)), None);
+        assert_eq!(chord(&rec(0x4A, 'j' as u16, LEFT_ALT | LEFT_CTRL)), None);
         // Alt+X belongs to Windows; other Ctrl keys belong to the session.
         assert_eq!(chord(&rec(0x58, 'x' as u16, LEFT_ALT)), None);
         assert_eq!(chord(&rec(0x53, 19, LEFT_CTRL)), None);
@@ -387,6 +403,8 @@ mod tests {
             (rec(0x4E, 'n' as u16, LEFT_ALT), ev(KeyCode::Char('n'), alt)),
             (rec(0x4E, 'N' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('N'), alt)),
             (rec(0x54, 't' as u16, LEFT_ALT), ev(KeyCode::Char('t'), alt)),
+            (rec(0x4A, 'j' as u16, LEFT_ALT), ev(KeyCode::Char('j'), alt)),
+            (rec(0x4B, 'K' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('K'), alt)),
             (rec(0x51, 'Q' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('Q'), alt)),
             (rec(0x51, 17, LEFT_CTRL), ev(KeyCode::Char('q'), ctrl)),
             (rec(0x58, 'x' as u16, LEFT_ALT), ev(KeyCode::Char('x'), alt)),
