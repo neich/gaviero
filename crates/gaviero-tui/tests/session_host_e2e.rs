@@ -299,14 +299,14 @@ fn has_badge(pty: &Pty, labels: &[&str]) -> bool {
         .any(|label| circles(pty, label).iter().any(|(letter, _)| !letter.trim().is_empty()))
 }
 
-/// The two badges after `label` on the tab bar, each a 2-cell slot (blank,
-/// letter on the badge colour): (letter, its cell's background) each; a
-/// blank letter when unset.
+/// The two badges after `label` on the tab bar (a blank, then two 3-cell
+/// slots: half block, letter on the badge colour, half block): (letter, its
+/// cell's background) each; a blank letter when unset.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
-    let col = (bar[..at].chars().count() + label.chars().count() + 1) as u16;
-    [pty.cell(0, col), pty.cell(0, col + 2)]
+    let col = (bar[..at].chars().count() + label.chars().count() + 2) as u16;
+    [pty.cell(0, col), pty.cell(0, col + 3)]
 }
 
 #[test]

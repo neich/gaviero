@@ -85,18 +85,18 @@ const DONE: vt100::Color = vt100::Color::Rgb(51, 136, 255);
 const AGENT: &str = "A";
 const SHELL: &str = "S";
 
-/// The two badges after `label` on the tab bar, each a 2-cell slot (blank,
-/// letter on the badge colour): (letter, its cell's background) each; a
-/// blank letter when unset.
+/// The two badges after `label` on the tab bar (a blank, then two 3-cell
+/// slots: half block, letter on the badge colour, half block): (letter, its
+/// cell's background) each; a blank letter when unset.
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
-    let col = (bar[..at].chars().count() + label.chars().count() + 1) as u16;
+    let col = (bar[..at].chars().count() + label.chars().count() + 2) as u16;
     let badge = |at: u16| {
         let (letter, bg) = pty.cell(0, at);
         (letter.trim().to_string(), bg)
     };
-    [badge(col), badge(col + 2)]
+    [badge(col), badge(col + 3)]
 }
 
 /// Work that ended out of view marks the tab finished. Coming back, the
