@@ -81,9 +81,9 @@ fn kitty_keys_reach_a_gaviero_tab_as_legacy_vt() {
 
 /// The host's "finished" badge colour (`session_host/render.rs`).
 const DONE: vt100::Color = vt100::Color::Rgb(51, 136, 255);
-/// The badges' letters, small capitals (`session_host/render.rs`).
-const AGENT: &str = "\u{1D00}";
-const SHELL: &str = "\u{A731}";
+/// The badges' letters (`session_host/render.rs`).
+const AGENT: &str = "A";
+const SHELL: &str = "S";
 
 /// The two badges after `label` on the tab bar, each a 2-cell slot (blank,
 /// letter on the badge colour): (letter, its cell's background) each; a
