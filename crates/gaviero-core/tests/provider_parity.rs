@@ -37,6 +37,7 @@ const PROVIDER_SPECS: &[&str] = &[
     "codex-app-server:gpt-5",
     "cursor:x",
     "dsh:x",
+    "agy:x",
     "deepseek:x",
     "ollama:x",
 ];
@@ -149,7 +150,7 @@ fn provider_rows_and_the_vendor_lookup_share_one_source() {
         .map(|p| format!("{p:?}"))
         .collect();
     vendorless.sort();
-    assert_eq!(vendorless, vec!["Deepseek", "Dsh", "Ollama"]);
+    assert_eq!(vendorless, vec!["Agy", "Deepseek", "Dsh", "Ollama"]);
 
     // A vendor the table does not name must not be silently muted (§2.9).
     assert!(McpCapabilities::for_synth_vendor("not-a-vendor").context7);
@@ -186,6 +187,13 @@ fn declared_enforcement_and_prompt_axes_match_the_real_mechanism() {
         ),
         // Decision 1: dsh keeps its y/n channel but no tool policing.
         ("dsh:x", ToolEnforcement::Unenforced, PromptKind::YesNo),
+        // Build-time PreToolUse deny rules in the generated `.agents/hooks.json`;
+        // MCP `ask_user_question` + y/n `session/request_permission`.
+        (
+            "agy:x",
+            ToolEnforcement::GeneratedConfig,
+            PromptKind::MultiChoice,
+        ),
         // Registry membership; decision 3 gave both a multi-choice ask tool.
         (
             "deepseek:x",

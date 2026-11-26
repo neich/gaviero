@@ -1,0 +1,16 @@
+{
+  "gaviero": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/home/natx/.local/bin/gaviero-cli --hook agy:pre-tool-use",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      }
+    ]
+  }
+}

@@ -558,6 +558,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::Terminal(_)
         | Event::ClaudeSessionStarted { .. }
         | Event::CursorSessionStarted { .. }
+        | Event::AcpSessionStarted { .. }
         | Event::ChatMemoryInjected { .. }
         | Event::TurnBootstrapMeasured { .. }
         | Event::ToolAgentEditsPending { .. }

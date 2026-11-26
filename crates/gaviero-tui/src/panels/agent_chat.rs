@@ -1252,6 +1252,15 @@ impl AgentChatState {
                     options.push(cursor_model);
                 }
             }
+            // agy lists its catalog only inside an ACP session (a short
+            // handshake, no model call); its default model when it can't be asked.
+            for agy_model in
+                gaviero_core::agent_session::agent_client_protocol::agy::discover_agy_model_options()
+            {
+                if !options.iter().any(|opt| opt == &agy_model) {
+                    options.push(agy_model);
+                }
+            }
             for deepseek_model in gaviero_core::swarm::backend::shared::DEEPSEEK_API_MODELS {
                 let spec = format!("deepseek:{deepseek_model}");
                 if !options.iter().any(|opt| opt == &spec) {
@@ -2009,6 +2018,7 @@ impl AgentChatState {
                          codex:gpt-6-luna, codex:gpt-5.6-sol, codex:gpt-6.1-terra, \
                          codex:gpt-5.6-terra, codex:gpt-5.6-luna, codex:gpt-5.5, \
                          cursor:composer-2.5, cursor:grok-4.7-high, \
+                         agy:gemini-4-carbon-medium, \
                          ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
@@ -2019,7 +2029,7 @@ impl AgentChatState {
                         &format!(
                             "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
                          Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
-                         `deepseek:`, `dsh:`, `ollama:`, or `local:`.",
+                         `deepseek:`, `dsh:`, `agy:`, `ollama:`, or `local:`.",
                             current, list
                         ),
                     );
@@ -2714,8 +2724,8 @@ impl AgentChatState {
                 self.add_system_message_at(idx,
                     "Available commands:\n\n\
                      Conversation:\n\
-                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, deepseek:deepseek-flash, dsh:deepseek-flash, ollama:<model>\n\
-                     /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
+                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, deepseek:deepseek-flash, dsh:deepseek-flash, agy:<model>, ollama:<model>\n\
+                     /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra; agy: effort is part of the model id). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /permissions [clear]     — List (or revoke) tools allowed for this session with `a` / `A` on a permission prompt\n\
@@ -5958,7 +5968,7 @@ const COMPACT_INSTRUCTIONS: &str = "Keep verbatim: file paths, commands, error m
 /// provider cannot enforce them.
 pub(crate) const ADD_DIR_UNSUPPORTED_NOTICE: &str = "/add-dir grants are not enforced for dsh:, \
      ollama: or local: models (dsh cannot take extra directories; ollama/local have no file \
-     tools). Switch to claude:, codex:, cursor: or deepseek: to use them.";
+     tools). Switch to claude:, codex:, cursor:, deepseek: or agy: to use them.";
 
 /// Notice for providers that cannot enforce `/add-dir` grants, by the model
 /// spec's provider prefix; `None` when the provider honours them.
