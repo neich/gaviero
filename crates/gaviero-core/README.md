@@ -54,6 +54,7 @@ println!("{}", plan.to_gaviero_script()?);
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
 | DeepSeek (ACP) | `dsh:deepseek-flash`, `dsh:deepseek-v4-pro` | Subprocess `dsh --profile acp` (Agent Client Protocol) |
+| Antigravity (ACP) | `agy:gemini-4-neon-high`, `agy:gemini-3.8-flash-low`, … (effort is part of the id; list from the CLI) | Subprocess `agy acp --disable-telemetry` (Agent Client Protocol, native resume) |
 
 **Observer traits** — implement to receive execution events:
 
@@ -112,7 +113,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | Module | Purpose |
 |---|---|
 | `acp/` | Claude subprocess protocol, file-block routing |
-| `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (`deepseek:`), `agent_client_protocol` (`dsh:`), `registry` |
+| `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (`deepseek:`), `agent_client_protocol` (`dsh:`, `agy:`), `registry` |
 | `swarm/` | Orchestration, tier routing, DAG execution, backends, verification, git merge |
 | `mcp/` | In-process MCP server (eleven tools: nine read-only incl. `memory_ping` and `symbol_refs` + write-adjacent `memory_flag` + interactive `ask_user_question`, listed only for a loopback-HTTP connection that names its conversation), config synthesis, stdio + loopback HTTP transport, reach probe |
 | `memory/` | Five-level scoped embeddings, RRF retrieval, consolidation, soft-delete |

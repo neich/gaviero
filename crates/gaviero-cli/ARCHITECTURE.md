@@ -115,7 +115,7 @@ parse Cli
 [`resolve_model_spec`](src/main.rs) / [`backend_config_for_model`](../gaviero-core/src/swarm/backend/shared.rs):
 
 ```
-claude:…  codex:…  cursor:…  ollama:…  local:…  deepseek:…  dsh:…
+claude:…  codex:…  cursor:…  ollama:…  local:…  deepseek:…  dsh:…  agy:…
 ```
 
 Bare names rejected. `--coordinator-model` for `--coordinated`. `--ollama-base-url` overrides Ollama endpoint.
