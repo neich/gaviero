@@ -230,7 +230,38 @@ where
                     .get("additionalDirectories")
                     .and_then(Value::as_array)
                     .is_some_and(|a| !a.is_empty());
-                if scenario == "reject_extra_dirs" && extra_nonempty {
+                // Live dsh connects every `mcpServers` entry inside
+                // `session/new` and fails the whole call on the first one it
+                // cannot reach, naming it only in `error.data.details`.
+                let unreachable = session_params
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.get("name").and_then(Value::as_str))
+                    .find(|name| name.starts_with("broken"))
+                    .map(str::to_string);
+                if scenario == "mcp_client_failure"
+                    && let Some(name) = unreachable
+                {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32603,
+                                "message": "Internal error",
+                                "data": {
+                                    "details": format!(
+                                        "mcp-client({name}): initial connection or tool synchronization failed"
+                                    )
+                                }
+                            }
+                        }),
+                    )
+                    .await?;
+                } else if scenario == "reject_extra_dirs" && extra_nonempty {
                     write_json(
                         &mut writer,
                         &json!({
@@ -305,6 +336,7 @@ where
             "session/prompt" => {
                 turn_count += 1;
                 if scenario == "inspect"
+                    || scenario == "mcp_client_failure"
                     || scenario == "model_catalog"
                     || scenario == "thinking_only"
                     || scenario == "reasoning_default_off"

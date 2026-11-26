@@ -43,6 +43,51 @@ pub struct JsonRpcHandle {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// JSON-RPC `error.data`. dsh answers every failure with the generic
+    /// `-32603 Internal error` and puts the real cause here
+    /// (`{"details": "mcp-client(<name>): initial connection … failed"}`).
+    pub data: Option<Value>,
+}
+
+impl RpcError {
+    /// `ACP RPC <method> error <code>: <message>`, followed by the cause from
+    /// `error.data` when the agent sent one.
+    fn describe(&self, method: &str) -> String {
+        let mut out = format!("ACP RPC {method} error {}: {}", self.code, self.message);
+        if let Some(details) = self.data.as_ref().and_then(error_data_details) {
+            out.push_str(": ");
+            out.push_str(&details);
+        }
+        out
+    }
+}
+
+/// Human-readable cause carried by a JSON-RPC `error.data`: a bare string,
+/// a `details` / `message` field, or else the compact JSON, clipped.
+fn error_data_details(data: &Value) -> Option<String> {
+    const MAX: usize = 1_000;
+    let text = match data {
+        Value::Null => return None,
+        Value::String(s) => s.clone(),
+        Value::Object(map) => match ["details", "message"]
+            .iter()
+            .find_map(|k| map.get(*k).and_then(Value::as_str))
+        {
+            Some(s) => s.to_string(),
+            None => data.to_string(),
+        },
+        other => other.to_string(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > MAX {
+        let clipped: String = text.chars().take(MAX).collect();
+        Some(format!("{clipped}…"))
+    } else {
+        Some(text.to_string())
+    }
 }
 
 pub struct JsonRpcChild {
@@ -69,7 +114,7 @@ impl JsonRpcHandle {
         let (id_key, rx) = self.send_request(method, params).await?;
         match rx.await {
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(anyhow!("ACP RPC {method} error {}: {}", e.code, e.message)),
+            Ok(Err(e)) => Err(anyhow!(e.describe(method))),
             Err(_) => {
                 self.pending.lock().await.remove(&id_key);
                 Err(anyhow!("ACP RPC {method}: caller dropped"))
@@ -86,7 +131,7 @@ impl JsonRpcHandle {
         let (id_key, rx) = self.send_request(method, params).await?;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(anyhow!("ACP RPC {method} error {}: {}", e.code, e.message)),
+            Ok(Ok(Err(e))) => Err(anyhow!(e.describe(method))),
             Ok(Err(_)) => Err(anyhow!("ACP RPC {method}: caller dropped")),
             Err(_) => {
                 self.pending.lock().await.remove(&id_key);
@@ -224,6 +269,7 @@ impl JsonRpcChild {
                 let _ = tx.send(Err(RpcError {
                     code: -1,
                     message: message.clone(),
+                    data: None,
                 }));
             }
         });
@@ -343,6 +389,7 @@ async fn dispatch_line(
                         .and_then(|m| m.as_str())
                         .unwrap_or("error")
                         .to_string(),
+                    data: err.get("data").cloned(),
                 }));
             } else {
                 let result = value.get("result").cloned().unwrap_or(Value::Null);
@@ -404,6 +451,60 @@ mod tests {
         let req = incoming_rx.recv().await.unwrap();
         assert_eq!(req.method, "fs/read_text_file");
         assert_eq!(req.params["path"], "a.rs");
+    }
+
+    /// Live dsh 0.2.3 answers a failed MCP connection on `session/new` with
+    /// the generic `-32603 Internal error`; the cause is only in
+    /// `error.data.details`. It must reach the user's error line.
+    #[tokio::test]
+    async fn dispatch_keeps_error_data_details_in_the_message() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (incoming_tx, _incoming_rx) = mpsc::channel(4);
+        let (notif_tx, _notif_rx) = mpsc::channel(4);
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert("2".into(), tx);
+
+        dispatch_line(
+            json!({"jsonrpc":"2.0","id":2,"error":{
+                "code":-32603,
+                "message":"Internal error",
+                "data":{"details":"mcp-client(semantic-scholar): initial connection or tool synchronization failed"}
+            }}),
+            &pending,
+            &incoming_tx,
+            &notif_tx,
+        )
+        .await;
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(
+            err.describe("session/new"),
+            "ACP RPC session/new error -32603: Internal error: \
+             mcp-client(semantic-scholar): initial connection or tool synchronization failed"
+        );
+    }
+
+    #[test]
+    fn error_data_details_shapes() {
+        assert_eq!(error_data_details(&json!(null)), None);
+        assert_eq!(error_data_details(&json!("  ")), None);
+        assert_eq!(error_data_details(&json!("boom")).as_deref(), Some("boom"));
+        assert_eq!(
+            error_data_details(&json!({"message": "why"})).as_deref(),
+            Some("why")
+        );
+        assert_eq!(
+            error_data_details(&json!({"other": 1})).as_deref(),
+            Some(r#"{"other":1}"#)
+        );
+        let plain = RpcError {
+            code: -32602,
+            message: "Invalid params".into(),
+            data: None,
+        };
+        assert_eq!(
+            plain.describe("session/new"),
+            "ACP RPC session/new error -32602: Invalid params"
+        );
     }
 
     #[test]

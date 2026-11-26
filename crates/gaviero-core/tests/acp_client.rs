@@ -267,6 +267,61 @@ async fn session_new_retries_when_additional_directories_unsupported() {
     Box::new(session).close().await;
 }
 
+/// Live dsh fails `session/new` outright when one `mcpServers` entry cannot be
+/// reached (`-32603`, cause in `error.data.details`). gaviero drops just that
+/// server, keeps the others, and says which one it dropped.
+#[tokio::test]
+async fn session_new_drops_an_unreachable_mcp_server_and_keeps_the_rest() {
+    let dir = workspace();
+    let gav = dir.path().join(".gaviero");
+    std::fs::create_dir_all(&gav).unwrap();
+    std::fs::write(
+        gav.join("settings.json"),
+        r#"{"mcp":{"extraServers":[
+            {"name":"broken-placeholder","url":"https://YOUR-MCP-ENDPOINT"},
+            {"name":"reachable","url":"http://127.0.0.1:9/mcp"}
+        ]}}"#,
+    )
+    .unwrap();
+    let status = Arc::new(Mutex::new(Vec::new()));
+    let args = construction(
+        dir.path(),
+        Box::new(RecStatus {
+            status: status.clone(),
+        }),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("mcp_client_failure"));
+    let events = drain(&mut session, true).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, UnifiedStreamEvent::Done(StopReason::EndTurn))),
+        "{events:?}"
+    );
+    let report = inspect_prompt(&events);
+    let names: Vec<&str> = report["new"]["mcpServers"]
+        .as_array()
+        .expect("mcpServers array")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(names.contains(&"reachable"), "{report}");
+    assert!(!names.contains(&"broken-placeholder"), "{report}");
+    let status = status.lock().unwrap().clone();
+    assert!(
+        status
+            .iter()
+            .any(|s| s.contains("could not connect MCP server(s) broken-placeholder")),
+        "{status:?}"
+    );
+    Box::new(session).close().await;
+}
+
 fn sibling_workspace() -> (TempDir, PathBuf, PathBuf) {
     let parent = tempfile::tempdir().unwrap();
     let primary = parent.path().join("gaviero");

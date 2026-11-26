@@ -300,6 +300,18 @@ impl AcpClientSession {
                 "dsh: additionalDirectories is not supported; sibling folders are not mounted",
             );
         }
+        if !new.failed_mcp_servers.is_empty() {
+            // Same reason as the `registers_gaviero` check above: without
+            // gaviero's own server its retrieval tools are absent.
+            if new.failed_mcp_servers.iter().any(|n| n == "gaviero") {
+                self.options.exposed_tools = Some(Vec::new());
+            }
+            self.observer.on_streaming_status(&format!(
+                "dsh: could not connect MCP server(s) {}; continuing without them \
+                 (check mcp.extraServers / mcp.context7 in .gaviero/settings.json)",
+                new.failed_mcp_servers.join(", ")
+            ));
+        }
         if new.mcp_dropped {
             self.options.exposed_tools = Some(Vec::new());
             self.observer.on_streaming_status(
@@ -697,6 +709,9 @@ struct SessionNew {
     value: Value,
     mcp_dropped: bool,
     additional_dirs_dropped: bool,
+    /// Servers dsh could not connect, removed one by one before the retry
+    /// that succeeded (registration order).
+    failed_mcp_servers: Vec<String>,
 }
 
 async fn session_new(
@@ -711,9 +726,17 @@ async fn session_new(
     // an enclosing parent pass an empty list. Nested extras (still inside
     // the primary cwd) are forwarded, and this retry strips them if the
     // child refuses. The same strip-and-retry applies to `mcpServers`.
+    //
+    // dsh connects every `mcpServers` entry inside `session/new` and fails the
+    // whole call when one cannot be reached (`-32603 Internal error`,
+    // `data.details: "mcp-client(<name>): initial connection or tool
+    // synchronization failed"`). One dead `mcp.extraServers` URL must not
+    // take the provider down, so only the named server is dropped and the
+    // call retried. Each pass removes a server or returns, so the loop ends.
     let mut extra_dirs = additional_roots.to_vec();
     let mut mcp_dropped = false;
     let mut additional_dirs_dropped = false;
+    let mut failed_mcp_servers: Vec<String> = Vec::new();
     loop {
         let params = json!({
             "cwd": cwd,
@@ -726,10 +749,25 @@ async fn session_new(
                     value,
                     mcp_dropped,
                     additional_dirs_dropped,
+                    failed_mcp_servers,
                 });
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                if let Some(name) = session_new_failed_mcp_server(&msg)
+                    && let Some(pos) = servers
+                        .iter()
+                        .position(|s| s.get("name").and_then(Value::as_str) == Some(name))
+                {
+                    tracing::warn!(
+                        error = %e,
+                        server = name,
+                        "dsh session/new could not connect an MCP server; retrying without it"
+                    );
+                    servers.remove(pos);
+                    failed_mcp_servers.push(name.to_string());
+                    continue;
+                }
                 if !extra_dirs.is_empty() && session_new_additional_dirs_rejected(&msg) {
                     tracing::warn!(
                         error = %e,
@@ -801,6 +839,16 @@ async fn session_new_agy(
 fn session_new_mcp_rejected(err: &str) -> bool {
     let l = err.to_ascii_lowercase();
     l.contains("mcpserver") || l.contains("mcp server") || l.contains("mcp_server")
+}
+
+/// The MCP server a dsh `session/new` failure names:
+/// `mcp-client(<name>): initial connection or tool synchronization failed`.
+fn session_new_failed_mcp_server(err: &str) -> Option<&str> {
+    const MARK: &str = "mcp-client(";
+    let start = err.find(MARK)? + MARK.len();
+    let len = err[start..].find(')')?;
+    let name = err[start..start + len].trim();
+    (!name.is_empty()).then_some(name)
 }
 
 fn session_new_additional_dirs_rejected(err: &str) -> bool {
@@ -2082,6 +2130,23 @@ mod tests {
             Some("")
         );
         assert_eq!(current_select_value(&json!({ "type": "select" })), None);
+    }
+
+    #[test]
+    fn session_new_failed_mcp_server_reads_the_dsh_details() {
+        assert_eq!(
+            session_new_failed_mcp_server(
+                "ACP RPC session/new error -32603: Internal error: \
+                 mcp-client(semantic-scholar): initial connection or tool synchronization failed"
+            ),
+            Some("semantic-scholar")
+        );
+        assert_eq!(session_new_failed_mcp_server("mcp-client(): x"), None);
+        assert_eq!(session_new_failed_mcp_server("mcp-client(open"), None);
+        assert_eq!(
+            session_new_failed_mcp_server("ACP RPC session/new error -32603: Internal error"),
+            None
+        );
     }
 
     #[test]
