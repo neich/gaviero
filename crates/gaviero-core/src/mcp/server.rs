@@ -178,6 +178,66 @@ pub struct GavieroMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Rewrite schemars' `Option<T>` idiom, `"type": [T, "null"]`, to the single
+/// `"type": T` every vendor's function-calling schema accepts.
+///
+/// Gemini (Vertex AI) takes function parameters as an OpenAPI-subset `Schema`
+/// whose `type` is one enum value; agy forwards MCP input schemas there, so a
+/// type array arrives as "no type" and Vertex rejects the *whole* request
+/// ("schema didn't specify the schema type field"). An optional property needs
+/// no `null` — leaving it out already means "none" — so `null` is dropped;
+/// a required one (or an array item, a `$defs` entry …) keeps it as OpenAPI's
+/// `"nullable": true`. Arrays with more than one non-null type are left alone
+/// (no single-type form exists).
+fn single_type_schemas(schema: &mut serde_json::Value, keep_null: bool) {
+    match schema {
+        serde_json::Value::Object(object) => {
+            collapse_type_array(object, keep_null);
+            let required: Vec<String> = object
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default();
+            for (key, value) in object.iter_mut() {
+                match (key.as_str(), value) {
+                    ("properties", serde_json::Value::Object(properties)) => {
+                        for (name, property) in properties.iter_mut() {
+                            single_type_schemas(property, required.contains(name));
+                        }
+                    }
+                    ("$defs" | "definitions", serde_json::Value::Object(defs)) => {
+                        for def in defs.values_mut() {
+                            single_type_schemas(def, true);
+                        }
+                    }
+                    (_, value) => single_type_schemas(value, true),
+                }
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                single_type_schemas(value, true);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collapse_type_array(object: &mut serde_json::Map<String, serde_json::Value>, keep_null: bool) {
+    let Some(serde_json::Value::Array(types)) = object.get("type") else {
+        return;
+    };
+    let had_null = types.iter().any(|t| t.as_str() == Some("null"));
+    let mut non_null = types.iter().filter(|t| t.as_str() != Some("null")).cloned();
+    let (Some(single), None) = (non_null.next(), non_null.next()) else {
+        return;
+    };
+    object.insert("type".into(), single);
+    if had_null && keep_null {
+        object.insert("nullable".into(), serde_json::Value::Bool(true));
+    }
+}
+
 fn strip_schema_descriptions(schema: &mut serde_json::Value) {
     if let Some(object) = schema.as_object_mut() {
         object.remove("description");
@@ -483,6 +543,7 @@ impl GavieroMcpServer {
             .map(|mut tool| {
                 let mut schema = serde_json::Value::Object((*tool.input_schema).clone());
                 strip_schema_descriptions(&mut schema);
+                single_type_schemas(&mut schema, true);
                 tool.input_schema = Arc::new(schema.as_object().expect("schema object").clone());
                 if let Some(output) = &tool.output_schema {
                     let mut schema = serde_json::Value::Object((**output).clone());
@@ -4770,6 +4831,82 @@ mod tests {
         let names = s.listed_tool_names();
         assert!(!names.contains(&"blast_radius".to_string()));
         assert!(names.contains(&"memory_search".to_string()));
+    }
+
+    fn type_arrays(schema: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match schema {
+            serde_json::Value::Object(object) => {
+                if object.get("type").is_some_and(|t| t.is_array()) {
+                    out.push(path.to_string());
+                }
+                for (key, value) in object {
+                    type_arrays(value, &format!("{path}/{key}"), out);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for (i, value) in array.iter().enumerate() {
+                    type_arrays(value, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// agy hands MCP input schemas to Gemini, whose `Schema.type` is a single
+    /// value: one `["integer","null"]` anywhere fails every agy turn.
+    #[test]
+    fn listed_input_schemas_use_a_single_type() {
+        let s = fixture().with_symbol_enrichment(true);
+        let mut bad = Vec::new();
+        for tool in s.listed_tools() {
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            type_arrays(&schema, &tool.name, &mut bad);
+        }
+        let ask = serde_json::Value::Object((*super::super::ask::tool_definition().input_schema).clone());
+        type_arrays(&ask, "ask_user_question", &mut bad);
+        assert!(bad.is_empty(), "type arrays in listed input schemas: {bad:?}");
+
+        let blast = s
+            .listed_tools()
+            .into_iter()
+            .find(|t| t.name == "blast_radius")
+            .unwrap();
+        assert_eq!(
+            blast.input_schema["properties"]["depth"],
+            serde_json::json!({ "format": "uint32", "minimum": 0, "type": "integer" })
+        );
+    }
+
+    #[test]
+    fn single_type_schemas_keeps_null_only_where_it_means_something() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "required": ["must"],
+            "properties": {
+                "optional": { "type": ["integer", "null"] },
+                "must": { "type": ["string", "null"] },
+                "list": { "type": ["array", "null"], "items": { "type": ["string", "null"] } },
+                "either": { "type": ["string", "integer"] },
+                "plain": { "type": "boolean" }
+            },
+            "$defs": { "Row": { "type": ["object", "null"] } }
+        });
+        single_type_schemas(&mut schema, true);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "required": ["must"],
+                "properties": {
+                    "optional": { "type": "integer" },
+                    "must": { "type": "string", "nullable": true },
+                    "list": { "type": "array", "items": { "type": "string", "nullable": true } },
+                    "either": { "type": ["string", "integer"] },
+                    "plain": { "type": "boolean" }
+                },
+                "$defs": { "Row": { "type": "object", "nullable": true } }
+            })
+        );
     }
 
     fn compact_tools_json(server: &GavieroMcpServer) -> (String, String) {
