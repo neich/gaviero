@@ -114,6 +114,14 @@ pub(crate) fn parse_work(title: Option<&str>) -> Vec<&'static str> {
     work
 }
 
+/// The child has files modified and not saved (`unsaved` in its status
+/// title): its tab gets the `●` an editor tab shows for an unsaved buffer.
+/// Kept apart from [`Activity`], whose changes latch and clear the badges'
+/// "finished" marks — saving a file is not the end of any work.
+pub(crate) fn parse_unsaved(title: Option<&str>) -> bool {
+    status_fields(title).is_some_and(|(_, detail)| detail.split(',').any(|k| k == "unsaved"))
+}
+
 /// `(status, detail)` of a status title; detail is empty when absent.
 fn status_fields(title: Option<&str>) -> Option<(&str, &str)> {
     let rest = title?.strip_prefix(STATUS_TITLE_PREFIX)?;
@@ -173,6 +181,9 @@ pub(crate) struct Session {
     pub activity: Activity,
     /// What closing this session now would cut off (`parse_work`).
     pub work: Vec<&'static str>,
+    /// The child reports files modified and not saved (`parse_unsaved`):
+    /// drawn as `●` before the tab label. Never set for a shell tab.
+    pub unsaved: bool,
     /// An agent turn / a shell command ended while this tab was not
     /// current. The agent mark clears when the user leaves the tab after
     /// making it current, the shell mark as soon as the tab is made current;
@@ -382,6 +393,7 @@ pub(crate) fn spawn(
         control,
         activity: Activity::default(),
         work: Vec::new(),
+        unsaved: false,
         agent_done_unseen: false,
         shell_done_unseen: false,
         restart_pending: false,
@@ -498,6 +510,7 @@ impl Session {
             let title = self.parser.callbacks().title.as_deref();
             self.activity = parse_activity(title);
             self.work = parse_work(title);
+            self.unsaved = parse_unsaved(title);
         }
         if let Some(data) = self.parser.callbacks_mut().copied.take()
             && let Some(text) = copied_text(&data)
@@ -659,6 +672,20 @@ mod tests {
         );
         assert!(parse_work(Some("vim")).is_empty());
         assert!(parse_work(None).is_empty());
+    }
+
+    #[test]
+    fn unsaved_files_parse_from_the_title() {
+        assert!(parse_unsaved(Some("gaviero-session:idle:unsaved")));
+        assert!(parse_unsaved(Some("gaviero-session:busy:agent,unsaved,review")));
+        assert!(parse_unsaved(Some("gaviero-session:attention:unsaved")));
+        assert!(!parse_unsaved(Some("gaviero-session:busy:agent")));
+        assert!(!parse_unsaved(Some("gaviero-session:idle")));
+        // Only the detail counts, and only the whole keyword.
+        assert!(!parse_unsaved(Some("gaviero-session:unsaved")));
+        assert!(!parse_unsaved(Some("gaviero-session:idle:unsaved-ish")));
+        assert!(!parse_unsaved(Some("vim unsaved")));
+        assert!(!parse_unsaved(None));
     }
 
     #[test]
