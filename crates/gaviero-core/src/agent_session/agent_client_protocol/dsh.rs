@@ -482,6 +482,17 @@ fn http_entry(name: &str, url: &str, headers: Vec<serde_json::Value>) -> serde_j
     })
 }
 
+/// ACP stdio server entry (`McpServerStdio`): `{name, command, args, env}`,
+/// `env` an array of `{name, value}` like the HTTP headers.
+fn stdio_entry(name: &str, command: &str, args: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "command": command,
+        "args": args,
+        "env": [],
+    })
+}
+
 /// Whether `servers` registers gaviero's **own** MCP server.
 ///
 /// Callers need this separately from "the list is non-empty": context7 and
@@ -500,6 +511,11 @@ pub fn registers_gaviero(servers: &[serde_json::Value]) -> bool {
 /// `mcpCapabilities.http` only. Every entry here is therefore HTTP; a stdio
 /// entry is skipped rather than sent, so `session/new` is never rejected for
 /// an unadvertised transport.
+///
+/// **`McpTransport::AcpSession` (agy).** agy 1.5.18 hosts stdio and HTTP
+/// entries alike, so the same list also carries the stdio forms: gaviero's
+/// shim ([`stdio_mcp_server`]) when no HTTP endpoint is live, context7's
+/// stdio fallback, and `command` extras. The gates below are unchanged.
 ///
 /// **Parity (decision E).** The same three source servers the file-based
 /// providers register, each behind the *same* `mcp.permissions` registration
@@ -545,10 +561,15 @@ pub fn mcp_servers_for_session(
     if !caps.uses_mcp_servers() {
         return Vec::new();
     }
+    // `HttpOnly` (dsh) skips every stdio entry; `AcpSession` (agy) hosts both,
+    // so it also gets the stdio forms the HTTP-only path drops.
+    let stdio_ok = caps.transport == crate::context_planner::types::McpTransport::AcpSession;
 
     let mut servers = Vec::new();
-    if let Some(http) = http_mcp_server(root, conv_id) {
-        servers.push(http);
+    match http_mcp_server(root, conv_id) {
+        Some(http) => servers.push(http),
+        None if stdio_ok => servers.push(stdio_mcp_server(root)),
+        None => {}
     }
 
     let workspace = crate::workspace::Workspace::single_folder(root.to_path_buf());
@@ -560,12 +581,14 @@ pub fn mcp_servers_for_session(
     // Both must hold, and the table is the single source for the former
     // (`Provider::mcp_capabilities`).
     let ctx7 = crate::mcp::resolve_context7_config(&workspace, Some(root));
-    if caps.context7
-        && ctx7.enabled
-        && let Some(url) = ctx7.remote_url()
-        && permissions.server_allowed("context7")
-    {
-        servers.push(http_entry("context7", url, Vec::new()));
+    if caps.context7 && ctx7.enabled && permissions.server_allowed("context7") {
+        match ctx7.remote_url() {
+            Some(url) => servers.push(http_entry("context7", url, Vec::new())),
+            None if stdio_ok => {
+                servers.push(stdio_entry("context7", &ctx7.command, &ctx7.args))
+            }
+            None => {}
+        }
     }
 
     if caps.extra_servers {
@@ -573,8 +596,14 @@ pub fn mcp_servers_for_session(
             if !permissions.server_allowed(&extra.name) {
                 continue;
             }
-            if let crate::mcp::ExtraMcpTransport::Url { url } = extra.transport {
-                servers.push(http_entry(&extra.name, &url, Vec::new()));
+            match extra.transport {
+                crate::mcp::ExtraMcpTransport::Url { url } => {
+                    servers.push(http_entry(&extra.name, &url, Vec::new()))
+                }
+                crate::mcp::ExtraMcpTransport::Stdio { command, args } if stdio_ok => {
+                    servers.push(stdio_entry(&extra.name, &command, &args))
+                }
+                crate::mcp::ExtraMcpTransport::Stdio { .. } => {}
             }
         }
     }
@@ -1090,6 +1119,68 @@ mod tests {
                 "context7":{"enabled":true},
                 "extraServers":[{"name":"consensus","url":"https://example.test/mcp"}],
                 "permissions":{"deny":["context7:*","consensus:*"]}
+            }}"#,
+        );
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());
+    }
+
+    fn agy_caps() -> crate::context_planner::types::McpCapabilities {
+        crate::context_planner::types::Provider::Agy.mcp_capabilities()
+    }
+
+    /// agy hosts stdio entries, so the stdio forms dsh drops are registered:
+    /// a `command` extra and context7's stdio fallback, beside URL extras.
+    #[test]
+    fn acp_session_transport_registers_stdio_extras_and_context7() {
+        let dir = tempdir().unwrap();
+        write_settings(
+            dir.path(),
+            r#"{"mcp":{
+                "context7":{"enabled":true,"url":""},
+                "extraServers":[
+                    {"name":"consensus","url":"https://example.test/mcp"},
+                    {"name":"local-thing","command":"some-server","args":["--x"]}
+                ]
+            }}"#,
+        );
+        let servers = mcp_servers_for_session(dir.path(), agy_caps(), None);
+        let by_name = |n: &str| servers.iter().find(|s| s["name"] == n).cloned();
+        let ctx7 = by_name("context7").expect("stdio context7");
+        assert!(ctx7.get("command").and_then(|c| c.as_str()).is_some(), "{ctx7}");
+        assert!(ctx7["args"].is_array(), "{ctx7}");
+        assert!(ctx7["env"].is_array(), "{ctx7}");
+        assert_eq!(by_name("consensus").expect("url extra")["type"], "http");
+        let local = by_name("local-thing").expect("stdio extra");
+        assert_eq!(local["command"], "some-server");
+        assert_eq!(local["args"], serde_json::json!(["--x"]));
+        assert!(local.get("type").is_none(), "stdio entries carry no type: {local}");
+    }
+
+    /// No live HTTP endpoint: agy still gets gaviero's server, through the
+    /// stdio shim, so the retrieval tools stay reachable.
+    #[test]
+    fn acp_session_falls_back_to_stdio_gaviero_without_http() {
+        let dir = tempdir().unwrap();
+        let servers = mcp_servers_for_session(dir.path(), agy_caps(), None);
+        assert_eq!(names(&servers), vec!["gaviero"]);
+        assert!(servers[0].get("command").and_then(|c| c.as_str()).is_some());
+        assert!(registers_gaviero(&servers));
+
+        // A live endpoint wins over the shim.
+        write_http_descriptor(dir.path());
+        let servers = mcp_servers_for_session(dir.path(), agy_caps(), Some("conv-1"));
+        assert_eq!(servers[0]["type"], "http");
+    }
+
+    /// dsh's HTTP-only row is unchanged: every stdio form is still skipped.
+    #[test]
+    fn http_only_still_skips_stdio() {
+        let dir = tempdir().unwrap();
+        write_settings(
+            dir.path(),
+            r#"{"mcp":{
+                "context7":{"enabled":true,"url":""},
+                "extraServers":[{"name":"local-thing","command":"some-server","args":[]}]
             }}"#,
         );
         assert!(mcp_servers_for_session(dir.path(), dsh_caps(), None).is_empty());

@@ -116,6 +116,9 @@ pub enum McpTransport {
     /// server is ever *handed to* the agent, so no `mcpServers` entry is
     /// synthesized for it.
     InProcess,
+    /// Servers are handed over on ACP `session/new` / `session/resume`; the
+    /// agent hosts both stdio and HTTP entries (agy).
+    AcpSession,
 }
 
 /// Per-provider MCP capability gates — the `context7_allowed` /
@@ -199,7 +202,7 @@ impl Provider {
     /// Exists so exhaustive iteration cannot silently miss an arm when one is
     /// added — the reverse lookup in [`McpCapabilities::for_synth_vendor`] and
     /// the table's own tests both walk this instead of a hand-copied list.
-    pub const ALL: [Provider; 7] = [
+    pub const ALL: [Provider; 8] = [
         Provider::Claude,
         Provider::Codex,
         Provider::CodexAppServer,
@@ -207,6 +210,7 @@ impl Provider {
         Provider::Ollama,
         Provider::Deepseek,
         Provider::Dsh,
+        Provider::Agy,
     ];
 
     /// The single source for this provider's MCP capability gates.
@@ -221,6 +225,9 @@ impl Provider {
                 McpCapabilities::permissive_over(McpTransport::ConfigFileStdio)
             }
             Provider::Dsh => McpCapabilities::permissive_over(McpTransport::HttpOnly),
+            // agy (1.5.18) connects stdio and HTTP entries passed on
+            // `session/new` / `session/resume`.
+            Provider::Agy => McpCapabilities::permissive_over(McpTransport::AcpSession),
             // Phase 2d: context7 reaches the in-process loop as a *native* tool
             // over context7's REST API (`tools/context7.rs`), not as an MCP
             // server — so `context7` is allowed. `deepseek:` also reaches
@@ -252,7 +259,7 @@ impl Provider {
             Provider::Claude => Some("claude"),
             Provider::Codex | Provider::CodexAppServer => Some("codex"),
             Provider::Cursor => Some("cursor"),
-            Provider::Ollama | Provider::Deepseek | Provider::Dsh => None,
+            Provider::Ollama | Provider::Deepseek | Provider::Dsh | Provider::Agy => None,
         }
     }
 }
@@ -422,6 +429,7 @@ impl ModelSpec {
             "cursor",
             "deepseek",
             "dsh",
+            "agy",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -450,6 +458,7 @@ impl ModelSpec {
             "cursor" => Provider::Cursor,
             "deepseek" => Provider::Deepseek,
             "dsh" => Provider::Dsh,
+            "agy" => Provider::Agy,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
@@ -474,6 +483,9 @@ pub enum Provider {
     /// DeepSeek via `dsh --profile acp` over the Agent Client Protocol
     /// (`ProcessBound`).
     Dsh,
+    /// Antigravity CLI via `agy acp` over the Agent Client Protocol
+    /// (`NativeResume` through `session/resume`).
+    Agy,
 }
 
 /// Runtime config the factory needs.
@@ -670,6 +682,26 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             tool_enforcement: ToolEnforcement::Unenforced,
             // y/n via `session/request_permission`.
             prompt_kind: PromptKind::YesNo,
+        },
+        Provider::Agy => ProviderProfile {
+            provider: "agy".to_string(),
+            model: spec.model.clone(),
+            // The ACP session id round-trips as `ContinuityHandle::AcpSessionId`
+            // and the next turn calls `session/resume` (agy keeps the history).
+            continuity_mode: ContinuityMode::NativeResume,
+            supports_tool_use: true,
+            supports_native_resume: true,
+            max_context_tokens: Some(crate::swarm::backend::agy::AGY_CONTEXT_WINDOW),
+            // tool_use + a 1M context ⇒ Strong.
+            bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
+            // PreToolUse deny rules in the generated `.agents/hooks.json`.
+            tool_enforcement: ToolEnforcement::GeneratedConfig,
+            // MCP `ask_user_question` over loopback HTTP + y/n
+            // `session/request_permission`.
+            prompt_kind: PromptKind::MultiChoice,
         },
     }
 }
@@ -1160,6 +1192,28 @@ mod tests {
     }
 
     #[test]
+    fn agy_is_native_resume_hook_enforced_and_multichoice() {
+        let spec = ModelSpec::parse("agy:gemini-3.8-flash-low");
+        assert_eq!(spec.provider(), Provider::Agy);
+        assert_eq!(spec.model, "gemini-3.8-flash-low");
+        let p = profile("agy:gemini-3.8-flash-low");
+        assert_eq!(p.provider, "agy");
+        assert_eq!(p.continuity_mode, ContinuityMode::NativeResume);
+        assert!(p.supports_native_resume);
+        assert_eq!(
+            p.max_context_tokens,
+            Some(crate::swarm::backend::agy::AGY_CONTEXT_WINDOW)
+        );
+        assert_eq!(p.mcp_transport, McpTransport::AcpSession);
+        assert!(p.mcp_capabilities().uses_mcp_servers());
+        assert!(p.context7_allowed);
+        assert!(p.extra_servers_allowed);
+        assert_eq!(p.tool_enforcement, ToolEnforcement::GeneratedConfig);
+        assert_eq!(p.prompt_kind, PromptKind::MultiChoice);
+        assert_eq!(Provider::Agy.synth_vendor(), None);
+    }
+
+    #[test]
     fn codex_app_server_enforces_at_runtime_and_prompts_yesno() {
         let p = profile("codex-app-server:gpt-5");
         assert_eq!(p.mcp_transport, McpTransport::ConfigFileStdio);
@@ -1213,6 +1267,7 @@ mod tests {
             ("ollama:llama3.1", Provider::Ollama),
             ("deepseek:deepseek-flash", Provider::Deepseek),
             ("dsh:deepseek-flash", Provider::Dsh),
+            ("agy:gemini-3.8-flash-low", Provider::Agy),
         ] {
             let p = profile(spec);
             let caps = provider.mcp_capabilities();
@@ -1233,7 +1288,7 @@ mod tests {
         // One key: both load `<worktree>/.codex/config.toml`.
         assert_eq!(Provider::CodexAppServer.synth_vendor(), Some("codex"));
         assert_eq!(Provider::Cursor.synth_vendor(), Some("cursor"));
-        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh] {
+        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh, Provider::Agy] {
             assert_eq!(p.synth_vendor(), None, "{p:?}");
         }
     }

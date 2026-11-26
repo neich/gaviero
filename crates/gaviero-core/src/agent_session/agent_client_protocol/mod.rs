@@ -22,6 +22,7 @@
 //! module exists for, and a long turn's edits would land with no diff to
 //! review.
 
+pub mod agy;
 pub mod dsh;
 #[cfg(test)]
 pub mod fake;
@@ -61,7 +62,14 @@ use super::registry::SessionConstruction;
 use super::replay_compaction::compact_turn_replay;
 use super::tool_surface::AgentToolSurface;
 use super::{AgentSession, Turn};
+use agy::{AcpAgentKind, AgyLaunchSpec};
 use dsh::{DshLaunchSpec, mcp_servers_for_session, registers_gaviero};
+
+/// Appended to agy's system prompt when gaviero's `ask_user_question` is
+/// reachable: agy's built-in `ask_question` has no ACP answer channel (its
+/// call stays pending and the turn ends), the MCP tool does.
+const AGY_ASK_STEERING: &str = "To ask the user a question, call the MCP tool \
+     `mcp_gaviero_ask_user_question`; never use the built-in `ask_question` tool.";
 use permission::{PermissionPlan, ToolCallLog, plan_permission};
 use rpc::{IncomingRequest, JsonRpcChild, JsonRpcHandle};
 
@@ -81,6 +89,11 @@ pub struct AcpClientSession {
     capabilities: McpCapabilities,
     /// `ProviderProfile::max_context_tokens`, for the replay bound.
     max_context_tokens: Option<usize>,
+    /// Which ACP agent this session drives (from `ProviderProfile::provider`).
+    agent: AcpAgentKind,
+    /// `ProviderProfile::continuity_mode`: `ProcessBound` for dsh,
+    /// `NativeResume` for agy.
+    continuity: ContinuityMode,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     observer: Arc<dyn AcpObserver>,
     cancel_token: CancellationToken,
@@ -135,6 +148,8 @@ impl AcpClientSession {
             file_scope,
             capabilities: profile.mcp_capabilities(),
             max_context_tokens: profile.max_context_tokens,
+            agent: AcpAgentKind::from_provider(&profile.provider),
+            continuity: profile.continuity_mode,
             write_gate,
             observer: Arc::from(observer),
             cancel_token,
@@ -173,6 +188,8 @@ impl AcpClientSession {
             file_scope,
             capabilities: profile.mcp_capabilities(),
             max_context_tokens: profile.max_context_tokens,
+            agent: AcpAgentKind::from_provider(&profile.provider),
+            continuity: profile.continuity_mode,
             write_gate,
             observer,
             cancel_token,
@@ -200,6 +217,10 @@ impl AcpClientSession {
         if self.inner.is_some() {
             return Ok(false);
         }
+        if self.agent == AcpAgentKind::Agy {
+            return self.start_agy().await;
+        }
+        // dsh: everything below is the original dsh path, unchanged.
         let spec = DshLaunchSpec::from_workspace_root(&self.workspace_root, &self.extra);
         let cmd = spec.build_command(&self.workspace_root, &self.additional_roots)?;
         let rpc = JsonRpcChild::spawn(cmd).await.with_context(|| {
@@ -292,7 +313,10 @@ impl AcpClientSession {
             .and_then(|v| v.as_str())
             .context("ACP session/new omitted sessionId")?
             .to_string();
-        let model = self.model.strip_prefix("dsh:").unwrap_or(&self.model);
+        let model = self
+            .model
+            .strip_prefix(self.agent.model_prefix())
+            .unwrap_or(&self.model);
         // dsh advertises opaque select values (`JSON.stringify([provider, model])`),
         // not the bare API id. Sending `deepseek-flash` verbatim is
         // `unknown model option` and aborts the turn.
@@ -318,6 +342,211 @@ impl AcpClientSession {
             gate_written: HashSet::new(),
         });
         Ok(true)
+    }
+
+    /// Start (or resume) an `agy acp` session. Returns whether the turn must
+    /// replay history: `false` after a successful `session/resume`, which
+    /// keeps agy's own history.
+    ///
+    /// Verified against agy 1.5.18 (see `plans/agy-provider`):
+    /// * `session/resume` keeps the conversation but resets model and mode, so
+    ///   both are set again on every start;
+    /// * `_meta.antigravity.systemPrompt.append` is applied on `session/new`
+    ///   and persists across `session/resume`;
+    /// * `session/set_model` rejects an id agy does not offer with -32602,
+    ///   which fails the turn here rather than running on another model;
+    /// * agy hosts stdio and HTTP MCP entries alike (`McpTransport::AcpSession`).
+    async fn start_agy(&mut self) -> Result<bool> {
+        // gaviero's read/tool policy for agy lives in `.agents/hooks.json`.
+        // The TUI writes it at startup, so this is normally a no-op; it runs
+        // before `send_turn` takes its git baseline, so a swarm worktree never
+        // reconciles these files as the agent's writes.
+        let cli = crate::mcp::resolver::resolve_cli_binary();
+        for root in std::iter::once(&self.workspace_root).chain(self.additional_roots.iter()) {
+            if let Err(e) = crate::agent_guard::agy::ensure_agy_files(root, &cli) {
+                tracing::warn!(error = %e, root = %root.display(), "agy: could not write .agents/hooks.json");
+            }
+        }
+        let spec = AgyLaunchSpec::from_workspace_root(&self.workspace_root, &self.extra);
+        let cmd = spec.build_command(&self.workspace_root, &self.options.session_read_folders)?;
+        let rpc = JsonRpcChild::spawn(cmd).await.with_context(|| {
+            format!(
+                "spawning agy ACP agent `{}` (install the Antigravity CLI and sign in with `agy`, or set providers.agy.command)",
+                spec.command
+            )
+        })?;
+        initialize_client(&rpc.handle).await?;
+
+        let session_cwd = PathBuf::from(absolute_cwd(&self.workspace_root));
+        let cwd = session_cwd.to_string_lossy().into_owned();
+        let extra_dirs = self.agy_additional_directories(&session_cwd);
+        let servers = mcp_servers_for_session(
+            &self.workspace_root,
+            self.capabilities,
+            self.conv_id.as_deref(),
+        );
+        if !registers_gaviero(&servers) {
+            self.options.exposed_tools = Some(Vec::new());
+            self.observer
+                .on_streaming_status("agy: no MCP endpoint available; retrieval tools disabled");
+        }
+        // `ask_user_question` is listed only on a loopback-HTTP connection that
+        // carries the conversation header, so only then is it worth steering to.
+        let ask_reachable = self.conv_id.is_some()
+            && servers.iter().any(|s| {
+                s.get("name").and_then(Value::as_str) == Some("gaviero")
+                    && s.get("type").and_then(Value::as_str) == Some("http")
+            });
+        let system = self.agy_system_prompt(ask_reachable);
+
+        let mut resumed: Option<String> = None;
+        // The TUI hands the stored `ContinuityHandle::AcpSessionId` through
+        // this field, exactly as it does Cursor's thread id.
+        #[allow(deprecated)]
+        let resume_id = self.options.resume_session_id.clone();
+        if let Some(id) = resume_id.filter(|id| !id.trim().is_empty()) {
+            match rpc
+                .handle
+                .request(
+                    "session/resume",
+                    json!({
+                        "sessionId": id,
+                        "cwd": cwd,
+                        "mcpServers": servers.clone(),
+                        "additionalDirectories": extra_dirs,
+                    }),
+                )
+                .await
+            {
+                Ok(_) => resumed = Some(id),
+                Err(e) => {
+                    tracing::warn!(error = %e, session = %id, "agy: session/resume failed");
+                    self.observer.on_streaming_status(&format!(
+                        "agy: could not resume session {id}; starting a new one"
+                    ));
+                }
+            }
+        }
+        let (session_id, include_replay) = match resumed {
+            Some(id) => (id, false),
+            None => {
+                let new = session_new_agy(&rpc.handle, &cwd, &extra_dirs, servers, &system).await?;
+                let id = new
+                    .get("sessionId")
+                    .or_else(|| new.get("session_id"))
+                    .and_then(|v| v.as_str())
+                    .context("ACP session/new omitted sessionId")?
+                    .to_string();
+                (id, true)
+            }
+        };
+        self.observer.on_acp_session_started(&session_id);
+
+        let model = self
+            .model
+            .strip_prefix(self.agent.model_prefix())
+            .unwrap_or(&self.model)
+            .to_string();
+        if let Err(e) = rpc
+            .handle
+            .request(
+                "session/set_model",
+                json!({ "sessionId": session_id, "modelId": model }),
+            )
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "agy: model `{model}` is not offered by `agy acp` ({e:#}); pick one from /model"
+            ));
+        }
+        if let Err(e) = rpc
+            .handle
+            .request(
+                "session/set_mode",
+                json!({ "sessionId": session_id, "modeId": "accept-edits" }),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "agy: session/set_mode accept-edits failed");
+            self.observer
+                .on_streaming_status("agy: could not switch to accept-edits mode");
+        }
+        if !AgentToolSurface::from_agent_options(&self.options, &self.workspace_root)
+            .bash_available()
+        {
+            self.observer.on_streaming_status(
+                "agy: no Bash in agent.availableTools — it cannot list or search files",
+            );
+        }
+        if crate::instructions::is_active(&self.workspace_root, &self.additional_roots) {
+            self.observer
+                .on_streaming_status("agy: AGENTS.md / GEMINI.md also load natively");
+        }
+
+        self.handle = Some(ContinuityHandle::AcpSessionId(session_id.clone()));
+        self.inner = Some(LiveSession {
+            rpc,
+            session_id,
+            session_cwd,
+            // agy carries effort in the model id; `thought_level` is never sent.
+            reasoning: None,
+            gate_written: HashSet::new(),
+        });
+        Ok(include_replay)
+    }
+
+    /// `additionalDirectories` for agy: sibling roots, read-only folders
+    /// (`agent.permissions.read.extraFolders`, the settings `.gaviero`),
+    /// `/add-dir` grants and scratch folders — deduplicated, primary excluded.
+    /// Writes into the read-only ones are refused by gaviero's agy hook.
+    fn agy_additional_directories(&self, primary: &Path) -> Vec<PathBuf> {
+        let candidates = self
+            .additional_roots
+            .iter()
+            .cloned()
+            .chain(crate::agent_guard::read_only_folders_for(
+                &self.workspace_root,
+                &self.additional_roots,
+            ))
+            .chain(self.options.session_read_folders.iter().cloned())
+            .chain(crate::agent_guard::scratch_folders_for(
+                &self.workspace_root,
+                &self.additional_roots,
+            ));
+        let mut out: Vec<PathBuf> = Vec::new();
+        for dir in candidates {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let abs = PathBuf::from(absolute_cwd(&dir));
+            if paths_eq(&abs, primary) || out.iter().any(|d| paths_eq(d, &abs)) {
+                continue;
+            }
+            out.push(abs);
+        }
+        out
+    }
+
+    /// The text agy receives in `_meta.antigravity.systemPrompt.append`: the
+    /// swarm-provided prompt, else the editor system prompt plus `GAVIERO.md`,
+    /// then the `ask_user_question` steering when that tool is reachable.
+    fn agy_system_prompt(&self, ask_reachable: bool) -> String {
+        let mut system = match &self.system_prompt {
+            Some(prompt) => prompt.clone(),
+            None => crate::instructions::append_to_system_prompt(
+                default_editor_system_prompt(&capabilities_with(
+                    self.options.exposed_tools.as_deref(),
+                    self.max_context_tokens,
+                )),
+                &self.workspace_root,
+                &self.additional_roots,
+            ),
+        };
+        if ask_reachable {
+            system.push_str("\n\n");
+            system.push_str(AGY_ASK_STEERING);
+        }
+        system
     }
 
     /// Push the turn's effort onto the live session's reasoning config option.
@@ -523,6 +752,50 @@ async fn session_new(
             }
         }
     }
+}
+
+/// ACP `initialize` with the client capabilities gaviero advertises.
+async fn initialize_client(handle: &JsonRpcHandle) -> Result<Value> {
+    handle
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": true, "writeTextFile": true },
+                    "terminal": false
+                },
+                "clientInfo": {
+                    "name": "gaviero",
+                    "title": "Gaviero",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        )
+        .await
+}
+
+/// agy `session/new`: the system prompt rides
+/// `_meta.antigravity.systemPrompt.append`. No strip-and-retry — agy accepts
+/// `additionalDirectories` and every MCP entry gaviero builds for it.
+async fn session_new_agy(
+    handle: &JsonRpcHandle,
+    cwd: &str,
+    additional_dirs: &[PathBuf],
+    servers: Vec<Value>,
+    system: &str,
+) -> Result<Value> {
+    handle
+        .request(
+            "session/new",
+            json!({
+                "cwd": cwd,
+                "mcpServers": servers,
+                "additionalDirectories": additional_dirs,
+                "_meta": { "antigravity": { "systemPrompt": { "append": system } } },
+            }),
+        )
+        .await
 }
 
 fn session_new_mcp_rejected(err: &str) -> bool {
@@ -866,6 +1139,12 @@ fn reasoning_config_option(value: &Value) -> Option<&Value> {
 }
 
 fn capabilities(exposed: Option<&[String]>) -> Capabilities {
+    capabilities_with(exposed, None)
+}
+
+/// [`capabilities`] with the profile's context window (`None` keeps dsh's
+/// DeepSeek window).
+fn capabilities_with(exposed: Option<&[String]>, max_context_tokens: Option<usize>) -> Capabilities {
     let retrieval = match exposed {
         Some(tools) => RetrievalToolset::from_exposed(tools),
         None => RetrievalToolset {
@@ -879,7 +1158,8 @@ fn capabilities(exposed: Option<&[String]>) -> Capabilities {
         streaming: true,
         vision: false,
         extended_thinking: true,
-        max_context_tokens: crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW,
+        max_context_tokens: max_context_tokens
+            .unwrap_or(crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW),
         supports_system_prompt: true,
         supports_file_blocks: false,
         retrieval,
@@ -1010,6 +1290,7 @@ async fn handle_incoming(
     tool_surface: &AgentToolSurface,
     tool_calls: &ToolCallLog,
     gate_written: &mut HashSet<PathBuf>,
+    agent_label: &str,
 ) {
     match req.method.as_str() {
         "fs/read_text_file" => {
@@ -1144,6 +1425,7 @@ async fn handle_incoming(
                 tool_surface,
                 auto_approve,
                 workspace_root,
+                agent_label,
             ) {
                 PermissionPlan::Allow => true,
                 PermissionPlan::Reject => {
@@ -1430,7 +1712,7 @@ impl AgentSession for AcpClientSession {
             &mut turn,
             &CompactionPolicy::default(),
             self.max_context_tokens,
-            "dsh",
+            self.agent.label(),
         );
         let auto_approve = turn.auto_approve || self.options.auto_approve;
         let effort = turn
@@ -1456,11 +1738,17 @@ impl AgentSession for AcpClientSession {
         if let Some(system) = &self.system_prompt {
             prompt[0] = json!({ "type": "text", "text": system });
         }
+        if self.agent == AcpAgentKind::Agy {
+            // agy got the system prompt in `_meta` on `session/new`.
+            prompt.remove(0);
+        }
         let live = self.inner.as_mut().expect("ensure_running");
         let handle = live.rpc.handle.clone();
         let session_id = live.session_id.clone();
         let reasoning = live.reasoning.clone();
-        Self::apply_effort(&handle, &session_id, reasoning.as_ref(), &effort).await;
+        if self.agent == AcpAgentKind::Dsh {
+            Self::apply_effort(&handle, &session_id, reasoning.as_ref(), &effort).await;
+        }
 
         // Host capture: the host diffs the tree itself after the turn, so the
         // git dirty-set baseline and the out-of-band reconcile are skipped.
@@ -1490,6 +1778,7 @@ impl AgentSession for AcpClientSession {
         let agent_id = self.agent_id.clone();
         let conv_id = self.conv_id.clone();
         let tool_surface = AgentToolSurface::from_agent_options(&self.options, &self.workspace_root);
+        let agent_label = self.agent.label();
 
         // Take the live session so the task can own the RPC child.
         let mut live = self.inner.take().expect("ensure_running");
@@ -1539,6 +1828,7 @@ impl AgentSession for AcpClientSession {
                             &tool_surface,
                             &tool_calls,
                             &mut live.gate_written,
+                            agent_label,
                         )
                         .await;
                     }
@@ -1575,6 +1865,7 @@ impl AgentSession for AcpClientSession {
                     &tool_surface,
                     &tool_calls,
                     &mut live.gate_written,
+                    agent_label,
                 )
                 .await;
             }
@@ -1584,6 +1875,9 @@ impl AgentSession for AcpClientSession {
             let reusable = matches!(&prompt_result, Some(Ok(_)));
             match prompt_result {
                 Some(Ok(result)) if host_capture => {
+                    if let Some(usage) = map::map_prompt_usage(&result) {
+                        let _ = tx.send(Ok(usage)).await;
+                    }
                     let _ = tx
                         .send(Ok(UnifiedStreamEvent::Done(map::map_stop_reason(&result))))
                         .await;
@@ -1648,6 +1942,9 @@ impl AgentSession for AcpClientSession {
                             .send(Ok(UnifiedStreamEvent::PathsModified(reported)))
                             .await;
                     }
+                    if let Some(usage) = map::map_prompt_usage(&result) {
+                        let _ = tx.send(Ok(usage)).await;
+                    }
                     let _ = tx
                         .send(Ok(UnifiedStreamEvent::Done(map::map_stop_reason(&result))))
                         .await;
@@ -1679,7 +1976,7 @@ impl AgentSession for AcpClientSession {
     }
 
     fn continuity_mode(&self) -> ContinuityMode {
-        ContinuityMode::ProcessBound
+        self.continuity
     }
 
     fn continuity_handle(&self) -> Option<&ContinuityHandle> {

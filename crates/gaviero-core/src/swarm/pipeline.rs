@@ -48,6 +48,7 @@ pub fn tier_router_for_model(fallback_model: &str, ollama_base_url: Option<&str>
         tier_config.expensive_model = local_model.clone();
     } else if shared::is_codex_model(fallback_model)
         || shared::is_dsh_model(fallback_model)
+        || shared::is_agy_model(fallback_model)
         || shared::is_deepseek_model(fallback_model)
     {
         // API-backed like Claude. Propagate to both tier defaults so

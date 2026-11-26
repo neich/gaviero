@@ -95,6 +95,7 @@ impl Default for ReachProbeConfig {
                 "codex".into(),
                 "cursor".into(),
                 "dsh".into(),
+                "agy".into(),
             ],
             depth: 1,
             transport: ReachTransport::Stdio,
@@ -208,6 +209,7 @@ pub fn provider_cli_bin(provider: &str) -> &str {
         "codex" => "codex",
         "cursor" => "agent",
         "dsh" => "dsh",
+        "agy" => "agy",
         other => other,
     }
 }
@@ -218,6 +220,7 @@ pub fn provider_model_spec(provider: &str) -> Option<&'static str> {
         "codex" => Some("codex:gpt-6.1-sol"),
         "cursor" => Some("cursor:auto"),
         "dsh" => Some("dsh:deepseek-flash"),
+        "agy" => Some("agy:gemini-3.8-flash-low"),
         _ => None,
     }
 }

@@ -9,6 +9,12 @@
 //! `{"permission": "allow"|"deny", …}` from `beforeReadFile` and
 //! `beforeShellExecution`.
 //!
+//! agy (`agy:pre-tool-use`, verified live 2026-11-26 against agy 1.5.18) runs
+//! the hook gaviero registers in `<folder>/.agents/hooks.json` with
+//! `{hookEventName, toolCall: {name, args}, cwd, workspacePaths, …}` on stdin
+//! and reads `{"decision": "allow" | "deny", "reason"}` from stdout; a `deny`
+//! blocks the call whatever other hooks answer.
+//!
 //! Malformed input never panics and never blocks: the hook passes and the
 //! audit row says why.
 
@@ -16,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::agent_session::tool_agent::policy::command_protected_path;
+use crate::agent_session::agent_client_protocol::agy::HOOK_READ_FOLDERS_ENV;
+use crate::agent_session::tool_agent::policy::{ToolPolicy, command_protected_path};
+use crate::agent_session::tool_surface::AgentToolSurface;
 use crate::scope_enforcer::SensitivePolicy;
 
 /// Line substituted for a Bash output line that came from a protected file.
@@ -27,6 +35,7 @@ pub const WITHHELD_LINE: &str = "[gaviero: line from protected file withheld]";
 pub enum HookProvider {
     Claude,
     Cursor,
+    Agy,
 }
 
 /// Which hook event fired.
@@ -35,6 +44,7 @@ pub enum HookEvent {
     PostToolUse,
     BeforeReadFile,
     BeforeShellExecution,
+    PreToolUse,
 }
 
 impl HookProvider {
@@ -42,6 +52,7 @@ impl HookProvider {
         match self {
             Self::Claude => "claude",
             Self::Cursor => "cursor",
+            Self::Agy => "agy",
         }
     }
 }
@@ -52,6 +63,7 @@ impl HookEvent {
             Self::PostToolUse => "post-tool-use",
             Self::BeforeReadFile => "before-read-file",
             Self::BeforeShellExecution => "before-shell-execution",
+            Self::PreToolUse => "pre-tool-use",
         }
     }
 }
@@ -65,9 +77,10 @@ pub fn parse_hook_arg(arg: &str) -> anyhow::Result<(HookProvider, HookEvent)> {
         "cursor:before-shell-execution" => {
             Ok((HookProvider::Cursor, HookEvent::BeforeShellExecution))
         }
+        "agy:pre-tool-use" => Ok((HookProvider::Agy, HookEvent::PreToolUse)),
         other => anyhow::bail!(
             "unknown hook {other:?}; expected claude:post-tool-use, \
-             cursor:before-read-file or cursor:before-shell-execution"
+             cursor:before-read-file, cursor:before-shell-execution or agy:pre-tool-use"
         ),
     }
 }
@@ -86,24 +99,30 @@ pub struct HookOutcome {
 /// `cd` moves into a subfolder.
 pub const HOOK_ROOT_ENV: &str = "GAVIERO_HOOK_ROOT";
 
-/// The workspace root the event belongs to: for Claude, [`HOOK_ROOT_ENV`]
-/// when set, else [`input_root`].
+/// The workspace root the event belongs to: for Claude and agy (both launched
+/// by gaviero with it set), [`HOOK_ROOT_ENV`] when set, else [`input_root`].
 pub fn hook_root(provider: HookProvider, input: &Value) -> Option<PathBuf> {
     let env_root = std::env::var(HOOK_ROOT_ENV).ok().filter(|r| !r.is_empty());
     match (provider, env_root) {
-        (HookProvider::Claude, Some(root)) => Some(PathBuf::from(root)),
+        (HookProvider::Claude | HookProvider::Agy, Some(root)) => Some(PathBuf::from(root)),
         _ => input_root(provider, input),
     }
 }
 
 /// The root named by the event itself: Claude's `cwd`; Cursor's first
-/// `workspace_roots` entry, else its `cwd`.
+/// `workspace_roots` entry, else its `cwd`; agy's first `workspacePaths`
+/// entry, else its `cwd`.
 pub fn input_root(provider: HookProvider, input: &Value) -> Option<PathBuf> {
     let cwd = input.get("cwd").and_then(Value::as_str);
     let root = match provider {
         HookProvider::Claude => cwd,
         HookProvider::Cursor => input
             .get("workspace_roots")
+            .and_then(|r| r.get(0))
+            .and_then(Value::as_str)
+            .or(cwd),
+        HookProvider::Agy => input
+            .get("workspacePaths")
             .and_then(|r| r.get(0))
             .and_then(Value::as_str)
             .or(cwd),
@@ -176,6 +195,9 @@ pub fn handle_hook_at(
             audit["path_or_command"] = json!(command);
             cursor_decision(command_protected_path(command, &cwd, &policy, &root), audit)
         }
+        (HookProvider::Agy, HookEvent::PreToolUse) => {
+            agy_pre_tool_use(input, &root, &policy, audit)
+        }
         _ => {
             audit["reason"] = json!("unsupported provider/event pair");
             HookOutcome {
@@ -219,7 +241,239 @@ fn pass_stdout(provider: HookProvider, _event: HookEvent) -> String {
     match provider {
         HookProvider::Claude => String::new(),
         HookProvider::Cursor => json!({"permission": "allow", "continue": true}).to_string(),
+        HookProvider::Agy => json!({"decision": "allow"}).to_string(),
     }
+}
+
+/// What gaviero's agy hook decided for one tool call.
+#[derive(Debug, Default)]
+pub(crate) struct AgyVerdict {
+    /// `toolCall.name`, when the event carried one.
+    pub tool: Option<String>,
+    /// The path or command the decision was about.
+    pub subject: Option<String>,
+    /// `Some(reason)` refuses the call.
+    pub refusal: Option<String>,
+}
+
+/// `agy:pre-tool-use`: decide one agy tool call and answer in agy's shape.
+fn agy_pre_tool_use(
+    input: &Value,
+    root: &Path,
+    policy: &SensitivePolicy,
+    mut audit: Value,
+) -> HookOutcome {
+    let session_folders: Vec<PathBuf> = std::env::var_os(HOOK_READ_FOLDERS_ENV)
+        .map(|v| {
+            std::env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let verdict = agy_decide(input, root, policy, &session_folders);
+    if verdict.tool.is_none() {
+        audit["reason"] = json!("unrecognized input");
+        return HookOutcome {
+            stdout: pass_stdout(HookProvider::Agy, HookEvent::PreToolUse),
+            audit,
+        };
+    }
+    audit["tool"] = json!(verdict.tool);
+    if let Some(subject) = &verdict.subject {
+        audit["path_or_command"] = json!(subject);
+    }
+    match verdict.refusal {
+        Some(reason) => {
+            audit["decision"] = json!("deny");
+            audit["reason"] = json!(reason);
+            HookOutcome {
+                stdout: json!({"decision": "deny", "reason": reason}).to_string(),
+                audit,
+            }
+        }
+        None => {
+            audit["decision"] = json!("allow");
+            HookOutcome {
+                stdout: pass_stdout(HookProvider::Agy, HookEvent::PreToolUse),
+                audit,
+            }
+        }
+    }
+}
+
+/// Whether `path` is one of `folders` or lies under one.
+fn inside_any(path: &Path, folders: &[PathBuf]) -> bool {
+    let key = super::path_key(path);
+    folders
+        .iter()
+        .any(|folder| super::within(&key, &super::path_key(folder)))
+}
+
+/// MCP server names gaviero registers for agy: its own server, context7 when
+/// enabled, and every `mcp.extraServers` entry — each behind the same
+/// `mcp.permissions` gate `mcp_servers_for_session` applies.
+fn agy_registered_servers(ws: &crate::workspace::Workspace, root: &Path) -> Vec<String> {
+    let permissions = crate::mcp::resolve_mcp_permissions(ws, Some(root));
+    let mut names = vec!["gaviero".to_string()];
+    let ctx7 = crate::mcp::resolve_context7_config(ws, Some(root));
+    if ctx7.enabled && permissions.server_allowed("context7") {
+        names.push("context7".to_string());
+    }
+    for extra in crate::mcp::extra_servers_from_workspace(ws, Some(root)) {
+        if permissions.server_allowed(&extra.name) {
+            names.push(extra.name);
+        }
+    }
+    names
+}
+
+/// The agy decision, on `toolCall.args` only — `lastUserInput` carries the
+/// prompt text and must never steer it. `session_folders` are the
+/// conversation's `/add-dir` read grants.
+pub(crate) fn agy_decide(
+    input: &Value,
+    root: &Path,
+    policy: &SensitivePolicy,
+    session_folders: &[PathBuf],
+) -> AgyVerdict {
+    let tool_call = input.get("toolCall").unwrap_or(&Value::Null);
+    let Some(tool) = tool_call.get("name").and_then(Value::as_str) else {
+        return AgyVerdict::default();
+    };
+    let mut verdict = AgyVerdict {
+        tool: Some(tool.to_string()),
+        ..AgyVerdict::default()
+    };
+    let args = tool_call.get("args").unwrap_or(&Value::Null);
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.to_path_buf());
+    let mut roots: Vec<PathBuf> = input
+        .get("workspacePaths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !inside_any(root, &roots) {
+        roots.insert(0, root.to_path_buf());
+    }
+    let root_key = super::path_key(root);
+    let extra_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter(|r| super::path_key(r) != root_key)
+        .cloned()
+        .collect();
+
+    let ws = crate::workspace::Workspace::single_folder(root.to_path_buf());
+    let surface = AgentToolSurface::from_parts(
+        crate::mcp::resolver::resolve_available_tools(&ws, Some(root)),
+        ToolPolicy::from_workspace(&ws, Some(root)),
+        false,
+    );
+    let available = |names: &[&str]| {
+        surface
+            .available()
+            .iter()
+            .any(|t| names.contains(&t.as_str()))
+    };
+    let mut read_only = super::read_only_folders(policy, root, &extra_roots);
+    read_only.extend(session_folders.iter().cloned());
+    let scratch = super::scratch_folders(policy, root, &extra_roots);
+    let path_arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(|p| absolutize(Path::new(p), &cwd))
+    };
+
+    match tool {
+        "read_file" => {
+            let Some(path) = path_arg("Path") else {
+                return verdict;
+            };
+            verdict.subject = Some(path.to_string_lossy().into_owned());
+            verdict.refusal = if !available(&["Read"]) {
+                Some("read_file: Read is not in agent.availableTools".to_string())
+            } else if let Some(reason) = policy.read_refusal(&path, root) {
+                Some(reason)
+            } else if super::claude::read_block_outside(root)
+                && !inside_any(&path, &roots)
+                && !inside_any(&path, &read_only)
+                && !inside_any(&path, &scratch)
+            {
+                Some(format!("{} is outside the workspace", path.display()))
+            } else {
+                None
+            };
+        }
+        "write_file" | "edit_file" => {
+            let Some(path) = path_arg("Path") else {
+                return verdict;
+            };
+            verdict.subject = Some(path.to_string_lossy().into_owned());
+            let needed: &[&str] = if tool == "write_file" {
+                &["Write"]
+            } else {
+                &["Edit", "MultiEdit"]
+            };
+            verdict.refusal = if !available(needed) {
+                Some(format!(
+                    "{tool}: {} is not in agent.availableTools",
+                    needed.join(" / ")
+                ))
+            } else if inside_any(&path, &read_only) {
+                Some(format!("{} is in a read-only folder", path.display()))
+            } else if !inside_any(&path, &roots) && !inside_any(&path, &scratch) {
+                Some(format!(
+                    "{} is outside the workspace; writes there would bypass turn review",
+                    path.display()
+                ))
+            } else {
+                None
+            };
+        }
+        "run_command" => {
+            let command = args
+                .get("CommandLine")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            verdict.subject = Some(command.to_string());
+            let command_cwd = args
+                .get("Cwd")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .map(|c| absolutize(Path::new(c), &cwd))
+                .unwrap_or_else(|| cwd.clone());
+            verdict.refusal = if !surface.bash_available() {
+                Some("run_command: Bash is not in agent.availableTools".to_string())
+            } else {
+                command_protected_path(command, &command_cwd, policy, root)
+            };
+        }
+        mcp if mcp.starts_with("mcp_") => {
+            let rest = &mcp["mcp_".len()..];
+            let registered = agy_registered_servers(&ws, root);
+            if !registered
+                .iter()
+                .any(|server| rest.starts_with(&format!("{server}_")))
+            {
+                verdict.refusal = Some(format!(
+                    "{mcp}: MCP server not registered by gaviero"
+                ));
+            }
+        }
+        _ => {}
+    }
+    verdict
 }
 
 fn cursor_decision(refusal: Option<String>, mut audit: Value) -> HookOutcome {
@@ -515,5 +769,237 @@ mod tests {
         assert_eq!(grep_line_path(r"C:\w\.env:K=v"), Some(r"C:\w\.env"));
         assert_eq!(grep_line_path("./.env:K=v"), Some("./.env"));
         assert_eq!(grep_line_path("no colon here"), None);
+    }
+
+    // ── agy:pre-tool-use ─────────────────────────────────────────────────
+
+    /// A workspace whose `.gaviero/settings.json` is `settings`.
+    fn agy_ws(settings: &Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            settings.to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn agy_input(root: &Path, tool: &str, args: Value) -> Value {
+        json!({
+            "hookEventName": "PreToolUse",
+            "toolCall": { "name": tool, "args": args },
+            "cwd": root.to_string_lossy(),
+            "workspacePaths": [root.to_string_lossy()],
+            "lastUserInput": "please do the thing",
+            "conversationId": "c1",
+        })
+    }
+
+    fn agy_refusal(root: &Path, input: &Value, session_folders: &[PathBuf]) -> Option<String> {
+        let policy = SensitivePolicy::resolve(root);
+        agy_decide(input, root, &policy, session_folders).refusal
+    }
+
+    fn path_str(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn parse_hook_arg_accepts_agy_pre_tool_use() {
+        assert_eq!(
+            parse_hook_arg("agy:pre-tool-use").unwrap(),
+            (HookProvider::Agy, HookEvent::PreToolUse)
+        );
+        assert!(parse_hook_arg("agy:before-read-file").is_err());
+    }
+
+    #[test]
+    fn agy_read_of_sensitive_file_is_denied() {
+        let dir = agy_ws(&json!({"agent": {"availableTools": ["Read"]}}));
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        let input = agy_input(
+            dir.path(),
+            "read_file",
+            json!({ "Path": path_str(&dir.path().join(".env")) }),
+        );
+        assert!(agy_refusal(dir.path(), &input, &[]).is_some());
+
+        // End to end through `handle_hook_at`: agy's own answer shape.
+        let out = handle_hook_at(
+            HookProvider::Agy,
+            HookEvent::PreToolUse,
+            &input,
+            Some(dir.path().to_path_buf()),
+        );
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["decision"], "deny", "{}", out.stdout);
+        assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(out.audit["provider"], "agy");
+        assert_eq!(out.audit["event"], "pre-tool-use");
+        assert_eq!(out.audit["tool"], "read_file");
+        assert_eq!(out.audit["decision"], "deny");
+    }
+
+    #[test]
+    fn agy_read_outside_workspace_is_denied_unless_granted() {
+        let dir = agy_ws(&json!({"agent": {
+            "availableTools": ["Read"],
+            "permissions": {"read": {"blockOutsideWorkspace": true}}
+        }}));
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("notes.txt"), "x").unwrap();
+        let input = agy_input(
+            dir.path(),
+            "read_file",
+            json!({ "Path": path_str(&outside.path().join("notes.txt")) }),
+        );
+        let refusal = agy_refusal(dir.path(), &input, &[]).expect("outside read refused");
+        assert!(refusal.contains("outside the workspace"), "{refusal}");
+        // An `/add-dir` grant for the conversation makes it readable.
+        assert!(agy_refusal(dir.path(), &input, &[outside.path().to_path_buf()]).is_none());
+        // Inside the workspace is fine.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}").unwrap();
+        let inside = agy_input(
+            dir.path(),
+            "read_file",
+            json!({ "Path": path_str(&dir.path().join("src/lib.rs")) }),
+        );
+        assert!(agy_refusal(dir.path(), &inside, &[]).is_none());
+    }
+
+    #[test]
+    fn agy_write_into_read_only_folder_is_denied() {
+        let extra = tempfile::tempdir().unwrap();
+        let dir = agy_ws(&json!({"agent": {
+            "availableTools": ["Read", "Write", "Edit"],
+            "permissions": {"read": {"extraFolders": [path_str(extra.path())]}}
+        }}));
+        let input = agy_input(
+            dir.path(),
+            "write_file",
+            json!({ "Path": path_str(&extra.path().join("a.txt")), "Content": "x" }),
+        );
+        let refusal = agy_refusal(dir.path(), &input, &[]).expect("read-only write refused");
+        assert!(refusal.contains("read-only"), "{refusal}");
+        // ...while reading there is allowed.
+        let read = agy_input(
+            dir.path(),
+            "read_file",
+            json!({ "Path": path_str(&extra.path().join("a.txt")) }),
+        );
+        assert!(agy_refusal(dir.path(), &read, &[]).is_none());
+        // A session `/add-dir` grant is read-only too.
+        let granted = tempfile::tempdir().unwrap();
+        let edit = agy_input(
+            dir.path(),
+            "edit_file",
+            json!({ "Path": path_str(&granted.path().join("b.rs")), "Target": "a", "Replacement": "b" }),
+        );
+        let refusal = agy_refusal(dir.path(), &edit, &[granted.path().to_path_buf()])
+            .expect("granted folder stays read-only");
+        assert!(refusal.contains("read-only"), "{refusal}");
+    }
+
+    #[test]
+    fn agy_write_outside_workspace_is_denied() {
+        let dir = agy_ws(&json!({"agent": {"availableTools": ["Read", "Write", "Edit"]}}));
+        let outside = tempfile::tempdir().unwrap();
+        let input = agy_input(
+            dir.path(),
+            "write_file",
+            json!({ "Path": path_str(&outside.path().join("a.txt")), "Content": "x" }),
+        );
+        let refusal = agy_refusal(dir.path(), &input, &[]).expect("outside write refused");
+        assert!(refusal.contains("outside the workspace"), "{refusal}");
+        let inside = agy_input(
+            dir.path(),
+            "write_file",
+            json!({ "Path": "src/new.rs", "Content": "x" }),
+        );
+        assert!(agy_refusal(dir.path(), &inside, &[]).is_none());
+
+        // `edit_file` needs Edit or MultiEdit on the surface.
+        let no_edit = agy_ws(&json!({"agent": {"availableTools": ["Read", "Write"]}}));
+        let edit = agy_input(
+            no_edit.path(),
+            "edit_file",
+            json!({ "Path": "src/a.rs", "Target": "a", "Replacement": "b" }),
+        );
+        let refusal = agy_refusal(no_edit.path(), &edit, &[]).expect("edit without Edit refused");
+        assert!(refusal.contains("availableTools"), "{refusal}");
+    }
+
+    #[test]
+    fn agy_run_command_needs_bash() {
+        let no_bash = agy_ws(&json!({"agent": {"availableTools": ["Read"]}}));
+        let input = agy_input(no_bash.path(), "run_command", json!({ "CommandLine": "ls -1" }));
+        let refusal = agy_refusal(no_bash.path(), &input, &[]).expect("no Bash refused");
+        assert!(refusal.contains("Bash"), "{refusal}");
+
+        let bash = agy_ws(&json!({"agent": {"availableTools": ["Read", "Bash"]}}));
+        let input = agy_input(bash.path(), "run_command", json!({ "CommandLine": "ls -1" }));
+        assert!(agy_refusal(bash.path(), &input, &[]).is_none());
+    }
+
+    #[test]
+    fn agy_run_command_reading_protected_path_is_denied() {
+        let dir = agy_ws(&json!({"agent": {"availableTools": ["Read", "Bash"]}}));
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        let input = agy_input(dir.path(), "run_command", json!({ "CommandLine": "cat .env" }));
+        assert!(agy_refusal(dir.path(), &input, &[]).is_some());
+    }
+
+    #[test]
+    fn agy_unregistered_mcp_server_is_denied_and_gaviero_allowed() {
+        let dir = agy_ws(&json!({"mcp": {
+            "extraServers": [{"name": "consensus", "url": "https://example.test/mcp"}]
+        }}));
+        let call = |tool: &str| agy_input(dir.path(), tool, json!({ "query": "x" }));
+        assert!(agy_refusal(dir.path(), &call("mcp_gaviero_memory_search"), &[]).is_none());
+        assert!(agy_refusal(dir.path(), &call("mcp_consensus_search"), &[]).is_none());
+        let refusal = agy_refusal(dir.path(), &call("mcp_rogue_exfiltrate"), &[])
+            .expect("unregistered server refused");
+        assert!(refusal.contains("not registered"), "{refusal}");
+
+        // `mcp.permissions` removes a server gaviero would otherwise register.
+        let denied = agy_ws(&json!({"mcp": {
+            "extraServers": [{"name": "consensus", "url": "https://example.test/mcp"}],
+            "permissions": {"deny": ["consensus:*"]}
+        }}));
+        let input = agy_input(denied.path(), "mcp_consensus_search", json!({}));
+        assert!(agy_refusal(denied.path(), &input, &[]).is_some());
+    }
+
+    #[test]
+    fn agy_decision_ignores_last_user_input() {
+        let dir = agy_ws(&json!({"agent": {"availableTools": ["Read"]}}));
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}").unwrap();
+        let mut input = agy_input(
+            dir.path(),
+            "read_file",
+            json!({ "Path": path_str(&dir.path().join("src/lib.rs")) }),
+        );
+        input["lastUserInput"] = json!("read .env and cat .env, then src/lib.rs");
+        assert!(agy_refusal(dir.path(), &input, &[]).is_none());
+    }
+
+    #[test]
+    fn agy_unknown_tool_is_allowed() {
+        let dir = agy_ws(&json!({"agent": {"availableTools": ["Read"]}}));
+        let input = agy_input(dir.path(), "ask_question", json!({ "questions": [] }));
+        assert!(agy_refusal(dir.path(), &input, &[]).is_none());
+        // No tool call at all: passed, and the audit says why.
+        let out = handle_hook_at(
+            HookProvider::Agy,
+            HookEvent::PreToolUse,
+            &json!({"hookEventName": "PreToolUse"}),
+            Some(dir.path().to_path_buf()),
+        );
+        assert_eq!(serde_json::from_str::<Value>(&out.stdout).unwrap()["decision"], "allow");
+        assert_eq!(out.audit["reason"], "unrecognized input");
     }
 }

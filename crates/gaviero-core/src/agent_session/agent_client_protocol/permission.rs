@@ -81,22 +81,53 @@ impl ToolCallLog {
     }
 }
 
-/// The dsh shell tools: `bash` off Windows, `pwsh` on it (plus their
-/// persistent variants).
+/// The shell tools: dsh's `bash` off Windows and `pwsh` on it (plus their
+/// persistent variants), and agy's `run_command`.
 fn is_shell_tool(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["bash", "pwsh", "powershell", "shell"]
-        .iter()
-        .any(|shell| name == *shell || name.starts_with(&format!("{shell}_")))
+    name == "run_command"
+        || ["bash", "pwsh", "powershell", "shell"]
+            .iter()
+            .any(|shell| name == *shell || name.starts_with(&format!("{shell}_")))
 }
 
-/// Decide one `session/request_permission`.
+/// gaviero's own MCP server, as agy (`mcp_gaviero_<tool>`) or Claude
+/// (`mcp__gaviero__<tool>`) name its tools. Read-only by construction and
+/// auto-approved for Claude through `acp::session::GAVIERO_MCP_RULE`.
+fn is_gaviero_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp_gaviero_") || name.starts_with("mcp__gaviero__")
+}
+
+/// Whether an `agent.approvedTools` rule in Claude's MCP form approves the
+/// agy tool `name`: `mcp__<s>__<t>` approves `mcp_<s>_<t>`, and a
+/// server-wide `mcp__<s>` approves every `mcp_<s>_*`.
+fn approved_mcp_tool(name: &str, approved: &[String]) -> bool {
+    let Some(rest) = name.strip_prefix("mcp_") else {
+        return false;
+    };
+    if rest.starts_with('_') {
+        return false;
+    }
+    approved.iter().any(|rule| {
+        let Some(rule) = rule.trim().strip_prefix("mcp__") else {
+            return false;
+        };
+        match rule.split_once("__") {
+            Some((server, tool)) => !server.is_empty() && rest == format!("{server}_{tool}"),
+            None => !rule.is_empty() && rest.starts_with(&format!("{rule}_")),
+        }
+    })
+}
+
+/// Decide one `session/request_permission`. `agent_label` (`dsh`, `agy`)
+/// names the agent when the request carries no tool name.
 pub(super) fn plan_permission(
     params: &Value,
     log: &ToolCallLog,
     surface: &AgentToolSurface,
     auto_approve: bool,
     workspace_root: &Path,
+    agent_label: &str,
 ) -> PermissionPlan {
     if auto_approve {
         return PermissionPlan::Allow;
@@ -115,7 +146,12 @@ pub(super) fn plan_permission(
             .filter(|v| !v.is_null())
             .or_else(|| recorded.get(key))
     };
-    let name = field("title").and_then(|v| v.as_str()).unwrap_or("");
+    // agy names the tool (`run_command`, `mcp_<server>_<tool>`) and puts the
+    // command text in `title`; dsh only sends a `title`.
+    let name = field("name")
+        .or_else(|| field("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let raw_input = field("rawInput").cloned().unwrap_or(Value::Null);
 
     // The ask-user tool *is* the question channel: gaviero's MCP
@@ -131,8 +167,17 @@ pub(super) fn plan_permission(
         return PermissionPlan::Allow;
     }
 
+    // gaviero's own read-only server is approved for every provider, and a
+    // Claude-form `approvedTools` rule approves the same tool under agy's name.
+    if is_gaviero_mcp_tool(name) || approved_mcp_tool(name, &surface.policy().approved_tools) {
+        return PermissionPlan::Allow;
+    }
+
     if is_shell_tool(name)
-        && let Some(command) = raw_input.get("command").and_then(|v| v.as_str())
+        && let Some(command) = raw_input
+            .get("command")
+            .or_else(|| raw_input.get("CommandLine"))
+            .and_then(|v| v.as_str())
     {
         return match surface.decide_command(command) {
             CommandDecision::Allow => PermissionPlan::Allow,
@@ -149,13 +194,13 @@ pub(super) fn plan_permission(
         params
             .get("description")
             .and_then(|v| v.as_str())
-            .unwrap_or("dsh asks to run a tool call")
-            .to_string()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{agent_label} asks to run a tool call"))
     } else {
         format_tool_summary(name, &raw_input, workspace_root)
     };
     PermissionPlan::Ask {
-        tool_name: if name.is_empty() { "dsh" } else { name }.to_string(),
+        tool_name: if name.is_empty() { agent_label } else { name }.to_string(),
         description,
         input: raw_input,
     }
@@ -233,7 +278,7 @@ mod tests {
             &log,
             &surface(&["Bash"], &[], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert_eq!(plan, PermissionPlan::Allow);
     }
@@ -246,7 +291,7 @@ mod tests {
             &log,
             &surface(&[], &["cargo test"], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert_eq!(plan, PermissionPlan::Allow);
     }
@@ -259,7 +304,7 @@ mod tests {
             &log,
             &surface(&["Bash"], &[], &["git push"]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert_eq!(plan, PermissionPlan::Reject);
     }
@@ -272,7 +317,7 @@ mod tests {
             &log,
             &surface(&[], &[], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         ) {
             PermissionPlan::Ask {
                 tool_name,
@@ -295,7 +340,7 @@ mod tests {
             &ToolCallLog::default(),
             &surface(&["Bash"], &[], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert!(
             matches!(&plan, PermissionPlan::Ask { tool_name, .. } if tool_name == "dsh"),
@@ -311,7 +356,7 @@ mod tests {
             &log,
             &surface(&["Bash", "Write"], &[], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert!(
             matches!(&plan, PermissionPlan::Ask { tool_name, .. } if tool_name == "write_file"),
@@ -335,7 +380,7 @@ mod tests {
                 &log,
                 &surface(&[], &[], &[]),
                 false,
-                Path::new("."),
+                Path::new("."), "dsh",
             );
             assert_eq!(plan, PermissionPlan::Allow, "{title} must not prompt");
         }
@@ -346,7 +391,7 @@ mod tests {
             &log,
             &surface(&[], &[], &[]),
             false,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert!(
             matches!(&plan, PermissionPlan::Ask { tool_name, .. } if tool_name == "ask_user_question_helper"),
@@ -361,9 +406,145 @@ mod tests {
             &ToolCallLog::default(),
             &surface(&[], &[], &[]),
             true,
-            Path::new("."),
+            Path::new("."), "dsh",
         );
         assert_eq!(plan, PermissionPlan::Allow);
+    }
+
+    /// agy's live shape (agy 1.5.18): the tool call rides inline with `name`
+    /// and `rawInput.CommandLine`; `title` is the command text.
+    fn agy_request(name: &str, raw_input: Value) -> Value {
+        json!({
+            "sessionId": "s",
+            "toolCall": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "name": name,
+                "title": raw_input.get("CommandLine").and_then(|v| v.as_str()).unwrap_or(name),
+                "rawInput": raw_input,
+                "status": "pending",
+                "kind": "execute"
+            },
+            "options": [
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "deny", "name": "Deny", "kind": "reject_once" }
+            ]
+        })
+    }
+
+    fn surface_with(available: &[&str], approved: &[&str]) -> AgentToolSurface {
+        AgentToolSurface::from_parts(
+            Some(available.iter().map(|s| s.to_string()).collect()),
+            ToolPolicy {
+                approved_tools: approved.iter().map(|s| s.to_string()).collect(),
+                ..ToolPolicy::default()
+            },
+            false,
+        )
+    }
+
+    #[test]
+    fn agy_run_command_uses_commandline_and_policy() {
+        // Not on the default allowlist (`cargo test` is), so approval decides.
+        let req = agy_request(
+            "run_command",
+            json!({ "CommandLine": "npm install", "WaitMsBeforeAsync": 5000 }),
+        );
+        let log = ToolCallLog::default();
+        let root = Path::new(".");
+        assert_eq!(
+            plan_permission(&req, &log, &surface_with(&["Read", "Bash"], &["Bash"]), false, root, "agy"),
+            PermissionPlan::Allow
+        );
+        match plan_permission(&req, &log, &surface_with(&["Read", "Bash"], &[]), false, root, "agy") {
+            PermissionPlan::Ask {
+                tool_name, input, ..
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(input, json!({ "command": "npm install" }));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            plan_permission(&req, &log, &surface_with(&["Read"], &["Bash"]), false, root, "agy"),
+            PermissionPlan::Reject
+        );
+    }
+
+    #[test]
+    fn gaviero_mcp_tools_are_auto_allowed() {
+        for name in ["mcp_gaviero_memory_search", "mcp__gaviero__node_doc"] {
+            let req = agy_request(name, json!({ "query": "x" }));
+            assert_eq!(
+                plan_permission(
+                    &req,
+                    &ToolCallLog::default(),
+                    &surface_with(&["Read"], &[]),
+                    false,
+                    Path::new("."),
+                    "agy"
+                ),
+                PermissionPlan::Allow,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_claude_mcp_rule_approves_agy_tool_name() {
+        let tool = agy_request("mcp_context7_query_docs", json!({}));
+        let other = agy_request("mcp_context7_resolve_library_id", json!({}));
+        let log = ToolCallLog::default();
+        let root = Path::new(".");
+        let exact = surface_with(&["Read"], &["mcp__context7__query_docs"]);
+        assert_eq!(
+            plan_permission(&tool, &log, &exact, false, root, "agy"),
+            PermissionPlan::Allow
+        );
+        assert!(matches!(
+            plan_permission(&other, &log, &exact, false, root, "agy"),
+            PermissionPlan::Ask { .. }
+        ));
+        let server_wide = surface_with(&["Read"], &["mcp__context7"]);
+        assert_eq!(
+            plan_permission(&other, &log, &server_wide, false, root, "agy"),
+            PermissionPlan::Allow
+        );
+    }
+
+    #[test]
+    fn unknown_mcp_tool_asks() {
+        let req = agy_request("mcp_consensus_search", json!({ "query": "x" }));
+        match plan_permission(
+            &req,
+            &ToolCallLog::default(),
+            &surface_with(&["Read", "Bash"], &["Bash", "mcp__context7"]),
+            false,
+            Path::new("."),
+            "agy",
+        ) {
+            PermissionPlan::Ask { tool_name, .. } => assert_eq!(tool_name, "mcp_consensus_search"),
+            other => panic!("{other:?}"),
+        }
+        // No tool name at all: the agent label names the request.
+        match plan_permission(
+            &request("missing"),
+            &ToolCallLog::default(),
+            &surface_with(&["Read"], &[]),
+            false,
+            Path::new("."),
+            "agy",
+        ) {
+            PermissionPlan::Ask {
+                tool_name,
+                description,
+                ..
+            } => {
+                assert_eq!(tool_name, "agy");
+                assert_eq!(description, "agy asks to run a tool call");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

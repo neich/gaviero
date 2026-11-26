@@ -418,7 +418,7 @@ pub fn resolve_exposed_tools(workspace: &Workspace, root: Option<&Path>) -> Vec<
 /// `agent.availableTools` after the workspace cascade (hardcoded default
 /// is the Claude fallback set: Read/Glob/Grep/Write/Edit/MultiEdit, no
 /// Bash). Always `Some` unless the resolved value is not an array.
-fn resolve_available_tools(workspace: &Workspace, root: Option<&Path>) -> Option<Vec<String>> {
+pub(crate) fn resolve_available_tools(workspace: &Workspace, root: Option<&Path>) -> Option<Vec<String>> {
     let val = workspace.resolve_setting(S::AGENT_AVAILABLE_TOOLS, root);
     val.as_array().map(|arr| {
         arr.iter()

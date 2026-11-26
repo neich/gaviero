@@ -1,9 +1,10 @@
 //! Transport-session registry.
 //!
 //! This façade selects a concrete [`AgentSession`] for a provider profile.
-//! Claude and Cursor own their native-resume transports, Codex chat uses the
-//! app-server protocol, DeepSeek uses its in-process tool agent, and Ollama
-//! retains stateless replay.
+//! Claude and Cursor own their native-resume transports, agy resumes natively
+//! over the ACP client (`session/resume`), Codex chat uses the app-server
+//! protocol, dsh is process-bound over the same ACP client, DeepSeek uses its
+//! in-process tool agent, and Ollama retains stateless replay.
 //!
 //! Standard `codex:` profiles remain `StatelessReplay` at the planner layer
 //! because swarm still uses `codex exec`. At this chat-only construction seam,
@@ -262,7 +263,9 @@ fn create_observed_codex_session(args: SessionConstruction) -> Box<dyn AgentSess
     })
 }
 
-fn create_observed_dsh_session(args: SessionConstruction) -> Box<dyn AgentSession> {
+/// An [`AcpClientSession`] (`dsh:` process-bound, `agy:` native resume) behind
+/// the stream-to-observer wrapper.
+fn create_observed_acp_session(args: SessionConstruction) -> Box<dyn AgentSession> {
     let SessionConstruction {
         write_gate,
         observer,
@@ -314,13 +317,15 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
         ContinuityMode::NativeResume => {
             if args.profile.provider == "cursor" {
                 Box::new(CursorSession::new(args))
+            } else if args.profile.provider == "agy" {
+                create_observed_acp_session(args)
             } else {
                 Box::new(ClaudeSession::new(args))
             }
         }
         ContinuityMode::ProcessBound => {
             if args.profile.provider == "dsh" {
-                create_observed_dsh_session(args)
+                create_observed_acp_session(args)
             } else {
                 create_observed_codex_session(args)
             }

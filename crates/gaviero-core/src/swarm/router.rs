@@ -61,6 +61,8 @@ pub enum ResolvedBackend {
     Deepseek { model: String },
     /// Route to `dsh --profile acp` over the Agent Client Protocol.
     Dsh { model: String },
+    /// Route to `agy acp` (Antigravity CLI) over the Agent Client Protocol.
+    Agy { model: String },
     /// Blocked — cannot dispatch (privacy constraint, unavailable backend).
     Blocked { reason: String },
 }
@@ -76,6 +78,7 @@ impl ResolvedBackend {
             Self::Ollama { model, .. } => format!("ollama:{model}"),
             Self::Deepseek { model } => format!("deepseek:{model}"),
             Self::Dsh { model } => format!("dsh:{model}"),
+            Self::Agy { model } => format!("agy:{model}"),
             Self::Blocked { .. } => return None,
         })
     }
@@ -141,6 +144,10 @@ impl TierRouter {
             }
             ResolvedBackend::Dsh { model } => {
                 let model_spec = format!("dsh:{}", model);
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
+            }
+            ResolvedBackend::Agy { model } => {
+                let model_spec = format!("agy:{}", model);
                 shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
             ResolvedBackend::Blocked { reason } => Err(reason),
@@ -223,6 +230,13 @@ impl TierRouter {
         if shared::is_dsh_model(model) {
             let resolved_model = model.strip_prefix("dsh:").unwrap_or(model).to_string();
             return ResolvedBackend::Dsh {
+                model: resolved_model,
+            };
+        }
+
+        if shared::is_agy_model(model) {
+            let resolved_model = model.strip_prefix("agy:").unwrap_or(model).to_string();
+            return ResolvedBackend::Agy {
                 model: resolved_model,
             };
         }
@@ -310,6 +324,12 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Dsh { model: stripped }
+    } else if shared::is_agy_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("agy:")
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::Agy { model: stripped }
     } else {
         ResolvedBackend::Claude {
             model: model_spec.to_string(),
@@ -347,6 +367,12 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
         if shared::is_dsh_model(model) {
             return Err(format!(
                 "unit '{}': LocalOnly privacy with dsh API model override '{}'",
+                unit.id, model
+            ));
+        }
+        if shared::is_agy_model(model) {
+            return Err(format!(
+                "unit '{}': LocalOnly privacy with agy API model override '{}'",
                 unit.id, model
             ));
         }
@@ -544,6 +570,40 @@ mod tests {
                 model: "deepseek-v4-pro".into()
             }
         );
+    }
+
+    #[test]
+    fn test_agy_model_override_routes_to_agy_backend() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::Public,
+            Some("agy:gemini-3.8-flash-low"),
+        );
+        let resolved = router.resolve(&unit);
+        assert_eq!(
+            resolved,
+            ResolvedBackend::Agy {
+                model: "gemini-3.8-flash-low".into()
+            }
+        );
+        assert_eq!(
+            resolved.model_spec().as_deref(),
+            Some("agy:gemini-3.8-flash-low")
+        );
+        assert_eq!(
+            api_backend_for_spec("agy:gemini-4-neon-high"),
+            ResolvedBackend::Agy {
+                model: "gemini-4-neon-high".into()
+            }
+        );
+
+        let local = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("agy:gemini-3.8-flash-low"),
+        );
+        assert!(validate_privacy(&local).is_err());
     }
 
     #[test]
