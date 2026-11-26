@@ -195,6 +195,13 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
+    fn on_acp_session_started(&self, session_id: &str) {
+        let _ = self.tx.send(Event::AcpSessionStarted {
+            conv_id: self.conv_id.clone(),
+            session_id: session_id.to_string(),
+        });
+    }
+
     fn on_memory_injected(&self, summary: &gaviero_core::observer::ChatInjectionSummary) {
         let _ = self.tx.send(Event::ChatMemoryInjected {
             conv_id: self.conv_id.clone(),

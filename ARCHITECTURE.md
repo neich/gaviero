@@ -35,7 +35,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 | Crate | Type | Role | Detail |
 |---|---|---|---|
-| [`gaviero-core`](crates/gaviero-core/) | lib (**27** pub mods) | Swarm, memory, MCP (stdio + loopback HTTP), ACP/agent-session (`deepseek:` tool_agent, `dsh:` ACP), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
+| [`gaviero-core`](crates/gaviero-core/) | lib (**27** pub mods) | Swarm, memory, MCP (stdio + loopback HTTP), ACP/agent-session (`deepseek:` tool_agent, `dsh:` / `agy:` ACP), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
 | [`gaviero-tui`](crates/gaviero-tui/) | bin `gaviero` | Ratatui UI, observers, slash commands | [ARCHITECTURE](crates/gaviero-tui/ARCHITECTURE.md) |
 | [`gaviero-cli`](crates/gaviero-cli/) | bin `gaviero-cli` | Clap runner (~4000-line `main.rs`), eval/memory admin | [ARCHITECTURE](crates/gaviero-cli/ARCHITECTURE.md) |
 | [`gaviero-dsl`](crates/gaviero-dsl/) | lib (**9** pub mods) | `.gaviero` compiler → `CompiledPlan` | [ARCHITECTURE](crates/gaviero-dsl/ARCHITECTURE.md) |
@@ -77,8 +77,8 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 ### Provider transport
 
 - [`AgentBackend`](crates/gaviero-core/src/swarm/backend/mod.rs) + [`UnifiedStreamEvent`](crates/gaviero-core/src/swarm/backend/mod.rs) — ClaudeCode, Codex, Cursor, Ollama, Deepseek, **Dsh**, Mock.
-- [`AgentSession`](crates/gaviero-core/src/agent_session/mod.rs) + [`Turn`](crates/gaviero-core/src/agent_session/mod.rs) — claude, codex_exec, codex_app_server, cursor, ollama, **tool_agent** (`deepseek:`), **agent_client_protocol** (`dsh:`), registry.
-- Model spec: `provider:model`. Prefixes in [`SUPPORTED_PROVIDER_PREFIXES`](crates/gaviero-core/src/swarm/backend/shared.rs): `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. Bare names rejected by [`validate_model_spec`](crates/gaviero-core/src/swarm/backend/shared.rs).
+- [`AgentSession`](crates/gaviero-core/src/agent_session/mod.rs) + [`Turn`](crates/gaviero-core/src/agent_session/mod.rs) — claude, codex_exec, codex_app_server, cursor, ollama, **tool_agent** (`deepseek:`), **agent_client_protocol** (`dsh:`, `agy:`), registry.
+- Model spec: `provider:model`. Prefixes in [`SUPPORTED_PROVIDER_PREFIXES`](crates/gaviero-core/src/swarm/backend/shared.rs): `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`, `agy`. Bare names rejected by [`validate_model_spec`](crates/gaviero-core/src/swarm/backend/shared.rs).
 
 ### Memory + MCP + write path
 
@@ -101,7 +101,7 @@ The TUI process hosts an in-process WSS sidecar ([`gaviero-remote`](crates/gavie
 ### Agent write
 
 ```
-Agent stream (ACP / Codex / Cursor / Ollama / DeepSeek tool_agent / dsh ACP fs)
+Agent stream (ACP / Codex / Cursor / Ollama / DeepSeek tool_agent / dsh + agy ACP)
   → UnifiedStreamEvent::FileBlock | native tool write | PathsModified
   → scope check (brief lock) → diff + enrich (no lock)
   → WriteGatePipeline::insert_proposal → fs::write when finalized

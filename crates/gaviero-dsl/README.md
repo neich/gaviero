@@ -104,6 +104,7 @@ Model strings appear only in model profiles (`client { model "…" }`). Canonica
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` (legacy: `deepseek:deepseek-v4-flash`) |
 | DeepSeek (ACP) | `dsh:deepseek-flash`, `dsh:deepseek-v4-pro` (legacy: `dsh:deepseek-v4-flash`) |
+| Antigravity (ACP) | `agy:gemini-4-neon-high`, `agy:gemini-3.8-flash-low`, … (effort is part of the id) |
 
 ## Configuration
 

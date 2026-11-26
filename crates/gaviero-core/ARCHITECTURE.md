@@ -20,7 +20,7 @@ gaviero-core (lib, 28 pub mods)
          └── McpEndpoint ($XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock | \\.\pipe\gaviero-<hash>)
                    ▲
                    │ gaviero-mcp-shim (stdio bridge; not a crate dep)
-         subprocess agents (claude / codex / cursor / dsh-acp)
+         subprocess agents (claude / codex / cursor / dsh-acp / agy-acp)
          DeepSeek `deepseek:`: in-process tool_agent — no shim
          HTTP: 127.0.0.1:<derived-port>/mcp (bearer token)
 ```
@@ -81,7 +81,7 @@ gaviero-core/src/
 │  │  ├─ mod.rs / client.rs / config.rs / agent_loop.rs / policy.rs
 │  │  ├─ replay.rs / snapshot.rs / swarm.rs
 │  │  └─ tools/           read / write / bash / glob / grep
-│  └─ agent_client_protocol/  Pattern D — ACP client (`dsh:`)
+│  └─ agent_client_protocol/  Pattern D — ACP client (`dsh:`, `agy:`)
 ├─ context_planner/       Bootstrap / delta / replay → PlannerSelections
 ├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
@@ -106,6 +106,7 @@ gaviero-core/src/
 │     ├─ claude_code.rs / codex.rs / cursor.rs / ollama.rs
 │     ├─ deepseek.rs      DeepseekBackend → tool_agent
 │     ├─ dsh.rs           DshBackend → AcpClientSession
+│     ├─ agy.rs           AgyBackend → AcpClientSession
 │     ├─ mock.rs / executor.rs / runner.rs / shared.rs
 │     └─ mod.rs           BackendConfig (incl. Deepseek)
 ├─ iteration/             IterationEngine (retry, BestOfN, TDD)
@@ -146,8 +147,9 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `ollama:<name>` / `local:<name>` | `OllamaStreamBackend` |
 | `deepseek:<name>` | `DeepseekBackend` → [`tool_agent`](src/agent_session/tool_agent) |
 | `dsh:<name>` | `DshBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
+| `agy:<name>` | `AgyBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
 
-[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. DeepSeek ids for both `deepseek:` and `dsh:`: `DEEPSEEK_API_MODELS` (`deepseek-flash`, `deepseek-v4-pro`), plus the retired `DEEPSEEK_LEGACY_MODELS` (`deepseek-v4-flash`), which stay valid but are not offered.
+[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`, `agy`. DeepSeek ids for both `deepseek:` and `dsh:`: `DEEPSEEK_API_MODELS` (`deepseek-flash`, `deepseek-v4-pro`), plus the retired `DEEPSEEK_LEGACY_MODELS` (`deepseek-v4-flash`), which stay valid but are not offered.
 
 ### `AgentSession` + `Turn` ([`agent_session/mod.rs`](src/agent_session/mod.rs))
 
@@ -162,6 +164,7 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `ollama` / `local` | StatelessReplay | `OllamaSession` |
 | `deepseek` | StatelessReplay | `ToolAgentSession` |
 | `dsh` | ProcessBound | `AcpClientSession` |
+| `agy` | NativeResume (`session/resume`) | `AcpClientSession` |
 
 Writes, TUI chat: every provider writes during the turn (`AgentOptions::host_capture`) and [`turn_capture`](src/turn_capture) records the turn's change set for the mandatory post-turn review. Writes, swarm / CLI: native edit tools (Claude/Codex/Cursor) in the worktree, ACP `fs/write_text_file` (`dsh:`), or `<file>` blocks (Ollama) → [`WriteGatePipeline`](src/write_gate.rs).
 
@@ -350,7 +353,7 @@ First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/
 ```rust
 // crates/gaviero-core/src/lib.rs — 28 pub mods
 pub mod acp;
-pub mod agent_session;   // + tool_agent (deepseek:) + agent_client_protocol (dsh:)
+pub mod agent_session;   // + tool_agent (deepseek:) + agent_client_protocol (dsh:, agy:)
 pub mod context_planner;
 pub mod diff_engine;
 pub mod git;

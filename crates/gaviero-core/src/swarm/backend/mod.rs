@@ -4,6 +4,7 @@
 //! [`UnifiedStreamEvent`] stream. This replaces the old dual-dispatch pattern
 //! (separate code paths for Claude Code subprocess and Ollama HTTP).
 
+pub mod agy;
 pub mod claude_code;
 pub mod codex;
 pub mod cursor;
@@ -279,6 +280,10 @@ pub enum BackendConfig {
     Dsh {
         model: String,
     },
+    /// Antigravity CLI via `agy acp` (Agent Client Protocol).
+    Agy {
+        model: String,
+    },
     Custom {
         command: String,
         args: Vec<String>,
@@ -306,6 +311,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
         }
         BackendConfig::Deepseek { model } => Ok(Box::new(deepseek::DeepseekBackend::new(model))),
         BackendConfig::Dsh { model } => Ok(Box::new(dsh::DshBackend::new(model))),
+        BackendConfig::Agy { model } => Ok(Box::new(agy::AgyBackend::new(model))),
         BackendConfig::Custom { command, args } => {
             anyhow::bail!(
                 "Custom backend not yet implemented (command={}, args={:?})",
@@ -539,6 +545,13 @@ mod tests {
         let dsh_backend = create_backend(&dsh).unwrap();
         assert!(dsh_backend.name().contains("dsh"));
         assert!(!dsh_backend.capabilities().supports_file_blocks);
+
+        let agy = BackendConfig::Agy {
+            model: "gemini-3.8-flash-low".into(),
+        };
+        let agy_backend = create_backend(&agy).unwrap();
+        assert_eq!(agy_backend.name(), "agy:gemini-3.8-flash-low");
+        assert!(!agy_backend.capabilities().supports_file_blocks);
 
         // Custom not yet implemented — returns error
         let custom = BackendConfig::Custom {

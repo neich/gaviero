@@ -804,15 +804,20 @@ fn start_agent_services(
     memory_root: Option<PathBuf>,
     embedder_name: String,
 ) {
-    // Cursor's read policy lives in `.cursor/hooks.json`. Written here, before
-    // any turn starts, so it is a host write and never lands in TURN REVIEW;
-    // the per-spawn call in the Cursor session is then a no-op.
+    // Cursor's read policy lives in `.cursor/hooks.json`, agy's in
+    // `.agents/hooks.json` (plus the `.gaviero/skills` entry in
+    // `.agents/skills.json`). Written here, before any turn starts, so they are
+    // host writes and never land in TURN REVIEW; the per-spawn calls in the
+    // Cursor and agy sessions are then no-ops.
     {
         let cli = gaviero_core::mcp::resolver::resolve_cli_binary();
         for folder in app.workspace.folders() {
             if let Err(e) = gaviero_core::agent_guard::cursor::ensure_cursor_hooks(&folder.path, &cli)
             {
                 tracing::warn!(error = %e, "could not write .cursor/hooks.json");
+            }
+            if let Err(e) = gaviero_core::agent_guard::agy::ensure_agy_files(&folder.path, &cli) {
+                tracing::warn!(error = %e, "could not write .agents/hooks.json");
             }
         }
     }

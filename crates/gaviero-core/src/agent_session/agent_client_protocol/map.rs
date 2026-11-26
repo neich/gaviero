@@ -101,10 +101,35 @@ fn tool_end(update: &Value) -> Vec<UnifiedStreamEvent> {
         .unwrap_or("")
         .to_string();
     let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    if status == "in_progress" {
+    // Only a settled call ends: agy reports `pending` before every permission
+    // request, and a content-only update carries no status at all.
+    if !matches!(status, "completed" | "failed") {
         return Vec::new();
     }
     vec![UnifiedStreamEvent::ToolCallEnd { id }]
+}
+
+/// Token usage carried by a `session/prompt` result, when the agent reports
+/// one. agy sends `{inputTokens, outputTokens, cachedReadTokens, …}` there,
+/// not in a `usage_update`.
+pub fn map_prompt_usage(result: &Value) -> Option<UnifiedStreamEvent> {
+    let usage = result.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let read = |camel: &str, snake: &str| {
+        usage
+            .get(camel)
+            .or_else(|| usage.get(snake))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    Some(UnifiedStreamEvent::Usage(TokenUsage {
+        input_tokens: read("inputTokens", "input_tokens"),
+        output_tokens: read("outputTokens", "output_tokens"),
+        cost_usd: None,
+        duration_ms: None,
+    }))
 }
 
 fn usage(update: &Value) -> Option<UnifiedStreamEvent> {
@@ -210,6 +235,72 @@ mod tests {
             map_stop_reason(&json!({"stopReason":"cancelled"})),
             StopReason::Timeout
         );
+    }
+
+    #[test]
+    fn pending_tool_update_does_not_end_the_tool() {
+        let root = Path::new(".");
+        for status in ["pending", "in_progress", ""] {
+            let update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "c1",
+                "status": status
+            });
+            assert!(
+                map_session_update(&update, root).is_empty(),
+                "status {status:?} must not end the tool"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_and_failed_end_the_tool() {
+        let root = Path::new(".");
+        for status in ["completed", "failed"] {
+            let update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "c1",
+                "status": status
+            });
+            assert!(
+                matches!(
+                    &map_session_update(&update, root)[..],
+                    [UnifiedStreamEvent::ToolCallEnd { id }] if id == "c1"
+                ),
+                "status {status:?} must end the tool"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_usage_maps_input_and_output_tokens() {
+        let result = json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 12994, "outputTokens": 165,
+                "cachedReadTokens": 3543, "thoughtTokens": 0, "totalTokens": 16702
+            }
+        });
+        match map_prompt_usage(&result) {
+            Some(UnifiedStreamEvent::Usage(t)) => {
+                assert_eq!(t.input_tokens, 12994);
+                assert_eq!(t.output_tokens, 165);
+            }
+            other => panic!("{other:?}"),
+        }
+        let snake = json!({"usage": {"input_tokens": 3, "output_tokens": 4}});
+        match map_prompt_usage(&snake) {
+            Some(UnifiedStreamEvent::Usage(t)) => {
+                assert_eq!((t.input_tokens, t.output_tokens), (3, 4));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_without_usage_maps_nothing() {
+        assert!(map_prompt_usage(&json!({"stopReason": "end_turn"})).is_none());
+        assert!(map_prompt_usage(&json!({"usage": null})).is_none());
     }
 
     #[test]

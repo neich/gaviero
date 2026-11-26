@@ -18,7 +18,7 @@ During a turn, agents work freely: edit tools, shell commands, formatters, delet
 ## Why gaviero
 
 - **Review what the turn did, not what the tools reported.** Turn capture diffs the files on disk, so a change made by `sed`, `cargo fmt`, a code generator or a stray `rm` is reviewed like any edit-tool change. Sensitive files (`.env`, keys) an agent changed are restored automatically.
-- **One editor, many agents.** Claude Code, Codex, Cursor CLI, DeepSeek (API or `dsh`) and Ollama run behind the same chat panel, activity stream and review path. They use your existing logins and subscriptions. Switch with `/model codex:…`.
+- **One editor, many agents.** Claude Code, Codex, Cursor CLI, DeepSeek (API or `dsh`), Antigravity (`agy`) and Ollama run behind the same chat panel, activity stream and review path. They use your existing logins and subscriptions. Switch with `/model codex:…`.
 - **One policy for every provider.** Read rules, bash allow/deny lists, MCP servers and network policy live in `.gaviero/settings.json`. At launch gaviero compiles them into each vendor's own format, and a loopback proxy logs which hosts each agent connects to.
 - **Multi-agent workflows as code.** The `.gaviero` DSL declares agents, file scopes, dependencies, loops and verification steps (compile, clippy, impacted tests). Scripts ask for a model *tier* rather than a vendor, so one workflow runs on any provider, from the SWARM panel or headless in CI.
 - **Shared code graph and memory.** A built-in MCP server gives every agent the same tools: a ranked repo outline, blast radius, symbol references, and project memory that persists across sessions.
@@ -186,7 +186,7 @@ Settings are JSON, loaded in three layers. Each later layer overrides the one be
 }
 ```
 
-**Model specs** use `provider:model`; bare names are rejected. Providers: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:`.
+**Model specs** use `provider:model`; bare names are rejected. Providers: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:`, `agy:`.
 
 The full reference is in **[docs/configuration.md](docs/configuration.md)**. It covers layer merging and `key+` extension, multi-folder workspaces, `GAVIERO.md` project instructions, agent permissions and bash allow/deny lists, protected files per provider, and outbound-traffic logging.
 

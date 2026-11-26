@@ -10,7 +10,7 @@ use super::{
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
-    "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh",
+    "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh", "agy",
 ];
 
 /// DeepSeek model ids the picker offers (without the `deepseek:` / `dsh:`
@@ -411,6 +411,12 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
+    if let Some(model) = trimmed.strip_prefix("agy:") {
+        return BackendConfig::Agy {
+            model: model.trim().to_string(),
+        };
+    }
+
     let claude_model = trimmed.strip_prefix("claude:").unwrap_or(trimmed);
 
     BackendConfig::ClaudeCode {
@@ -453,7 +459,9 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     }
 
     match prefix {
-        "ollama" | "local" | "claude" | "codex" | "cursor" => {
+        // agy's catalog comes from the CLI itself (an ACP handshake), so any
+        // non-empty id is passed through; `agy acp` rejects an unknown one.
+        "ollama" | "local" | "claude" | "codex" | "cursor" | "agy" => {
             if remainder.trim().is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
@@ -691,6 +699,10 @@ pub fn is_deepseek_model(model_spec: &str) -> bool {
 
 pub fn is_dsh_model(model_spec: &str) -> bool {
     model_spec.trim().starts_with("dsh:")
+}
+
+pub fn is_agy_model(model_spec: &str) -> bool {
+    model_spec.trim().starts_with("agy:")
 }
 
 /// Render planner selections back into the legacy single-string prompt swarm
@@ -1165,6 +1177,25 @@ mod tests {
         assert!(!is_cursor_model("claude:sonnet"));
         assert!(!is_cursor_model("codex:gpt-5"));
         assert!(!is_cursor_model("auto"));
+    }
+
+    #[test]
+    fn test_agy_specs_validate_route_and_parse() {
+        validate_model_spec("agy:gemini-3.8-flash-low").unwrap();
+        validate_model_spec("agy:gemini-4-neon-xhigh").unwrap();
+        assert!(validate_model_spec("agy:").is_err());
+        assert!(validate_model_spec("claude:agy:x").is_err());
+        assert_eq!(
+            backend_config_for_model("agy:gemini-4-neon-high", None),
+            BackendConfig::Agy {
+                model: "gemini-4-neon-high".into()
+            }
+        );
+        assert!(is_agy_model("agy:x"));
+        assert!(!is_agy_model("dsh:x"));
+        assert!(SUPPORTED_PROVIDER_PREFIXES.contains(&"agy"));
+        // Discovery-only, like cursor: no static ids are offered.
+        assert!(static_model_ids("agy").is_empty());
     }
 
     #[test]

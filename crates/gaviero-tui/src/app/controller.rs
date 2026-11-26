@@ -578,6 +578,74 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             }
         }
+        Event::AcpSessionStarted {
+            conv_id,
+            session_id,
+        } => {
+            // agy: the Cursor pattern with `ContinuityHandle::AcpSessionId`.
+            // `side_panel` reads the handle back into
+            // `AgentOptions::resume_session_id`, and the ACP session calls
+            // `session/resume` with it. A different id after a resume attempt
+            // means agy refused the old session and opened a new one.
+            if let Some(conv) = app
+                .chat_state
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conv_id)
+            {
+                let prior_id = conv
+                    .session_ledger
+                    .as_ref()
+                    .and_then(|l| l.continuity_handle.as_ref())
+                    .and_then(|h| match h {
+                        gaviero_core::context_planner::ContinuityHandle::AcpSessionId(id) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    });
+                let was_resume_attempt = prior_id.is_some();
+                let resume_failed =
+                    was_resume_attempt && prior_id.as_deref() != Some(session_id.as_str());
+
+                if resume_failed {
+                    tracing::warn!(
+                        target: "turn_metrics",
+                        conv_id = %conv_id,
+                        asked_id = %prior_id.clone().unwrap_or_default(),
+                        got_id = %session_id,
+                        "agy resume rejected — forcing bootstrap on next turn"
+                    );
+                    if let Some(ref mut ledger) = conv.session_ledger {
+                        ledger.record_resume_failure();
+                    }
+                }
+                if prior_id.as_deref() != Some(session_id.as_str()) {
+                    tracing::info!(
+                        "Captured agy session id for conv {}: {}",
+                        conv_id,
+                        session_id
+                    );
+                }
+                // Same /reset transcript-inline flip as the Claude and Cursor
+                // paths: agy has opened a session, so restore the Auto default.
+                if conv.transcript_inline_mode
+                    == crate::panels::agent_chat::TranscriptInlineMode::Suppress
+                {
+                    conv.restore_transcript_inline();
+                }
+                if let Some(ref mut ledger) = conv.session_ledger {
+                    ledger.record_continuity_handle(
+                        gaviero_core::context_planner::ContinuityHandle::AcpSessionId(session_id),
+                    );
+                    if !resume_failed {
+                        ledger.record_resume_success();
+                    }
+                    if ledger.is_first_turn() {
+                        ledger.record_turn_dispatched();
+                    }
+                }
+            }
+        }
         Event::MemoryWriteEnqueued => {
             // Count only; the committed callback drives the refresh.
             app.memory_panel.write_activity_counter =
@@ -2470,5 +2538,57 @@ mod editor_only_tests {
         handle_action(&mut app, Action::FocusSidePanel);
         assert!(app.panel_visible.side_panel);
         assert_eq!(app.focus, Focus::SidePanel);
+    }
+}
+
+#[cfg(test)]
+mod acp_session_tests {
+    use super::*;
+    use gaviero_core::context_planner::types::ModelSpec;
+    use gaviero_core::context_planner::{
+        ContinuityHandle, PlannerFingerprint, RuntimeConfig, SessionLedger,
+        build_provider_profile,
+    };
+
+    fn handle(app: &App) -> Option<ContinuityHandle> {
+        app.chat_state.conversations[0]
+            .session_ledger
+            .as_ref()
+            .and_then(|l| l.continuity_handle.clone())
+    }
+
+    #[test]
+    fn acp_session_started_records_handle_and_detects_resume_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Workspace::single_folder(dir.path().to_path_buf()), tx);
+        let profile = build_provider_profile(&ModelSpec::parse("agy:x"), &RuntimeConfig::default());
+        app.chat_state.conversations[0].session_ledger = Some(SessionLedger::new(
+            &profile,
+            PlannerFingerprint::from_profile(&profile),
+        ));
+        let conv_id = app.chat_state.conversations[0].id.clone();
+
+        handle_event(
+            &mut app,
+            Event::AcpSessionStarted {
+                conv_id: conv_id.clone(),
+                session_id: "s1".into(),
+            },
+        );
+        assert_eq!(handle(&app), Some(ContinuityHandle::AcpSessionId("s1".into())));
+        let ledger = app.chat_state.conversations[0].session_ledger.as_ref().unwrap();
+        assert!(!ledger.is_first_turn(), "the first session counts as a dispatched turn");
+
+        // agy answered a resume of `s1` with a new session: the resume failed,
+        // the ledger resets and the new id becomes the handle.
+        handle_event(
+            &mut app,
+            Event::AcpSessionStarted {
+                conv_id,
+                session_id: "s2".into(),
+            },
+        );
+        assert_eq!(handle(&app), Some(ContinuityHandle::AcpSessionId("s2".into())));
     }
 }

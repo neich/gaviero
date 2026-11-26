@@ -11,6 +11,10 @@
 //! * [`cursor`] — `.cursor/hooks.json`, written before every Cursor spawn.
 //! * [`codex`] — the `thread/start` config (deny-read permission profile,
 //!   MXC sandbox on Windows) for the Codex app-server.
+//! * [`agy`] — gaviero's `"gaviero"` entry in `<folder>/.agents/hooks.json`
+//!   (`gaviero-cli --hook agy:pre-tool-use`: reads, writes, shell, tool
+//!   surface, foreign MCP servers) and the `.gaviero/skills` entry in
+//!   `.agents/skills.json`, merged on every TUI start and agy spawn.
 //!
 //! `agent.permissions.read.extraFolders` ([`read_only_folders`]) widens the
 //! readable set with folders that are not workspace folders: no turn
@@ -29,6 +33,7 @@
 //! scope or `GAVIERO.md`), but reads and writes are both allowed; the
 //! sensitive-file denies still apply inside them.
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -39,14 +44,14 @@ use std::path::{Path, PathBuf};
 use crate::scope_enforcer::SensitivePolicy;
 
 /// Comparison key: `/` separators, no trailing slash, case-folded on Windows.
-fn path_key(path: &Path) -> String {
+pub(crate) fn path_key(path: &Path) -> String {
     let s = path.to_string_lossy().replace('\\', "/");
     let s = s.trim_end_matches('/').to_string();
     if cfg!(windows) { s.to_ascii_lowercase() } else { s }
 }
 
 /// `a` is `b` or lies under it.
-fn within(a: &str, b: &str) -> bool {
+pub(crate) fn within(a: &str, b: &str) -> bool {
     a == b || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
 }
 

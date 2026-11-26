@@ -148,6 +148,15 @@ pub enum Event {
         session_id: String,
     },
 
+    /// agy (ACP) opened or resumed a session. The controller stores it on the
+    /// `Conversation`'s `SessionLedger` as a `ContinuityHandle::AcpSessionId`
+    /// so the next turn calls `session/resume <session_id>` instead of
+    /// replaying the conversation.
+    AcpSessionStarted {
+        conv_id: String,
+        session_id: String,
+    },
+
     /// Fired once per chat turn after `retrieve_for_chat` selects the memories
     /// that will be spliced into the prompt. Summary is surfaced in the
     /// status bar and (Tier A4) the memory panel. Mirrors S4's manifest data

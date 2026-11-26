@@ -23,6 +23,11 @@ where
     let mut session_params = Value::Null;
     let mut model_params = Value::Null;
     let mut reasoning_params = Value::Null;
+    // agy scenarios: what the client sent, and a prompt held open while a
+    // permission request waits for the client's answer.
+    let mut resume_params = Value::Null;
+    let mut mode_params = Value::Null;
+    let mut agy_pending: Option<(Value, u64)> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
@@ -38,6 +43,165 @@ where
         };
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned();
+        // agy: the client's answer to the permission request a held prompt is
+        // waiting on. Echo the chosen option, settle the tool, finish the turn.
+        if method.is_empty()
+            && let Some((prompt_id, perm_id)) = agy_pending.take()
+        {
+            if msg.get("id").and_then(Value::as_u64) != Some(perm_id) {
+                agy_pending = Some((prompt_id, perm_id));
+                continue;
+            }
+            let option = msg["result"]["outcome"]["optionId"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string();
+            emit_update(
+                &mut writer,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("OPTION:{option}") }
+                }),
+            )
+            .await?;
+            emit_update(
+                &mut writer,
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed" }),
+            )
+            .await?;
+            write_json(&mut writer, &agy_prompt_result(prompt_id)).await?;
+            continue;
+        }
+        if is_agy_scenario(scenario) {
+            match method {
+                "initialize" => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": 1,
+                                "agentCapabilities": {
+                                    "loadSession": true,
+                                    "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true },
+                                    "sessionCapabilities": { "resume": {}, "close": {}, "additionalDirectories": {} }
+                                },
+                                "agentInfo": { "name": "fake-agy", "version": "0.0.0" },
+                                "authMethods": []
+                            }
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
+                "session/new" => {
+                    session_params = msg["params"].clone();
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "sessionId": "sess_agy",
+                                "models": {
+                                    "availableModels": [ { "modelId": "fake-low" }, { "modelId": "fake-high" } ],
+                                    "currentModelId": "fake-low"
+                                },
+                                "modes": {
+                                    "currentModeId": "default",
+                                    "availableModes": [ { "id": "default" }, { "id": "accept-edits" } ]
+                                }
+                            }
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
+                "session/resume" => {
+                    resume_params = msg["params"].clone();
+                    let reply = if msg["params"]["sessionId"] == "sess_agy" {
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                    } else {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32603, "message": "Failed to read session; retry, or load it with session/load" }
+                        })
+                    };
+                    write_json(&mut writer, &reply).await?;
+                    continue;
+                }
+                "session/set_model" => {
+                    let model = msg["params"]["modelId"].as_str().unwrap_or("");
+                    let reply = if ["fake-low", "fake-high"].contains(&model) {
+                        model_params = msg["params"].clone();
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                    } else {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32602, "message": format!("Unknown model ID: {model}") }
+                        })
+                    };
+                    write_json(&mut writer, &reply).await?;
+                    continue;
+                }
+                "session/set_mode" => {
+                    mode_params = msg["params"].clone();
+                    write_json(&mut writer, &json!({ "jsonrpc": "2.0", "id": id, "result": {} }))
+                        .await?;
+                    continue;
+                }
+                "session/prompt" => {
+                    let prompt_id = id.clone().unwrap_or(Value::Null);
+                    if scenario == "agy_inspect" {
+                        emit_update(&mut writer, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": json!({ "new": session_params, "resume": resume_params, "model": model_params, "mode": mode_params, "prompt": msg["params"]["prompt"] }).to_string() } })).await?;
+                        emit_update(&mut writer, json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "File hello.txt", "kind": "edit", "status": "in_progress", "rawInput": { "Path": "hello.txt", "Content": "hi" } })).await?;
+                        emit_update(&mut writer, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "pending" })).await?;
+                        emit_update(&mut writer, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed" })).await?;
+                        write_json(&mut writer, &agy_prompt_result(prompt_id)).await?;
+                    } else {
+                        let (name, title, raw) = if scenario == "agy_mcp_permission" {
+                            ("mcp_gaviero_memory_search", "Run mcp_gaviero_memory_search", json!({ "query": "x" }))
+                        } else {
+                            ("run_command", "npm install", json!({ "CommandLine": "npm install", "WaitMsBeforeAsync": 5000 }))
+                        };
+                        emit_update(&mut writer, json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": title, "kind": "execute", "status": "in_progress", "rawInput": raw })).await?;
+                        emit_update(&mut writer, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "pending" })).await?;
+                        next_agent_id += 1;
+                        write_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": next_agent_id,
+                                "method": "session/request_permission",
+                                "params": {
+                                    "sessionId": "sess_agy",
+                                    "toolCall": {
+                                        "sessionUpdate": "tool_call",
+                                        "toolCallId": "t1",
+                                        "name": name,
+                                        "title": title,
+                                        "rawInput": raw,
+                                        "status": "pending",
+                                        "kind": "execute"
+                                    },
+                                    "options": [
+                                        { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                                        { "optionId": "deny", "name": "Deny", "kind": "reject_once" }
+                                    ]
+                                }
+                            }),
+                        )
+                        .await?;
+                        agy_pending = Some((prompt_id, next_agent_id));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
         match method {
             "initialize" => {
                 write_json(
@@ -478,6 +642,24 @@ async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(
     )
     .await?;
     Ok(())
+}
+
+/// agy-shaped scenarios (`agy_inspect`, `agy_permission`, `agy_mcp_permission`).
+fn is_agy_scenario(scenario: &str) -> bool {
+    scenario.starts_with("agy_")
+}
+
+/// agy's `session/prompt` result: stop reason plus the token usage live agy
+/// reports there (agy 1.5.18).
+fn agy_prompt_result(id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "stopReason": "end_turn",
+            "usage": { "inputTokens": 11, "outputTokens": 7, "cachedReadTokens": 0, "thoughtTokens": 0, "totalTokens": 18 }
+        }
+    })
 }
 
 async fn emit_update<W: tokio::io::AsyncWrite + Unpin>(

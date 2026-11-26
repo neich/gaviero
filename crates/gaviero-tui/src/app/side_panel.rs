@@ -2592,6 +2592,18 @@ pub(crate) fn dispatch_prompt_core(
                 }
                 _ => None,
             }),
+        // agy, like Cursor, keeps its resume id only on the typed ledger
+        // handle; the ACP session passes it to `session/resume`.
+        "agy" => app.chat_state.conversations[conv_idx]
+            .session_ledger
+            .as_ref()
+            .and_then(|l| l.continuity_handle.as_ref())
+            .and_then(|h| match h {
+                gaviero_core::context_planner::ContinuityHandle::AcpSessionId(id) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            }),
         _ => app.chat_state.conversations[conv_idx]
             .claude_session_id
             .clone(),

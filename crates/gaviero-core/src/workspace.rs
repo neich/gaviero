@@ -418,6 +418,10 @@ pub mod settings {
     /// dsh >= 0.2.1-alpha.2 otherwise prefers `~/.dsh/.credentials.yaml`.
     /// `"dsh"`: no patch; dsh's stored key wins when it has one.
     pub const PROVIDERS_DSH_CREDENTIAL_SOURCE: &str = "providers.dsh.credentialSource";
+    /// Antigravity CLI binary for `agy:` (launched as `<command> acp`).
+    pub const PROVIDERS_AGY_COMMAND: &str = "providers.agy.command";
+    /// Extra args after `agy acp`; `--disable-telemetry` is added unless present.
+    pub const PROVIDERS_AGY_ARGS: &str = "providers.agy.args";
 }
 
 /// Canonical workspace identity (Plan A §3.3) — the ONE portable helper
@@ -1893,6 +1897,8 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::PROVIDERS_DSH_ARGS => serde_json::json!([]),
         settings::PROVIDERS_DSH_PROFILE => serde_json::json!("acp"),
         settings::PROVIDERS_DSH_CREDENTIAL_SOURCE => serde_json::json!("gaviero"),
+        settings::PROVIDERS_AGY_COMMAND => serde_json::json!("agy"),
+        settings::PROVIDERS_AGY_ARGS => serde_json::json!([]),
 
         _ => serde_json::Value::Null,
     }

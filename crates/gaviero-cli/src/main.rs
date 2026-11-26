@@ -603,9 +603,10 @@ struct Cli {
     history_path: Option<PathBuf>,
 
     /// Agent hook endpoint (internal): `claude:post-tool-use` |
-    /// `cursor:before-read-file` | `cursor:before-shell-execution`. Reads the
-    /// hook JSON on stdin and writes the decision JSON on stdout; the policy
-    /// comes from the workspace's `.gaviero/settings.json`.
+    /// `cursor:before-read-file` | `cursor:before-shell-execution` |
+    /// `agy:pre-tool-use`. Reads the hook JSON on stdin and writes the
+    /// decision JSON on stdout; the policy comes from the workspace's
+    /// `.gaviero/settings.json`.
     #[arg(long = "hook", value_name = "PROVIDER:EVENT")]
     hook: Option<String>,
 
@@ -616,7 +617,7 @@ struct Cli {
     mcp_reach_probe: bool,
 
     /// Comma-separated providers for `--mcp-reach-probe`
-    /// (`claude`, `codex`, `cursor`, `dsh`). Default: all four.
+    /// (`claude`, `codex`, `cursor`, `dsh`, `agy`). Default: all five.
     #[arg(
         long = "reach-providers",
         value_name = "LIST",

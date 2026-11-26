@@ -173,7 +173,7 @@ impl ReachPolicy {
         let (enforce, max_age_days) = read_reach_settings(root);
         let record = ReachStore::load(root).ok().flatten();
         let mut providers = BTreeMap::new();
-        for name in ["claude", "codex", "cursor", "dsh"] {
+        for name in ["claude", "codex", "cursor", "dsh", "agy"] {
             let policy = match record.as_ref() {
                 None => NestingPolicy::Unknown,
                 Some(rec) => policy_for_provider(
@@ -457,6 +457,7 @@ mod tests {
             ("codex".into(), None),
             ("cursor".into(), None),
             ("dsh".into(), None),
+            ("agy".into(), None),
         ])
     }
 

@@ -57,6 +57,9 @@ pub fn effort_support(model_spec: &str) -> EffortSupport {
         "claude" => claude_support(model),
         "deepseek" | "dsh" => EffortSupport::Levels(owned(&["low", "high", "max"])),
         "cursor" => EffortSupport::InModelId,
+        // agy ids carry the level (`gemini-4-neon-xhigh`); its `thought_level`
+        // option is never sent.
+        "agy" => EffortSupport::InModelId,
         _ => EffortSupport::Ignored,
     }
 }
@@ -134,8 +137,8 @@ pub fn effort_problem(model_spec: &str, effort: &str) -> Option<String> {
             offered.join(", ")
         )),
         EffortSupport::InModelId => Some(format!(
-            "`{model_spec}` takes no `effort {effort}`: Cursor sets effort in the model id \
-             (see `agent --list-models`)"
+            "`{model_spec}` takes no `effort {effort}`: this provider sets effort in the model id \
+             (e.g. `cursor:grok-4.7-high`, `agy:gemini-4-neon-high`)"
         )),
         EffortSupport::Ignored => Some(format!(
             "`{model_spec}` takes no `effort {effort}`: this model does not use effort"
@@ -218,6 +221,16 @@ mod tests {
         assert_eq!(effort_support("claude:claude-sonnet-4-20250514"), EffortSupport::Ignored);
         assert_eq!(effort_support("cursor:composer-2.5"), EffortSupport::InModelId);
         assert_eq!(effort_support("ollama:qwen2.5-coder:7b"), EffortSupport::Ignored);
+    }
+
+    #[test]
+    fn agy_takes_effort_in_the_model_id() {
+        assert_eq!(effort_support("agy:gemini-4-neon-high"), EffortSupport::InModelId);
+        let problem = effort_problem("agy:gemini-4-neon-high", "high").expect("refused");
+        assert!(problem.contains("model id"), "{problem}");
+        assert!(effort_problem("agy:x", "auto").is_none());
+        assert!(effort_problem("agy:x", "off").is_none());
+        assert!(effort_completions("agy:x", "").is_empty());
     }
 
     #[test]

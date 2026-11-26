@@ -1100,3 +1100,318 @@ async fn missing_api_key_surfaces_on_first_turn() {
         }
     }
 }
+
+// ── agy: (Antigravity CLI over ACP) against the fake agent's agy scenarios ──
+
+struct AgyObserver {
+    started: Arc<Mutex<Vec<String>>>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl AcpObserver for AgyObserver {
+    fn on_stream_chunk(&self, _text: &str) {}
+    fn on_tool_call_started(&self, _tool_name: &str) {}
+    fn on_streaming_status(&self, _status: &str) {}
+    fn on_message_complete(&self, _role: &str, _content: &str) {}
+    fn on_proposal_deferred(&self, _path: &Path, _old: Option<&str>, _new: &str) {}
+    fn on_acp_session_started(&self, session_id: &str) {
+        self.started.lock().unwrap().push(session_id.to_string());
+    }
+    fn on_permission_request(
+        &self,
+        tool_name: &str,
+        _description: &str,
+        _input: &serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<PermissionDecision>,
+    ) {
+        self.asked.lock().unwrap().push(tool_name.to_string());
+        let _ = respond.send(PermissionDecision::deny());
+    }
+}
+
+fn agy_observer() -> (Arc<AgyObserver>, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    (
+        Arc::new(AgyObserver {
+            started: started.clone(),
+            asked: asked.clone(),
+        }),
+        started,
+        asked,
+    )
+}
+
+/// `SessionConstruction` for an `agy:` model, mirroring
+/// [`construction_with_gate`].
+fn agy_construction(
+    root: &Path,
+    model: &str,
+    write_gate: Arc<TokioMutex<WriteGatePipeline>>,
+    options: AgentOptions,
+) -> SessionConstruction {
+    let profile = build_provider_profile(&ModelSpec::parse(model), &RuntimeConfig::default());
+    SessionConstruction {
+        write_gate,
+        observer: Box::new(NoopAcp),
+        model: model.into(),
+        ollama_base_url: None,
+        workspace_root: root.to_path_buf(),
+        additional_roots: vec![],
+        agent_id: "agy".into(),
+        conv_id: None,
+        options,
+        profile,
+        cancel_token: CancellationToken::new(),
+        mcp_server: None,
+    }
+}
+
+fn agy_session(
+    root: &Path,
+    model: &str,
+    scenario: &str,
+    options: AgentOptions,
+    observer: Arc<dyn AcpObserver>,
+) -> AcpClientSession {
+    let gate = Arc::new(TokioMutex::new(WriteGatePipeline::new(
+        WriteMode::AutoAccept,
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )));
+    AcpClientSession::from_parts(
+        agy_construction(root, model, gate, options),
+        observer,
+        FileScope::default(),
+    )
+    .with_extra(vec![
+        ("agy_command".into(), fake_bin()),
+        ("agy_args".into(), scenario.into()),
+    ])
+}
+
+fn option_echo(events: &[UnifiedStreamEvent]) -> Option<String> {
+    events.iter().find_map(|e| match e {
+        UnifiedStreamEvent::TextDelta(t) => t.strip_prefix("OPTION:").map(str::to_string),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn agy_new_session_sends_system_prompt_in_meta_and_sets_model_and_mode() {
+    let dir = workspace();
+    let (obs, _, _) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:fake-low",
+        "agy_inspect",
+        AgentOptions::default(),
+        obs,
+    );
+    let report = inspect_prompt(&drain(&mut session, true).await);
+    let append = report["new"]["_meta"]["antigravity"]["systemPrompt"]["append"]
+        .as_str()
+        .expect("system prompt in _meta");
+    assert!(!append.trim().is_empty(), "{report}");
+    assert!(report["resume"].is_null(), "{report}");
+    assert_eq!(report["model"]["modelId"], "fake-low", "{report}");
+    assert_eq!(report["mode"]["modeId"], "accept-edits", "{report}");
+    let blocks = report["prompt"].as_array().expect("prompt blocks");
+    assert!(
+        blocks.iter().all(|b| b["text"].as_str() != Some(append)),
+        "the system prompt must not also ride the prompt: {report}"
+    );
+    assert_eq!(
+        blocks.last().and_then(|b| b["text"].as_str()),
+        Some("hello"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn agy_resume_uses_session_resume_and_skips_replay() {
+    let dir = workspace();
+    let (obs, _, _) = agy_observer();
+    #[allow(deprecated)]
+    let options = AgentOptions {
+        resume_session_id: Some("sess_agy".into()),
+        ..AgentOptions::default()
+    };
+    let mut session = agy_session(dir.path(), "agy:fake-low", "agy_inspect", options, obs);
+    let mut t = turn("follow-up", true);
+    t.replay_history = Some(ReplayPayload {
+        entries: vec![
+            (Role::User, "old q".into()),
+            (Role::Assistant, "old a".into()),
+        ],
+    });
+    let report = inspect_prompt(&drain_turn(&mut session, t).await);
+    assert_eq!(report["resume"]["sessionId"], "sess_agy", "{report}");
+    assert!(report["new"].is_null(), "resume must not open a new session: {report}");
+    // Resumed sessions come back on agy's default model and mode.
+    assert_eq!(report["model"]["modelId"], "fake-low", "{report}");
+    assert_eq!(report["mode"]["modeId"], "accept-edits", "{report}");
+    let texts: Vec<&str> = report["prompt"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("old q")),
+        "agy keeps its own history; replay must be skipped: {texts:?}"
+    );
+    assert_eq!(
+        session.continuity_handle(),
+        Some(&gaviero_core::context_planner::ContinuityHandle::AcpSessionId(
+            "sess_agy".into()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn agy_unknown_resume_falls_back_to_new_session() {
+    let dir = workspace();
+    let (obs, started, _) = agy_observer();
+    #[allow(deprecated)]
+    let options = AgentOptions {
+        resume_session_id: Some("gone".into()),
+        ..AgentOptions::default()
+    };
+    let mut session = agy_session(dir.path(), "agy:fake-low", "agy_inspect", options, obs);
+    let report = inspect_prompt(&drain(&mut session, true).await);
+    assert_eq!(report["resume"]["sessionId"], "gone", "{report}");
+    assert!(report["new"].is_object(), "fallback must open a new session: {report}");
+    // The new id is reported, so the TUI's resume-failure path can reset.
+    assert_eq!(started.lock().unwrap().as_slice(), ["sess_agy"]);
+}
+
+#[tokio::test]
+async fn agy_rejected_model_fails_the_turn() {
+    let dir = workspace();
+    let (obs, _, _) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:not-offered",
+        "agy_inspect",
+        AgentOptions::default(),
+        obs,
+    );
+    let err = match session.send_turn(turn("hi", true)).await {
+        Ok(_) => panic!("a model agy does not offer must fail the turn"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("not offered"), "{err}");
+    assert!(err.contains("not-offered"), "{err}");
+}
+
+#[tokio::test]
+async fn agy_prompt_usage_and_pending_tool_mapping() {
+    let dir = workspace();
+    let (obs, _, _) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:fake-low",
+        "agy_inspect",
+        AgentOptions::default(),
+        obs,
+    );
+    let events = drain(&mut session, true).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UnifiedStreamEvent::Usage(u) if u.input_tokens == 11 && u.output_tokens == 7
+        )),
+        "{events:?}"
+    );
+    let ends = events
+        .iter()
+        .filter(|e| matches!(e, UnifiedStreamEvent::ToolCallEnd { id } if id == "t1"))
+        .count();
+    assert_eq!(ends, 1, "`pending` must not end the tool: {events:?}");
+    assert!(
+        matches!(events.last(), Some(UnifiedStreamEvent::Done(StopReason::EndTurn))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn agy_session_started_is_observed() {
+    let dir = workspace();
+    let (obs, started, _) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:fake-high",
+        "agy_inspect",
+        AgentOptions::default(),
+        obs,
+    );
+    let _ = drain(&mut session, true).await;
+    assert_eq!(started.lock().unwrap().as_slice(), ["sess_agy"]);
+    assert_eq!(
+        session.continuity_mode(),
+        gaviero_core::context_planner::ContinuityMode::NativeResume
+    );
+}
+
+#[tokio::test]
+async fn agy_run_command_follows_bash_policy() {
+    let dir = workspace();
+    let (obs, _, asked) = agy_observer();
+    let approved = AgentOptions {
+        available_tools: Some(vec!["Read".into(), "Bash".into()]),
+        approved_tools: Some(vec!["Bash".into()]),
+        ..AgentOptions::default()
+    };
+    let mut session = agy_session(dir.path(), "agy:fake-low", "agy_permission", approved, obs);
+    let events = drain(&mut session, false).await;
+    assert_eq!(option_echo(&events).as_deref(), Some("allow"), "{events:?}");
+    assert!(asked.lock().unwrap().is_empty(), "approved Bash must not prompt");
+
+    let dir = workspace();
+    let (obs, _, asked) = agy_observer();
+    let no_bash = AgentOptions {
+        available_tools: Some(vec!["Read".into()]),
+        approved_tools: Some(vec!["Bash".into()]),
+        ..AgentOptions::default()
+    };
+    let mut session = agy_session(dir.path(), "agy:fake-low", "agy_permission", no_bash, obs);
+    let events = drain(&mut session, false).await;
+    assert_eq!(option_echo(&events).as_deref(), Some("deny"), "{events:?}");
+    assert!(asked.lock().unwrap().is_empty(), "no Bash is a hard deny, not a prompt");
+}
+
+#[tokio::test]
+async fn agy_gaviero_mcp_tool_is_auto_allowed() {
+    let dir = workspace();
+    let (obs, _, asked) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:fake-low",
+        "agy_mcp_permission",
+        AgentOptions::default(),
+        obs,
+    );
+    let events = drain(&mut session, false).await;
+    assert_eq!(option_echo(&events).as_deref(), Some("allow"), "{events:?}");
+    assert!(asked.lock().unwrap().is_empty(), "gaviero's own tools never prompt");
+}
+
+#[tokio::test]
+async fn dsh_still_process_bound() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let session = AcpClientSession::new_with_scope(args, FileScope::default());
+    assert_eq!(
+        session.continuity_mode(),
+        gaviero_core::context_planner::ContinuityMode::ProcessBound
+    );
+}

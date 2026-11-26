@@ -147,6 +147,12 @@ pub trait AcpObserver: Send + Sync {
     /// `NativeResume`.
     fn on_cursor_session_started(&self, _session_id: &str) {}
 
+    /// ACP session id after `session/new` or a successful `session/resume`
+    /// (`agy:`); the TUI stores it as `ContinuityHandle::AcpSessionId` and
+    /// hands it back through `AgentOptions::resume_session_id` next turn.
+    /// Default no-op.
+    fn on_acp_session_started(&self, _session_id: &str) {}
+
     /// Fired once per chat turn immediately after the prompt assembler has
     /// decided which memories to inject. Carries a summary snapshot
     /// (`items_injected`, `tokens_used`, `token_budget`) for UI / logging.
