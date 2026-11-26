@@ -531,9 +531,9 @@ fn fallback_model_ids(provider: &str, discovered: &[String]) -> Vec<String> {
 }
 
 /// Cursor's own models — every `composer-*` variant plus the bundled
-/// `grok-*` family. `cursor:` completions surface these ahead of the many
-/// third-party models Cursor proxies (gpt-*, claude-*, gemini-*, …) so the
-/// 10-candidate truncation can never bury them.
+/// `grok-*` family. `cursor:` completions list these ahead of the many
+/// third-party models Cursor proxies (gpt-*, claude-*, gemini-*, …), so they
+/// sit at the top of the popup instead of below the proxied ones.
 fn is_preferred_cursor_model(model: &str) -> bool {
     let m = model.to_lowercase();
     m.starts_with("composer") || m.starts_with("grok")
@@ -542,26 +542,44 @@ fn is_preferred_cursor_model(model: &str) -> bool {
 /// Claude's stable aliases (`fable`, `sonnet`, `opus`, `haiku`, `opusplan`,
 /// and the `[1m]` long-context variants) are digit-free, while concrete model
 /// ids (`claude-fable-5-2`, `claude-opus-5-5`, …) always carry a version digit.
-/// Ranking aliases first keeps [`CLAUDE_MODEL_ALIASES`]'s concrete entries from
-/// crowding the aliases out of the 10-candidate completion window.
+/// Ranking aliases first keeps them above [`CLAUDE_MODEL_ALIASES`]'s concrete
+/// entries in the completion popup.
 fn is_preferred_claude_model(model: &str) -> bool {
     !model.chars().any(|c| c.is_ascii_digit())
 }
 
+/// Providers whose discovered catalog already comes in the provider's own
+/// order, newest family first: agy's ACP `models.availableModels`
+/// (`gemini-4-*` before `gemini-3.8-*` … before the proxied Claude ids). Their
+/// completions keep that order — the alphabet would put `claude-*` and
+/// `gemini-3.1-*` above every `gemini-4-*`.
+fn keeps_catalog_order(provider: &str) -> bool {
+    provider == "agy"
+}
+
 /// Completion ordering: providers alphabetical, models alphabetical within a
 /// provider — except `cursor:`, whose own models
-/// ([`is_preferred_cursor_model`]) form a band ahead of the proxied rest, and
+/// ([`is_preferred_cursor_model`]) form a band ahead of the proxied rest,
 /// `claude:`, whose aliases ([`is_preferred_claude_model`]) rank ahead of the
-/// concrete catalog ids.
-fn spec_sort_key(spec: &str) -> (String, u8, String) {
+/// concrete catalog ids, and `agy:`, whose models keep their position in
+/// `discovered` ([`keeps_catalog_order`]).
+fn spec_sort_key(spec: &str, discovered: &[String]) -> (String, u8, usize, String) {
     match spec.split_once(':') {
         Some((provider, model)) => {
             let provider = provider.to_lowercase();
             let demoted = (provider == "cursor" && !is_preferred_cursor_model(model))
                 || (provider == "claude" && !is_preferred_claude_model(model));
-            (provider, u8::from(demoted), model.to_lowercase())
+            let catalog_rank = if keeps_catalog_order(&provider) {
+                discovered
+                    .iter()
+                    .position(|d| d.eq_ignore_ascii_case(spec))
+                    .unwrap_or(usize::MAX)
+            } else {
+                0
+            };
+            (provider, u8::from(demoted), catalog_rank, model.to_lowercase())
         }
-        None => (spec.to_lowercase(), 0, String::new()),
+        None => (spec.to_lowercase(), 0, 0, String::new()),
     }
 }
 
@@ -573,14 +591,18 @@ fn spec_sort_key(spec: &str) -> (String, u8, String) {
 ///   DeepSeek) merged with matching entries from `discovered`
 ///   (CLI-discovered Claude / Cursor / Ollama specs), filtered by the typed
 ///   model fragment. `cursor:` candidates rank Cursor's own models
-///   (composer / grok variants) ahead of the proxied third-party ones.
+///   (composer / grok variants) ahead of the proxied third-party ones;
+///   `agy:` candidates keep agy's catalog order (newest family first).
 /// * otherwise the fragment may be the start of a model name rather than a
 ///   provider: offer matching provider prefixes first, then model ids from
 ///   every provider that start with the fragment, as full `provider:model`
 ///   specs (the provider prefix is filled in). An empty fragment lists
-///   prefixes only, so providers are never buried below the truncation
-///   limit. A fragment whose own colon head is not a provider (e.g. the
-///   Ollama id `qwen2.5-coder:7b`) is matched as a model id too.
+///   prefixes only, so providers stay on top. A fragment whose own colon
+///   head is not a provider (e.g. the Ollama id `qwen2.5-coder:7b`) is
+///   matched as a model id too.
+///
+/// Every match is returned — the popup scrolls. (A cap here once hid agy's
+/// `gemini-4-*` ids: 33 catalog ids, alphabetical, first ten kept.)
 ///
 /// Candidates whose model id is itself a `provider:` prefix are dropped, so a
 /// doubly-prefixed spec can never be suggested.
@@ -618,9 +640,8 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
                 .map(|m| format!("{provider_lower}:{m}"))
                 .collect();
 
-            candidates.sort_by_key(|s| spec_sort_key(s));
+            candidates.sort_by_cached_key(|s| spec_sort_key(s, discovered));
             candidates.dedup();
-            candidates.truncate(10);
             return candidates;
         }
         // Colon head is not a provider — the fragment may be a bare model id
@@ -662,12 +683,11 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
                 model_matches.push(format!("{provider}:{model}"));
             }
         }
-        model_matches.sort_by_key(|s| spec_sort_key(s));
+        model_matches.sort_by_cached_key(|s| spec_sort_key(s, discovered));
         model_matches.dedup();
         out.extend(model_matches);
     }
 
-    out.truncate(10);
     out
 }
 
@@ -1426,8 +1446,8 @@ mod tests {
 
     #[test]
     fn test_model_spec_completions_claude_ranks_aliases_ahead_of_catalog_ids() {
-        // Adding concrete catalog ids must not push the stable aliases out of
-        // the 10-candidate window.
+        // Adding concrete catalog ids must not push the stable aliases down
+        // the list.
         let hits = model_spec_completions("claude:", &[]);
         let alias_end = hits
             .iter()
@@ -1464,9 +1484,9 @@ mod tests {
     #[test]
     fn test_model_spec_completions_empty_partial_lists_prefixes_only() {
         // With nothing typed the picker offers provider prefixes, not full
-        // discovered specs — keeps it aligned with `provider:model` and avoids
-        // burying providers below the truncation limit. Model-name matching
-        // only kicks in once a fragment is typed.
+        // discovered specs — keeps it aligned with `provider:model` and keeps
+        // providers on top. Model-name matching only kicks in once a fragment
+        // is typed.
         let discovered = vec!["cursor:composer-2.5".to_string()];
         let hits = model_spec_completions("", &discovered);
         assert!(hits.contains(&"cursor:".to_string()), "got {hits:?}");
@@ -1557,19 +1577,102 @@ mod tests {
     }
 
     #[test]
-    fn test_model_spec_completions_cursor_preference_survives_truncation() {
-        // Enough alphabetically-early proxied models to fill the whole
-        // 10-candidate window on their own — composer/grok must still
-        // surface at the top instead of being truncated away.
+    fn test_model_spec_completions_cursor_preference_tops_a_long_list() {
+        // More alphabetically-early proxied models than the popup shows —
+        // composer/grok still come first, and nothing is cut.
         let mut discovered: Vec<String> = (0..12)
             .map(|i| format!("cursor:aaa-proxied-{i:02}"))
             .collect();
         discovered.push("cursor:grok-4".to_string());
         discovered.push("cursor:composer-2.5".to_string());
         let hits = model_spec_completions("cursor:", &discovered);
-        assert_eq!(hits.len(), 10);
+        assert_eq!(hits.len(), 14);
         assert_eq!(hits[0], "cursor:composer-2.5");
         assert_eq!(hits[1], "cursor:grok-4");
+    }
+
+    /// agy's ACP catalog as `session/new` returns it (agy 1.5.18): newest
+    /// family first, 33 ids with the effort in each.
+    fn agy_catalog() -> Vec<String> {
+        [
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-low",
+            "gemini-4-neon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-low",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "gemini-4-argon-low",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "gemini-3.7-flash-medium",
+            "gemini-3.7-flash-high",
+            "gemini-3.7-flash-low",
+            "gemini-3.6-flash-medium",
+            "gemini-3.6-flash-high",
+            "gemini-3.6-flash-low",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+            "claude-opus-5-5-max",
+            "claude-opus-5-5-high",
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-low",
+            "claude-sonnet-5-5-max",
+            "claude-sonnet-5-5-high",
+            "claude-sonnet-5-5-medium",
+            "claude-sonnet-5-5-low",
+            "gemini-pro-orchestrator",
+        ]
+        .iter()
+        .map(|id| format!("agy:{id}"))
+        .collect()
+    }
+
+    #[test]
+    fn test_model_spec_completions_agy_lists_the_whole_catalog_in_its_order() {
+        // Regression: sorted alphabetically and cut at ten, `agy:gem` stopped
+        // at gemini-3.8 and no gemini-4 model (Neon, Hydrogen, …) could be
+        // picked.
+        let catalog = agy_catalog();
+        assert_eq!(model_spec_completions("agy:", &catalog), catalog);
+
+        let gemini = model_spec_completions("agy:gem", &catalog);
+        let expected: Vec<String> = catalog
+            .iter()
+            .filter(|s| s.starts_with("agy:gem"))
+            .cloned()
+            .collect();
+        assert_eq!(gemini, expected);
+        assert_eq!(gemini[0], "agy:gemini-4-carbon-medium");
+
+        let neon = model_spec_completions("agy:gemini-4-n", &catalog);
+        assert_eq!(
+            neon,
+            [
+                "agy:gemini-4-neon-high",
+                "agy:gemini-4-neon-xhigh",
+                "agy:gemini-4-neon-medium",
+                "agy:gemini-4-neon-low",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_spec_completions_bare_fragment_keeps_every_agy_match() {
+        // A bare `gemini-4` fragment fills in `agy:` and keeps all thirteen
+        // gemini-4 ids, newest family first.
+        let catalog = agy_catalog();
+        let hits = model_spec_completions("gemini-4", &catalog);
+        assert_eq!(hits.len(), 13, "got {hits:?}");
+        assert_eq!(hits[0], "agy:gemini-4-carbon-medium");
+        assert!(hits.contains(&"agy:gemini-4-hydrogen-low".to_string()));
+        assert!(hits.contains(&"agy:gemini-4-argon-low".to_string()));
     }
 
     #[test]
