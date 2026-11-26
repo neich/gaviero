@@ -223,3 +223,223 @@ fn a_terminal_without_the_protocol_gets_no_flags() {
     assert_eq!(count(&raw, b"\x1b[>"), 0, "nothing pushed");
     assert_eq!(count(&raw, POP), 0, "nothing popped");
 }
+
+/// Ctrl+Alt+R opens the rename popup (in both legacy VT and kitty-protocol
+/// terminals), Esc cancels without leaking keys, Enter locks the name so
+/// another tab with the same folder name does not disturb it, and quitting
+/// and reopening keeps the custom name.
+#[test]
+fn ctrl_alt_r_renames_a_tab_and_keeps_the_name_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    let clash = root.path().join("Backend");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&clash).unwrap();
+    let state = root.path().join("state.json");
+
+    let mut pty = Pty::spawn_answering(
+        &[OsStr::new("--sessions"), a.as_os_str()],
+        &[
+            ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+            ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ],
+        root.path(),
+        Answers::Legacy,
+    );
+    pty.wait_for("the tab", |_, _| pty.row(0).contains("alpha-a"));
+
+    // Legacy VT Ctrl+Alt+R (ESC + 0x12): Esc cancels and leaks nothing.
+    pty.send("\x1b\x12");
+    pty.wait_text(" Rename tab ");
+    pty.send("Discard");
+    pty.send("\x1b");
+    pty.wait_for("popup closed", |s, _| !s.contains(" Rename tab "));
+    assert!(pty.row(0).contains("alpha-a"), "row 0: {}", pty.row(0));
+    assert!(!pty.contents().contains("KEY"), "leaked to probe:\n{}", pty.contents());
+
+    // Rename to "Backend" (initial label is pre-selected, so typing replaces it).
+    pty.send("\x1b\x12");
+    pty.wait_text(" Rename tab ");
+    pty.send("Backend\r");
+    pty.wait_for("renamed tab", |s, _| {
+        !s.contains(" Rename tab ") && pty.row(0).contains("Backend") && !pty.row(0).contains("alpha-a")
+    });
+    assert!(!pty.contents().contains("KEY"), "leaked to probe:\n{}", pty.contents());
+
+    // Opening a folder literally named "Backend" numbers the new tab, never the renamed one.
+    pty.send("\x1bn");
+    pty.wait_text(" New session ");
+    pty.send(&clash.display().to_string());
+    pty.send("\r");
+    pty.wait_for("both tabs", |_, _| {
+        let bar = pty.row(0);
+        bar.contains(" x Backend ") && bar.contains("Backend (2)")
+    });
+
+    // Ctrl+Q quits and keeps both tabs plus the custom name.
+    pty.send("\x11");
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(pty);
+
+    // Reopen under kitty protocol: "Backend" is restored and Ctrl+Alt+R (\x1b[114;7u) renames again.
+    let mut pty = Pty::spawn_answering(
+        &[OsStr::new("--sessions")],
+        &[
+            ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+            ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ],
+        root.path(),
+        Answers::Kitty,
+    );
+    pty.wait_for("reopened tabs", |_, _| {
+        let bar = pty.row(0);
+        bar.contains(" x Backend ") && bar.contains("Backend (2)")
+    });
+
+    // Switch back to the first tab ("Backend") and rename via kitty Ctrl+Alt+R.
+    pty.send("\x1b[1;3D");
+    pty.send("\x1b[114;7u");
+    pty.wait_text(" Rename tab ");
+    pty.send("Core\r");
+    pty.wait_for("renamed via kitty", |s, _| {
+        !s.contains(" Rename tab ") && pty.row(0).contains(" x Core ")
+    });
+
+    pty.send("\x1b[113;5u");
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
+/// A renamed shell tab never reverts when the shell changes folder (OSC 7)
+/// and reopens with its custom name in the new folder.
+#[test]
+fn a_renamed_shell_tab_keeps_its_name_across_cd_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    let sub = a.join("sub-dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let state = root.path().join("state.json");
+    let envs = [
+        ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+        ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ("SHELL", OsStr::new("/bin/sh")),
+        ("PS1", OsStr::new("$ ")),
+    ];
+
+    let mut pty = Pty::spawn_answering(
+        &[OsStr::new("--sessions"), a.as_os_str()],
+        &envs,
+        root.path(),
+        Answers::Legacy,
+    );
+    pty.wait_for("alpha tab", |_, _| pty.row(0).contains("alpha-a"));
+
+    // Open a shell tab (Alt+T) and rename it to "Logs".
+    pty.send("\x1bt");
+    pty.wait_for("shell tab", |_, _| pty.row(0).contains(">_ alpha-a"));
+    pty.send("\x1b\x12");
+    pty.wait_text(" Rename tab ");
+    pty.send("Logs\r");
+    pty.wait_for("renamed shell tab", |s, _| {
+        !s.contains(" Rename tab ") && pty.row(0).contains("Logs") && !pty.row(0).contains(">_")
+    });
+
+    // Change directory and report OSC 7 as shell integration does.
+    pty.send("cd sub-dir && printf '\\033]7;file://localhost%s\\007done-cd\\n' \"$PWD\"\r");
+    pty.wait_text("done-cd");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&state).unwrap_or_default();
+        if text.contains("sub-dir") && text.contains("\"Logs\"") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "state.json:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pty.row(0).contains("Logs"), "row 0: {}", pty.row(0));
+    assert!(!pty.row(0).contains("sub-dir"), "row 0: {}", pty.row(0));
+
+    // Quit and reopen: shell tab reopens in sub-dir, still named "Logs".
+    pty.send("\x11");
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(pty);
+
+    let mut pty = Pty::spawn_answering(&[OsStr::new("--sessions")], &envs, root.path(), Answers::Legacy);
+    pty.wait_for("reopened renamed shell", |_, _| {
+        let bar = pty.row(0);
+        bar.contains("alpha-a") && bar.contains("Logs") && !bar.contains("sub-dir")
+    });
+    pty.send("\x11");
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
+/// A renamed SSH tab keeps its name when the remote reports its picked folder
+/// (OSC 7), when the connection drops and reconnects, and across reopen.
+#[test]
+fn a_renamed_ssh_tab_keeps_its_name_across_osc7_and_reconnect() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("alpha-a");
+    std::fs::create_dir(&a).unwrap();
+    let state = root.path().join("state.json");
+    let args_file = root.path().join("ssh-args.txt");
+    let envs = [
+        ("GAVIERO_INPUT_PROBE", OsStr::new("1")),
+        ("GAVIERO_SESSION_HOST_STATE", state.as_os_str()),
+        ("GAVIERO_SSH", OsStr::new(env!("CARGO_BIN_EXE_gaviero"))),
+        ("GAVIERO_PROBE_ARGS", args_file.as_os_str()),
+    ];
+
+    let mut pty = Pty::spawn_answering(
+        &[OsStr::new("--sessions"), a.as_os_str()],
+        &envs,
+        root.path(),
+        Answers::Legacy,
+    );
+    pty.wait_for("alpha tab", |_, _| pty.row(0).contains("alpha-a"));
+
+    // Alt+N -> Ctrl+T (SSH) -> "testhost" -> Enter.
+    pty.send("\x1bn");
+    pty.wait_text("Ctrl+T: switch");
+    pty.send("\x14");
+    pty.wait_text("host or host:/path");
+    pty.send("testhost\r");
+    pty.wait_for("SSH tab", |_, _| pty.row(0).contains("testhost:~"));
+
+    // Rename SSH tab to "Prod" before remote picks its folder.
+    pty.send("\x1b\x12");
+    pty.wait_text(" Rename tab ");
+    pty.send("Prod\r");
+    pty.wait_for("renamed SSH tab", |s, _| {
+        !s.contains(" Rename tab ") && pty.row(0).contains("Prod") && !pty.row(0).contains("testhost")
+    });
+
+    // Probe reports OSC 7 /srv/my proj (Ctrl+O): target updates, name stays "Prod".
+    pty.send("\x0f");
+    pty.wait_text("STATUS osc7");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&state).unwrap_or_default();
+        if text.contains("ssh://testhost/srv/my proj") && text.contains("\"Prod\"") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "state.json:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pty.row(0).contains("Prod"), "row 0: {}", pty.row(0));
+    assert!(!pty.row(0).contains("my proj"), "row 0: {}", pty.row(0));
+
+    // Connection drops (Ctrl+K -> exit 255) and Enter reconnects: still "Prod".
+    let _ = std::fs::remove_file(&args_file);
+    pty.send("\x0b");
+    pty.wait_text("Enter reconnect");
+    assert!(pty.row(0).contains("Prod"), "row 0: {}", pty.row(0));
+    pty.send("\r");
+    pty.wait_for("reconnected", |s, _| !s.contains("Enter reconnect"));
+    // Another OSC 7 after reconnect still leaves "Prod" untouched.
+    pty.send("\x0f");
+    pty.wait_text("STATUS osc7");
+    assert!(pty.row(0).contains("Prod"), "row 0: {}", pty.row(0));
+    assert!(!pty.row(0).contains("my proj"), "row 0: {}", pty.row(0));
+
+    pty.send("\x11");
+    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+}

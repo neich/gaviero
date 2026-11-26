@@ -201,6 +201,9 @@ pub(crate) fn draw(host: &Host, frame: &mut Frame) {
     if let Some(picker) = &host.picker {
         picker.render(area, frame.buffer_mut());
     }
+    if let Some(rename) = &host.rename {
+        rename.render(area, frame.buffer_mut());
+    }
     if let Some((title, lines)) = host.confirm_popup() {
         draw_confirm(&title, &lines, area, frame.buffer_mut());
     }

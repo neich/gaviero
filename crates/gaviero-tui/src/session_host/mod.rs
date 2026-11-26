@@ -6,11 +6,12 @@ pub(crate) mod clipboard;
 pub(crate) mod encode;
 pub(crate) mod input_term;
 pub(crate) mod keys;
+pub(crate) mod osc7;
 pub(crate) mod picker;
 #[cfg(windows)]
 pub(crate) mod input_windows;
-pub(crate) mod osc7;
 pub(crate) mod probe;
+pub(crate) mod rename;
 pub(crate) mod render;
 pub(crate) mod restart;
 pub(crate) mod session;
@@ -142,6 +143,8 @@ pub(crate) enum Chord {
     New,
     /// Alt+T: open a shell tab in the current tab's folder.
     NewShell,
+    /// Ctrl+Alt+R: rename the active tab (locks the name permanently).
+    Rename,
     /// Alt+Q: close the active tab and end its session (asks first).
     Close,
     /// Ctrl+Q: quit the host, keeping every tab for the next start (asks
@@ -202,6 +205,8 @@ pub(crate) struct Host {
     state_path: Option<PathBuf>,
     /// The new-session picker, while open (Alt+N).
     picker: Option<picker::Picker>,
+    /// The tab-rename popup, while open (Ctrl+Alt+R).
+    rename: Option<rename::RenameDialog>,
     /// Where relative paths typed in the picker are resolved.
     cwd: PathBuf,
     /// Restart-on-new-build for the host and all its tabs.
@@ -278,6 +283,7 @@ impl Host {
             tx,
             dirty: true,
             picker: None,
+            rename: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             restart: restart::HostRestart::new(),
             zoom: ZoomWindow::default(),
@@ -304,9 +310,61 @@ impl Host {
         }
     }
 
-    /// A question or the picker owns the keyboard.
+    /// A question, the rename popup or the picker owns the keyboard.
     fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.picker.is_some()
+        self.confirm.is_some() || self.rename.is_some() || self.picker.is_some()
+    }
+
+    fn open_rename(&mut self) {
+        let Some(s) = self.active_session() else {
+            return;
+        };
+        self.rename = Some(rename::RenameDialog::new(s.id, &s.label));
+        self.dirty = true;
+    }
+
+    /// Apply a key to the open rename popup; Enter locks the new name on the
+    /// tab and persists it.
+    fn rename_key(&mut self, key: rename::RenameKey) {
+        let Some(dialog) = self.rename.as_mut() else {
+            return;
+        };
+        let tab_id = dialog.tab_id;
+        self.dirty = true;
+        match dialog.on_key(key) {
+            rename::RenameOutcome::Stay => {}
+            rename::RenameOutcome::Close => self.rename = None,
+            rename::RenameOutcome::Apply(name) => {
+                self.rename = None;
+                self.apply_rename(tab_id, name);
+            }
+        }
+    }
+
+    /// Lock `name` on session `tab_id`: once renamed by the user, its label
+    /// never changes automatically again.
+    fn apply_rename(&mut self, tab_id: u64, name: String) {
+        let Some(i) = self.index_of(tab_id) else {
+            return;
+        };
+        self.sessions[i].label = name;
+        self.sessions[i].custom_label = true;
+        if !self.quitting() {
+            self.sync_open_names();
+            self.save_state();
+        }
+        self.dirty = true;
+    }
+
+    /// Keep `state.names` in step with every currently open renamed tab.
+    fn sync_open_names(&mut self) {
+        let entries: Vec<(&Target, &str)> = self
+            .sessions
+            .iter()
+            .filter(|s| s.custom_label)
+            .map(|s| (&s.target, s.label.as_str()))
+            .collect();
+        self.state.set_names(&entries);
     }
 
     fn open_picker(&mut self) {
@@ -359,16 +417,27 @@ impl Host {
 
     /// Start a session for `target` in a new tab and make it active.
     fn open(&mut self, target: Target) -> anyhow::Result<()> {
-        self.open_with(target, None)
+        self.open_with(target, None, None)
     }
 
     /// [`Host::open`], with the tab's launch-state file seeded from `launch`
     /// (what a restarting host recorded for it) or, on a normal start, from
     /// the answer the host remembered for this target last time, so a folder
-    /// holding a workspace file is not asked about again.
-    fn open_with(&mut self, target: Target, launch: Option<&str>) -> anyhow::Result<()> {
-        let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
-        let label = session::label_for(&target, &taken);
+    /// holding a workspace file is not asked about again, and with an optional
+    /// `custom_name` restored verbatim (locked against automatic changes).
+    fn open_with(
+        &mut self,
+        target: Target,
+        launch: Option<&str>,
+        custom_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (label, custom_label) = match custom_name {
+            Some(name) => (name, true),
+            None => {
+                let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
+                (session::label_for(&target, &taken), false)
+            }
+        };
         let id = self.next_id;
         self.next_id += 1;
         let launch = launch
@@ -381,7 +450,7 @@ impl Host {
             }
         }
         let program = self.gaviero_override(&target);
-        let s = session::spawn(
+        let mut s = session::spawn(
             id,
             &target,
             label,
@@ -392,10 +461,12 @@ impl Host {
             self.restart.supervised(),
             program.as_deref(),
         )?;
+        s.custom_label = custom_label;
         tracing::info!(id, target = %target.display(), "session opened");
         self.sessions.push(s);
         self.switch_to(self.sessions.len() - 1);
         self.state.note_opened(&target);
+        self.sync_open_names();
         self.save_state();
         Ok(())
     }
@@ -650,26 +721,32 @@ impl Host {
         }
     }
 
-    /// A shell tab changed folder (`cd`): it is named after the new one and
-    /// reopens there next time.
+    /// A shell tab changed folder (`cd`): it is named after the new one (unless
+    /// the user renamed it) and reopens there next time.
     fn follow_shell_cwd(&mut self, i: usize, dir: PathBuf) {
         let new = Target::Shell(dir);
         if self.sessions[i].target == new {
             return;
         }
-        let taken: Vec<String> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, s)| s.label.clone())
-            .collect();
+        let auto_label = (!self.sessions[i].custom_label).then(|| {
+            let taken: Vec<String> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.label.clone())
+                .collect();
+            session::label_for(&new, &taken)
+        });
         let s = &mut self.sessions[i];
-        s.label = session::label_for(&new, &taken);
+        if let Some(label) = auto_label {
+            s.label = label;
+        }
         s.target = new;
         if !self.quitting() {
             let tabs: Vec<Target> = self.sessions.iter().map(|s| s.target.clone()).collect();
             self.state.set_open(&tabs);
+            self.sync_open_names();
             self.save_state();
         }
         self.dirty = true;
@@ -689,8 +766,9 @@ impl Host {
 
     /// An SSH tab's remote gaviero reported the folder it opened (picked on
     /// the remote, or the workspace file chosen there): the tab is named
-    /// after it and remembered as that target, so reopening goes straight
-    /// there. Local tabs already know their path and ignore reports.
+    /// after it (unless the user renamed it) and remembered as that target,
+    /// so reopening goes straight there. Local tabs already know their path
+    /// and ignore reports.
     fn adopt_reported_path(&mut self, i: usize, path: String) {
         let Target::Ssh { host, path: known } = &self.sessions[i].target else {
             return;
@@ -703,19 +781,27 @@ impl Host {
             host: host.clone(),
             path: Some(path),
         };
-        let taken: Vec<String> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, s)| s.label.clone())
-            .collect();
+        let auto_label = (!self.sessions[i].custom_label).then(|| {
+            let taken: Vec<String> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.label.clone())
+                .collect();
+            session::label_for(&new, &taken)
+        });
         let s = &mut self.sessions[i];
-        s.label = session::label_for(&new, &taken);
+        if let Some(label) = auto_label {
+            s.label = label;
+        }
         s.target = new.clone();
         tracing::info!(id = s.id, target = %new.display(), "SSH session reported its folder");
         self.state.replace_open(&old, &new);
         self.state.note_opened(&new);
+        if !self.quitting() {
+            self.sync_open_names();
+        }
         self.save_state();
         self.dirty = true;
     }
@@ -769,9 +855,9 @@ impl Host {
 
     /// Start the session at `i` again, in the same tab with the same id.
     fn relaunch(&mut self, i: usize) {
-        let (id, target, label) = {
+        let (id, target, label, custom_label) = {
             let s = &self.sessions[i];
-            (s.id, s.target.clone(), s.label.clone())
+            (s.id, s.target.clone(), s.label.clone(), s.custom_label)
         };
         let program = self.gaviero_override(&target);
         match session::spawn(
@@ -785,7 +871,8 @@ impl Host {
             self.restart.supervised(),
             program.as_deref(),
         ) {
-            Ok(fresh) => {
+            Ok(mut fresh) => {
+                fresh.custom_label = custom_label;
                 tracing::info!(id, "session restarted onto a new build");
                 let old = std::mem::replace(&mut self.sessions[i], fresh);
                 retire(old);
@@ -802,9 +889,9 @@ impl Host {
     /// Enter on a disconnected SSH tab: connect again, in the same tab. The
     /// remote gaviero restores the session it saved when the link dropped.
     fn reconnect(&mut self, i: usize) {
-        let (id, target, label) = {
+        let (id, target, label, custom_label) = {
             let s = &self.sessions[i];
-            (s.id, s.target.clone(), s.label.clone())
+            (s.id, s.target.clone(), s.label.clone(), s.custom_label)
         };
         let program = self.gaviero_override(&target);
         match session::spawn(
@@ -818,7 +905,8 @@ impl Host {
             self.restart.supervised(),
             program.as_deref(),
         ) {
-            Ok(fresh) => {
+            Ok(mut fresh) => {
+                fresh.custom_label = custom_label;
                 tracing::info!(id, "reconnecting the SSH session");
                 let old = std::mem::replace(&mut self.sessions[i], fresh);
                 retire(old);
@@ -857,9 +945,12 @@ impl Host {
     /// before it becomes current.
     fn remove_tab(&mut self, i: usize) -> Session {
         let old = self.sessions.remove(i);
-        // A guard asking about this tab has nothing left to ask.
+        // A guard or rename popup targeting this tab has nothing left to act on.
         if self.confirm == Some(Confirm::Close { id: old.id }) {
             self.confirm = None;
+        }
+        if self.rename.as_ref().is_some_and(|r| r.tab_id == old.id) {
+            self.rename = None;
         }
         // The launch answer survives the tab in the host state, so
         // reopening the target keeps the same mode; only the per-run file
@@ -872,6 +963,9 @@ impl Host {
         // it open.
         if !self.sessions.iter().any(|s| s.target == old.target) {
             self.state.note_tab_ended(&old.target, self.quitting());
+        }
+        if !self.quitting() {
+            self.sync_open_names();
         }
         self.save_state();
         self.active = previous_active(self.active, i, self.sessions.len());
@@ -964,6 +1058,7 @@ impl Host {
                         Target::Local(_) => std::fs::read_to_string(&s.launch_state).ok(),
                         Target::Ssh { .. } | Target::Shell(_) => None,
                     },
+                    name: s.custom_label.then(|| s.label.clone()),
                 })
                 .collect(),
             active: self.active,
@@ -989,6 +1084,7 @@ impl Host {
         self.dirty = true;
         // Every open tab keeps its launch answer (in `open` and `recent`);
         // answers for targets the host has not seen for a while go.
+        self.sync_open_names();
         self.state.prune_launches();
         self.save_state();
         for s in &mut self.sessions {
@@ -1035,6 +1131,8 @@ impl Host {
             Chord::New => {}
             Chord::NewShell if !self.quitting() => self.open_shell_here(),
             Chord::NewShell => {}
+            Chord::Rename if !self.quitting() => self.open_rename(),
+            Chord::Rename => {}
             Chord::Close => self.request_close(self.active),
             Chord::QuitAll if !self.quitting() => self.request_quit(),
             Chord::QuitAll => {}
@@ -1116,6 +1214,7 @@ impl Host {
     fn key_view(&self, key: &keys::HostKey) -> keys::HostView {
         keys::HostView {
             confirm_open: self.confirm.is_some(),
+            rename_open: self.rename.is_some(),
             picker_open: self.picker.is_some(),
             active_disconnected: self.active_disconnected(),
             active_ssh: self.active_session().is_some_and(|s| s.target.is_ssh()),
@@ -1137,6 +1236,7 @@ impl Host {
             HostRoute::Drop => {}
             HostRoute::SwallowKeyUp => self.swallow_keyups.retain(|vk| *vk != key.vk),
             HostRoute::Confirm(yes) => self.answer_confirm(yes),
+            HostRoute::Rename(k) => self.rename_key(k),
             HostRoute::Picker(k) => self.picker_key(k),
             HostRoute::Chord(chord) => self.run_chord(chord),
             HostRoute::Reconnect => self.reconnect(self.active),
@@ -1228,8 +1328,16 @@ impl Host {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_term_key(k),
             Event::Mouse(m) => self.on_term_mouse(m),
             Event::Paste(text) => {
+                if self.confirm.is_none()
+                    && let Some(rename) = &mut self.rename
+                {
+                    rename.paste(&text);
+                    self.dirty = true;
+                    return;
+                }
                 let view = keys::HostView {
                     confirm_open: self.confirm.is_some(),
+                    rename_open: self.rename.is_some(),
                     picker_open: self.picker.is_some(),
                     active_disconnected: self.active_disconnected(),
                     ..keys::HostView::default()
@@ -1572,7 +1680,14 @@ pub(crate) fn run(launch: HostLaunch) -> i32 {
             Ok(paths) => restart::RestartRecord {
                 tabs: paths
                     .into_iter()
-                    .map(|path| restart::RestartTab { path, launch: None })
+                    .map(|path| {
+                        let name = saved.name_for(&path).map(str::to_string);
+                        restart::RestartTab {
+                            path,
+                            launch: None,
+                            name,
+                        }
+                    })
                     .collect(),
                 active: usize::MAX,
             },
@@ -1600,8 +1715,10 @@ pub(crate) fn run(launch: HostLaunch) -> i32 {
         eprintln!("gaviero: creating {}: {e}", state_dir.display());
         return 1;
     }
-    // The open set is rebuilt from the tabs this run actually opens.
+    // The open set and its custom names are rebuilt from the tabs this run
+    // actually opens.
     saved.open.clear();
+    saved.names.clear();
     let result = runtime.block_on(host_loop(initial, state_dir.clone(), saved, state_path));
     // Sessions retired on background threads may still be closing.
     runtime.shutdown_timeout(Duration::from_secs(2));
@@ -1659,7 +1776,7 @@ async fn host_loop(
     let mut last_error = None;
     let restarted = initial.active != usize::MAX;
     for tab in initial.tabs {
-        if let Err(e) = host.open_with(tab.path.clone(), tab.launch.as_deref()) {
+        if let Err(e) = host.open_with(tab.path.clone(), tab.launch.as_deref(), tab.name) {
             tracing::error!(target = %tab.path.display(), "opening the session failed: {e:#}");
             host.notify(format!("could not open {}: {e}", tab.path.display()));
             last_error = Some(e);
