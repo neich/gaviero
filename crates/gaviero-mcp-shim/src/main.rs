@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 )]
 struct Cli {
     /// Absolute path to the workspace MCP Unix socket
-    /// (`<workspace>/.gaviero/mcp.sock`). Unix only.
+    /// (`$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock`). Unix only.
     #[arg(long, conflicts_with = "pipe")]
     socket: Option<PathBuf>,
 

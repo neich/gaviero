@@ -1,8 +1,8 @@
 //! In-process MCP server task (Tier A / A5).
 //!
 //! Listens on the workspace's [`McpEndpoint`] — a Unix domain socket
-//! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
-//! on Windows. Each shim connection is a single MCP session
+//! in the per-user runtime dir (`$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock`)
+//! on Unix, a `\\.\pipe\gaviero-…` named pipe on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
 //! framing, initialize, and tools/list. Gaviero owns only the eleven
 //! tool handlers below.
@@ -2029,7 +2029,10 @@ pub struct McpServerHandle {
 impl McpServerHandle {
     /// Persist `<root>/.gaviero/mcp-endpoint.json` for shim `--resolve`.
     /// Write failures are logged; the server still serves on the pipe/socket.
+    /// Also unlinks a dead `<root>/.gaviero/mcp.sock` left by a build that
+    /// bound the socket inside the workspace.
     pub fn with_endpoint_descriptor(mut self, root: &std::path::Path) -> Self {
+        super::transport::remove_stale_legacy_socket(root);
         let mut desc = super::endpoint_file::McpEndpointDescriptor::from_listener(
             root,
             &self.endpoint,
@@ -2156,8 +2159,7 @@ fn spawn_unix(server: GavieroMcpServer, socket_path: PathBuf) -> Result<McpServe
     use tokio::net::UnixListener;
 
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        super::transport::prepare_unix_socket_dir(parent)?;
     }
     // Remove any stale socket from a previous run.
     let _ = std::fs::remove_file(&socket_path);

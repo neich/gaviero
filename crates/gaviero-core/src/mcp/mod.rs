@@ -30,8 +30,10 @@
 //! The server runs as an in-process tokio task launched at
 //! `Workspace::open` time. A small `gaviero-mcp-shim` binary connects
 //! subprocess agents' stdio to the server's workspace endpoint
-//! ([`McpEndpoint`]): the Unix domain socket `<workspace>/.gaviero/mcp.sock`
-//! on Unix, a `\\.\pipe\gaviero-…` named pipe on Windows. A loopback
+//! ([`McpEndpoint`]): a Unix domain socket in the per-user runtime dir
+//! (`$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock`, never inside the workspace —
+//! sync clients cannot sync sockets) on Unix, a `\\.\pipe\gaviero-…` named
+//! pipe on Windows. A loopback
 //! streamable-HTTP listener ([`http`]) binds `127.0.0.1` with a bearer
 //! token; `gaviero-mcp-shim --resolve` finds the live endpoint via
 //! `.gaviero/mcp-endpoint.json`.

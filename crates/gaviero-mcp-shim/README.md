@@ -2,7 +2,7 @@
 
 ## Overview
 
-A tiny stdio↔socket bridge that connects subprocess coding agents (Claude Code, Codex, Cursor) to Gaviero's in-process MCP server. The agent speaks MCP over stdio; the shim forwards bytes to Gaviero's per-workspace endpoint — Unix socket `<workspace>/.gaviero/mcp.sock` or Windows named pipe `\\.\pipe\gaviero-<hash>`.
+A tiny stdio↔socket bridge that connects subprocess coding agents (Claude Code, Codex, Cursor) to Gaviero's in-process MCP server. The agent speaks MCP over stdio; the shim forwards bytes to Gaviero's per-workspace endpoint — Unix socket `$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock` (kept out of the workspace so sync clients such as Dropbox never see it) or Windows named pipe `\\.\pipe\gaviero-<hash>`.
 
 Zero workspace dependencies (`tokio`, `clap`, `anyhow`, `tracing` only). Gaviero writes per-worktree agent configs automatically via `gaviero_core::mcp::config_synth`.
 
@@ -21,7 +21,7 @@ Subprocess agents need the shim on `PATH` or referenced by absolute path in thei
 
 ```bash
 # Unix
-gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock
+gaviero-mcp-shim --socket /run/user/1000/gaviero/mcp-0123456789abcdef.sock
 
 # Windows
 gaviero-mcp-shim --pipe '\\.\pipe\gaviero-<hash>'
@@ -30,7 +30,7 @@ gaviero-mcp-shim --pipe '\\.\pipe\gaviero-<hash>'
 gaviero-mcp-shim --resolve
 
 # Widen initial connect retry window
-gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock --connect-timeout-secs 10
+gaviero-mcp-shim --socket /run/user/1000/gaviero/mcp-0123456789abcdef.sock --connect-timeout-secs 10
 ```
 
 MCP requests on stdin, responses on stdout; diagnostics on stderr (WARN level).
@@ -44,7 +44,7 @@ Typical agent MCP config (written automatically by Gaviero):
   "mcpServers": {
     "gaviero": {
       "command": "gaviero-mcp-shim",
-      "args": ["--socket", "/path/to/.gaviero/mcp.sock"]
+      "args": ["--socket", "/run/user/1000/gaviero/mcp-0123456789abcdef.sock"]
     }
   }
 }
