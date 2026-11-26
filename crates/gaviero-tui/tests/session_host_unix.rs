@@ -85,18 +85,27 @@ const DONE: vt100::Color = vt100::Color::Rgb(51, 136, 255);
 const AGENT: &str = "A";
 const SHELL: &str = "S";
 
-/// The two badges after `label` on the tab bar (a blank, then two 3-cell
-/// slots: half block, letter on the badge colour, half block): (letter, its
-/// cell's background) each; a blank letter when unset.
+/// The badges after `label` on the tab bar, as [agent, shell]: (letter, its
+/// cell's background) each, a blank letter when not shown. Each shown badge
+/// is a blank, then its letter on the badge colour, agent first, and the tab
+/// is only as wide as the badges it shows — so a cell after the label is a
+/// badge only when it holds a badge letter (otherwise the trailing pad, the
+/// separator or the next tab).
 fn circles(pty: &Pty, label: &str) -> [(String, vt100::Color); 2] {
     let bar = pty.row(0);
     let at = bar.find(label).expect("label on the tab bar");
-    let col = (bar[..at].chars().count() + label.chars().count() + 2) as u16;
-    let badge = |at: u16| {
-        let (letter, bg) = pty.cell(0, at);
-        (letter.trim().to_string(), bg)
-    };
-    [badge(col), badge(col + 3)]
+    let end = (bar[..at].chars().count() + label.chars().count()) as u16;
+    let mut shown = [(String::new(), vt100::Color::Default), (String::new(), vt100::Color::Default)];
+    for col in [end + 1, end + 3] {
+        let (letter, bg) = pty.cell(0, col);
+        let slot = match letter.trim() {
+            AGENT => 0,
+            SHELL => 1,
+            _ => break,
+        };
+        shown[slot] = (letter.trim().to_string(), bg);
+    }
+    shown
 }
 
 /// Work that ended out of view marks the tab finished. Coming back, the

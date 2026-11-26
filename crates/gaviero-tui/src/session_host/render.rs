@@ -112,11 +112,11 @@ pub(crate) fn tab_badges(host: &Host) -> Vec<TabBadges> {
         .collect()
 }
 
-/// The host's tab bar: every tab has a close button and two activity
-/// badges, a capital on a square of the state colour (`A` agent, `S` shell —
-/// a shell tab only ever shows `S`), drawn in
-/// the host's own palette so it never looks like the editor's tab row inside
-/// the session below it; shell tabs in their own teal.
+/// The host's tab bar: every tab has a close button and up to two activity
+/// badges, a capital on one cell of the state colour (`A` agent, `S` shell
+/// — a shell tab only ever shows `S`); a tab widens only while it shows
+/// them. Drawn in the host's own palette so it never looks like the editor's
+/// tab row inside the session below it; shell tabs in their own teal.
 pub(crate) fn tab_bar<'a>(
     host: &Host,
     titles: &'a [(String, bool, TabKind)],
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn badge_letters_take_one_cell() {
-        // The tab bar keeps fixed 3-cell slots (half block, letter, half
-        // block); `widgets::tabs` checks the half blocks.
+        // The tab bar sizes a tab by a blank and one letter cell per badge
+        // shown; `widgets::tabs` checks the layout.
         use unicode_width::UnicodeWidthChar;
         for letter in [AGENT_LETTER, SHELL_LETTER] {
             assert_eq!(letter.width(), Some(1), "{letter:?}");
