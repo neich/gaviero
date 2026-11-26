@@ -28,7 +28,8 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
    │           │ shim: standalone        │              │
    │           ▼                         │              │
    │    McpEndpoint ◄────────────────────┘              │
-   │    .gaviero/mcp.sock | \\.\pipe\gaviero-<hash>     │
+   │    $XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock |       │
+   │    \\.\pipe\gaviero-<hash>                         │
    └─── re-exports tree-sitter ─────────────────────────┘
 ```
 

@@ -19,13 +19,13 @@ Per-worktree configs (`.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`) ref
 - `bridge` — bidirectional `tokio::select!` stdin↔endpoint↔stdout; byte-faithful; exits when either side closes.
 - Does **not** parse JSON-RPC — `rmcp` on the server expects intact framing.
 
-Endpoint shape: `<workspace>/.gaviero/mcp.sock` or `\\.\pipe\gaviero-<hash>` ([`gaviero_core::mcp::transport`](../gaviero-core/src/mcp/transport.rs)).
+Endpoint shape: `$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock` (outside the workspace) or `\\.\pipe\gaviero-<hash>` ([`gaviero_core::mcp::transport`](../gaviero-core/src/mcp/transport.rs)).
 
 ### Flags
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--socket <path>` | required on Unix | Absolute path to `mcp.sock`. |
+| `--socket <path>` | required on Unix | Absolute path to the workspace's `mcp-<hash>.sock`. |
 | `--pipe <name>` | required on Windows | Named-pipe name (`\\.\pipe\gaviero-…`). |
 | `--resolve` | off | Walk up from cwd for `.gaviero/mcp-endpoint.json`; connect to that endpoint. Exit 2 immediately if missing or `pid` is dead. |
 | `--connect-timeout-secs <N>` | `5` | Connect retry budget (not used on `--resolve` fail-fast). |

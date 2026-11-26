@@ -386,6 +386,17 @@ async fn isolated_refuses_a_folder_another_process_serves() {
     let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(&root);
     let handle = gaviero_core::mcp::spawn_mcp_server(server, &endpoint).unwrap();
     assert!(endpoint.has_live_server());
+    // The socket lives in the per-user runtime dir, never in the folder:
+    // sync clients (Dropbox) cannot sync a socket and re-index it forever.
+    #[cfg(unix)]
+    {
+        let gaviero_core::mcp::McpEndpoint::Unix(sock) = &endpoint else {
+            panic!("unix endpoint must be a socket");
+        };
+        assert!(sock.exists(), "{}", sock.display());
+        assert!(!sock.starts_with(&root), "{}", sock.display());
+        assert!(!root.join(".gaviero/mcp.sock").exists());
+    }
 
     let output = tokio::task::spawn_blocking({
         let (script, root) = (script.clone(), root.clone());

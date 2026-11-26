@@ -32,7 +32,7 @@ Crates — read the per-crate `CLAUDE.md` (where one exists) before touching its
 - [`tree-sitter-gaviero/`](crates/tree-sitter-gaviero/CLAUDE.md) — `.gaviero` grammar.
 - [`gaviero-relay/`](crates/gaviero-relay/README.md) — VPS relay for Gaviero Remote. Built only with `-p gaviero-relay` and never installed with gaviero. It depends only on `gaviero-remote`'s plain wire types: `relay_proto` is the single protocol definition, shared with `gaviero_remote::relay_client`.
 
-Dependency rules: core has no UI/DSL deps. `tui` and `cli` depend on `core` + `dsl`. `dsl` depends on `core`. `gaviero-mcp-shim` is self-contained and reaches core only over the workspace MCP endpoint (`McpEndpoint`: `<workspace>/.gaviero/mcp.sock` on Unix, `\\.\pipe\gaviero-<hash>` on Windows). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full topology.
+Dependency rules: core has no UI/DSL deps. `tui` and `cli` depend on `core` + `dsl`. `dsl` depends on `core`. `gaviero-mcp-shim` is self-contained and reaches core only over the workspace MCP endpoint (`McpEndpoint`: `$XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock` on Unix — never inside the workspace, sync clients like Dropbox cannot sync a socket — `\\.\pipe\gaviero-<hash>` on Windows). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full topology.
 
 ## Architecture
 

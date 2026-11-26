@@ -110,6 +110,11 @@ http = "1"
 subtle = "2.6"
 rand = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+# getuid(2) for the per-user MCP socket directory
+# (`mcp::transport::unix_socket_dir`). Already in-tree through tokio.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Kill-on-close Job Object (util::spawn::kill_tree_on_exit): ties every
 # agent descendant to the host process lifetime now that agent trees run

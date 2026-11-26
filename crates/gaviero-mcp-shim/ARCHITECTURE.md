@@ -15,7 +15,7 @@ Subprocess agent (claude / codex / cursor)
 gaviero-mcp-shim
   connect_with_backoff → bridge (tokio::io::copy ×2)
         │
-        ▼  Unix: <workspace>/.gaviero/mcp.sock
+        ▼  Unix: $XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock
            Windows: \\.\pipe\gaviero-<hash>
 gaviero-core::mcp::server  (rmcp, 9 tools: 8 read-only + memory_flag)
 ```

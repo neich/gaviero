@@ -17,7 +17,7 @@ gaviero-core (lib, 28 pub mods)
  └── acp/ git/ terminal/ …      supporting subsystems
          │
          ├── re-exports tree-sitter 0.25 (+ tree-sitter-gaviero grammar)
-         └── McpEndpoint (.gaviero/mcp.sock | \\.\pipe\gaviero-<hash>)
+         └── McpEndpoint ($XDG_RUNTIME_DIR/gaviero/mcp-<hash>.sock | \\.\pipe\gaviero-<hash>)
                    ▲
                    │ gaviero-mcp-shim (stdio bridge; not a crate dep)
          subprocess agents (claude / codex / cursor / dsh-acp)
