@@ -37,6 +37,10 @@ pub(crate) struct RestartTab {
     /// verbatim, so the restarted tab does not ask again.
     #[serde(default)]
     pub launch: Option<String>,
+    /// Custom tab name set by the user (`Ctrl+Alt+R`), kept verbatim across
+    /// the restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// What a restarting host hands to the next one.
@@ -67,11 +71,22 @@ pub(crate) fn take_record(path: &Path) -> Option<RestartRecord> {
     let mut record: RestartRecord = serde_json::from_str(&text)
         .map_err(|e| tracing::warn!("ignoring corrupt restart record {}: {e}", path.display()))
         .ok()?;
-    let active = record.tabs.get(record.active).map(|t| t.path.clone());
-    record.tabs.retain(|t| super::state::still_openable(&t.path));
-    record.active = active
-        .and_then(|p| record.tabs.iter().position(|t| t.path == p))
-        .unwrap_or(0);
+    let mut new_active = 0;
+    let mut kept = Vec::with_capacity(record.tabs.len());
+    for (i, mut tab) in record.tabs.into_iter().enumerate() {
+        if super::state::still_openable(&tab.path) {
+            tab.name = tab
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+            if i == record.active {
+                new_active = kept.len();
+            }
+            kept.push(tab);
+        }
+    }
+    record.tabs = kept;
+    record.active = new_active;
     (!record.tabs.is_empty()).then_some(record)
 }
 
@@ -228,11 +243,12 @@ mod tests {
         let path = dir.path().join("cache").join("restart.json");
         let record = RestartRecord {
             tabs: vec![
-                RestartTab { path: Target::Local(a.clone()), launch: None },
-                RestartTab { path: Target::Local(b.clone()), launch: Some("x\nfolder\n".into()) },
+                RestartTab { path: Target::Local(a.clone()), launch: None, name: Some("Core".into()) },
+                RestartTab { path: Target::Local(b.clone()), launch: Some("x\nfolder\n".into()), name: None },
                 RestartTab {
                     path: Target::Ssh { host: "vps".into(), path: Some("/srv/p".into()) },
                     launch: None,
+                    name: Some("Prod".into()),
                 },
             ],
             active: 1,
@@ -251,7 +267,7 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&c).unwrap();
         let path = dir.path().join("restart.json");
-        let tab = |p: &Path| RestartTab { path: Target::Local(p.to_path_buf()), launch: None };
+        let tab = |p: &Path| RestartTab { path: Target::Local(p.to_path_buf()), launch: None, name: None };
         let record = RestartRecord {
             tabs: vec![tab(&a), tab(&dir.path().join("gone")), tab(&c)],
             active: 2,
@@ -261,9 +277,35 @@ mod tests {
         assert_eq!(got.tabs, vec![tab(&a), tab(&c)]);
         assert_eq!(got.active, 1, "still c");
 
+        // Duplicate targets keep their individual custom names and active index.
+        let dup = RestartRecord {
+            tabs: vec![
+                RestartTab { path: Target::Local(a.clone()), launch: None, name: Some("First".into()) },
+                RestartTab { path: Target::Local(a.clone()), launch: None, name: Some("Second".into()) },
+            ],
+            active: 1,
+        };
+        save_record(&path, &dup).unwrap();
+        assert_eq!(take_record(&path), Some(dup));
+
         // Nothing left to open: no record.
         save_record(&path, &RestartRecord { tabs: vec![tab(&dir.path().join("gone"))], active: 0 }).unwrap();
         assert_eq!(take_record(&path), None);
+    }
+
+    #[test]
+    fn a_legacy_record_without_names_loads_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        let path = dir.path().join("restart.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "tabs": [{ "path": a, "launch": null }], "active": 0 }).to_string(),
+        )
+        .unwrap();
+        let got = take_record(&path).unwrap();
+        assert_eq!(got.tabs[0].name, None);
     }
 
     #[test]

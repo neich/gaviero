@@ -33,6 +33,11 @@ pub(crate) struct HostState {
     /// asking again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launches: BTreeMap<String, String>,
+    /// Custom tab names set by the user (Ctrl+Alt+R), keyed by the target's
+    /// string form. Survives quit/reopen, restarts, shell `cd` and SSH folder
+    /// reports without reverting to the automatic label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
 }
 
 /// Settings for one SSH host (`sshHosts.<host>` in the state file).
@@ -141,8 +146,8 @@ fn local_openable(path: &Path) -> bool {
                 .is_some_and(|ext| ext == "gaviero-workspace"))
 }
 
-/// The key a target's launch answer is stored under: its string form.
-fn launch_key(target: &Target) -> String {
+/// The key a target's per-target host metadata is stored under: its string form.
+fn target_key(target: &Target) -> String {
     String::from(target.clone())
 }
 
@@ -211,13 +216,13 @@ impl HostState {
 
     /// The launch answer saved for `target`, if any.
     pub fn launch_choice(&self, target: &Target) -> Option<&str> {
-        self.launches.get(&launch_key(target)).map(String::as_str)
+        self.launches.get(&target_key(target)).map(String::as_str)
     }
 
     /// Remember how `target` was opened; true when that changed the saved
     /// answer (a target not seen before, or a different one).
     pub fn remember_launch(&mut self, target: &Target, launch: String) -> bool {
-        let key = launch_key(target);
+        let key = target_key(target);
         if self.launches.get(&key).is_some_and(|old| *old == launch) {
             return false;
         }
@@ -228,8 +233,30 @@ impl HostState {
     /// Drop launch answers for targets neither open nor recent, so the file
     /// does not grow with every folder ever opened.
     pub fn prune_launches(&mut self) {
-        let keep: Vec<String> = self.open.iter().chain(&self.recent).map(launch_key).collect();
+        let keep: Vec<String> = self.open.iter().chain(&self.recent).map(target_key).collect();
         self.launches.retain(|key, _| keep.contains(key));
+    }
+
+    /// The custom tab name saved for `target`, if any.
+    pub fn name_for(&self, target: &Target) -> Option<&str> {
+        self.names
+            .get(&target_key(target))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Replace the saved custom tab names from the currently open renamed
+    /// tabs (first renamed tab wins if two tabs share a target).
+    pub fn set_names(&mut self, entries: &[(&Target, &str)]) {
+        self.names.clear();
+        for &(target, name) in entries {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                self.names
+                    .entry(target_key(target))
+                    .or_insert_with(|| trimmed.to_string());
+            }
+        }
     }
 
     /// The tab for `target` closed.
@@ -488,5 +515,35 @@ mod tests {
         // Old one gone: the new one is added once.
         state.replace_open(&l("zzz"), &l("c"));
         assert_eq!(state.open.last(), Some(&l("c")));
+    }
+
+    #[test]
+    fn custom_names_round_trip_omit_when_empty_and_ignore_blanks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let a = l("C:\\work\\alpha");
+        let sh = Target::Shell("/tmp/proj".into());
+        let ssh = Target::Ssh { host: "vps".into(), path: Some("/srv".into()) };
+
+        let mut state = HostState::default();
+        state.set_names(&[(&a, "Backend"), (&a, "IgnoredSecond"), (&sh, "Logs"), (&ssh, "  Prod  ")]);
+        assert_eq!(state.name_for(&a), Some("Backend"));
+        assert_eq!(state.name_for(&sh), Some("Logs"));
+        assert_eq!(state.name_for(&ssh), Some("Prod"));
+        assert_eq!(state.name_for(&l("other")), None);
+
+        save(&path, &state).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"names\""), "{text}");
+        assert_eq!(load(&path), state);
+
+        // Blank entries from hand edits are ignored.
+        let mut corrupt = HostState::default();
+        corrupt.names.insert(target_key(&a), "   ".into());
+        assert_eq!(corrupt.name_for(&a), None);
+
+        // No custom names: the key is left out.
+        save(&path, &HostState::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("names"));
     }
 }

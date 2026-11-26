@@ -171,6 +171,10 @@ pub(crate) struct Session {
     pub id: u64,
     pub target: Target,
     pub label: String,
+    /// The user explicitly renamed this tab (`Ctrl+Alt+R`); once set, its
+    /// label is never replaced automatically (not by shell `cd`, SSH folder
+    /// reports, relaunches, reconnects, restarts, or duplicate numbering).
+    pub custom_label: bool,
     pub parser: vt100::Parser<TitleCb>,
     master: Box<dyn MasterPty + Send>,
     input: std::sync::mpsc::Sender<Vec<u8>>,
@@ -384,6 +388,7 @@ pub(crate) fn spawn(
         id,
         target: target.clone(),
         label,
+        custom_label: false,
         parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, TitleCb::default()),
         master: pair.master,
         input,

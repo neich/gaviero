@@ -12,11 +12,12 @@
 //! The precedence, for a key-down:
 //! 1. close guard open → it takes every key but a bare modifier (`y`/`Y`
 //!    without Ctrl/Alt is yes, anything else no);
-//! 2. picker open → it takes the keys it understands, drops the rest;
-//! 3. host chord ([`chord`]) → the host runs it, the session never sees it;
-//! 4. active tab disconnected → plain Enter reconnects, the rest is dropped;
-//! 5. Ctrl+V in an SSH tab → the local clipboard is pasted;
-//! 6. everything else → the active session.
+//! 2. rename popup open → it takes the keys it understands, drops the rest;
+//! 3. picker open → it takes the keys it understands, drops the rest;
+//! 4. host chord ([`chord`]) → the host runs it, the session never sees it;
+//! 5. active tab disconnected → plain Enter reconnects, the rest is dropped;
+//! 6. Ctrl+V in an SSH tab → the local clipboard is pasted;
+//! 7. everything else → the active session.
 //!
 //! A key-up whose key-down the host took is swallowed; any other key-up is
 //! dropped while a dialog is open or the tab is disconnected, and forwarded
@@ -25,15 +26,16 @@
 use super::Chord;
 use super::encode::{self, KeyRecord};
 use super::picker::PickerKey;
+use super::rename::RenameKey;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// One key as the host decides on it, whichever input path it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HostKey {
-    /// The key. A letter or digit pressed with Ctrl or Alt (not both) is the
-    /// lowercase `Char` of the key itself, whatever the layout types, with
-    /// `SHIFT` in `mods` when it was uppercase — so chords match one way on
-    /// both input paths.
+    /// The key. A letter or digit pressed with Ctrl or Alt (including both,
+    /// when not an AltGr character) is the lowercase `Char` of the key itself,
+    /// whatever the layout types, with `SHIFT` in `mods` when it was uppercase
+    /// — so chords match one way on both input paths.
     pub code: KeyCode,
     /// `CONTROL`, `ALT` and `SHIFT` only. AltGr keeps both Ctrl and Alt here
     /// and is told apart by `text`.
@@ -59,6 +61,9 @@ impl HostKey {
         mods.set(KeyModifiers::ALT, alt);
         mods.set(KeyModifiers::SHIFT, r.ctrl_state & encode::SHIFT != 0);
         let printable = printable(r.uchar);
+        let text = printable.filter(|c| {
+            (!ctrl && !alt) || (ctrl && alt && !c.is_ascii_alphanumeric())
+        });
         let code = match r.vk {
             0x08 => KeyCode::Backspace,
             0x09 => KeyCode::Tab,
@@ -75,14 +80,11 @@ impl HostKey {
             0x2D => KeyCode::Insert,
             0x2E => KeyCode::Delete,
             0x70..=0x87 => KeyCode::F((r.vk - 0x6F) as u8),
-            0x30..=0x39 | 0x41..=0x5A if ctrl != alt => {
+            0x30..=0x39 | 0x41..=0x5A if (ctrl || alt) && text.is_none() => {
                 KeyCode::Char((r.vk as u8 as char).to_ascii_lowercase())
             }
             _ => printable.map_or(KeyCode::Null, KeyCode::Char),
         };
-        let text = printable.filter(|c| {
-            (!ctrl && !alt) || (ctrl && alt && !c.is_ascii_alphanumeric())
-        });
         HostKey {
             code,
             mods,
@@ -151,6 +153,7 @@ fn printable(u: u16) -> Option<char> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostView {
     pub confirm_open: bool,
+    pub rename_open: bool,
     pub picker_open: bool,
     pub active_disconnected: bool,
     pub active_ssh: bool,
@@ -160,7 +163,7 @@ pub(crate) struct HostView {
 
 impl HostView {
     fn modal_open(&self) -> bool {
-        self.confirm_open || self.picker_open
+        self.confirm_open || self.rename_open || self.picker_open
     }
 }
 
@@ -173,6 +176,7 @@ pub(crate) enum HostRoute {
     SwallowKeyUp,
     /// The close guard's answer: yes or no.
     Confirm(bool),
+    Rename(RenameKey),
     Picker(PickerKey),
     Chord(Chord),
     Reconnect,
@@ -210,6 +214,9 @@ pub(crate) fn route(view: &HostView, key: &HostKey) -> HostRoute {
         let yes = matches!(key.text, Some('y' | 'Y'));
         return HostRoute::Confirm(yes);
     }
+    if view.rename_open {
+        return rename_key(key).map_or(HostRoute::Drop, HostRoute::Rename);
+    }
     if view.picker_open {
         return picker_key(key).map_or(HostRoute::Drop, HostRoute::Picker);
     }
@@ -241,9 +248,11 @@ pub(crate) fn paste_goes_to_session(view: &HostView) -> bool {
     !view.modal_open() && !view.active_disconnected
 }
 
-/// The host chord a key-down is, if any. Ctrl+Q is Ctrl without Alt and the
-/// rest Alt without Ctrl, so AltGr chords stay text. Alt+X is never a chord:
-/// Windows keeps it for itself.
+/// The host chord a key-down is, if any. Ctrl+Q is Ctrl without Alt,
+/// Ctrl+Alt+R is Ctrl+Alt without Shift (only when not an AltGr character,
+/// so layouts where AltGr+R types `®`/`¶` keep typing text; Ctrl+Alt+N is
+/// avoided because Konsole binds it to Next Profile), and the rest are Alt
+/// without Ctrl. Alt+X is never a chord: Windows keeps it for itself.
 ///
 /// A tab moves with Alt+Shift+Left/Right or Alt+J/K. Alt+J/K are there for
 /// when Alt+Shift never arrives: an XKB Alt+Shift layout toggle
@@ -255,10 +264,14 @@ pub(crate) fn chord(key: &HostKey) -> Option<Chord> {
         return None;
     }
     let (ctrl, alt, shift) = (key.ctrl(), key.alt(), key.shift());
+    if ctrl && alt {
+        return (!shift && key.text.is_none() && key.code == KeyCode::Char('r'))
+            .then_some(Chord::Rename);
+    }
     if ctrl && !alt {
         return (key.code == KeyCode::Char('q')).then_some(Chord::QuitAll);
     }
-    if !alt || ctrl {
+    if !alt {
         return None;
     }
     match key.code {
@@ -273,6 +286,34 @@ pub(crate) fn chord(key: &HostKey) -> Option<Chord> {
         KeyCode::Char('q') => Some(Chord::Close),
         _ => None,
     }
+}
+
+/// The rename-popup key a key-down is, if the popup understands it.
+pub(crate) fn rename_key(key: &HostKey) -> Option<RenameKey> {
+    if !key.down {
+        return None;
+    }
+    let (ctrl, alt, shift) = (key.ctrl(), key.alt(), key.shift());
+    Some(match key.code {
+        KeyCode::Enter if !ctrl && !alt => RenameKey::Enter,
+        KeyCode::Esc => RenameKey::Esc,
+        KeyCode::Backspace if ctrl && !alt => RenameKey::DeleteWordBack,
+        KeyCode::Backspace => RenameKey::Backspace,
+        KeyCode::Delete => RenameKey::Delete,
+        KeyCode::Left if ctrl && !alt => RenameKey::WordLeft,
+        KeyCode::Right if ctrl && !alt => RenameKey::WordRight,
+        KeyCode::Left if shift && !ctrl && !alt => RenameKey::SelectLeft,
+        KeyCode::Right if shift && !ctrl && !alt => RenameKey::SelectRight,
+        KeyCode::Left => RenameKey::Left,
+        KeyCode::Right => RenameKey::Right,
+        KeyCode::Home => RenameKey::Home,
+        KeyCode::End => RenameKey::End,
+        KeyCode::Char('a') if ctrl && !alt => RenameKey::SelectAll,
+        KeyCode::Char('u') if ctrl && !alt => RenameKey::Clear,
+        KeyCode::Char('w') if ctrl && !alt => RenameKey::DeleteWordBack,
+        KeyCode::Char('v') if ctrl && !alt => RenameKey::Paste,
+        _ => RenameKey::Char(key.text?),
+    })
 }
 
 /// The picker key a key-down is, if the picker understands it.
@@ -334,6 +375,7 @@ mod tests {
 
     const IDLE: HostView = HostView {
         confirm_open: false,
+        rename_open: false,
         picker_open: false,
         active_disconnected: false,
         active_ssh: false,
@@ -352,6 +394,11 @@ mod tests {
         assert_eq!(chord(&rec(0x25, 0, LEFT_ALT)), Some(Chord::Prev));
         assert_eq!(chord(&rec(0x27, 0, RIGHT_ALT)), Some(Chord::Next));
         assert_eq!(chord(&rec(0x4E, 'n' as u16, LEFT_ALT)), Some(Chord::New));
+        assert_eq!(chord(&rec(0x52, 0, LEFT_CTRL | LEFT_ALT)), Some(Chord::Rename));
+        assert_eq!(chord(&rec(0x52, 0x12, LEFT_CTRL | LEFT_ALT)), Some(Chord::Rename));
+        assert_eq!(chord(&rec(0x52, 'r' as u16, LEFT_CTRL | LEFT_ALT)), Some(Chord::Rename));
+        assert_eq!(chord(&rec(0x52, 0, LEFT_CTRL | LEFT_ALT | SHIFT)), None);
+        assert_eq!(chord(&rec(0x4E, 0, LEFT_CTRL | LEFT_ALT)), None);
         assert_eq!(chord(&rec(0x54, 't' as u16, LEFT_ALT)), Some(Chord::NewShell));
         assert_eq!(chord(&rec(0x54, 'T' as u16, LEFT_ALT | SHIFT)), None);
         assert_eq!(chord(&rec(0x51, 'q' as u16, LEFT_ALT)), Some(Chord::Close));
@@ -382,12 +429,23 @@ mod tests {
 
     #[test]
     fn altgr_and_plain_keys_are_not_chords() {
-        assert_eq!(chord(&rec(0x4E, 'n' as u16, RIGHT_ALT | LEFT_CTRL)), None);
+        // AltGr+R typing '®' (US-Intl) or '¶' stays text, never Rename.
+        for ch in ['®', '¶'] {
+            let k = rec(0x52, ch as u16, RIGHT_ALT | LEFT_CTRL);
+            assert_eq!(chord(&k), None);
+            assert_eq!(k.text, Some(ch));
+            assert_eq!(route(&IDLE, &k), HostRoute::Forward);
+        }
         // AltGr+Q is '@' on German layouts: text, not quit.
         let at = rec(0x51, '@' as u16, RIGHT_ALT | LEFT_CTRL);
         assert_eq!(chord(&at), None);
         assert_eq!(at.text, Some('@'));
         assert_eq!(route(&IDLE, &at), HostRoute::Forward);
+        // Other Ctrl+Alt letters are not host chords either.
+        assert_eq!(chord(&rec(0x4E, 0, LEFT_CTRL | LEFT_ALT)), None);
+        assert_eq!(chord(&rec(0x54, 0, LEFT_CTRL | LEFT_ALT)), None);
+        assert_eq!(chord(&rec(0x51, 0, LEFT_CTRL | LEFT_ALT)), None);
+        assert_eq!(chord(&rec(0x52, 'r' as u16, 0)), None);
         assert_eq!(chord(&rec(0x4E, 'n' as u16, 0)), None);
         assert_eq!(chord(&rec(0x51, 'q' as u16, 0)), None);
         assert_eq!(chord(&rec(0x25, 0, 0)), None);
@@ -401,6 +459,9 @@ mod tests {
             (rec(0x25, 0, LEFT_ALT), ev(KeyCode::Left, alt)),
             (rec(0x27, 0, LEFT_ALT | SHIFT), ev(KeyCode::Right, alt | shift)),
             (rec(0x4E, 'n' as u16, LEFT_ALT), ev(KeyCode::Char('n'), alt)),
+            (rec(0x52, 0, LEFT_CTRL | LEFT_ALT), ev(KeyCode::Char('r'), ctrl | alt)),
+            (rec(0x52, 0x12, LEFT_CTRL | LEFT_ALT), ev(KeyCode::Char('r'), ctrl | alt)),
+            (rec(0x52, 0, LEFT_CTRL | LEFT_ALT | SHIFT), ev(KeyCode::Char('R'), ctrl | alt | shift)),
             (rec(0x4E, 'N' as u16, LEFT_ALT | SHIFT), ev(KeyCode::Char('N'), alt)),
             (rec(0x54, 't' as u16, LEFT_ALT), ev(KeyCode::Char('t'), alt)),
             (rec(0x4A, 'j' as u16, LEFT_ALT), ev(KeyCode::Char('j'), alt)),
@@ -426,6 +487,37 @@ mod tests {
         assert_eq!(esc, HostRoute::Confirm(false));
         // A bare modifier neither answers nor is swallowed.
         assert_eq!(route(&guard, &rec(0x10, 0, SHIFT)), HostRoute::Drop);
+
+        // The rename popup: editing keys and plain/AltGr text work, chords drop.
+        let rename = HostView { rename_open: true, ..IDLE };
+        assert_eq!(
+            same_route(rename, rec(0x0D, 13, 0), ev(KeyCode::Enter, KeyModifiers::NONE)),
+            HostRoute::Rename(RenameKey::Enter)
+        );
+        assert_eq!(
+            same_route(rename, rec(0x1B, 0x1B, 0), ev(KeyCode::Esc, KeyModifiers::NONE)),
+            HostRoute::Rename(RenameKey::Esc)
+        );
+        assert_eq!(
+            same_route(rename, rec(0x41, 1, LEFT_CTRL), ev(KeyCode::Char('a'), ctrl)),
+            HostRoute::Rename(RenameKey::SelectAll)
+        );
+        assert_eq!(
+            same_route(rename, rec(0x55, 21, LEFT_CTRL), ev(KeyCode::Char('u'), ctrl)),
+            HostRoute::Rename(RenameKey::Clear)
+        );
+        assert_eq!(
+            same_route(rename, rec(0x25, 0, LEFT_CTRL), ev(KeyCode::Left, ctrl)),
+            HostRoute::Rename(RenameKey::WordLeft)
+        );
+        assert_eq!(
+            same_route(rename, rec(0x4E, 'n' as u16, LEFT_ALT), ev(KeyCode::Char('n'), alt)),
+            HostRoute::Drop
+        );
+        assert_eq!(
+            route(&rename, &rec(0x32, '@' as u16, RIGHT_ALT | LEFT_CTRL)),
+            HostRoute::Rename(RenameKey::Char('@'))
+        );
 
         // The picker: Ctrl+T (with or without Shift) switches mode; Alt+letter
         // types nothing; AltGr symbols are text.
@@ -466,16 +558,22 @@ mod tests {
     }
 
     #[test]
-    fn precedence_is_guard_picker_chord_disconnected_paste_forward() {
+    fn precedence_is_guard_rename_picker_chord_disconnected_paste_forward() {
         let alt_q = rec(0x51, 'q' as u16, LEFT_ALT);
-        // The guard wins over a chord, the picker over a chord.
-        let guard = HostView { confirm_open: true, picker_open: true, ..IDLE };
+        let ctrl_alt_r = rec(0x52, 0, LEFT_CTRL | LEFT_ALT);
+        // The guard wins over rename/picker/chord; rename wins over picker/chord.
+        let guard = HostView { confirm_open: true, rename_open: true, picker_open: true, ..IDLE };
         assert_eq!(route(&guard, &alt_q), HostRoute::Confirm(false));
+        let rename = HostView { rename_open: true, picker_open: true, ..IDLE };
+        assert_eq!(route(&rename, &alt_q), HostRoute::Drop);
+        assert_eq!(route(&rename, &ctrl_alt_r), HostRoute::Drop);
         let picker = HostView { picker_open: true, ..IDLE };
         assert_eq!(route(&picker, &alt_q), HostRoute::Drop);
-        // A chord works in a disconnected tab.
+        assert_eq!(route(&picker, &ctrl_alt_r), HostRoute::Drop);
+        // A chord works in a disconnected tab (including Rename).
         let gone = HostView { active_disconnected: true, active_ssh: true, ..IDLE };
         assert_eq!(route(&gone, &alt_q), HostRoute::Chord(Chord::Close));
+        assert_eq!(route(&gone, &ctrl_alt_r), HostRoute::Chord(Chord::Rename));
         // A disconnected SSH tab takes no clipboard paste.
         assert_eq!(route(&gone, &rec(0x56, 0x16, LEFT_CTRL)), HostRoute::Drop);
     }
@@ -485,11 +583,14 @@ mod tests {
         let enter = up(rec(0x0D, 13, 0));
         let swallowed = HostView { keyup_swallowed: true, ..IDLE };
         assert_eq!(route(&swallowed, &enter), HostRoute::SwallowKeyUp);
+        assert_eq!(route(&HostView { rename_open: true, ..IDLE }, &enter), HostRoute::Drop);
         assert_eq!(route(&HostView { picker_open: true, ..IDLE }, &enter), HostRoute::Drop);
         assert_eq!(route(&HostView { active_disconnected: true, ..IDLE }, &enter), HostRoute::Drop);
         assert_eq!(route(&IDLE, &enter), HostRoute::Forward);
         // What the host acts on swallows its key-up; forwarding does not.
         assert!(HostRoute::Chord(Chord::New).takes_key());
+        assert!(HostRoute::Chord(Chord::Rename).takes_key());
+        assert!(HostRoute::Rename(RenameKey::Enter).takes_key());
         assert!(HostRoute::Confirm(false).takes_key());
         assert!(!HostRoute::Forward.takes_key());
         assert!(!HostRoute::Drop.takes_key());
@@ -498,6 +599,7 @@ mod tests {
     #[test]
     fn pastes_never_pass_a_dialog() {
         assert!(paste_goes_to_session(&IDLE));
+        assert!(!paste_goes_to_session(&HostView { rename_open: true, ..IDLE }));
         assert!(!paste_goes_to_session(&HostView { picker_open: true, ..IDLE }));
         assert!(!paste_goes_to_session(&HostView { confirm_open: true, ..IDLE }));
         assert!(!paste_goes_to_session(&HostView { active_disconnected: true, ..IDLE }));

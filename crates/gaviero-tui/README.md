@@ -111,6 +111,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Alt+Shift+Left/Right or Alt+J/K (`--sessions` host) | Move the current tab one place left / right (stops at the ends; the order is kept for the next start). Use Alt+J/K where Alt+Shift does not arrive (an Alt+Shift keyboard-layout toggle) |
 | Alt+N (`--sessions` host) | New session picker; Ctrl+T in the picker switches Local / SSH (`host` or `host:/path`) / Shell (a shell tab in the chosen folder) |
 | Alt+T (`--sessions` host) | New shell tab in the current tab's folder |
+| Ctrl+Alt+R (`--sessions` host) | Rename the active tab in a small popup; once renamed, the name stays locked (never changed by `cd`, SSH folder reports, reconnects, restarts, or reopening) |
 | Ctrl+V (SSH tab, `--sessions` host) | Paste this machine's clipboard into the remote session |
 | Alt+Q (`--sessions` host) | Close the active tab and end its gaviero (or click the `x` on a tab; asks first when work is in progress) |
 | Ctrl+Q (`--sessions` host) | Quit the host; every tab reopens next start (asks first when work is in progress) |
