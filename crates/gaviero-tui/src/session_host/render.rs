@@ -55,14 +55,16 @@ const SHELL_RUNNING: Color = GREEN;
 const SHELL_WAITING: Color = YELLOW;
 const SHELL_DONE: Color = BLUE;
 
-/// Every tab's label; a shell tab (its label already starts with
-/// `shell::SHELL_MARK`) is drawn in its own teal, not the host palette.
+/// Every tab's label, marked modified (the editor tabs' `●` before it) while
+/// its gaviero reports files not saved; a shell tab (its label already
+/// starts with `shell::SHELL_MARK`) is drawn in its own teal, not the host
+/// palette.
 pub(crate) fn tab_titles(host: &Host) -> Vec<(String, bool, TabKind)> {
     host.sessions
         .iter()
         .map(|s| {
             let kind = if s.shell.is_some() { TabKind::Shell } else { TabKind::Normal };
-            (s.label.clone(), false, kind)
+            (s.label.clone(), s.unsaved, kind)
         })
         .collect()
 }

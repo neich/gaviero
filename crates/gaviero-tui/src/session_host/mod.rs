@@ -737,6 +737,7 @@ impl Host {
             let s = &mut self.sessions[i];
             s.disconnected = true;
             s.work.clear();
+            s.unsaved = false;
             s.activity = session::Activity::default();
             let label = s.label.clone();
             tracing::info!(id = s.id, "SSH connection lost");
