@@ -402,8 +402,9 @@ workflow w {
 - `wall` is `<digits>[s|m|h]` (no suffix = seconds). With
   `gaviero-cli --run-timeout`, the smaller of the two applies; the TUI, which
   passes no run timeout, gets the script's `wall`.
-- `usd` caps the cost providers report. Only `claude:` and `deepseek:` report
-  cost; `codex:`, `cursor:`, `ollama:` and `dsh:` report none, and a run with
+- `usd` caps the cost providers report. Only `claude:`, `deepseek:` and
+  `llamacpp:` (always $0, local) report cost; `codex:`, `cursor:`, `ollama:`
+  and `dsh:` report none, and a run with
   a `usd` budget names the units whose spend it cannot see when it starts.
   Spend includes every retry and every `best_of_N` attempt, and judges.
 - Both are checked before every dispatch — each agent, clone, worker, loop
