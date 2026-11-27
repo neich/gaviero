@@ -979,6 +979,174 @@ pub fn paint_preview_matches(
     }
 }
 
+/// A mouse selection in the rendered markdown preview. Positions are
+/// `(rendered line, char offset)` into [`ChatLine::text`]; the later end is
+/// exclusive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewSelection {
+    pub anchor: (usize, usize),
+    pub end: (usize, usize),
+    /// The button is still down.
+    pub dragging: bool,
+    /// The pointer left the cell it was pressed on: the release ends a
+    /// selection instead of clicking (link / heading fold).
+    pub moved: bool,
+    /// Screen cell the button went down on.
+    pub press: (u16, u16),
+    /// `(buffer, text width, rendered line count)` of the layout the positions
+    /// index into; a preview laid out differently drops the selection.
+    pub layout: (usize, usize, usize),
+}
+
+impl PreviewSelection {
+    /// `(start, end)` in document order.
+    pub fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.end {
+            (self.anchor, self.end)
+        } else {
+            (self.end, self.anchor)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.end
+    }
+}
+
+/// `(line, char)` under display column `visual_col` of rendered line `line`
+/// (0-based from where [`render_lines_to_buffer`] starts the text). Past the
+/// end of a line is its end; past the last line is the end of the last line.
+pub fn preview_text_pos(lines: &[ChatLine], line: usize, visual_col: usize) -> (usize, usize) {
+    let Some(last) = lines.len().checked_sub(1) else {
+        return (0, 0);
+    };
+    if line > last {
+        return (last, lines[last].text().chars().count());
+    }
+    let mut col = 0usize;
+    for (idx, ch) in lines[line].text().chars().enumerate() {
+        // Same width rule as `render_utils::write_text`, which drew the row.
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w > visual_col {
+            return (line, idx);
+        }
+        col += w;
+    }
+    (line, lines[line].text().chars().count())
+}
+
+/// The text a selection over rendered rows copies: from `start` to `end`
+/// (`(row, char)`, end exclusive), rows fetched through `row`.
+///
+/// Gives back the source text, not the layout: a soft-wrapped row is rejoined
+/// to the row above with the whitespace the wrap dropped, screen-only indents
+/// (code block, hanging list indent) are left out, and so are screen-only
+/// rows. Only real line breaks become newlines. Stops at the first row `row`
+/// does not have.
+pub fn selection_copy_text<'a>(
+    row: impl Fn(usize) -> Option<(String, Option<&'a RowCopy>)>,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Option<String> {
+    let ((sl, sc), (el, ec)) = (start, end);
+    if start == end {
+        return None;
+    }
+    let mut result = String::new();
+    let mut started = false;
+    for line_idx in sl..=el {
+        let Some((line, copy)) = row(line_idx) else {
+            break;
+        };
+        if copy.is_some_and(|c| c.omit) {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let skip = copy.map_or(0, |c| c.skip).min(chars.len());
+        let start_c = if line_idx == sl {
+            sc.min(chars.len())
+        } else {
+            0
+        }
+        .max(skip);
+        let end_c = if line_idx == el {
+            ec.min(chars.len())
+        } else {
+            chars.len()
+        };
+
+        if started {
+            match copy.and_then(|c| c.join.as_deref()) {
+                Some(sep) => result.push_str(sep),
+                None => result.push('\n'),
+            }
+        }
+        started = true;
+
+        if start_c < end_c {
+            result.extend(&chars[start_c..end_c]);
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// What a preview selection copies (see [`selection_copy_text`]).
+pub fn preview_selection_text(lines: &[ChatLine], selection: &PreviewSelection) -> Option<String> {
+    let (start, end) = selection.range();
+    selection_copy_text(
+        |i| lines.get(i).map(|l| (l.text(), Some(&l.copy))),
+        start,
+        end,
+    )
+}
+
+/// Paint the selected part of the preview rows visible in `area` (same origin
+/// as [`render_lines_to_buffer`]).
+pub fn paint_preview_selection(
+    lines: &[ChatLine],
+    selection: &PreviewSelection,
+    area: Rect,
+    buf: &mut Buffer,
+    scroll_top: usize,
+) {
+    if selection.is_empty() {
+        return;
+    }
+    let ((sl, sc), (el, ec)) = selection.range();
+    let x_start = area.x.saturating_add(1) as usize;
+    let first = sl.max(scroll_top);
+    let last = el.min((scroll_top + area.height as usize).saturating_sub(1));
+    for line_idx in first..=last {
+        let Some(line) = lines.get(line_idx) else {
+            break;
+        };
+        let y = area.y + (line_idx - scroll_top) as u16;
+        if y >= buf.area().bottom() {
+            break;
+        }
+        let from = if line_idx == sl { sc } else { 0 };
+        let to = if line_idx == el { ec } else { usize::MAX };
+        let mut x = x_start;
+        for (idx, ch) in line.text().chars().enumerate() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if idx >= to || x + w > area.right() as usize {
+                break;
+            }
+            if idx >= from {
+                for cx in x..x + w {
+                    let cell = &mut buf[(cx as u16, y)];
+                    cell.set_style(cell.style().bg(theme::SELECTION_BG));
+                }
+            }
+            x += w;
+        }
+    }
+}
+
 /// First rendered line whose heading slug matches `fragment`, if any.
 pub fn preview_line_for_fragment(lines: &[ChatLine], fragment: &str) -> Option<usize> {
     use crate::editor::markdown::{heading_slug, strip_heading_marker};
@@ -1214,6 +1382,88 @@ fn strip_inline_markers(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection(anchor: (usize, usize), end: (usize, usize)) -> PreviewSelection {
+        PreviewSelection {
+            anchor,
+            end,
+            dragging: false,
+            moved: true,
+            press: (0, 0),
+            layout: (0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn preview_text_pos_maps_columns_to_chars_and_clamps() {
+        let lines = vec![
+            ChatLine::single("a界b", Style::default()),
+            ChatLine::single("xy", Style::default()),
+        ];
+        assert_eq!(preview_text_pos(&lines, 0, 0), (0, 0));
+        // `界` is two columns wide: both of them are char 1.
+        assert_eq!(preview_text_pos(&lines, 0, 1), (0, 1));
+        assert_eq!(preview_text_pos(&lines, 0, 2), (0, 1));
+        assert_eq!(preview_text_pos(&lines, 0, 3), (0, 2));
+        assert_eq!(preview_text_pos(&lines, 0, 99), (0, 3), "past the end is the end");
+        assert_eq!(preview_text_pos(&lines, 7, 0), (1, 2), "past the last line");
+        assert_eq!(preview_text_pos(&[], 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn preview_selection_copies_source_text_in_either_direction() {
+        let text = "Some **bold** words\n\n```\n  indented code\n```";
+        let lines = format_chat_markdown(text, 40, Style::default());
+        let texts: Vec<String> = lines.iter().map(ChatLine::text).collect();
+        let word = texts.iter().position(|t| t.contains("bold")).unwrap();
+        let code = texts.iter().position(|t| t.contains("indented")).unwrap();
+
+        // Markdown markers are not part of the rendered text.
+        let start = texts[word].find("bold").unwrap();
+        let sel = selection((word, start), (word, start + 4));
+        assert_eq!(preview_selection_text(&lines, &sel).as_deref(), Some("bold"));
+        // Dragged backwards: same text.
+        let back = selection((word, start + 4), (word, start));
+        assert_eq!(preview_selection_text(&lines, &back).as_deref(), Some("bold"));
+
+        // The code block's screen indent is left out; its own indent stays.
+        let end = texts[code].chars().count();
+        let sel = selection((word, 0), (code, end));
+        assert_eq!(
+            preview_selection_text(&lines, &sel).as_deref(),
+            Some("Some bold words\n\n  indented code")
+        );
+        assert_eq!(preview_selection_text(&lines, &selection((0, 2), (0, 2))), None);
+    }
+
+    #[test]
+    fn preview_selection_rejoins_a_soft_wrapped_paragraph() {
+        let text = "one two three four five six seven eight";
+        let lines = format_chat_markdown(text, 12, Style::default());
+        assert!(lines.len() > 1, "the paragraph must wrap");
+        let last = lines.len() - 1;
+        let end = lines[last].text().chars().count();
+        let sel = selection((0, 0), (last, end));
+        assert_eq!(preview_selection_text(&lines, &sel).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn preview_selection_paints_only_the_selected_cells() {
+        let lines = vec![
+            ChatLine::single("hello", Style::default()),
+            ChatLine::single("world", Style::default()),
+        ];
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        render_lines_to_buffer(&lines, area, &mut buf, 0, Style::default(), None);
+        paint_preview_selection(&lines, &selection((0, 3), (1, 2)), area, &mut buf, 0);
+        let selected = |x: u16, y: u16| buf[(x, y)].style().bg == Some(theme::SELECTION_BG);
+        // Text starts one column in.
+        let row0: Vec<bool> = (0..7).map(|x| selected(x, 0)).collect();
+        assert_eq!(row0, [false, false, false, false, true, true, false]);
+        let row1: Vec<bool> = (0..7).map(|x| selected(x, 1)).collect();
+        assert_eq!(row1, [false, true, true, false, false, false, false]);
+    }
 
     #[test]
     fn copy_button_carries_the_exact_block_source() {

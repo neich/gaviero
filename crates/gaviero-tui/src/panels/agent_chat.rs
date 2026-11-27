@@ -3887,53 +3887,17 @@ impl AgentChatState {
     /// `[copy]` header) are left out.
     pub fn selected_chat_text(&self) -> Option<String> {
         let (sl, sc, el, ec) = self.text_selection_range()?;
-        if sl == el && sc == ec {
-            return None;
-        }
-        let mut result = String::new();
-        let mut started = false;
-        for line_idx in sl..=el {
-            if line_idx >= self.rendered_lines_cache.len() {
-                break;
-            }
-            let (ref line, _msg_idx) = self.rendered_lines_cache[line_idx];
-            // `line_cache.lines` and `rendered_lines_cache` are laid out together,
-            // row for row.
-            let copy = self.line_cache.lines.get(line_idx).map(|(_, _, copy)| copy);
-            if copy.is_some_and(|c| c.omit) {
-                continue;
-            }
-            let chars: Vec<char> = line.chars().collect();
-            let skip = copy.map_or(0, |c| c.skip).min(chars.len());
-            let start_c = if line_idx == sl {
-                sc.min(chars.len())
-            } else {
-                0
-            }
-            .max(skip);
-            let end_c = if line_idx == el {
-                ec.min(chars.len())
-            } else {
-                chars.len()
-            };
-
-            if started {
-                match copy.and_then(|c| c.join.as_deref()) {
-                    Some(sep) => result.push_str(sep),
-                    None => result.push('\n'),
-                }
-            }
-            started = true;
-
-            if start_c < end_c {
-                result.extend(&chars[start_c..end_c]);
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        crate::panels::chat_markdown::selection_copy_text(
+            |i| {
+                let (line, _msg_idx) = self.rendered_lines_cache.get(i)?;
+                // `line_cache.lines` and `rendered_lines_cache` are laid out
+                // together, row for row.
+                let copy = self.line_cache.lines.get(i).map(|(_, _, copy)| copy);
+                Some((line.clone(), copy))
+            },
+            (sl, sc),
+            (el, ec),
+        )
     }
 
     /// Move to the previous message in browse mode.

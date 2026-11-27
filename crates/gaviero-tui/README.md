@@ -101,6 +101,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | F5 / F7 | Format buffer / toggle word wrap |
 | F10 / Shift+F10 | Fold block at cursor / fold all — or click the `▾` in the gutter |
 | F10 / Shift+F10 (markdown preview-only, Alt+P) | Fold the `#`–`###` section at the top of the preview / step the outline: `#` only → down to `##` → down to `###` → all expanded. Clicking a heading folds it in split view too |
+| Drag (markdown preview, split or preview-only) | Select rendered text; the release copies it and Ctrl+C copies it again. Soft-wrapped lines rejoin and screen-only indents are dropped, like a chat selection. Dragging past the top / bottom scrolls. A click without a drag still follows a link or folds a heading |
 | Ctrl+T / Ctrl+W | New tab / close tab |
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |

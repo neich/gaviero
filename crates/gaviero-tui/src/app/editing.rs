@@ -275,6 +275,11 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
         }
     }
 
+    // A preview selection lives until the user does something else.
+    if !matches!(action, Action::Copy) {
+        app.preview_selection = None;
+    }
+
     match action {
         Action::Copy => {
             app.clipboard_copy();
@@ -390,7 +395,13 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
     ensure_editor_cursor_visible(app);
 }
 
+/// Ctrl+C in the editor: a markdown-preview selection wins (it is the newest —
+/// any other click or editor key drops it), else the source selection.
 pub(super) fn clipboard_copy(app: &mut App) {
+    if let Some(text) = preview_selected_text(app) {
+        copy_with_status(app, &text);
+        return;
+    }
     let Some(buf) = app.buffers.get(app.active_buffer) else {
         return;
     };
@@ -398,9 +409,14 @@ pub(super) fn clipboard_copy(app: &mut App) {
     if text.is_empty() {
         return;
     }
+    copy_with_status(app, &text);
+}
+
+/// Put `text` on the clipboard and say how it got there.
+fn copy_with_status(app: &mut App, text: &str) {
     let n = text.chars().count();
     let suffix = if n == 1 { "" } else { "s" };
-    let msg = match app.set_clipboard(&text) {
+    let msg = match app.set_clipboard(text) {
         ClipboardResult::System => format!("Copied {} char{}", n, suffix),
         ClipboardResult::Osc52 => format!("Copied {} char{} (via terminal)", n, suffix),
         ClipboardResult::Unavailable => format!(
@@ -676,6 +692,114 @@ fn preview_heading_under_pointer(app: &App, col: u16, row: u16) -> Option<usize>
         .position(|h| h.start <= line && line < h.end)
 }
 
+/// `(rendered line, char)` under `(col, row)`, when that cell is inside the
+/// preview's text rows (scrollbar excluded by the caller).
+fn preview_text_pos_under_pointer(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let preview = app.layout.preview_area?;
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
+    if !inner.contains((col, row).into()) {
+        return None;
+    }
+    let line = app.preview_scroll() + (row - inner.y) as usize;
+    // Text starts one column in, like `chat_markdown::render_lines_to_buffer`.
+    let visual_col = col.saturating_sub(inner.x.saturating_add(1)) as usize;
+    Some(crate::panels::chat_markdown::preview_text_pos(
+        &app.preview_lines,
+        line,
+        visual_col,
+    ))
+}
+
+/// Left press on the preview text: start a (still empty) selection there.
+fn start_preview_selection(app: &mut App, col: u16, row: u16) {
+    let Some(pos) = preview_text_pos_under_pointer(app, col, row) else {
+        return;
+    };
+    let Some(preview) = app.layout.preview_area else {
+        return;
+    };
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
+    let layout = (
+        app.active_buffer,
+        super::render::preview_content_width(inner),
+        app.preview_lines.len(),
+    );
+    app.preview_selection = Some(crate::panels::chat_markdown::PreviewSelection {
+        anchor: pos,
+        end: pos,
+        dragging: true,
+        moved: false,
+        press: (col, row),
+        layout,
+    });
+}
+
+/// Drag with a preview selection in progress. Above or below the text the
+/// preview scrolls a line per event and the selection follows to the edge row.
+fn extend_preview_selection(app: &mut App, col: u16, row: u16) {
+    let Some(preview) = app.layout.preview_area else {
+        return;
+    };
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
+    if inner.is_empty() {
+        return;
+    }
+    let edge_row = if row < inner.y {
+        scroll_preview_lines(app, -1);
+        inner.y
+    } else if row >= inner.bottom() {
+        scroll_preview_lines(app, 1);
+        inner.bottom() - 1
+    } else {
+        row
+    };
+    let edge_col = col.clamp(inner.x, inner.right() - 1);
+    let Some(pos) = preview_text_pos_under_pointer(app, edge_col, edge_row) else {
+        return;
+    };
+    if let Some(sel) = app.preview_selection.as_mut() {
+        if (col, row) != sel.press {
+            sel.moved = true;
+        }
+        sel.end = pos;
+    }
+}
+
+/// Left release ending a preview press. Without movement it was a click: a
+/// link is followed, else a heading's section folds (links win, a heading can
+/// carry one). A drag copies what it selected and leaves it highlighted.
+fn end_preview_press(app: &mut App) {
+    let Some(sel) = app.preview_selection.as_mut() else {
+        return;
+    };
+    sel.dragging = false;
+    if !sel.moved {
+        let (col, row) = sel.press;
+        app.preview_selection = None;
+        if preview_href_under_pointer(app, col, row).is_none()
+            && let Some(idx) = preview_heading_under_pointer(app, col, row)
+        {
+            toggle_preview_fold(app, idx);
+            return;
+        }
+        follow_preview_link_at(app, col, row);
+        return;
+    }
+    match preview_selected_text(app) {
+        Some(text) => copy_with_status(app, &text),
+        None => app.preview_selection = None,
+    }
+}
+
+/// What the preview selection copies; `None` without a non-empty selection.
+fn preview_selected_text(app: &App) -> Option<String> {
+    let selection = app.preview_selection.as_ref()?;
+    if selection.is_empty() {
+        return None;
+    }
+    crate::panels::chat_markdown::preview_selection_text(&app.preview_lines, selection)
+}
+
 /// Collapse or expand the preview section `app.preview_headings[idx]`.
 fn toggle_preview_fold(app: &mut App, idx: usize) {
     let Some(heading) = app.preview_headings.get(idx).cloned() else {
@@ -766,6 +890,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Any press drops the preview selection; one inside the preview
+            // text starts a new one below.
+            app.preview_selection = None;
             if let Some(ref mut review) = app.diff_review
                 && app.layout.editor_area.contains((col, row).into())
                 && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
@@ -935,14 +1062,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
                     return;
                 }
-                // Links win over folding: a heading can carry a link.
-                if preview_href_under_pointer(app, col, row).is_none()
-                    && let Some(idx) = preview_heading_under_pointer(app, col, row)
-                {
-                    toggle_preview_fold(app, idx);
-                    return;
-                }
-                follow_preview_link_at(app, col, row);
+                // The press may start a text selection: a link or a heading
+                // fold acts on release, and only when the pointer did not move.
+                start_preview_selection(app, col, row);
                 return;
             }
             if app.layout.editor_area.contains((col, row).into()) {
@@ -1219,6 +1341,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if super::swarm_run::drag(app, col, row) {
                 return;
             }
+            if app.preview_selection.as_ref().is_some_and(|s| s.dragging) {
+                extend_preview_selection(app, col, row);
+                return;
+            }
             if app.chat_state.input_dragging {
                 if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
                     app.chat_state.extend_input_mouse_selection(ci);
@@ -1364,6 +1490,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     app.set_clipboard(&text);
                 }
                 app.terminal_selection.dragging = false;
+            }
+            if app.preview_selection.as_ref().is_some_and(|s| s.dragging) {
+                end_preview_press(app);
             }
             super::swarm_run::end_drag(app);
             if app.chat_state.input_dragging {
@@ -2512,6 +2641,7 @@ pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
         app.set_preview_scroll(0);
     }
     app.preview_synced_top = None;
+    app.preview_selection = None;
     clear_preview_link_hover(app);
 }
 
@@ -3165,6 +3295,126 @@ mod tests {
             wheel_target(Focus::Terminal, &hidden_term, None),
             WheelTarget::Hover
         );
+    }
+
+    // ── Markdown preview text selection ──────────────────────────
+
+    fn left(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    fn render_app(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Screen cell of the first `needle` inside the preview pane.
+    fn preview_cell_of(app: &App, screen: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let area = app.layout.preview_area.expect("preview on screen");
+        for y in area.y..area.bottom() {
+            let row: Vec<&str> = (area.x..area.right()).map(|x| screen[(x, y)].symbol()).collect();
+            let joined: String = row.concat();
+            if let Some(byte) = joined.find(needle) {
+                // Every cell before the match holds one single-width char.
+                let x = joined[..byte].chars().count() as u16;
+                return (area.x + x, y);
+            }
+        }
+        panic!("{needle:?} not in the preview");
+    }
+
+    #[test]
+    fn preview_drag_selects_rendered_text_and_copies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Title\n\nSome **alpha beta** gamma\n\n## Part\n\nbody\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        app.clipboard = None;
+        open_file(&mut app, &path);
+        app.focus = Focus::Editor;
+        app.set_preview_mode(MarkdownPreviewMode::PreviewOnly);
+        let screen = render_app(&mut app);
+        let (x, y) = preview_cell_of(&app, &screen, "alpha");
+
+        handle_mouse(&mut app, left(MouseEventKind::Down(MouseButton::Left), x, y));
+        handle_mouse(&mut app, left(MouseEventKind::Drag(MouseButton::Left), x + 10, y));
+        assert_eq!(preview_selected_text(&app).as_deref(), Some("alpha beta"));
+        handle_mouse(&mut app, left(MouseEventKind::Up(MouseButton::Left), x + 10, y));
+
+        assert_eq!(app.internal_clipboard, "alpha beta", "release copies the selection");
+        assert!(status_text(&app).starts_with("Copied 10 chars"), "{}", status_text(&app));
+        let sel = app.preview_selection.as_ref().expect("the selection stays on screen");
+        assert!(!sel.dragging);
+
+        let screen = render_app(&mut app);
+        assert_eq!(screen[(x, y)].bg, theme::SELECTION_BG);
+        assert_eq!(screen[(x + 9, y)].bg, theme::SELECTION_BG);
+        assert_ne!(screen[(x + 10, y)].bg, theme::SELECTION_BG);
+
+        // Ctrl+C copies the preview selection again, not the hidden source.
+        app.internal_clipboard.clear();
+        handle_editor_action(&mut app, Action::Copy);
+        assert_eq!(app.internal_clipboard, "alpha beta");
+
+        // Any other editor key drops it.
+        handle_editor_action(&mut app, Action::Escape);
+        assert!(app.preview_selection.is_none());
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn preview_drag_below_the_pane_scrolls_and_extends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.md");
+        let body: String = (0..80).map(|i| format!("line {i}\n\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let mut app = agent_edit_app(dir.path());
+        app.clipboard = None;
+        open_file(&mut app, &path);
+        app.focus = Focus::Editor;
+        app.set_preview_mode(MarkdownPreviewMode::PreviewOnly);
+        let screen = render_app(&mut app);
+        let (x, y) = preview_cell_of(&app, &screen, "line 0");
+        let below = app.layout.preview_area.unwrap().bottom();
+
+        handle_mouse(&mut app, left(MouseEventKind::Down(MouseButton::Left), x, y));
+        handle_mouse(&mut app, left(MouseEventKind::Drag(MouseButton::Left), x, below));
+        handle_mouse(&mut app, left(MouseEventKind::Drag(MouseButton::Left), x, below));
+
+        assert_eq!(app.preview_scroll(), 2, "one line per drag event");
+        let (_, end) = app.preview_selection.as_ref().unwrap().range();
+        assert_eq!(end.0, app.preview_scroll() + app.preview_viewport_lines - 1);
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn preview_click_without_drag_still_folds_a_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Title\n\nintro\n\n## Part\n\nbody\n").unwrap();
+        let mut app = agent_edit_app(dir.path());
+        app.clipboard = None;
+        open_file(&mut app, &path);
+        app.focus = Focus::Editor;
+        app.set_preview_mode(MarkdownPreviewMode::PreviewOnly);
+        let screen = render_app(&mut app);
+        let (x, y) = preview_cell_of(&app, &screen, "Part");
+
+        handle_mouse(&mut app, left(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(app.buffers[0].preview_folds.is_empty(), "the press alone does nothing yet");
+        handle_mouse(&mut app, left(MouseEventKind::Up(MouseButton::Left), x, y));
+
+        assert_eq!(app.buffers[0].preview_folds.len(), 1, "release on the same cell folds");
+        assert!(app.preview_selection.is_none());
+        assert!(app.internal_clipboard.is_empty(), "a click copies nothing");
+        cleanup_session(dir.path());
     }
 
     #[test]
