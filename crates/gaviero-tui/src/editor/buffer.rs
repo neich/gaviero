@@ -3301,7 +3301,13 @@ fn atomic_write_to_path(path: &Path, content: &[u8]) -> Result<()> {
         file.write_all(content)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    // The rename replaces the inode: keep the saved file's mode (e.g. `+x`).
+    if let Err(e) = gaviero_core::util::fs::copy_permissions_from_target(path, &tmp)
+        .and_then(|()| std::fs::rename(&tmp, path))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -4012,6 +4018,25 @@ mod tests {
         let reopened = Buffer::open(&path).unwrap();
         assert_eq!(reopened.text.to_string(), "new\n");
         assert!(!reopened.modified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut buf = Buffer::open(&path).unwrap();
+        buf.text = Rope::from_str("#!/bin/sh\necho hi\n");
+        buf.modified = true;
+        buf.save().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho hi\n");
     }
 
     #[test]

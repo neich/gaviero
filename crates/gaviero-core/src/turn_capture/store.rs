@@ -129,17 +129,46 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Write `bytes` to `path` through a sibling temp file and a rename, so a
-/// reader never observes a half-written file.
+/// reader never observes a half-written file. A replaced file keeps its
+/// permission bits; a new one is private (`0600` on Unix) — right for the
+/// capture's own records and blobs, which may hold sensitive file contents.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_via_temp(path, bytes, false, None)
+}
+
+/// [`atomic_write`] for a workspace file being restored. Its permission bits
+/// become `mode` when known (the pre-turn mode the baseline recorded), else
+/// those of the file it replaces, else the usual new-file mode
+/// (`0666 & !umask`) — never the private `0600`.
+pub fn restore_write(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    write_via_temp(path, bytes, true, mode)
+}
+
+fn write_via_temp(path: &Path, bytes: &[u8], public: bool, mode: Option<u32>) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent", path.display()))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".gaviero-tmp-")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".gaviero-tmp-");
+    #[cfg(unix)]
+    if public {
+        use std::os::unix::fs::PermissionsExt;
+        // Created through `open(2)`, so the umask applies as for any new file.
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    #[cfg(not(unix))]
+    let _ = public;
+    let mut tmp = builder
         .tempfile_in(parent)
         .with_context(|| format!("creating temp file in {}", parent.display()))?;
     std::io::Write::write_all(&mut tmp, bytes)
         .with_context(|| format!("writing temp file for {}", path.display()))?;
+    // The rename replaces the inode, so the mode must be set on the new one.
+    match mode {
+        Some(mode) => crate::util::fs::set_mode(tmp.path(), mode),
+        None => crate::util::fs::copy_permissions_from_target(path, tmp.path()),
+    }
+    .with_context(|| format!("setting permissions of {}", path.display()))?;
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("renaming into {}", path.display()))?;
@@ -175,5 +204,21 @@ mod tests {
         let p = dir.path().join("f");
         std::fs::write(&p, b"hello world").unwrap();
         assert_eq!(hash_file(&p).unwrap(), hash_bytes(b"hello world"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_replaced_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("run.sh");
+        std::fs::write(&p, "#!/bin/sh\necho agent\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        atomic_write(&p, b"#!/bin/sh\n").unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755);
+        assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\n");
     }
 }

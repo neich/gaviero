@@ -18,7 +18,7 @@ use crate::types::DiffHunk;
 
 use super::TurnCapture;
 use super::changeset::FileChange;
-use super::store::{atomic_write, hash_file};
+use super::store::{hash_file, restore_write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevertOutcome {
@@ -86,18 +86,21 @@ pub fn revert_file(cap: &TurnCapture, change: &FileChange, force: bool) -> Resul
         Some(b) => {
             let hash = b.sha256.as_deref().expect("revertible implies a hash");
             let bytes = cap.store().get(hash)?;
-            write_back(cap, &change.path, &bytes)?;
+            // The pre-turn mode too: a deleted script comes back executable.
+            write_back(cap, &change.path, &bytes, b.mode)?;
         }
     }
     Ok(RevertOutcome::Reverted)
 }
 
-fn write_back(cap: &TurnCapture, path: &Path, bytes: &[u8]) -> Result<()> {
+/// `mode`: the permission bits to give the file, `None` to keep the current
+/// file's (see [`restore_write`]).
+fn write_back(cap: &TurnCapture, path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    atomic_write(path, bytes)?;
+    restore_write(path, bytes, mode)?;
     cap.ledger().record(path, Some(bytes));
     Ok(())
 }
@@ -159,7 +162,8 @@ pub fn revert_hunks(
     }
     let after = stored_text(cap, change.after.as_ref()).expect("file_hunks checked");
     let content = splice(&after, &hunks, revert);
-    write_back(cap, &change.path, content.as_bytes())?;
+    // Partly reverted: the file stays the one the turn left, mode included.
+    write_back(cap, &change.path, content.as_bytes(), None)?;
     Ok(RevertOutcome::Reverted)
 }
 
