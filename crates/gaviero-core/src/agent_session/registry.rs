@@ -333,7 +333,7 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
         ContinuityMode::StatelessReplay => {
             if args.profile.provider == "codex" {
                 create_observed_codex_session(args)
-            } else if args.profile.provider == "deepseek" {
+            } else if args.profile.provider == "deepseek" || args.profile.provider == "llamacpp" {
                 Box::new(ToolAgentSession::new(args))
             } else {
                 Box::new(OllamaSession::new(args))

@@ -51,7 +51,7 @@ use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
 
 use self::client::DeepseekClient;
-use self::config::ApiClientConfig;
+use self::config::{ApiClientConfig, ApiDialect};
 use self::policy::ToolPolicy;
 use self::replay::{apply_replay_compaction, build_messages};
 use self::snapshot::TurnSnapshot;
@@ -138,6 +138,8 @@ pub struct ToolAgentSession {
     /// `AgentOptions::effort`, the host-resolved default for this session.
     /// `Turn::effort` overrides it per turn; thinking mode is never disabled.
     effort: String,
+    /// The server this session talks to, from `profile.provider`.
+    dialect: ApiDialect,
     #[allow(dead_code)] // Option-B writes are direct-to-disk; see the struct doc
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     cancel_token: CancellationToken,
@@ -155,9 +157,11 @@ pub struct ToolAgentSession {
 
 impl ToolAgentSession {
     /// Construct from the registry's [`SessionConstruction`]. Resolves the
-    /// DeepSeek [`ApiClientConfig`] (env/secrets key + default base_url) and
-    /// builds a [`DeepseekClient`]. Key-resolution failure is surfaced lazily on
-    /// the first turn so construction stays infallible (matches the other arms).
+    /// [`ApiClientConfig`] of the profile's dialect (`deepseek:` → env/secrets
+    /// key + api.deepseek.com; `llamacpp:` → `providers.llamacpp.baseUrl`,
+    /// optional key) and builds a [`DeepseekClient`]. Resolution failure is
+    /// surfaced lazily on the first turn so construction stays infallible
+    /// (matches the other arms).
     pub(super) fn new(args: SessionConstruction) -> Self {
         let SessionConstruction {
             write_gate,
@@ -170,7 +174,8 @@ impl ToolAgentSession {
             mcp_server,
             ..
         } = args;
-        let config = resolve_api_config(&workspace_root);
+        let dialect = ApiDialect::from_provider(&profile.provider).unwrap_or_default();
+        let config = resolve_api_config(&workspace_root, dialect);
         // Registry membership is *derived* from the tool surface rather than
         // answering "is Bash available?" a second time (Phase 3). Two
         // behaviour notes, both deliberate:
@@ -277,6 +282,7 @@ impl ToolAgentSession {
             profile,
             policy,
             effort,
+            dialect,
             write_gate,
             cancel_token,
             host_capture,
@@ -368,7 +374,7 @@ impl ToolAgentSession {
     }
 
     fn vision(&self) -> bool {
-        crate::swarm::backend::deepseek::deepseek_supports_vision(&self.model)
+        self.dialect.supports_vision(&self.model)
     }
 
     /// Assemble the user-facing prompt from the turn's planner selections.
@@ -409,12 +415,12 @@ impl AgentSession for ToolAgentSession {
             attachments::user_content(prompt, &turn.file_refs, self.vision()).await;
         let messages = build_messages(&system, turn.replay_history.as_ref(), user_content);
         // Per-turn effort, resolved the same way the ACP path resolves it:
-        // the turn's value wins over the session default. Thinking mode is
-        // always on, so an unset/`off`/`auto` effort becomes DeepSeek's `high`
-        // rather than nothing.
+        // the turn's value wins over the session default. DeepSeek's thinking
+        // mode is always on, so an unset/`off`/`auto` effort becomes its
+        // `high` rather than nothing; llama.cpp sends a level only when one
+        // was chosen, leaving the chat template's default otherwise.
         let effort = turn.effort.as_deref().unwrap_or(self.effort.as_str());
-        let reasoning_effort =
-            crate::swarm::backend::deepseek::deepseek_reasoning_effort(Some(effort));
+        let reasoning_effort = self.dialect.reasoning_effort(Some(effort));
         let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
         let ctx = ToolCtx {
             workspace_root: self.workspace_root.clone(),
@@ -434,7 +440,7 @@ impl AgentSession for ToolAgentSession {
             &ctx,
             self.observer.as_ref(),
             &self.model,
-            Some(reasoning_effort),
+            reasoning_effort,
             messages,
             &self.limits,
             &self.cancel_token,
@@ -488,8 +494,9 @@ impl AgentSession for ToolAgentSession {
     async fn close(self: Box<Self>) {}
 }
 
-/// The notice a UI shows when `deepseek:` cannot honour part of the
-/// configured tool surface, or `None` when it honours all of it.
+/// The notice a UI shows when an in-process tool-agent provider (`deepseek:`,
+/// `llamacpp:`) cannot honour part of the configured tool surface, or `None`
+/// when it honours all of it.
 ///
 /// `agent.availableTools` is the single source of truth for every provider,
 /// and Claude/Cursor honour names the in-process loop has no implementation
@@ -511,9 +518,8 @@ pub fn tool_agent_disclosure(
     workspace: &crate::workspace::Workspace,
     root: Option<&Path>,
 ) -> Option<String> {
-    if profile.provider != "deepseek" {
-        return None;
-    }
+    ApiDialect::from_provider(&profile.provider)?;
+    let provider = profile.provider.as_str();
     let permissions = crate::mcp::resolve_mcp_permissions(workspace, root);
     let context7_on = profile.context7_allowed
         && crate::mcp::resolve_context7_config(workspace, root).enabled
@@ -548,14 +554,14 @@ pub fn tool_agent_disclosure(
     let mut lines: Vec<String> = Vec::new();
     if !unsupported.is_empty() {
         lines.push(format!(
-            "deepseek runs gaviero's in-process tool loop, which has no equivalent for {} \
+            "{provider} runs gaviero's in-process tool loop, which has no equivalent for {} \
              (named in `agent.availableTools`); this agent cannot use them.",
             unsupported.join(", ")
         ));
     }
     if !profile.extra_servers_allowed && !extras.is_empty() {
         lines.push(format!(
-            "`mcp.extraServers` {} cannot be reached by deepseek.",
+            "`mcp.extraServers` {} cannot be reached by {provider}.",
             extras.join(", ")
         ));
     }
@@ -576,16 +582,27 @@ fn resolve_loop_limits(workspace_root: &Path) -> agent_loop::LoopLimits {
     agent_loop::LoopLimits::from_workspace(&ws, Some(workspace_root))
 }
 
-/// Resolve DeepSeek API config from the settings cascade + env/secrets.
+/// Resolve the API config of `dialect` from the settings cascade + env/secrets.
 ///
-/// `providers.deepseek.baseUrl` / `.pricing` resolve like every other key
-/// (folder → workspace → user `~/.gaviero/settings.json`), root-scoped the same
-/// way as [`resolve_loop_limits`]. The legacy snake_case `base_url` is still
-/// honoured when the camelCase key is absent at every level.
-pub(crate) fn resolve_api_config(workspace_root: &std::path::Path) -> Result<ApiClientConfig> {
+/// `providers.deepseek.baseUrl` / `.pricing` and `providers.llamacpp.baseUrl`
+/// resolve like every other key (folder → workspace → user
+/// `~/.gaviero/settings.json`), root-scoped the same way as
+/// [`resolve_loop_limits`]. The legacy snake_case `providers.deepseek.base_url`
+/// is still honoured when the camelCase key is absent at every level.
+pub(crate) fn resolve_api_config(
+    workspace_root: &std::path::Path,
+    dialect: ApiDialect,
+) -> Result<ApiClientConfig> {
     use crate::workspace::settings;
     let ws = crate::workspace::Workspace::single_folder(workspace_root.to_path_buf());
     let root = Some(workspace_root);
+    if dialect == ApiDialect::LlamaCpp {
+        let base_url = ws
+            .resolve_setting_opt(settings::PROVIDERS_LLAMACPP_BASE_URL, root)
+            .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+            .filter(|s| !s.is_empty());
+        return ApiClientConfig::resolve_llamacpp(workspace_root, base_url);
+    }
     let base_url = ws
         .resolve_setting_opt(settings::PROVIDERS_DEEPSEEK_BASE_URL, root)
         .or_else(|| ws.resolve_setting_opt("providers.deepseek.base_url", root))
@@ -632,7 +649,7 @@ mod tests {
                 "pricing": { "cache_hit_in": 1.0, "cache_miss_in": 2.0, "out": 3.0 }
             } } }"#,
         );
-        let cfg = resolve_api_config(dir.path()).unwrap();
+        let cfg = resolve_api_config(dir.path(), ApiDialect::Deepseek).unwrap();
         assert_eq!(cfg.base_url, "https://gateway.example/v1");
         let pricing = cfg.pricing.expect("pricing override");
         assert_eq!(pricing.out, 3.0);
@@ -643,7 +660,7 @@ mod tests {
         let dir = workspace_with(
             r#"{ "providers": { "deepseek": { "base_url": "https://legacy.example" } } }"#,
         );
-        let cfg = resolve_api_config(dir.path()).unwrap();
+        let cfg = resolve_api_config(dir.path(), ApiDialect::Deepseek).unwrap();
         assert_eq!(cfg.base_url, "https://legacy.example");
         assert!(cfg.pricing.is_none());
     }
@@ -734,8 +751,40 @@ mod tests {
     #[test]
     fn absent_provider_keys_fall_back_to_defaults() {
         let dir = workspace_with("{}");
-        let cfg = resolve_api_config(dir.path()).unwrap();
+        let cfg = resolve_api_config(dir.path(), ApiDialect::Deepseek).unwrap();
         assert_eq!(cfg.base_url, config::DEFAULT_DEEPSEEK_BASE_URL);
         assert!(cfg.pricing.is_none());
+        let cfg = resolve_api_config(dir.path(), ApiDialect::LlamaCpp).unwrap();
+        assert_eq!(cfg.base_url, config::DEFAULT_LLAMACPP_BASE_URL);
+        assert_eq!(cfg.dialect, ApiDialect::LlamaCpp);
+    }
+
+    /// `providers.llamacpp.baseUrl` points the session at a server elsewhere;
+    /// the workspace's DeepSeek key (`workspace_with` writes one) is not sent
+    /// to it.
+    #[test]
+    fn llamacpp_base_url_resolves_through_the_cascade() {
+        let dir = workspace_with(
+            r#"{ "providers": { "llamacpp": { "baseUrl": "http://gpu-box:8081/v1/" } } }"#,
+        );
+        let cfg = resolve_api_config(dir.path(), ApiDialect::LlamaCpp).unwrap();
+        assert_eq!(cfg.base_url, "http://gpu-box:8081/v1");
+        if std::env::var(config::LLAMACPP_API_KEY_ENV).is_err() {
+            assert_eq!(cfg.api_key.expose(), "", "a DeepSeek key must not leak to llama.cpp");
+        }
+    }
+
+    #[test]
+    fn llamacpp_gets_the_tool_surface_disclosure() {
+        let dir = workspace_with("{}");
+        let ws = crate::workspace::Workspace::single_folder(dir.path().to_path_buf());
+        let profile = crate::context_planner::build_provider_profile(
+            &crate::context_planner::ModelSpec::parse("llamacpp:qwen3.8-27b"),
+            &crate::context_planner::RuntimeConfig::default(),
+        );
+        let notice =
+            tool_agent_disclosure(&["WebFetch".to_string()], &profile, &ws, Some(dir.path()))
+                .expect("WebFetch has no in-process equivalent");
+        assert!(notice.starts_with("llamacpp runs gaviero's in-process tool loop"), "{notice}");
     }
 }

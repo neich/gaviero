@@ -39,6 +39,7 @@ const PROVIDER_SPECS: &[&str] = &[
     "dsh:x",
     "agy:x",
     "deepseek:x",
+    "llamacpp:x",
     "ollama:x",
 ];
 
@@ -143,14 +144,14 @@ fn provider_rows_and_the_vendor_lookup_share_one_source() {
     }
 
     // Exactly the providers that never receive a synthesized config file:
-    // the two in-process loops, and dsh (an ACP session, not a config file).
+    // the in-process loops, and dsh/agy (ACP sessions, not config files).
     let mut vendorless: Vec<String> = Provider::ALL
         .iter()
         .filter(|p| p.synth_vendor().is_none())
         .map(|p| format!("{p:?}"))
         .collect();
     vendorless.sort();
-    assert_eq!(vendorless, vec!["Agy", "Deepseek", "Dsh", "Ollama"]);
+    assert_eq!(vendorless, vec!["Agy", "Deepseek", "Dsh", "LlamaCpp", "Ollama"]);
 
     // A vendor the table does not name must not be silently muted (§2.9).
     assert!(McpCapabilities::for_synth_vendor("not-a-vendor").context7);
@@ -197,6 +198,12 @@ fn declared_enforcement_and_prompt_axes_match_the_real_mechanism() {
         // Registry membership; decision 3 gave both a multi-choice ask tool.
         (
             "deepseek:x",
+            ToolEnforcement::RegistryMembership,
+            PromptKind::MultiChoice,
+        ),
+        // The same in-process loop, against a local llama-server.
+        (
+            "llamacpp:x",
             ToolEnforcement::RegistryMembership,
             PromptKind::MultiChoice,
         ),

@@ -50,6 +50,7 @@ pub fn tier_router_for_model(fallback_model: &str, ollama_base_url: Option<&str>
         || shared::is_dsh_model(fallback_model)
         || shared::is_agy_model(fallback_model)
         || shared::is_deepseek_model(fallback_model)
+        || shared::is_llamacpp_model(fallback_model)
     {
         // API-backed like Claude. Propagate to both tier defaults so
         // work units without an explicit `model` override stay on the
@@ -4362,8 +4363,11 @@ fn warn_unreported_budget_costs(plan: &CompiledPlan, observer: &dyn SwarmObserve
     if plan.budget.as_ref().and_then(|b| b.usd).is_none() {
         return;
     }
+    // `llamacpp:` reports its true cost: zero (local inference).
     let reports_cost = |model: Option<&str>| {
-        model.is_some_and(|m| m.starts_with("claude:") || m.starts_with("deepseek:"))
+        model.is_some_and(|m| {
+            m.starts_with("claude:") || m.starts_with("deepseek:") || m.starts_with("llamacpp:")
+        })
     };
     let mut ids: Vec<String> = plan
         .work_units_unordered()
@@ -4378,7 +4382,7 @@ fn warn_unreported_budget_costs(plan: &CompiledPlan, observer: &dyn SwarmObserve
         return;
     }
     let msg = format!(
-        "budget: cost is not reported for: {} — usd counts claude: and deepseek: only",
+        "budget: cost is not reported for: {} — usd counts claude:, deepseek: and llamacpp: only",
         ids.join(", ")
     );
     tracing::warn!("{msg}");

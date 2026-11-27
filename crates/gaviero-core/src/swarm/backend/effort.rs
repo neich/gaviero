@@ -7,6 +7,7 @@
 //! | Codex | the installed CLI's catalog, else [`super::codex`]'s static table |
 //! | Claude | Claude Code's model-config docs — the CLI lists no per-model data |
 //! | DeepSeek / dsh | `GET /models` (`supported_levels`) |
+//! | llama.cpp | the levels llama-server's Qwen templates accept ([`super::llamacpp`]) |
 //! | Cursor | none: effort is part of the model id |
 //! | Ollama / local | none: effort is not used |
 //!
@@ -14,7 +15,7 @@
 //! starts ([`effort_problem`], from `pipeline::preflight_plan_models` and
 //! fan-out), and chat refuses or moves the level ([`fit_effort`]).
 
-use super::{codex, deepseek};
+use super::{codex, deepseek, llamacpp};
 
 /// Reasoning levels, weakest first.
 const LEVEL_LADDER: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -56,6 +57,7 @@ pub fn effort_support(model_spec: &str) -> EffortSupport {
         "codex" | "codex-app-server" => EffortSupport::Levels(codex::codex_effort_levels(model)),
         "claude" => claude_support(model),
         "deepseek" | "dsh" => EffortSupport::Levels(owned(&["low", "high", "max"])),
+        "llamacpp" => EffortSupport::Levels(owned(llamacpp::LLAMACPP_EFFORT_LEVELS)),
         "cursor" => EffortSupport::InModelId,
         // agy ids carry the level (`gemini-4-neon-xhigh`); its `thought_level`
         // option is never sent.
@@ -344,5 +346,19 @@ mod tests {
         assert_eq!(effort_summary("dsh:deepseek-flash"), "low, high, max");
         assert!(effort_summary("cursor:composer-2.5").contains("model id"));
         assert!(effort_summary("ollama:llama3").contains("does not use"));
+    }
+
+    /// `max` / `minimal` would be an HTTP 400 from llama-server's Qwen
+    /// templates, so a script asking for them is refused and chat moves the
+    /// level onto one the server takes.
+    #[test]
+    fn llamacpp_offers_only_the_levels_llama_server_accepts() {
+        let spec = "llamacpp:qwen3.8-27b";
+        assert_eq!(levels(spec), ["low", "medium", "high"]);
+        assert_eq!(effort_problem(spec, "medium"), None);
+        assert!(effort_problem(spec, "max").is_some());
+        assert_eq!(fit_effort(spec, "max"), "high");
+        assert_eq!(fit_effort(spec, "minimal"), "low");
+        assert_eq!(fit_effort(spec, "auto"), "auto");
     }
 }

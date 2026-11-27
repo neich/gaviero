@@ -10,7 +10,7 @@ use super::{
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
-    "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh", "agy",
+    "claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh", "agy", "llamacpp",
 ];
 
 /// DeepSeek model ids the picker offers (without the `deepseek:` / `dsh:`
@@ -405,6 +405,12 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
+    if let Some(model) = trimmed.strip_prefix("llamacpp:") {
+        return BackendConfig::LlamaCpp {
+            model: model.trim().to_string(),
+        };
+    }
+
     if let Some(model) = trimmed.strip_prefix("dsh:") {
         return BackendConfig::Dsh {
             model: model.trim().to_string(),
@@ -461,7 +467,9 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     match prefix {
         // agy's catalog comes from the CLI itself (an ACP handshake), so any
         // non-empty id is passed through; `agy acp` rejects an unknown one.
-        "ollama" | "local" | "claude" | "codex" | "cursor" | "agy" => {
+        // `llamacpp:` sends the id as the request's `model`, which a
+        // single-model llama-server ignores and a router/llama-swap resolves.
+        "ollama" | "local" | "claude" | "codex" | "cursor" | "agy" | "llamacpp" => {
             if remainder.trim().is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
@@ -504,7 +512,8 @@ fn model_id_has_nested_provider(model: &str) -> bool {
 
 /// Static (discovery-independent) model ids for a provider, without the
 /// provider prefix. Providers whose model lists come only from CLI discovery
-/// (cursor, ollama, local) have no static entries.
+/// (cursor, ollama, local) or from the user's own server (llamacpp) have no
+/// static entries.
 fn static_model_ids(provider: &str) -> Vec<String> {
     match provider {
         "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
@@ -719,6 +728,10 @@ pub fn is_deepseek_model(model_spec: &str) -> bool {
 
 pub fn is_dsh_model(model_spec: &str) -> bool {
     model_spec.trim().starts_with("dsh:")
+}
+
+pub fn is_llamacpp_model(model_spec: &str) -> bool {
+    model_spec.trim().starts_with("llamacpp:")
 }
 
 pub fn is_agy_model(model_spec: &str) -> bool {
@@ -1697,6 +1710,32 @@ mod tests {
         // The colon-bearing Ollama form is NOT a nested prefix and stays valid.
         validate_model_spec("ollama:qwen2.5-coder:7b").unwrap();
         validate_model_spec("local:qwen2.5-coder:14b").unwrap();
+    }
+
+    /// `llamacpp:` takes any non-empty id — llama-server's `--alias`, a GGUF
+    /// path (what a server without `--alias` reports in `/v1/models`), or a
+    /// llama-swap model name — and routes to the in-process tool agent, not
+    /// to Ollama's `/api/chat`, which llama-server does not serve.
+    #[test]
+    fn llamacpp_specs_validate_and_route_to_the_tool_agent() {
+        for spec in [
+            "llamacpp:qwen3.8-27b",
+            "llamacpp:/models/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            "llamacpp:default",
+        ] {
+            validate_model_spec(spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert!(is_llamacpp_model(spec));
+            assert!(!is_ollama_model(spec) && !is_deepseek_model(spec));
+        }
+        assert!(validate_model_spec("llamacpp:").is_err());
+        assert!(validate_model_spec("llamacpp:deepseek:x").is_err(), "nested prefix");
+        assert_eq!(
+            backend_config_for_model("llamacpp:qwen3.8-27b", None),
+            BackendConfig::LlamaCpp {
+                model: "qwen3.8-27b".into()
+            }
+        );
+        assert!(model_spec_completions("llam", &[]).contains(&"llamacpp:".to_string()));
     }
 
     // ── Tagged-prompt format tests ────────────────────────────────

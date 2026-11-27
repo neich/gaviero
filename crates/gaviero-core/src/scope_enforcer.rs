@@ -464,6 +464,25 @@ impl SensitivePolicy {
         self.root.as_deref()
     }
 
+    /// `path` relative to [`Self::root`] (slash-separated) when it lies under
+    /// it, else `path` itself. Scope entries (`scope { owned ["src/"] }`) and
+    /// `sensitivePaths.allow` globs are workspace-relative, but some callers —
+    /// the in-process tool agent — check the absolute path they confined.
+    fn workspace_relative(&self, path: &Path) -> String {
+        match self.root() {
+            Some(root) => relative_slash(path, root),
+            None => slash_path(path),
+        }
+    }
+
+    /// Whether a workspace-relative `pattern` names `path`, given either
+    /// relative or absolute — the same both-forms match [`Self::read_refusal`]
+    /// applies to `sensitivePaths.allow`.
+    fn matches_relative(&self, pattern: &str, path: &Path) -> bool {
+        crate::path_pattern::matches(pattern, &path.to_string_lossy())
+            || crate::path_pattern::matches(pattern, &self.workspace_relative(path))
+    }
+
     /// `Some(reason)` when an agent must not read `path`.
     ///
     /// Order: the hard floor (never exemptable), then
@@ -514,7 +533,7 @@ impl SensitivePolicy {
     /// This is the whole decision — callers log the reason and drop the write.
     pub fn refusal(&self, path: &Path) -> Option<String> {
         let entry = sensitive_match(path)?;
-        if self.allows(path) {
+        if self.allows(path) || self.allows(Path::new(&self.workspace_relative(path))) {
             return None;
         }
         Some(format!(
@@ -563,7 +582,14 @@ impl ScopeEnforcer {
             });
         }
 
-        if self.scope.owned_paths.is_empty() || self.scope.is_owned(&path.to_string_lossy()) {
+        // Owned entries are workspace-relative; `path` may be absolute.
+        if self.scope.owned_paths.is_empty()
+            || self
+                .scope
+                .owned_paths
+                .iter()
+                .any(|owned| self.sensitive.matches_relative(owned, path))
+        {
             return Ok(());
         }
 
@@ -594,14 +620,14 @@ impl ScopeEnforcer {
             return Ok(());
         };
 
-        let path_str = path.to_string_lossy();
         // Allow if explicitly listed in owned_paths or read_only_paths
+        // (workspace-relative entries; `path` may be absolute).
         let explicitly_allowed = self
             .scope
             .owned_paths
             .iter()
             .chain(self.scope.read_only_paths.iter())
-            .any(|p| crate::path_pattern::matches(p, &path_str));
+            .any(|p| self.sensitive.matches_relative(p, path));
 
         if explicitly_allowed {
             return Ok(());
@@ -773,6 +799,37 @@ mod tests {
                 .is_ok()
         );
         assert!(e.check_write(Path::new(".env")).is_err());
+    }
+
+    /// Scope entries and `sensitivePaths.allow` globs are workspace-relative;
+    /// a caller passing the absolute path (the in-process tool agent, after
+    /// `confine`) must get the same answers as one passing the relative path.
+    #[test]
+    fn workspace_relative_entries_match_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = SensitivePolicy::resolve(root);
+        let scope = FileScope {
+            owned_paths: vec!["calc.py".into(), "src/".into()],
+            read_only_paths: vec!["config/.env.local".into()],
+            ..FileScope::default()
+        };
+        let e = ScopeEnforcer::with_policy(scope, policy);
+        for rel in ["calc.py", "src/a/b.rs"] {
+            assert!(e.check_write(Path::new(rel)).is_ok(), "{rel}");
+            assert!(e.check_write(&root.join(rel)).is_ok(), "absolute {rel}");
+        }
+        for rel in ["other.py", "srcx/a.rs", "lib/calc.py"] {
+            assert!(e.check_write(Path::new(rel)).is_err(), "{rel}");
+            assert!(e.check_write(&root.join(rel)).is_err(), "absolute {rel}");
+        }
+        // A sensitive file named in the read-only scope is readable either way.
+        assert!(e.check_read(Path::new("config/.env.local")).is_ok());
+        assert!(e.check_read(&root.join("config/.env.local")).is_ok());
+        assert!(e.check_read(&root.join(".env.local")).is_err());
+        // Outside the root, nothing is relativized, so nothing is widened.
+        let outside = root.parent().unwrap().join("calc.py");
+        assert!(e.check_write(&outside).is_err());
     }
 
     #[test]

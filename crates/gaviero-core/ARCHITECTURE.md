@@ -146,10 +146,11 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `cursor:<name>` | `CursorBackend` |
 | `ollama:<name>` / `local:<name>` | `OllamaStreamBackend` |
 | `deepseek:<name>` | `DeepseekBackend` → [`tool_agent`](src/agent_session/tool_agent) |
+| `llamacpp:<name>` | `DeepseekBackend::llamacpp` → [`tool_agent`](src/agent_session/tool_agent) (`ApiDialect::LlamaCpp`, local `llama-server`) |
 | `dsh:<name>` | `DshBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
 | `agy:<name>` | `AgyBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
 
-[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`, `agy`. DeepSeek ids for both `deepseek:` and `dsh:`: `DEEPSEEK_API_MODELS` (`deepseek-flash`, `deepseek-v4-pro`), plus the retired `DEEPSEEK_LEGACY_MODELS` (`deepseek-v4-flash`), which stay valid but are not offered.
+[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`, `agy`, `llamacpp` (any non-empty id). DeepSeek ids for both `deepseek:` and `dsh:`: `DEEPSEEK_API_MODELS` (`deepseek-flash`, `deepseek-v4-pro`), plus the retired `DEEPSEEK_LEGACY_MODELS` (`deepseek-v4-flash`), which stay valid but are not offered.
 
 ### `AgentSession` + `Turn` ([`agent_session/mod.rs`](src/agent_session/mod.rs))
 

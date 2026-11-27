@@ -213,7 +213,8 @@ pub struct TierBinding {
 }
 
 /// A workflow's `budget { wall "<dur>" usd <n> }`: limits checked before every
-/// dispatch. `usd` counts the cost providers report (`claude:`, `deepseek:`);
+/// dispatch. `usd` counts the cost providers report (`claude:`, `deepseek:`,
+/// `llamacpp:` at $0);
 /// the wall clock merges with `--run-timeout` (the smaller non-zero wins).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunBudget {

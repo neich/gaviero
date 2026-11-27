@@ -10,6 +10,7 @@ use crate::observer::AcpObserver;
 use crate::types::FileScope;
 
 use super::client::DeepseekClient;
+use super::config::ApiDialect;
 use super::policy::ToolPolicy;
 use super::replay::build_messages;
 use super::resolve_api_config;
@@ -34,6 +35,8 @@ pub struct SwarmTurnRequest {
     /// `None` falls back to resolving from `workspace_root`, which inside a
     /// swarm worktree finds no settings file and therefore no denylist.
     pub tool_policy: Option<ToolPolicy>,
+    /// Which server the loop talks to (`deepseek:` or `llamacpp:`).
+    pub dialect: ApiDialect,
 }
 
 /// Outcome of a swarm harness turn.
@@ -50,7 +53,7 @@ pub async fn run_turn(
     observer: &dyn AcpObserver,
     cancel: &CancellationToken,
 ) -> SwarmTurnOutcome {
-    let client = match resolve_api_config(&req.workspace_root) {
+    let client = match resolve_api_config(&req.workspace_root, req.dialect) {
         Ok(cfg) => DeepseekClient::new(Ok(cfg)),
         Err(e) => {
             return SwarmTurnOutcome {
@@ -68,10 +71,9 @@ pub async fn run_turn(
         ToolRegistry::from_names(&req.allowed_tools)
     };
 
-    // Resolve before the request is decomposed; thinking is always on, so this
-    // is never `off`.
-    let reasoning_effort =
-        crate::swarm::backend::deepseek::deepseek_reasoning_effort(req.effort.as_deref());
+    // Resolve before the request is decomposed. DeepSeek always gets a level
+    // (thinking is always on, so never `off`); llama.cpp only a chosen one.
+    let reasoning_effort = req.dialect.reasoning_effort(req.effort.as_deref());
 
     let messages = build_messages(&req.system_prompt, None, req.user_prompt.as_str());
     let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
@@ -99,7 +101,7 @@ pub async fn run_turn(
         &ctx,
         observer,
         &req.model,
-        Some(reasoning_effort),
+        reasoning_effort,
         messages,
         &limits,
         cancel,

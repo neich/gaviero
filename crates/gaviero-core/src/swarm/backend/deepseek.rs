@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_session::tool_agent::config::ApiDialect;
 use crate::agent_session::tool_agent::swarm::{SwarmTurnRequest, run_turn};
 use crate::observer::AcpObserver;
 
@@ -83,27 +84,40 @@ pub fn deepseek_reasoning_effort(effort: Option<&str>) -> &'static str {
     }
 }
 
-/// Swarm backend that delegates to the in-process tool-agent harness.
+/// Swarm backend that delegates to the in-process tool-agent harness — against
+/// DeepSeek (`deepseek:`) or a local llama-server (`llamacpp:`), which share
+/// one OpenAI-compatible dialect ([`ApiDialect`]).
 pub struct DeepseekBackend {
     model: String,
     display_name: String,
+    dialect: ApiDialect,
 }
 
 impl DeepseekBackend {
     pub fn new(model: &str) -> Self {
+        Self::with_dialect(model, ApiDialect::Deepseek)
+    }
+
+    /// `llamacpp:<model>` — the same harness against `providers.llamacpp.baseUrl`.
+    pub fn llamacpp(model: &str) -> Self {
+        Self::with_dialect(model, ApiDialect::LlamaCpp)
+    }
+
+    fn with_dialect(model: &str, dialect: ApiDialect) -> Self {
         Self {
             model: model.to_string(),
-            display_name: format!("deepseek:{}", model),
+            display_name: format!("{}:{}", dialect.label(), model),
+            dialect,
         }
     }
 
-    fn capabilities_for_swarm(model: &str) -> Capabilities {
+    fn capabilities_for_swarm(model: &str, dialect: ApiDialect) -> Capabilities {
         Capabilities {
             tool_use: true,
             streaming: true,
-            vision: deepseek_supports_vision(model),
+            vision: dialect.supports_vision(model),
             extended_thinking: true,
-            max_context_tokens: DEEPSEEK_CONTEXT_WINDOW,
+            max_context_tokens: dialect.context_window(),
             supports_system_prompt: true,
             supports_file_blocks: false,
             // DeepSeek's in-process tool agent exposes Read/Grep/Glob/Bash/Write,
@@ -179,7 +193,7 @@ impl AgentBackend for DeepseekBackend {
         let exposed = request.exposed_tools.clone();
         let system = request.system_prompt.unwrap_or_else(|| {
             super::shared::default_editor_system_prompt(
-                &Self::capabilities_for_swarm(&self.model)
+                &Self::capabilities_for_swarm(&self.model, self.dialect)
                     .with_exposed_tools(exposed.as_deref()),
             )
         });
@@ -199,6 +213,7 @@ impl AgentBackend for DeepseekBackend {
             auto_approve: request.auto_approve,
             tool_policy: request.tool_policy,
             effort: request.effort,
+            dialect: self.dialect,
         };
 
         tokio::spawn(async move {
@@ -239,7 +254,7 @@ impl AgentBackend for DeepseekBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Self::capabilities_for_swarm(&self.model)
+        Self::capabilities_for_swarm(&self.model, self.dialect)
     }
 
     fn name(&self) -> &str {
@@ -264,12 +279,24 @@ mod tests {
 
     #[test]
     fn capabilities_match_tool_agent() {
-        let caps = DeepseekBackend::capabilities_for_swarm("deepseek-v4-pro");
+        let caps = DeepseekBackend::capabilities_for_swarm("deepseek-v4-pro", ApiDialect::Deepseek);
         assert!(caps.tool_use);
         assert!(!caps.supports_file_blocks);
         assert_eq!(caps.max_context_tokens, DEEPSEEK_CONTEXT_WINDOW);
         assert!(!caps.vision, "V4-Pro is text-only");
-        assert!(DeepseekBackend::capabilities_for_swarm("deepseek-flash").vision);
+        assert!(DeepseekBackend::capabilities_for_swarm("deepseek-flash", ApiDialect::Deepseek).vision);
+    }
+
+    #[test]
+    fn llamacpp_backend_runs_the_llamacpp_dialect() {
+        let backend = DeepseekBackend::llamacpp("qwen3.8-27b");
+        assert_eq!(backend.name(), "llamacpp:qwen3.8-27b");
+        let caps = backend.capabilities();
+        assert!(caps.tool_use && !caps.supports_file_blocks && !caps.vision);
+        assert_eq!(
+            caps.max_context_tokens,
+            crate::swarm::backend::llamacpp::LLAMACPP_DEFAULT_CONTEXT_WINDOW
+        );
     }
 
     #[test]

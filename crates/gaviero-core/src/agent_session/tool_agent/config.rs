@@ -123,28 +123,129 @@ fn is_peak(at: chrono::DateTime<chrono::Utc>) -> bool {
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
+/// llama.cpp's `llama-server` on its default port. The OpenAI-compatible
+/// routes live under `/v1`, so the client posts to `<base>/chat/completions`.
+pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+/// Optional bearer token for a `llama-server --api-key …`. A server started
+/// without `--api-key` checks nothing, so no key is required.
+pub const LLAMACPP_API_KEY_ENV: &str = "LLAMACPP_API_KEY";
+
+/// Which OpenAI-compatible server the in-process tool agent talks to.
+///
+/// One wire format (chat completions + SSE + `tool_calls` +
+/// `reasoning_content`), two servers that differ in a few request fields,
+/// auth, pricing and model limits. Everything that differs is answered here,
+/// so the loop, tools and SSE parsing stay shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApiDialect {
+    /// `deepseek:` — api.deepseek.com (key required, list prices, 1M window).
+    #[default]
+    Deepseek,
+    /// `llamacpp:` — a local `llama-server` (key optional, free, its `-c`).
+    LlamaCpp,
+}
+
+impl ApiDialect {
+    /// The dialect a `ProviderProfile::provider` name runs, or `None` when that
+    /// provider is not served by the in-process tool agent.
+    pub fn from_provider(provider: &str) -> Option<Self> {
+        match provider {
+            "deepseek" => Some(Self::Deepseek),
+            "llamacpp" => Some(Self::LlamaCpp),
+            _ => None,
+        }
+    }
+
+    /// The provider prefix (`deepseek` / `llamacpp`); also the egress label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deepseek => "deepseek",
+            Self::LlamaCpp => "llamacpp",
+        }
+    }
+
+    /// Human-readable server name for errors and logs.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Deepseek => "DeepSeek",
+            Self::LlamaCpp => "llama.cpp",
+        }
+    }
+
+    /// Context window the session sizes replay compaction against.
+    pub fn context_window(self) -> usize {
+        match self {
+            Self::Deepseek => crate::swarm::backend::deepseek::DEEPSEEK_CONTEXT_WINDOW,
+            Self::LlamaCpp => crate::swarm::backend::llamacpp::LLAMACPP_DEFAULT_CONTEXT_WINDOW,
+        }
+    }
+
+    /// Whether `model` takes image input. A llama-server is text-only unless it
+    /// was started with `--mmproj`, which gaviero cannot see, so it says no.
+    pub fn supports_vision(self, model: &str) -> bool {
+        match self {
+            Self::Deepseek => crate::swarm::backend::deepseek::deepseek_supports_vision(model),
+            Self::LlamaCpp => false,
+        }
+    }
+
+    /// The `reasoning_effort` to send for gaviero's `effort`, or `None` to send
+    /// none. DeepSeek always gets a level (thinking is always on there); a
+    /// llama-server gets one only when the user chose a level, otherwise its
+    /// chat template's default (or `--chat-template-kwargs`) applies.
+    pub fn reasoning_effort(self, effort: Option<&str>) -> Option<&'static str> {
+        match self {
+            Self::Deepseek => Some(crate::swarm::backend::deepseek::deepseek_reasoning_effort(
+                effort,
+            )),
+            Self::LlamaCpp => {
+                effort.and_then(crate::swarm::backend::llamacpp::reasoning_effort_for_llamacpp)
+            }
+        }
+    }
+
+    /// DeepSeek needs `thinking: {type: enabled}` beside the level so no
+    /// default can turn reasoning off; a llama-server has no such field.
+    pub fn sends_thinking_toggle(self) -> bool {
+        matches!(self, Self::Deepseek)
+    }
+}
+
 /// Resolved config handed to an [`super::ApiClient`].
 #[derive(Clone, Debug)]
 pub struct ApiClientConfig {
     pub base_url: String,
+    /// Bearer token. Empty = send no `Authorization` header (a llama-server
+    /// started without `--api-key`).
     pub api_key: ApiKey,
     /// Operator override (`providers.deepseek.pricing`). `None` prices each
-    /// request from [`PriceTable::for_model`] at the time it is sent.
+    /// request from [`PriceTable::for_model`] at the time it is sent
+    /// (DeepSeek) or at zero (llama.cpp — local inference is not billed).
     pub pricing: Option<PriceTable>,
+    pub dialect: ApiDialect,
 }
+
+/// Zero rates: local inference costs nothing, so the cost ceiling never trips.
+const FREE: PriceTable = PriceTable {
+    cache_hit_in: 0.0,
+    cache_miss_in: 0.0,
+    out: 0.0,
+};
 
 impl ApiClientConfig {
     /// The price table for one request to `model`, sent now.
     pub fn price_for(&self, model: &str) -> PriceTable {
-        self.pricing
-            .clone()
-            .unwrap_or_else(|| PriceTable::for_model(model, chrono::Utc::now()))
+        self.pricing.clone().unwrap_or_else(|| match self.dialect {
+            ApiDialect::Deepseek => PriceTable::for_model(model, chrono::Utc::now()),
+            ApiDialect::LlamaCpp => FREE,
+        })
     }
 }
 
 #[derive(Deserialize, Default)]
 struct SecretsToml {
     deepseek: Option<SecretsSection>,
+    llamacpp: Option<SecretsSection>,
 }
 
 #[derive(Deserialize, Default)]
@@ -177,8 +278,57 @@ impl ApiClientConfig {
                 .to_string(),
             api_key,
             pricing,
+            dialect: ApiDialect::Deepseek,
         })
     }
+
+    /// Resolve llama.cpp config. `base_url` comes from the settings cascade
+    /// (`providers.llamacpp.baseUrl`; `None` = [`DEFAULT_LLAMACPP_BASE_URL`]).
+    /// The key is optional, first match wins: `LLAMACPP_API_KEY`, then
+    /// `[llamacpp] api_key` in the workspace's and the user-level
+    /// `secrets.toml`; none = no `Authorization` header. Only an unreadable or
+    /// unparseable secrets file is an error.
+    pub fn resolve_llamacpp(workspace_root: &Path, base_url: Option<String>) -> Result<Self> {
+        let env_val = std::env::var(LLAMACPP_API_KEY_ENV).ok();
+        let api_key = pick_optional_api_key(env_val, &secrets_candidates(workspace_root))?;
+        Ok(Self {
+            base_url: base_url
+                .unwrap_or_else(|| DEFAULT_LLAMACPP_BASE_URL.to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            api_key: api_key.unwrap_or_else(|| ApiKey::new("")),
+            pricing: None,
+            dialect: ApiDialect::LlamaCpp,
+        })
+    }
+}
+
+/// [`pick_api_key`]'s counterpart for a key that may be absent: the env value,
+/// else the first `[llamacpp] api_key` in `secrets_paths`, else `None`.
+fn pick_optional_api_key(
+    env_val: Option<String>,
+    secrets_paths: &[PathBuf],
+) -> Result<Option<ApiKey>> {
+    if let Some(k) = env_val.map(|k| k.trim().to_string())
+        && !k.is_empty()
+    {
+        return Ok(Some(ApiKey::new(k)));
+    }
+    for path in secrets_paths {
+        if !path.exists() {
+            continue;
+        }
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let parsed: SecretsToml =
+            toml::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(k) = parsed.llamacpp.and_then(|s| s.api_key).map(|k| k.trim().to_string())
+            && !k.is_empty()
+        {
+            return Ok(Some(ApiKey::new(k)));
+        }
+    }
+    Ok(None)
 }
 
 /// Secrets files searched for the key, in order: the workspace's, then the
@@ -364,6 +514,7 @@ mod tests {
             base_url: DEFAULT_DEEPSEEK_BASE_URL.into(),
             api_key: ApiKey::new("k"),
             pricing: Some(fixed.clone()),
+            dialect: ApiDialect::Deepseek,
         };
         assert_eq!(cfg.price_for("deepseek-flash"), fixed);
         let cfg = ApiClientConfig {
@@ -372,6 +523,67 @@ mod tests {
         };
         let flash = cfg.price_for("deepseek-flash");
         assert!(flash == FLASH_OFF_PEAK || flash == FLASH_PEAK);
+    }
+
+    /// Local inference is free: an unknown model id must not fall into the
+    /// DeepSeek table's "price as V4-Pro" branch, or `costCeilingUsd` would
+    /// stop a llama.cpp loop for spend that never happened.
+    #[test]
+    fn llamacpp_is_priced_at_zero() {
+        let cfg = ApiClientConfig {
+            base_url: DEFAULT_LLAMACPP_BASE_URL.into(),
+            api_key: ApiKey::new(""),
+            pricing: None,
+            dialect: ApiDialect::LlamaCpp,
+        };
+        assert_eq!(cfg.price_for("qwen3.8-27b"), FREE);
+        assert_eq!(cfg.price_for("qwen3.8-27b").cost_usd(1_000, 50_000, 9_000), 0.0);
+    }
+
+    #[test]
+    fn llamacpp_needs_no_key_and_defaults_to_the_local_server() {
+        let dir = tempdir().unwrap();
+        assert!(pick_optional_api_key(None, &[dir.path().join("secrets.toml")])
+            .unwrap()
+            .is_none());
+        // A DeepSeek key in the same file is not a llama.cpp key.
+        let secrets = dir.path().join("secrets.toml");
+        std::fs::write(&secrets, "[deepseek]\napi_key = \"ds\"\n").unwrap();
+        assert!(pick_optional_api_key(None, std::slice::from_ref(&secrets)).unwrap().is_none());
+        std::fs::write(&secrets, "[llamacpp]\napi_key = \" local-key \"\n").unwrap();
+        let key = pick_optional_api_key(None, std::slice::from_ref(&secrets)).unwrap().unwrap();
+        assert_eq!(key.expose(), "local-key");
+        let key = pick_optional_api_key(Some("env-key".into()), &[secrets]).unwrap().unwrap();
+        assert_eq!(key.expose(), "env-key");
+    }
+
+    #[test]
+    fn llamacpp_base_url_is_trimmed_and_defaulted() {
+        let dir = tempdir().unwrap();
+        let cfg = ApiClientConfig::resolve_llamacpp(dir.path(), None).unwrap();
+        assert_eq!(cfg.base_url, DEFAULT_LLAMACPP_BASE_URL);
+        assert_eq!(cfg.dialect, ApiDialect::LlamaCpp);
+        let cfg =
+            ApiClientConfig::resolve_llamacpp(dir.path(), Some("http://gpu-box:9000/v1/".into()))
+                .unwrap();
+        assert_eq!(cfg.base_url, "http://gpu-box:9000/v1");
+    }
+
+    /// llama-server's Qwen templates refuse `max`/`minimal` with HTTP 400, so
+    /// the llama.cpp map sends only `low|medium|high`, and nothing when no
+    /// level was chosen (the template's default applies).
+    #[test]
+    fn dialect_effort_and_thinking_toggle() {
+        assert_eq!(ApiDialect::Deepseek.reasoning_effort(None), Some("high"));
+        assert_eq!(ApiDialect::Deepseek.reasoning_effort(Some("max")), Some("max"));
+        assert!(ApiDialect::Deepseek.sends_thinking_toggle());
+        assert_eq!(ApiDialect::LlamaCpp.reasoning_effort(None), None);
+        assert_eq!(ApiDialect::LlamaCpp.reasoning_effort(Some("auto")), None);
+        assert_eq!(ApiDialect::LlamaCpp.reasoning_effort(Some("medium")), Some("medium"));
+        assert_eq!(ApiDialect::LlamaCpp.reasoning_effort(Some("max")), Some("high"));
+        assert!(!ApiDialect::LlamaCpp.sends_thinking_toggle());
+        assert_eq!(ApiDialect::from_provider("llamacpp"), Some(ApiDialect::LlamaCpp));
+        assert_eq!(ApiDialect::from_provider("ollama"), None);
     }
 
     #[test]

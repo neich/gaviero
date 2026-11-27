@@ -53,6 +53,7 @@ println!("{}", plan.to_gaviero_script()?);
 | Cursor | `cursor:composer-2.5`, `cursor:grok-4.7-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
+| llama.cpp | `llamacpp:default`, `llamacpp:qwen3.8-27b` (any id; a single-model `llama-server` ignores it) | In-process HTTP (`tool_agent`) against a local `llama-server` |
 | DeepSeek (ACP) | `dsh:deepseek-flash`, `dsh:deepseek-v4-pro` | Subprocess `dsh --profile acp` (Agent Client Protocol) |
 | Antigravity (ACP) | `agy:gemini-4-neon-high`, `agy:gemini-3.8-flash-low`, … (effort is part of the id; list from the CLI) | Subprocess `agy acp --disable-telemetry` (Agent Client Protocol, native resume) |
 
@@ -84,10 +85,13 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `agent.toolAgent.costCeilingUsd` | unset | Dollar budget per `deepseek:` turn (priced per model, peak-aware); the turn hands off when reached |
 | `providers.deepseek.baseUrl` | `https://api.deepseek.com` | DeepSeek chat API base URL (legacy `base_url` still read) |
 | `providers.deepseek.pricing` | list prices | `{ "cache_hit_in", "cache_miss_in", "out" }` USD / 1M tokens, overriding the per-model table |
+| `providers.llamacpp.baseUrl` | `http://127.0.0.1:8080/v1` | OpenAI-compatible base URL of the `llama-server` for `llamacpp:` |
 
 **API key** (`deepseek:` and `dsh:`), first match wins: `DEEPSEEK_API_KEY`, then `[deepseek] api_key = "sk-…"` in `<workspace>/.gaviero/secrets.toml`, then the same in `~/.gaviero/secrets.toml`. For `dsh:`, gaviero launches dsh with `--patch ~/.gaviero/dsh/gaviero-acp.patch.yml`, which disables dsh's own credential store so this key is the one dsh uses. Set `providers.dsh.credentialSource` to `"dsh"` to let a key saved in `~/.dsh/.credentials.yaml` win instead (dsh ≥ 0.2.1-alpha.2 prefers it over the environment).
 
 `deepseek:` always runs in thinking mode. The effort maps onto DeepSeek's `low | high | max`, and an unset, `off`, or `auto` effort becomes `high`. `max_tokens` is left to the API's thinking default (64K, or 128K at `max`). The agent reaches `mcp.extraServers` (stdio and URL) through gaviero's in-process MCP client, and a TUI conversation names any `agent.availableTools` entry it cannot serve.
+
+`llamacpp:` runs the same in-process agent loop, with the same tools and MCP servers, against a llama.cpp `llama-server` started with `--jinja`, so the model's chat template parses tool calls. It needs no key; for a server started with `--api-key`, set `LLAMACPP_API_KEY` or `[llamacpp] api_key` in `secrets.toml`. Turns cost $0, so `agent.toolAgent.costCeilingUsd` never trips. Effort offers `low | medium | high`, sent as `reasoning_effort`; the Qwen3.x templates refuse `max` and `minimal`. An unset, `off` or `auto` effort sends nothing, so the template's default or the server's `--chat-template-kwargs` applies. Replay is sized for a 64K window (`-c 65536`), and a request past the server's `-c` fails with `exceed_context_size_error`. Images are not sent. A swarm unit with `LocalOnly` privacy may use `llamacpp:`, as it may use `ollama:`.
 
 ## API
 
@@ -113,7 +117,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | Module | Purpose |
 |---|---|
 | `acp/` | Claude subprocess protocol, file-block routing |
-| `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (`deepseek:`), `agent_client_protocol` (`dsh:`, `agy:`), `registry` |
+| `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (`deepseek:`, `llamacpp:`), `agent_client_protocol` (`dsh:`, `agy:`), `registry` |
 | `swarm/` | Orchestration, tier routing, DAG execution, backends, verification, git merge |
 | `mcp/` | In-process MCP server (eleven tools: nine read-only incl. `memory_ping` and `symbol_refs` + write-adjacent `memory_flag` + interactive `ask_user_question`, listed only for a loopback-HTTP connection that names its conversation), config synthesis, stdio + loopback HTTP transport, reach probe |
 | `memory/` | Five-level scoped embeddings, RRF retrieval, consolidation, soft-delete |

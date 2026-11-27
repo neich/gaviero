@@ -1275,6 +1275,12 @@ impl AgentChatState {
             if !options.iter().any(|opt| opt == &ollama_example) {
                 options.push(ollama_example);
             }
+            // A single-model llama-server ignores the id, so one entry reaches
+            // whatever it serves; a router/llama-swap takes `llamacpp:<alias>`.
+            let llamacpp_example = "llamacpp:default".to_string();
+            if !options.iter().any(|opt| opt == &llamacpp_example) {
+                options.push(llamacpp_example);
+            }
             self.cli_model_options = Some(options);
         }
         self.cli_model_options.as_deref().unwrap_or(&[])
@@ -2029,7 +2035,7 @@ impl AgentChatState {
                         &format!(
                             "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
                          Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
-                         `deepseek:`, `dsh:`, `agy:`, `ollama:`, or `local:`.",
+                         `deepseek:`, `dsh:`, `agy:`, `llamacpp:`, `ollama:`, or `local:`.",
                             current, list
                         ),
                     );
@@ -2724,7 +2730,7 @@ impl AgentChatState {
                 self.add_system_message_at(idx,
                     "Available commands:\n\n\
                      Conversation:\n\
-                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, deepseek:deepseek-flash, dsh:deepseek-flash, agy:<model>, ollama:<model>\n\
+                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, deepseek:deepseek-flash, dsh:deepseek-flash, agy:<model>, llamacpp:<model>, ollama:<model>\n\
                      /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra; agy: effort is part of the model id). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
@@ -5932,7 +5938,7 @@ const COMPACT_INSTRUCTIONS: &str = "Keep verbatim: file paths, commands, error m
 /// provider cannot enforce them.
 pub(crate) const ADD_DIR_UNSUPPORTED_NOTICE: &str = "/add-dir grants are not enforced for dsh:, \
      ollama: or local: models (dsh cannot take extra directories; ollama/local have no file \
-     tools). Switch to claude:, codex:, cursor:, deepseek: or agy: to use them.";
+     tools). Switch to claude:, codex:, cursor:, deepseek:, llamacpp: or agy: to use them.";
 
 /// Notice for providers that cannot enforce `/add-dir` grants, by the model
 /// spec's provider prefix; `None` when the provider honours them.
@@ -6406,6 +6412,8 @@ mod tests {
             "dsh:deepseek-flash",
             "dsh:deepseek-v4-pro",
             "dsh:deepseek-v4-flash",
+            "llamacpp:qwen3.8-27b",
+            "llamacpp:default",
         ] {
             assert_eq!(normalize_model_spec(spec), spec);
         }
@@ -7713,6 +7721,7 @@ mod tests {
             "codex:gpt-5.6-sol",
             "cursor:auto",
             "deepseek:deepseek-flash",
+            "llamacpp:qwen3.8-27b",
         ] {
             assert_eq!(add_dir_unsupported_notice(model), None, "{model}");
         }

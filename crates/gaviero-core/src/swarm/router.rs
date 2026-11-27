@@ -59,6 +59,8 @@ pub enum ResolvedBackend {
     Ollama { model: String, base_url: String },
     /// Route to the in-process DeepSeek tool-agent harness.
     Deepseek { model: String },
+    /// Route to the same harness against a local llama.cpp `llama-server`.
+    LlamaCpp { model: String },
     /// Route to `dsh --profile acp` over the Agent Client Protocol.
     Dsh { model: String },
     /// Route to `agy acp` (Antigravity CLI) over the Agent Client Protocol.
@@ -77,6 +79,7 @@ impl ResolvedBackend {
             Self::Cursor { model } => format!("cursor:{model}"),
             Self::Ollama { model, .. } => format!("ollama:{model}"),
             Self::Deepseek { model } => format!("deepseek:{model}"),
+            Self::LlamaCpp { model } => format!("llamacpp:{model}"),
             Self::Dsh { model } => format!("dsh:{model}"),
             Self::Agy { model } => format!("agy:{model}"),
             Self::Blocked { .. } => return None,
@@ -142,6 +145,10 @@ impl TierRouter {
                 let model_spec = format!("deepseek:{}", model);
                 shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
+            ResolvedBackend::LlamaCpp { model } => {
+                let model_spec = format!("llamacpp:{}", model);
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
+            }
             ResolvedBackend::Dsh { model } => {
                 let model_spec = format!("dsh:{}", model);
                 shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
@@ -186,6 +193,16 @@ impl TierRouter {
             return ResolvedBackend::Ollama {
                 model: resolved_model,
                 base_url: self.config.local.base_url.clone(),
+            };
+        }
+
+        // A llama.cpp server is local by declaration, exactly like `ollama:`
+        // (whose base URL is just as much the operator's to point elsewhere),
+        // so it passes the LocalOnly check below.
+        if shared::is_llamacpp_model(model) {
+            let resolved_model = model.strip_prefix("llamacpp:").unwrap_or(model).to_string();
+            return ResolvedBackend::LlamaCpp {
+                model: resolved_model,
             };
         }
 
@@ -318,6 +335,12 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Deepseek { model: stripped }
+    } else if shared::is_llamacpp_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("llamacpp:")
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::LlamaCpp { model: stripped }
     } else if shared::is_dsh_model(model_spec) {
         let stripped = model_spec
             .strip_prefix("dsh:")
@@ -376,7 +399,10 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
                 unit.id, model
             ));
         }
-        if !shared::is_ollama_model(model) && !model.contains("qwen") {
+        if !shared::is_ollama_model(model)
+            && !shared::is_llamacpp_model(model)
+            && !model.contains("qwen")
+        {
             return Err(format!(
                 "unit '{}': LocalOnly privacy with API model override '{}'",
                 unit.id, model
@@ -632,6 +658,35 @@ mod tests {
             router.resolve(&unit),
             ResolvedBackend::Blocked { .. }
         ));
+    }
+
+    /// A llama.cpp server is local, so it is reachable even from a LocalOnly
+    /// unit, and it never falls through to the Claude default.
+    #[test]
+    fn test_llamacpp_override_routes_locally_even_under_local_only() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        for privacy in [PrivacyLevel::Public, PrivacyLevel::LocalOnly] {
+            let unit = test_unit(ModelTier::Expensive, privacy, Some("llamacpp:qwen3.8-27b"));
+            let resolved = router.resolve(&unit);
+            assert_eq!(
+                resolved,
+                ResolvedBackend::LlamaCpp {
+                    model: "qwen3.8-27b".into()
+                },
+                "{privacy:?}"
+            );
+            assert_eq!(resolved.model_spec().as_deref(), Some("llamacpp:qwen3.8-27b"));
+            assert_eq!(validate_privacy(&unit), Ok(()), "{privacy:?}");
+            let backend = router.resolve_backend(&unit).unwrap();
+            assert_eq!(backend.name(), "llamacpp:qwen3.8-27b");
+        }
+        let config = TierConfig {
+            expensive_model: "llamacpp:qwen3.8-27b".into(),
+            ..TierConfig::default()
+        };
+        let router = TierRouter::new(config, false);
+        let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
+        assert!(matches!(router.resolve(&unit), ResolvedBackend::LlamaCpp { .. }));
     }
 
     #[test]

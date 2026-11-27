@@ -337,4 +337,91 @@ mod tests {
         assert!(out.is_error);
         assert!(!dir.path().join(".env").exists());
     }
+
+    /// A swarm work unit's context: a declared, workspace-relative owned
+    /// scope and the policy `tool_agent::swarm::run_turn` resolves.
+    fn scoped_ctx(root: &std::path::Path, owned: &[&str]) -> ToolCtx {
+        ToolCtx {
+            scope: FileScope {
+                owned_paths: owned.iter().map(|s| s.to_string()).collect(),
+                ..FileScope::default()
+            },
+            sensitive: crate::scope_enforcer::SensitivePolicy::resolve(root),
+            ..ctx_for(root, Arc::new(Mutex::new(TurnSnapshot::new())))
+        }
+    }
+
+    /// Regression: `confine` hands the scope check an absolute path, while
+    /// `scope { owned [...] }` entries are workspace-relative, so every write
+    /// of a script agent with a declared scope was refused as "outside agent's
+    /// owned scope" — on `deepseek:` and `llamacpp:` alike.
+    #[tokio::test]
+    async fn writes_inside_a_declared_owned_scope_are_allowed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("calc.py"), "return a - b\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let ctx = scoped_ctx(dir.path(), &["calc.py", "src/"]);
+
+        let out = EditTool
+            .run(
+                json!({ "file_path": "calc.py", "old_string": "-", "new_string": "+" }),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calc.py")).unwrap(),
+            "return a + b\n"
+        );
+        // The absolute spelling of an owned path is the same file.
+        let abs = dir.path().join("src/lib.rs");
+        let out = WriteTool
+            .run(json!({ "file_path": abs.to_string_lossy(), "contents": "x\n" }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(abs.exists());
+    }
+
+    #[tokio::test]
+    async fn writes_outside_a_declared_owned_scope_stay_refused() {
+        let dir = tempdir().unwrap();
+        let ctx = scoped_ctx(dir.path(), &["calc.py"]);
+        for path in ["other.py", "src/calc.py", "calc.py.bak"] {
+            let out = WriteTool
+                .run(json!({ "file_path": path, "contents": "x\n" }), &ctx)
+                .await;
+            assert!(out.is_error, "{path} must be refused");
+            assert!(out.content.contains("owned scope"), "{path}: {}", out.content);
+            assert!(!dir.path().join(path).exists(), "{path}");
+        }
+        // The sensitive block-list still applies inside the owned scope.
+        let ctx = scoped_ctx(dir.path(), &[".env"]);
+        let out = WriteTool
+            .run(json!({ "file_path": ".env", "contents": "X=1\n" }), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(!dir.path().join(".env").exists());
+    }
+
+    /// `agent.permissions.sensitivePaths.allow` globs are workspace-relative
+    /// too; an exempted fixture must be writable through the absolute path.
+    #[tokio::test]
+    async fn sensitive_allow_exemptions_apply_to_tool_writes() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{ "agent": { "permissions": { "sensitivePaths": { "allow": ["fixtures/**"] } } } }"#,
+        )
+        .unwrap();
+        let ctx = scoped_ctx(dir.path(), &[]);
+        let out = WriteTool
+            .run(json!({ "file_path": "fixtures/.env", "contents": "X=1\n" }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let out = WriteTool
+            .run(json!({ "file_path": ".env", "contents": "X=1\n" }), &ctx)
+            .await;
+        assert!(out.is_error, "only the exempted folder is writable");
+    }
 }
