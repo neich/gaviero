@@ -218,6 +218,9 @@ pub struct App {
     /// Current find-bar match in preview-only mode: `(rendered line, char
     /// offset)` into `preview_lines`. `None` until the first jump.
     pub preview_find_current: Option<(usize, usize)>,
+    /// Mouse text selection in the rendered preview (drag to select; release
+    /// or Ctrl+C copies). Indexes `preview_lines`.
+    pub preview_selection: Option<crate::panels::chat_markdown::PreviewSelection>,
     /// Last mouse cell, so preview scroll can re-hit-test without a move event.
     pub last_mouse: Option<(u16, u16)>,
     /// Set by handlers after `RenderScheduler` already ran (preview hover).
@@ -560,6 +563,7 @@ impl App {
             preview_headings: Vec::new(),
             preview_hover_href: None,
             preview_find_current: None,
+            preview_selection: None,
             last_mouse: None,
             needs_immediate_render: false,
             write_gate,
@@ -1583,6 +1587,11 @@ enum ClipboardResult {
 /// Returns `true` on success.  Works over SSH when the terminal supports OSC 52
 /// (kitty, iTerm2, WezTerm, alacritty, etc.).
 fn osc52_copy(text: &str) -> bool {
+    // A test that drops the OS clipboard must not reach the developer's
+    // terminal (and its clipboard) through stdout instead.
+    if cfg!(test) {
+        return false;
+    }
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     // OSC 52 ; c ; <base64> ST

@@ -179,6 +179,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         } else {
             app.preview_lines.clear();
             app.preview_hover_href = None;
+            app.preview_selection = None;
         }
         panel_idx += 1;
     } else {
@@ -186,6 +187,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         app.layout.preview_area = None;
         app.preview_lines.clear();
         app.preview_hover_href = None;
+        app.preview_selection = None;
     }
 
     app.layout.side_panel_area = None;
@@ -1395,6 +1397,12 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
     app.preview_headings = headings;
     app.preview_viewport_lines = inner.height.max(1) as usize;
     app.preview_line_count = app.preview_lines.len();
+    // Selection positions index this layout only: another buffer, width or
+    // fold state would point them at different text.
+    let layout_key = (app.active_buffer, preview_content_width(inner), app.preview_lines.len());
+    if app.preview_selection.as_ref().is_some_and(|s| s.layout != layout_key) {
+        app.preview_selection = None;
+    }
     sync_preview_to_editor(app, editor_top, &source_map);
     clamp_preview_scroll(app, app.preview_lines.len());
 
@@ -1413,6 +1421,15 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         app.theme.default_style(),
         hover.as_deref(),
     );
+    if let Some(selection) = &app.preview_selection {
+        chat_markdown::paint_preview_selection(
+            &app.preview_lines,
+            selection,
+            text_area,
+            frame.buffer_mut(),
+            scroll,
+        );
+    }
     crate::widgets::scrollbar::render_scrollbar(
         inner,
         frame.buffer_mut(),
