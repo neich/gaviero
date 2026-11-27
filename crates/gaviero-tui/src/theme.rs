@@ -153,16 +153,14 @@ pub const FILE_TREE_MIN_WIDTH: u16 = 12;
 /// Explorer width used when neither session state nor settings set one.
 /// Mirrors the `panels.fileTree.width` built-in default.
 pub const FILE_TREE_DEFAULT_WIDTH: u16 = 30;
-/// Explorer (file tree) maximum width in columns.
-pub const FILE_TREE_MAX_WIDTH: u16 = 80;
 /// Side panel (agent chat / swarm / git / memory) minimum width.
 pub const SIDE_PANEL_MIN_WIDTH: u16 = 20;
 /// Side-panel width used when neither session state nor settings set one.
 /// Mirrors the `panels.sidePanel.width` built-in default.
 pub const SIDE_PANEL_DEFAULT_WIDTH: u16 = 40;
-/// Side panel maximum width in columns.
-pub const SIDE_PANEL_MAX_WIDTH: u16 = 120;
 /// Editor pane must keep at least this many columns after a horizontal resize.
+/// Explorer and side panel have no maximum: they grow until the editor and the
+/// opposite panel are both at their minimums.
 pub const EDITOR_MIN_WIDTH: u16 = 20;
 /// Diff viewer page-scroll lines.
 pub const DIFF_PAGE_SCROLL: usize = 10;
