@@ -689,9 +689,10 @@ mod tests {
     }
 
     #[test]
-    fn restored_widths_are_clamped_to_the_configured_bounds() {
-        // A `state.json` written on a 4K monitor, hand-edited, or left over
-        // from an older build must not widen a panel past its maximum.
+    fn restored_widths_are_floored_but_not_capped() {
+        // A `state.json` written on a 4K monitor or hand-edited keeps its wide
+        // panel — there is no fixed maximum; the render path fits it to the
+        // terminal — but a width below a panel's minimum is raised to it.
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path();
         session_state::save_session(
@@ -706,7 +707,7 @@ mod tests {
 
         let mut app = session_app(key);
         restore_session(&mut app);
-        assert_eq!(app.file_tree_width, theme::FILE_TREE_MAX_WIDTH);
+        assert_eq!(app.file_tree_width, 9_000);
         assert_eq!(app.side_panel_width, theme::SIDE_PANEL_MIN_WIDTH);
 
         cleanup_session(key);
