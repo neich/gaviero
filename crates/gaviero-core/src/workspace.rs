@@ -409,6 +409,11 @@ pub mod settings {
     /// overriding the built-in per-model, peak-aware DeepSeek price table for
     /// every model. Unset = the list prices.
     pub const PROVIDERS_DEEPSEEK_PRICING: &str = "providers.deepseek.pricing";
+    /// OpenAI-compatible base URL of the llama.cpp `llama-server` for
+    /// `llamacpp:` (default `http://127.0.0.1:8080/v1`). An optional bearer
+    /// token comes from `LLAMACPP_API_KEY` or `[llamacpp] api_key` in
+    /// `.gaviero/secrets.toml`, never from settings.
+    pub const PROVIDERS_LLAMACPP_BASE_URL: &str = "providers.llamacpp.baseUrl";
     pub const PROVIDERS_DSH_COMMAND: &str = "providers.dsh.command";
     pub const PROVIDERS_DSH_ARGS: &str = "providers.dsh.args";
     pub const PROVIDERS_DSH_PROFILE: &str = "providers.dsh.profile";

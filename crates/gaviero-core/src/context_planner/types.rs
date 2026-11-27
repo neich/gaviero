@@ -202,13 +202,14 @@ impl Provider {
     /// Exists so exhaustive iteration cannot silently miss an arm when one is
     /// added — the reverse lookup in [`McpCapabilities::for_synth_vendor`] and
     /// the table's own tests both walk this instead of a hand-copied list.
-    pub const ALL: [Provider; 8] = [
+    pub const ALL: [Provider; 9] = [
         Provider::Claude,
         Provider::Codex,
         Provider::CodexAppServer,
         Provider::Cursor,
         Provider::Ollama,
         Provider::Deepseek,
+        Provider::LlamaCpp,
         Provider::Dsh,
         Provider::Agy,
     ];
@@ -233,7 +234,8 @@ impl Provider {
             // server — so `context7` is allowed. `deepseek:` also reaches
             // `mcp.extraServers` (stdio and URL) through the in-process MCP
             // client (`mcp/client.rs`), connected by `ToolAgentSession` itself.
-            Provider::Deepseek => McpCapabilities {
+            // `llamacpp:` runs that same session against a local llama-server.
+            Provider::Deepseek | Provider::LlamaCpp => McpCapabilities {
                 context7: true,
                 extra_servers: true,
                 transport: McpTransport::InProcess,
@@ -259,7 +261,11 @@ impl Provider {
             Provider::Claude => Some("claude"),
             Provider::Codex | Provider::CodexAppServer => Some("codex"),
             Provider::Cursor => Some("cursor"),
-            Provider::Ollama | Provider::Deepseek | Provider::Dsh | Provider::Agy => None,
+            Provider::Ollama
+            | Provider::Deepseek
+            | Provider::LlamaCpp
+            | Provider::Dsh
+            | Provider::Agy => None,
         }
     }
 }
@@ -428,6 +434,7 @@ impl ModelSpec {
             "codex",
             "cursor",
             "deepseek",
+            "llamacpp",
             "dsh",
             "agy",
             "claude",
@@ -457,6 +464,7 @@ impl ModelSpec {
             "codex" => Provider::Codex,
             "cursor" => Provider::Cursor,
             "deepseek" => Provider::Deepseek,
+            "llamacpp" => Provider::LlamaCpp,
             "dsh" => Provider::Dsh,
             "agy" => Provider::Agy,
             // Bare or claude-prefixed → Claude.
@@ -480,6 +488,9 @@ pub enum Provider {
     /// DeepSeek V4 Pro — in-process API tool-agent (`StatelessReplay`, native
     /// function-calling). See docs/plans/deepseek_v4_pro_provider.md.
     Deepseek,
+    /// A local llama.cpp `llama-server` — the same in-process tool agent as
+    /// `deepseek:`, over its OpenAI-compatible endpoint (`StatelessReplay`).
+    LlamaCpp,
     /// DeepSeek via `dsh --profile acp` over the Agent Client Protocol
     /// (`ProcessBound`).
     Dsh,
@@ -657,6 +668,27 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             extra_servers_allowed: caps.extra_servers,
             tool_enforcement: ToolEnforcement::RegistryMembership,
             // Delivered (Phase 4): `tools/ask.rs`, shared with the Ollama arm.
+            prompt_kind: PromptKind::MultiChoice,
+        },
+        Provider::LlamaCpp => ProviderProfile {
+            provider: "llamacpp".to_string(),
+            model: spec.model.clone(),
+            // `ToolAgentSession` against llama-server's OpenAI-compatible
+            // endpoint: history is replayed each turn (no server-side thread),
+            // and `--jinja` templates parse native tool calls server-side.
+            continuity_mode: ContinuityMode::StatelessReplay,
+            supports_tool_use: true,
+            supports_native_resume: false,
+            // The server's `-c`; see `LLAMACPP_DEFAULT_CONTEXT_WINDOW`.
+            max_context_tokens: Some(
+                crate::swarm::backend::llamacpp::LLAMACPP_DEFAULT_CONTEXT_WINDOW,
+            ),
+            // tool_use + a 64K context ⇒ Strong (matches BootstrapTier::derive).
+            bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
+            tool_enforcement: ToolEnforcement::RegistryMembership,
             prompt_kind: PromptKind::MultiChoice,
         },
         Provider::Dsh => ProviderProfile {
@@ -1266,6 +1298,7 @@ mod tests {
             ("cursor:gpt-5", Provider::Cursor),
             ("ollama:llama3.1", Provider::Ollama),
             ("deepseek:deepseek-flash", Provider::Deepseek),
+            ("llamacpp:qwen3.8-27b", Provider::LlamaCpp),
             ("dsh:deepseek-flash", Provider::Dsh),
             ("agy:gemini-3.8-flash-low", Provider::Agy),
         ] {
@@ -1288,7 +1321,13 @@ mod tests {
         // One key: both load `<worktree>/.codex/config.toml`.
         assert_eq!(Provider::CodexAppServer.synth_vendor(), Some("codex"));
         assert_eq!(Provider::Cursor.synth_vendor(), Some("cursor"));
-        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh, Provider::Agy] {
+        for p in [
+            Provider::Ollama,
+            Provider::Deepseek,
+            Provider::LlamaCpp,
+            Provider::Dsh,
+            Provider::Agy,
+        ] {
             assert_eq!(p.synth_vendor(), None, "{p:?}");
         }
     }
@@ -1323,7 +1362,7 @@ mod tests {
         );
         // The in-process providers have no vendor key, so their natural names
         // are unrecognised — they must not resolve to their own restrictive row.
-        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh] {
+        for p in [Provider::Ollama, Provider::Deepseek, Provider::LlamaCpp, Provider::Dsh] {
             assert_eq!(
                 McpCapabilities::for_synth_vendor(&format!("{p:?}").to_lowercase()),
                 McpCapabilities::permissive(),
@@ -1332,9 +1371,27 @@ mod tests {
         }
     }
 
+    /// `llamacpp:` is the in-process tool agent (not Ollama's text-only
+    /// session): tool use on, the server's 64K window, a Strong bootstrap
+    /// consistent with `BootstrapTier::derive`, and `extraServers` reachable.
+    #[test]
+    fn llamacpp_profile_is_the_tool_agent_row() {
+        let p = profile("llamacpp:qwen3.8-27b");
+        assert_eq!(p.provider, "llamacpp");
+        assert_eq!(p.model, "qwen3.8-27b");
+        assert_eq!(p.continuity_mode, ContinuityMode::StatelessReplay);
+        assert!(p.supports_tool_use);
+        assert_eq!(p.max_context_tokens, Some(65_536));
+        assert_eq!(
+            p.bootstrap_tier,
+            BootstrapTier::derive(p.supports_tool_use, p.max_context_tokens)
+        );
+        assert!(p.extra_servers_allowed && p.context7_allowed);
+    }
+
     #[test]
     fn in_process_loop_is_registry_enforced_over_a_linked_server() {
-        for spec in ["deepseek:deepseek-flash", "ollama:llama3.1"] {
+        for spec in ["deepseek:deepseek-flash", "llamacpp:qwen3.8-27b", "ollama:llama3.1"] {
             let p = profile(spec);
             assert_eq!(p.mcp_transport, McpTransport::InProcess, "{spec}");
             assert_eq!(

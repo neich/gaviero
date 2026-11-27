@@ -12,6 +12,7 @@ pub mod deepseek;
 pub mod dsh;
 pub mod effort;
 pub mod executor;
+pub mod llamacpp;
 pub mod mock;
 pub mod ollama;
 pub mod runner;
@@ -272,8 +273,13 @@ pub enum BackendConfig {
         model: String,
         base_url: Option<String>,
     },
-    /// In-process API tool-agent harness (`deepseek:` today).
+    /// In-process API tool-agent harness against DeepSeek (`deepseek:`).
     Deepseek {
+        model: String,
+    },
+    /// In-process API tool-agent harness against a local llama.cpp
+    /// `llama-server` (`llamacpp:`; `providers.llamacpp.baseUrl`).
+    LlamaCpp {
         model: String,
     },
     /// Subprocess `dsh-acp` over the Agent Client Protocol (`dsh:`).
@@ -310,6 +316,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(ollama::OllamaStreamBackend::new(url, model)))
         }
         BackendConfig::Deepseek { model } => Ok(Box::new(deepseek::DeepseekBackend::new(model))),
+        BackendConfig::LlamaCpp { model } => Ok(Box::new(deepseek::DeepseekBackend::llamacpp(model))),
         BackendConfig::Dsh { model } => Ok(Box::new(dsh::DshBackend::new(model))),
         BackendConfig::Agy { model } => Ok(Box::new(agy::AgyBackend::new(model))),
         BackendConfig::Custom { command, args } => {
@@ -538,6 +545,14 @@ mod tests {
         };
         let ds_backend = create_backend(&ds).unwrap();
         assert!(ds_backend.name().contains("deepseek"));
+
+        let lc = BackendConfig::LlamaCpp {
+            model: "qwen3.8-27b".into(),
+        };
+        let lc_backend = create_backend(&lc).unwrap();
+        assert_eq!(lc_backend.name(), "llamacpp:qwen3.8-27b");
+        assert!(lc_backend.capabilities().tool_use);
+        assert!(!lc_backend.capabilities().supports_file_blocks);
 
         let dsh = BackendConfig::Dsh {
             model: "deepseek-v4-flash".into(),

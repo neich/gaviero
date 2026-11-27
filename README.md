@@ -186,7 +186,7 @@ Settings are JSON, loaded in three layers. Each later layer overrides the one be
 }
 ```
 
-**Model specs** use `provider:model`; bare names are rejected. Providers: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:`, `agy:`.
+**Model specs** use `provider:model`; bare names are rejected. Providers: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:`, `agy:`, `llamacpp:` (a local llama.cpp `llama-server`, `providers.llamacpp.baseUrl`).
 
 The full reference is in **[docs/configuration.md](docs/configuration.md)**. It covers layer merging and `key+` extension, multi-folder workspaces, `GAVIERO.md` project instructions, agent permissions and bash allow/deny lists, protected files per provider, and outbound-traffic logging.
 

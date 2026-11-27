@@ -1,4 +1,6 @@
-//! DeepSeek chat-completions client.
+//! OpenAI-compatible chat-completions client for the in-process tool agent:
+//! DeepSeek (`deepseek:`) and a local llama.cpp `llama-server` (`llamacpp:`),
+//! which differ only in the request fields and auth [`ApiDialect`] decides.
 //!
 //! **PR-2 (plan Units 4–5):** real SSE streaming. `delta.content` →
 //! [`ApiEvent::Text`], `delta.reasoning_content` → [`ApiEvent::Reasoning`], the
@@ -19,12 +21,13 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::swarm::backend::{StopReason, TokenUsage};
 
-use super::config::{ApiClientConfig, PriceTable};
+use super::config::{ApiClientConfig, ApiDialect, PriceTable};
 use super::{ApiClient, ApiEvent, ApiRequest, ToolCall};
 
-/// DeepSeek client. Holds the resolved config as a `Result` so a key-resolution
-/// failure at construction surfaces on the first `complete` call rather than
-/// making session construction fallible.
+/// Chat-completions client (named for its first provider; it serves every
+/// [`ApiDialect`]). Holds the resolved config as a `Result` so a
+/// key-resolution failure at construction surfaces on the first `complete`
+/// call rather than making session construction fallible.
 pub struct DeepseekClient {
     cfg: std::result::Result<ApiClientConfig, String>,
     http: reqwest::Client,
@@ -32,9 +35,13 @@ pub struct DeepseekClient {
 
 impl DeepseekClient {
     pub fn new(cfg: Result<ApiClientConfig>) -> Self {
+        let label = cfg
+            .as_ref()
+            .map(|c| c.dialect.label())
+            .unwrap_or(ApiDialect::Deepseek.label());
         Self {
             cfg: cfg.map_err(|e| format!("{e:#}")),
-            http: crate::egress::client_builder("deepseek")
+            http: crate::egress::client_builder(label)
                 .build()
                 .unwrap_or_default(),
         }
@@ -64,17 +71,21 @@ impl ApiClient for DeepseekClient {
             body["max_tokens"] = json!(mt);
         }
         if let Some(effort) = &request.reasoning_effort {
-            // Thinking mode is on for every gaviero turn. The level and the
-            // toggle are sent together so neither a model default nor an
-            // account default can turn the chain of thought off — see
+            // DeepSeek: thinking mode is on for every gaviero turn. The level
+            // and the toggle are sent together so neither a model default nor
+            // an account default can turn the chain of thought off — see
             // <https://api-docs.deepseek.com/guides/thinking_mode>: on the
             // OpenAI-format endpoint the toggle is a top-level `thinking`
             // object and the level a top-level `reasoning_effort`.
+            // llama-server reads the same top-level `reasoning_effort` into the
+            // chat template's kwargs and has no `thinking` toggle.
             body["reasoning_effort"] = json!(effort);
-            body["thinking"] = json!({ "type": "enabled" });
+            if cfg.dialect.sends_thinking_toggle() {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
         }
 
-        let resp = post_with_retry(&self.http, &url, cfg.api_key.expose(), &body).await?;
+        let resp = post_with_retry(&self.http, &url, cfg, &body).await?;
 
         let (tx, rx) = mpsc::channel::<Result<ApiEvent>>(64);
         // Priced at send time: the peak/off-peak rate is fixed by when the
@@ -97,18 +108,24 @@ const MAX_API_RETRIES: u32 = 4;
 async fn post_with_retry(
     http: &reqwest::Client,
     url: &str,
-    api_key: &str,
+    cfg: &ApiClientConfig,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response> {
+    let server = cfg.dialect.display_name();
     let mut attempt = 0u32;
     loop {
-        let resp = http
-            .post(url)
-            .bearer_auth(api_key)
-            .json(body)
-            .send()
-            .await
-            .context("sending request to DeepSeek /chat/completions")?;
+        let mut req = http.post(url).json(body);
+        // An empty key means "send none" (a llama-server without --api-key).
+        if !cfg.api_key.expose().is_empty() {
+            req = req.bearer_auth(cfg.api_key.expose());
+        }
+        let resp = req.send().await.with_context(|| match cfg.dialect {
+            ApiDialect::Deepseek => "sending request to DeepSeek /chat/completions".to_string(),
+            ApiDialect::LlamaCpp => format!(
+                "sending request to llama.cpp at {url} — is llama-server running? \
+                 (set providers.llamacpp.baseUrl if it listens elsewhere)"
+            ),
+        })?;
 
         if resp.status().is_success() {
             return Ok(resp);
@@ -117,16 +134,17 @@ async fn post_with_retry(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !is_retryable_status(status.as_u16()) || attempt >= MAX_API_RETRIES {
-            anyhow::bail!("DeepSeek returned {}: {}", status, text);
+            anyhow::bail!("{server} returned {}: {}", status, text);
         }
 
         let delay = retry_delay(attempt);
         tracing::warn!(
             target: "tool_agent",
+            server,
             status = status.as_u16(),
             attempt,
             delay_ms = delay.as_millis(),
-            "DeepSeek request retrying after transient error"
+            "chat-completions request retrying after transient error"
         );
         tokio::time::sleep(delay).await;
         attempt += 1;
@@ -416,7 +434,149 @@ mod tests {
                 cache_miss_in: 0.56,
                 out: 1.68,
             }),
+            dialect: ApiDialect::Deepseek,
         }
+    }
+
+    /// A llama-server started without `--api-key`, as `resolve_llamacpp`
+    /// builds it when no key is configured.
+    fn llamacpp_cfg(base: &str) -> ApiClientConfig {
+        ApiClientConfig {
+            base_url: base.trim_end_matches('/').to_string(),
+            api_key: ApiKey::new(""),
+            pricing: None,
+            dialect: ApiDialect::LlamaCpp,
+        }
+    }
+
+    /// The llama.cpp dialect sends the level llama-server's template reads,
+    /// never DeepSeek's `thinking` toggle, and no `Authorization` header when
+    /// no key is configured.
+    #[tokio::test]
+    async fn llamacpp_sends_effort_without_thinking_toggle_or_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "reasoning_effort": "medium",
+                "stream_options": { "include_usage": true }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DeepseekClient::new(Ok(llamacpp_cfg(&server.uri())));
+        let request = ApiRequest {
+            model: "qwen3.8-27b".into(),
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            tools: vec![],
+            max_tokens: None,
+            reasoning_effort: Some("medium".into()),
+        };
+        let mut stream = client.complete(request).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(body.get("thinking").is_none(), "no DeepSeek toggle: {body}");
+        assert!(
+            !received[0].headers.contains_key("authorization"),
+            "no key configured, so no Authorization header"
+        );
+    }
+
+    /// llama-server's stream, as captured from v1.1.0 (Qwen3.8 template):
+    /// reasoning deltas, a tool call whose id has no `call_` prefix and whose
+    /// arguments arrive in fragments, the finish chunk, then a usage chunk
+    /// reporting cache hits as `prompt_tokens_details.cached_tokens`.
+    #[tokio::test]
+    async fn llamacpp_stream_yields_reasoning_tool_call_and_free_usage() {
+        let body = [
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"object":"chat.completion.chunk"}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Read it."}}],"object":"chat.completion.chunk"}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"OoEgmK2l95YvtvjQ0unUaYeyxbmMaKBT","type":"function","function":{"name":"Read","arguments":"{"}}]}}],"object":"chat.completion.chunk"}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"file_path\":\"calc.py\"}"}}]}}],"object":"chat.completion.chunk"}"#,
+            r#"data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}],"object":"chat.completion.chunk"}"#,
+            r#"data: {"choices":[],"usage":{"completion_tokens":62,"prompt_tokens":317,"total_tokens":379,"prompt_tokens_details":{"cached_tokens":300}},"timings":{"cache_n":300}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n\n");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = DeepseekClient::new(Ok(llamacpp_cfg(&server.uri())));
+        let request = ApiRequest {
+            model: "qwen3.8-27b".into(),
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            tools: vec![],
+            max_tokens: None,
+            reasoning_effort: None,
+        };
+        let mut stream = client.complete(request).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(e) = stream.next().await {
+            events.push(e.unwrap());
+        }
+
+        assert!(matches!(&events[0], ApiEvent::Reasoning(r) if r == "Read it."));
+        match &events[1] {
+            ApiEvent::ToolCall(ToolCall { id, name, args }) => {
+                assert_eq!(id, "OoEgmK2l95YvtvjQ0unUaYeyxbmMaKBT");
+                assert_eq!(name, "Read");
+                assert_eq!(args, &json!({ "file_path": "calc.py" }));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &events[2] {
+            ApiEvent::Usage(u) => {
+                assert_eq!((u.input_tokens, u.output_tokens), (317, 62));
+                assert_eq!(u.cost_usd, Some(0.0), "local inference is free");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert!(matches!(events[3], ApiEvent::Done(StopReason::ToolUse)));
+    }
+
+    /// Nothing listening: the error must say which server and how to point
+    /// gaviero at it, not "DeepSeek".
+    #[tokio::test]
+    async fn llamacpp_connection_error_names_the_server() {
+        // Bind and drop a listener so the port is (almost certainly) closed.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = DeepseekClient::new(Ok(llamacpp_cfg(&format!("http://127.0.0.1:{port}/v1"))));
+        let request = ApiRequest {
+            model: "x".into(),
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            tools: vec![],
+            max_tokens: None,
+            reasoning_effort: None,
+        };
+        let err = match client.complete(request).await {
+            Ok(_) => panic!("nothing listens there"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("llama-server running"), "{err}");
+        assert!(err.contains("providers.llamacpp.baseUrl"), "{err}");
+        assert!(!err.contains("DeepSeek"), "{err}");
     }
 
     async fn run_sse(server_body: String) -> Vec<ApiEvent> {
