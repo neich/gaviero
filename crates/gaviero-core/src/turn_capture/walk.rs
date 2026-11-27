@@ -47,6 +47,8 @@ pub struct Observed {
     pub rel: String,
     pub size: u64,
     pub mtime_ns: i64,
+    /// Unix permission bits; `None` elsewhere.
+    pub mode: Option<u32>,
 }
 
 /// Directory names never descended into.
@@ -250,6 +252,7 @@ fn push(out: &mut BTreeMap<PathBuf, Observed>, root: &Path, path: &Path) {
             rel,
             size: meta.len(),
             mtime_ns: mtime_ns(&meta),
+            mode: crate::util::fs::file_mode(&meta),
         },
     );
 }

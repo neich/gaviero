@@ -386,3 +386,82 @@ fn between_turn_changes_are_reported_at_the_next_begin() {
     let set = w.cap.end(h, TurnOutcome::Completed).unwrap().set;
     assert!(set.is_empty());
 }
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+#[cfg(unix)]
+fn chmod(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn revert_of_a_delete_restores_the_pre_turn_mode() {
+    let w = ws();
+    w.write("run.sh", "#!/bin/sh\necho hi\n");
+    w.write("secret.conf", "k=v\n");
+    chmod(&w.root.join("run.sh"), 0o755);
+    chmod(&w.root.join("secret.conf"), 0o640);
+    let set = w.turn("t1", |w| {
+        std::fs::remove_file(w.root.join("run.sh")).unwrap();
+        std::fs::remove_file(w.root.join("secret.conf")).unwrap();
+    });
+    for c in &set.files {
+        assert_eq!(c.kind, ChangeKind::Deleted, "{}", c.rel);
+        assert_eq!(revert_file(&w.cap, c, false).unwrap(), RevertOutcome::Reverted);
+    }
+    assert_eq!(w.read("run.sh").as_deref(), Some("#!/bin/sh\necho hi\n"));
+    assert_eq!(mode_of(&w.root.join("run.sh")), 0o755);
+    assert_eq!(mode_of(&w.root.join("secret.conf")), 0o640);
+}
+
+#[cfg(unix)]
+#[test]
+fn revert_of_an_edit_restores_the_pre_turn_mode() {
+    let w = ws();
+    w.write("run.sh", "#!/bin/sh\n");
+    chmod(&w.root.join("run.sh"), 0o755);
+    let set = w.turn("t1", |w| {
+        w.write("run.sh", "#!/bin/sh\nrm -rf build\n");
+        chmod(&w.root.join("run.sh"), 0o644);
+    });
+    assert_eq!(revert_file(&w.cap, &set.files[0], false).unwrap(), RevertOutcome::Reverted);
+    assert_eq!(mode_of(&w.root.join("run.sh")), 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_chmod_between_turns_reaches_the_baseline() {
+    let w = ws();
+    w.write("run.sh", "#!/bin/sh\n");
+    let p = w.root.join("run.sh");
+    // Old enough that the next begin reuses the entry instead of rehashing.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+    chmod(&p, 0o644);
+    let _ = w.turn("t1", |_| {});
+    // A chmod changes neither size nor mtime.
+    chmod(&p, 0o755);
+    let set = w.turn("t2", |w| std::fs::remove_file(w.root.join("run.sh")).unwrap());
+    assert_eq!(set.files[0].before.as_ref().unwrap().mode, Some(0o755));
+    revert_file(&w.cap, &set.files[0], false).unwrap();
+    assert_eq!(mode_of(&p), 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_without_a_recorded_mode_is_not_private() {
+    // Records written before modes were captured: the restored file gets the
+    // mode any new file would, not the temp file's 0600.
+    let w = ws();
+    let plain = w.root.join("plain.txt");
+    std::fs::write(&plain, "x").unwrap();
+    let restored = w.root.join("restored.txt");
+    store::restore_write(&restored, b"x", None).unwrap();
+    assert_eq!(mode_of(&restored), mode_of(&plain));
+}

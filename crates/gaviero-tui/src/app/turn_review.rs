@@ -917,6 +917,7 @@ fn recorded_blob(sha256: &str) -> BlobRef {
         sha256: Some(sha256.to_string()),
         size: 0,
         stored: true,
+        mode: None,
     }
 }
 

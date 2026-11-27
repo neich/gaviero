@@ -29,6 +29,9 @@ pub struct BlobRef {
     pub size: u64,
     /// Content is in the blob store (≤ [`super::MAX_BLOB_BYTES`]).
     pub stored: bool,
+    /// Unix permission bits; `None` off Unix and in records older than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

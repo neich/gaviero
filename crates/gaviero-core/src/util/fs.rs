@@ -39,6 +39,62 @@ pub fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
     Err(last)
 }
 
+/// Give `replacement` the permission bits of the file it is about to replace.
+///
+/// A save through a temp file + rename swaps in a new inode created with the
+/// creator's default mode (`File::create`: `0666 & !umask`; `tempfile`:
+/// `0600`), so without this every save drops a script's executable bit and
+/// changes who may read the file. Call it after writing `replacement` and
+/// before the rename. A missing `target` (a new file) leaves `replacement` as
+/// created. Unix only: Windows has no mode bits, and copying its read-only
+/// attribute would make the replacing rename itself fail.
+pub fn copy_permissions_from_target(target: &Path, replacement: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match std::fs::metadata(target) {
+            Ok(meta) => std::fs::set_permissions(replacement, meta.permissions()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, replacement);
+        Ok(())
+    }
+}
+
+/// A file's Unix permission bits (`0o7777`: rwx for all three classes plus
+/// setuid/setgid/sticky), for recording and restoring later with
+/// [`set_mode`]. `None` off Unix.
+pub fn file_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Set a file's Unix permission bits to `mode` (as read by [`file_mode`]).
+/// No-op off Unix.
+pub fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
 /// Strip Windows' verbatim prefix from a canonicalized path:
 /// `\\?\C:\ws` → `C:\ws`, `\\?\UNC\srv\share` → `\\srv\share`.
 ///
@@ -94,6 +150,34 @@ mod tests {
     fn missing_path_is_ok() {
         let dir = tempfile::tempdir().unwrap();
         remove_dir_all_retry(&dir.path().join("nope")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_mode_bits_onto_the_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("run.sh");
+        let replacement = dir.path().join("tmp");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(&replacement, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        copy_permissions_from_target(&target, &replacement).unwrap();
+
+        let mode = std::fs::metadata(&replacement).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o750);
+    }
+
+    #[test]
+    fn missing_target_leaves_the_replacement_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = dir.path().join("tmp");
+        std::fs::write(&replacement, "x").unwrap();
+        let before = std::fs::metadata(&replacement).unwrap().permissions();
+        copy_permissions_from_target(&dir.path().join("new.sh"), &replacement).unwrap();
+        assert_eq!(std::fs::metadata(&replacement).unwrap().permissions(), before);
     }
 
     #[cfg(windows)]

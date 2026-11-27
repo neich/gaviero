@@ -191,6 +191,8 @@ impl TurnCapture {
                     let mut e = e.clone();
                     e.root = o.root.clone();
                     e.rel = o.rel.clone();
+                    // A chmod leaves the mtime alone: always take the fresh stat's.
+                    e.mode = o.mode;
                     e
                 }
                 // A store that cannot be written fails the whole turn bracket,
@@ -271,7 +273,9 @@ impl TurnCapture {
         for (path, o) in &observed {
             let before = pre.entries.get(path);
             if let Some(e) = before.filter(|e| self.reusable(e, o)) {
-                scoped.entries.insert(path.clone(), e.clone());
+                let mut e = e.clone();
+                e.mode = o.mode;
+                scoped.entries.insert(path.clone(), e);
                 budget.files += 1;
                 continue;
             }
@@ -293,6 +297,7 @@ impl TurnCapture {
                         sha256: Some(hash),
                         stored: false,
                         racy: o.mtime_ns >= scan_ns - RACY_WINDOW_NS,
+                        mode: o.mode,
                     }
                 }
             };
@@ -447,6 +452,7 @@ impl TurnCapture {
                 sha256: None,
                 stored: false,
                 racy,
+                mode: o.mode,
             }));
         }
         if o.size <= MAX_BLOB_BYTES {
@@ -465,6 +471,7 @@ impl TurnCapture {
                 sha256: Some(hash),
                 stored: true,
                 racy,
+                mode: o.mode,
             }))
         } else {
             let Ok(hash) = hash_file(&o.path) else {
@@ -478,6 +485,7 @@ impl TurnCapture {
                 sha256: Some(hash),
                 stored: false,
                 racy,
+                mode: o.mode,
             }))
         }
     }
@@ -767,6 +775,7 @@ fn change(
         sha256: e.sha256.clone(),
         size: e.size,
         stored: e.stored,
+        mode: e.mode,
     };
     let any = before.or(after).expect("a change has at least one side");
     let before_ref = before.map(side);

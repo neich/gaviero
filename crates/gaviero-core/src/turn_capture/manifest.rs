@@ -19,6 +19,10 @@ pub struct Entry {
     /// entry, so an equal (size, mtime) later does not prove equal content.
     #[serde(default)]
     pub racy: bool,
+    /// Unix permission bits at the last scan, so a revert that recreates the
+    /// file restores them (`None` off Unix and in baselines older than this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
