@@ -76,7 +76,7 @@ impl ToolCallLog {
         }
     }
 
-    fn get(&self, id: &str) -> Option<&Value> {
+    pub(super) fn get(&self, id: &str) -> Option<&Value> {
         self.calls.get(id)
     }
 }

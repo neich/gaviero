@@ -1072,6 +1072,7 @@ async fn dsh_backend_happy_turn_with_fake_agent() {
                 }),
             ),
         )))),
+        claims: None,
     };
     let mut stream = backend.stream_completion(req).await.unwrap();
     let mut events = Vec::new();
@@ -1282,6 +1283,56 @@ async fn agy_new_session_sends_system_prompt_in_meta_and_sets_model_and_mode() {
         Some("hello"),
         "{report}"
     );
+}
+
+/// `FilesWritten` paths in `events`, flattened.
+fn files_written(events: &[UnifiedStreamEvent]) -> Vec<std::path::PathBuf> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            UnifiedStreamEvent::FilesWritten(w) => Some(w.iter().map(|f| f.path.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[tokio::test]
+async fn agy_completed_edit_emits_files_written() {
+    let dir = workspace();
+    let (obs, _, _) = agy_observer();
+    let mut session = agy_session(
+        dir.path(),
+        "agy:fake-low",
+        "agy_inspect",
+        AgentOptions::default(),
+        obs,
+    );
+    let events = drain(&mut session, true).await;
+    let written = files_written(&events);
+    assert_eq!(written.len(), 1, "{events:?}");
+    assert!(written[0].ends_with("hello.txt"), "{written:?}");
+    assert!(written[0].is_absolute(), "{written:?}");
+}
+
+#[tokio::test]
+async fn dsh_completed_write_emits_files_written() {
+    let dir = workspace();
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+        true,
+    );
+    let mut session =
+        AcpClientSession::new_with_scope(args, FileScope::default()).with_extra(extra("dsh_write"));
+    let events = drain(&mut session, true).await;
+    let written = files_written(&events);
+    assert_eq!(written.len(), 1, "{events:?}");
+    assert!(written[0].ends_with("note.txt"), "{written:?}");
+    assert!(written[0].is_absolute(), "{written:?}");
 }
 
 #[tokio::test]

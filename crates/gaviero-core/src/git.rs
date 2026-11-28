@@ -561,6 +561,26 @@ pub fn files_changed_in_commit(repo_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Paths that differ between `from` and `to` (`git diff --name-only
+/// --relative <from> <to>`), relative to `repo_dir`.
+pub fn diff_names(repo_dir: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
+    let out = Command::new("git")
+        .args(["diff", "--name-only", "--relative", from, to])
+        .current_dir(repo_dir)
+        .output()
+        .context("git diff --name-only")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git diff --name-only failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
 /// Return the unified diff of `branch` relative to `base_sha`.
 ///
 /// Works even after the worktree for `branch` has been torn down, since the
@@ -1190,6 +1210,38 @@ impl Default for GitCoordinator {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn diff_names_lists_files_changed_on_a_branch() {
+        let dir = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@test.com"])
+                .args(["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "same\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("b/c.txt"), "new\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "change"]);
+        git(&["checkout", "-q", "main"]);
+
+        let mut names = diff_names(dir.path(), "HEAD", "feature").unwrap();
+        names.sort();
+        assert_eq!(names, vec![PathBuf::from("a.txt"), PathBuf::from("b/c.txt")]);
+        assert!(diff_names(dir.path(), "HEAD", "no-such-branch").is_err());
+    }
 
     fn init_test_repo() -> (TempDir, GitRepo) {
         let dir = TempDir::new().unwrap();

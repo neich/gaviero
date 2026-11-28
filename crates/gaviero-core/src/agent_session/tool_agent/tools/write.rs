@@ -235,6 +235,9 @@ async fn commit_write(ctx: &ToolCtx, file_path: &str, contents: &str) -> Result<
     tokio::fs::write(&path, contents)
         .await
         .map_err(|e| format!("writing '{}': {e}", file_path))?;
+    if let Some(observer) = &ctx.observer {
+        observer.on_files_written(&[crate::write_claims::FileWrite::unknown(path.clone())]);
+    }
 
     Ok(format!("Wrote {}", display_rel(&path, &ctx.workspace_root)))
 }
@@ -301,6 +304,26 @@ mod tests {
             "hello\n"
         );
         assert_eq!(snap.lock().await.touched_paths().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_write_reports_the_written_path_to_the_observer() {
+        use crate::observer::test_support::FilesWrittenRecorder;
+        let dir = tempdir().unwrap();
+        let snap = Arc::new(Mutex::new(TurnSnapshot::new()));
+        let recorder = Arc::new(FilesWrittenRecorder::default());
+        let ctx = ToolCtx {
+            observer: Some(recorder.clone()),
+            ..ctx_for(dir.path(), snap)
+        };
+        let out = WriteTool
+            .run(json!({ "file_path": "sub/../y.txt", "contents": "hi\n" }), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            recorder.writes(),
+            vec![crate::write_claims::FileWrite::unknown(dir.path().join("y.txt"))]
+        );
     }
 
     #[tokio::test]

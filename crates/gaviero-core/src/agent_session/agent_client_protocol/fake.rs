@@ -593,6 +593,31 @@ async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(
             )
             .await?;
         }
+        // dsh's own `write` tool: a `kind: "other"` call named in `title`,
+        // settled by a `completed` update (no `fs/write_text_file`).
+        "dsh_write" => {
+            emit_update(
+                writer,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "w1",
+                    "title": "write",
+                    "kind": "other",
+                    "status": "in_progress",
+                    "rawInput": { "file_path": "note.txt", "content": "hi" }
+                }),
+            )
+            .await?;
+            emit_update(
+                writer,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "w1",
+                    "status": "completed"
+                }),
+            )
+            .await?;
+        }
         "read" => {
             *next_agent_id += 1;
             write_json(
