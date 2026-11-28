@@ -4880,6 +4880,22 @@ async fn main() -> Result<()> {
         }),
         memory_root: run_state.swarm_memory_root(),
         graph_db_path: run_state.swarm_graph_db(&repo),
+        // Write claims: the run and its agents publish what they write, so a
+        // TUI chat turn running in the same tree leaves those files out of
+        // its review (and the dsh/agy reconcile leaves out the TUI's).
+        claims: gaviero_core::write_claims::ClaimJournal::machine_default().map(|journal| {
+            gaviero_core::write_claims::SwarmClaimConfig {
+                journal,
+                label: format!("gaviero-cli '{}'", run_display_name(&cli)),
+                consume: workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::TURN_REVIEW_ATTRIBUTION,
+                        Some(&repo),
+                    )
+                    .as_bool()
+                    .unwrap_or(true),
+            }
+        }),
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -5246,12 +5262,10 @@ async fn wait_for_limits(
 /// Start the run's published record (`swarm::live_run`): every planned agent
 /// queued, labelled like the SWARM panel labels a run. None when there is no
 /// machine folder; a write failure only logs.
-fn start_live_run(
-    cli: &Cli,
-    plan: &gaviero_core::swarm::plan::CompiledPlan,
-    run_root: &std::path::Path,
-) -> Option<LiveRunHandle> {
-    let store = CliRunStore::machine_default()?;
+/// What a run is called for people: the script (or plan) file stem, or
+/// `work units` / `task`, plus ` · <workflow>` when one is picked. Shown by
+/// the phone's run list and in write-claim labels (`gaviero-cli '<name>'`).
+fn run_display_name(cli: &Cli) -> String {
     let stem = |p: &std::path::Path| {
         p.file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -5269,6 +5283,16 @@ fn start_live_run(
     if let Some(workflow) = &cli.workflow {
         script = format!("{script} · {workflow}");
     }
+    script
+}
+
+fn start_live_run(
+    cli: &Cli,
+    plan: &gaviero_core::swarm::plan::CompiledPlan,
+    run_root: &std::path::Path,
+) -> Option<LiveRunHandle> {
+    let store = CliRunStore::machine_default()?;
+    let script = run_display_name(cli);
     let folder = run_root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

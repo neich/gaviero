@@ -132,6 +132,7 @@ fn run(script: &Path, workspace: &Path, extra: &[&str]) -> Output {
         // Covers the isolated run with no settings to read.
         .env("GAVIERO_EMBEDDER_MODEL", "null")
         .env("GAVIERO_CLI_RUNS_DIR", shared_cli_runs_dir())
+        .env("GAVIERO_CLAIMS_DIR", shared_cli_runs_dir().join("claims"))
         .output()
         .expect("spawn gaviero-cli")
 }
@@ -166,6 +167,17 @@ fn shared_cli_runs_dir() -> PathBuf {
     std::env::temp_dir().join("gaviero-cli-runs-tests")
 }
 
+/// Where a run publishing to `cli_runs` keeps its write claims
+/// (`write_claims`) — never the machine's runtime dir. Beside the runs
+/// folder, so the folder still holds run records only.
+fn claims_dir_for(cli_runs: &Path) -> PathBuf {
+    let name = cli_runs
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    cli_runs.with_file_name(format!("{name}-claims"))
+}
+
 /// `gaviero-cli --script` started from `cwd`, with no root flags.
 fn run_from(cwd: &Path, script: &Path) -> Output {
     run_from_publishing(cwd, script, &shared_cli_runs_dir())
@@ -184,6 +196,7 @@ fn run_from_publishing(cwd: &Path, script: &Path, cli_runs: &Path) -> Output {
         .args(["--skip-mcp-preflight", "--run-timeout", "120"])
         .env("GAVIERO_EMBEDDER_MODEL", "null")
         .env("GAVIERO_CLI_RUNS_DIR", cli_runs)
+        .env("GAVIERO_CLAIMS_DIR", claims_dir_for(cli_runs))
         .output()
         .expect("spawn gaviero-cli")
 }
@@ -267,6 +280,41 @@ fn a_run_is_published_for_the_phone() {
     assert_eq!(run["agents"][0]["status"], "completed", "{run}");
     let output = std::fs::read_to_string(records[0].join("agents/writer.json")).unwrap();
     assert!(output.contains("Running"), "{output}");
+}
+
+/// The run and its agent register as write-claim writers, and finish.
+#[test]
+fn a_run_publishes_its_writers_to_the_claims_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    configure(&root);
+    init_repo(&root);
+    let script = write_repo_script(&root);
+    let runs = tmp.path().join("cli-runs");
+
+    let stderr = stderr_of(&run_from_publishing(&root, &script, &runs));
+
+    let claims = claims_dir_for(&runs);
+    let writers: Vec<serde_json::Value> = std::fs::read_dir(&claims)
+        .unwrap_or_else(|e| panic!("no claims folder ({e}): {stderr}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".writer.json"))
+        .map(|p| serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    let run = writers
+        .iter()
+        .find(|w| w["kind"] == "swarm_run")
+        .unwrap_or_else(|| panic!("no swarm_run writer in {writers:?}"));
+    assert!(!run["ended_ns"].is_null(), "{run}");
+    assert_eq!(run["label"], "gaviero-cli 'wf'", "{run}");
+    assert!(
+        writers
+            .iter()
+            .any(|w| w["kind"] == "swarm_agent" && w["label"] == "gaviero-cli 'wf' · writer"),
+        "{writers:?}"
+    );
 }
 
 /// Each folder of a multi-folder workspace has its own graph in the TUI, so

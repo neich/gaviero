@@ -112,6 +112,7 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         skill_catalog: None,
         memory_root: None,
         graph_db_path: None,
+        claims: None,
     }
 }
 
