@@ -63,6 +63,7 @@ impl ConsolidationLlm for BackendConsolidationLlm {
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         };
         let outcome = executor::complete_to_text(self.backend.as_ref(), request, None).await?;
         Ok(outcome.text)

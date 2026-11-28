@@ -164,6 +164,7 @@ fn config_for(workspace: &Path, ollama_url: &str, max_parallel: usize) -> SwarmC
         skill_catalog: None,
         memory_root: None,
         graph_db_path: None,
+        claims: None,
     }
 }
 

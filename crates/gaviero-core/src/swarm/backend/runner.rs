@@ -142,6 +142,7 @@ pub async fn run_backend(
     exposed_tools: Option<&[String]>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
+    claims: Option<&crate::write_claims::RunClaims>,
 ) -> Result<AgentManifest> {
     let inner = run_backend_inner(
         backend,
@@ -161,6 +162,7 @@ pub async fn run_backend(
         exposed_tools,
         skip_repo_context,
         skill_catalog,
+        claims,
     );
     if work_unit.timeout_secs == 0 {
         return inner.await;
@@ -189,7 +191,7 @@ pub async fn run_backend(
 }
 
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory, tool_policy, exposed_tools),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory, tool_policy, exposed_tools, claims),
     fields(
         agent_id = %work_unit.id,
         tier = ?work_unit.tier,
@@ -225,6 +227,7 @@ async fn run_backend_inner(
     exposed_tools: Option<&[String]>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
+    claims: Option<&crate::write_claims::RunClaims>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -373,6 +376,8 @@ async fn run_backend_inner(
     // Spend across every attempt: a corrective retry is paid for too, so each
     // manifest below reports the total, not just its last turn.
     let mut turn_cost_usd = 0.0_f64;
+    // This agent invocation's write-claim writer (finished when dropped).
+    let agent_claims = claims.and_then(|c| c.register_agent(&work_unit.id, workspace_root));
 
     for attempt in 0..max_attempts {
         let prompt = match &corrective {
@@ -409,6 +414,7 @@ async fn run_backend_inner(
             tool_policy: tool_policy.cloned(),
             exposed_tools: exposed_tools.map(|s| s.to_vec()),
             write_gate: Some(super::WriteGateHandle(write_gate.clone())),
+            claims: agent_claims.clone(),
         };
 
         // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
@@ -485,7 +491,21 @@ async fn run_backend_inner(
                 UnifiedStreamEvent::ToolCallDelta { .. } => {}
                 UnifiedStreamEvent::ToolCallEnd { .. } => {}
                 UnifiedStreamEvent::PathsModified(paths) => {
+                    if let Some(h) = &agent_claims {
+                        h.writer.record_all(
+                            &paths
+                                .iter()
+                                .cloned()
+                                .map(crate::write_claims::FileWrite::unknown)
+                                .collect::<Vec<_>>(),
+                        );
+                    }
                     attempt_modified.extend(paths);
+                }
+                UnifiedStreamEvent::FilesWritten(writes) => {
+                    if let Some(h) = &agent_claims {
+                        h.writer.record_all(&writes);
+                    }
                 }
                 UnifiedStreamEvent::FileBlock { path, content } => {
                     match propose_write(
@@ -496,6 +516,7 @@ async fn run_backend_inner(
                         workspace_root,
                         &write_gate,
                         observer,
+                        agent_claims.as_ref().map(|h| h.writer.as_ref()),
                     )
                     .await
                     {
@@ -721,6 +742,7 @@ async fn run_backend_inner(
                     workspace_root,
                     &write_gate,
                     observer,
+                    agent_claims.as_ref().map(|h| h.writer.as_ref()),
                 )
                 .await
                 {
@@ -815,6 +837,7 @@ pub(crate) async fn propose_write(
     workspace_root: &Path,
     write_gate: &Arc<Mutex<WriteGatePipeline>>,
     observer: &dyn AcpObserver,
+    claims: Option<&crate::write_claims::ClaimWriter>,
 ) -> Result<bool> {
     let abs_path = workspace_root.join(rel_path);
 
@@ -913,10 +936,12 @@ pub(crate) async fn propose_write(
         observer.on_proposal_deferred(&abs_path, old, proposed_content);
     }
 
-    // 5. Auto-accept: perform the disk action outside the lock.
+    // 5. Auto-accept: perform the disk action outside the lock, and report
+    // it as written (hashed before the write: a write claim's proof).
     if let Some(action) = auto_accept_result {
         match action {
             AutoAcceptAction::Write { path, content } => {
+                let claim = crate::write_claims::FileWrite::before_now(&path);
                 // Agents legitimately create the first file in a new artefact
                 // directory ({{OUT_DIR}} on the init pass, for instance), so a
                 // missing parent is expected rather than an error.
@@ -934,14 +959,25 @@ pub(crate) async fn propose_write(
                 tokio::fs::write(&path, &content)
                     .await
                     .map_err(|e| anyhow::anyhow!("writing auto-accepted file: {}", e))?;
-            }
-            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow::anyhow!("removing auto-accepted file: {}", e));
+                observer.on_files_written(std::slice::from_ref(&claim));
+                if let Some(w) = claims {
+                    w.record(&claim);
                 }
-            },
+            }
+            AutoAcceptAction::Delete { path } => {
+                let claim = crate::write_claims::FileWrite::before_now(&path);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("removing auto-accepted file: {}", e));
+                    }
+                }
+                observer.on_files_written(std::slice::from_ref(&claim));
+                if let Some(w) = claims {
+                    w.record(&claim);
+                }
+            }
         }
     }
 
@@ -1132,6 +1168,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1175,6 +1212,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -1228,6 +1266,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -1286,6 +1325,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1301,6 +1341,92 @@ mod tests {
     // {{OUT_DIR}} that does not exist yet. Without `create_dir_all` the write
     // failed, the error was logged and swallowed, and the agent reported
     // Completed having produced nothing.
+    #[tokio::test]
+    async fn run_backend_records_file_blocks_and_files_written_as_agent_claims() {
+        use crate::write_claims::{
+            Before, ClaimJournal, FileWrite, RunClaims, SwarmClaimConfig, WriterKind,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        let edited = workspace.join("src/edited.rs");
+        std::fs::write(&edited, "fn x() {}\n").unwrap();
+
+        let events = vec![
+            UnifiedStreamEvent::FileBlock {
+                path: PathBuf::from("src/new.md"),
+                content: "# new\n".into(),
+            },
+            UnifiedStreamEvent::FilesWritten(vec![FileWrite::unknown(&edited)]),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let unit = test_work_unit(); // owns src/
+        let journal = ClaimJournal::at(tmp.path().join("claims"));
+        let run = RunClaims::start(
+            &SwarmClaimConfig {
+                journal: journal.clone(),
+                label: "t".into(),
+                consume: true,
+            },
+            "r1",
+            &workspace,
+        )
+        .expect("run writer");
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            &workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            Some(&run),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(manifest.status, AgentStatus::Completed));
+
+        let snap = journal.snapshot(0);
+        let agent = snap
+            .writers
+            .iter()
+            .find(|w| w.info.kind == WriterKind::SwarmAgent)
+            .expect("agent writer registered");
+        assert_eq!(agent.info.label, format!("t · {}", unit.id));
+        assert!(agent.info.ended_ns.is_some(), "the agent writer finished");
+        let new_key = crate::write_claims::claim_key(&workspace.join("src/new.md"));
+        let edited_key = crate::write_claims::claim_key(&edited);
+        let block = agent
+            .claims
+            .iter()
+            .find(|c| c.key == new_key)
+            .expect("FileBlock claimed");
+        assert_eq!(block.before, Before::Absent, "a new file");
+        assert!(block.after.is_some());
+        assert!(
+            agent.claims.iter().any(|c| c.key == edited_key),
+            "FilesWritten claimed: {:?}",
+            agent.claims
+        );
+    }
+
     #[tokio::test]
     async fn test_run_backend_file_block_creates_missing_parent_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1338,6 +1464,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -1394,6 +1521,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1448,6 +1576,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -1508,6 +1637,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1564,6 +1694,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1617,6 +1748,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1669,6 +1801,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             ),
         )
         .await
@@ -1719,6 +1852,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1755,6 +1889,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await

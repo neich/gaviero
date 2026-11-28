@@ -357,6 +357,7 @@ fn probe_request(
         tool_policy: None,
         exposed_tools: None,
         write_gate: None,
+        claims: None,
     }
 }
 

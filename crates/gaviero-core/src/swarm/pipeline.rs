@@ -304,6 +304,8 @@ pub struct SwarmConfig {
     /// a graph built from a different scan root (see
     /// [`crate::repo_map::graph_builder::build_graph_at`]).
     pub graph_db_path: Option<PathBuf>,
+    /// Write-claim publishing and the dsh/agy reconcile filter. None = publish nothing (tests).
+    pub claims: Option<crate::write_claims::SwarmClaimConfig>,
 }
 
 impl SwarmConfig {
@@ -598,6 +600,17 @@ pub async fn execute(
             .unwrap_or_default()
             .as_millis()
     );
+    // Write claims: the run's own writer, and per-agent writers through the
+    // iteration config every dispatch receives.
+    let run_claims = config
+        .claims
+        .as_ref()
+        .and_then(|c| crate::write_claims::RunClaims::start(c, &run_id, &config.workspace_root));
+    let iteration_config = {
+        let mut c = plan.iteration_config.clone();
+        c.claims = run_claims.clone();
+        c
+    };
 
     // Capture HEAD SHA before any merges (for revert support)
     let pre_swarm_sha = if use_worktrees {
@@ -705,7 +718,7 @@ pub async fn execute(
             None,
             &agent_ctx,
             &tier_router,
-            &plan.iteration_config,
+            &iteration_config,
             make_observer(&unit.id),
         )
         .await?;
@@ -916,7 +929,7 @@ pub async fn execute(
         analysis: &analysis,
         pre_fetched_memory: pre_fetched_memory.clone(),
         tier_router: &tier_router,
-        iteration_config: &plan.iteration_config,
+        iteration_config: &iteration_config,
         bus: &bus,
         run_id: &run_id,
         plan_hash: &plan_hash,
@@ -1151,7 +1164,7 @@ pub async fn execute(
                     worktree_mgr.as_mut(),
                     &agent_ctx,
                     &tier_router,
-                    &plan.iteration_config,
+                    &iteration_config,
                     make_observer(unit_id),
                 )
                 .await?;
@@ -1282,7 +1295,7 @@ pub async fn execute(
                 let rm = repo_map.clone();
                 let agent_impact = impact_texts.get(unit_id).cloned();
                 let router = tier_router.clone();
-                let iteration_config = plan.iteration_config.clone();
+                let iteration_config = iteration_config.clone();
                 let pfm = pre_fetched_memory.clone();
                 let swarm_extras = config.swarm_extra_tools.clone();
                 let tool_policy = config.tool_policy.clone();
@@ -1748,7 +1761,7 @@ pub async fn execute(
                     worktree_mgr.as_mut(),
                     &agent_ctx,
                     &tier_router,
-                    &plan.iteration_config,
+                    &iteration_config,
                     make_observer(agent_id),
                     BranchOverride { branch, base_sha },
                 )
@@ -1863,7 +1876,7 @@ pub async fn execute(
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
                     tier_router: &tier_router,
-                    iteration_config: &plan.iteration_config,
+                    iteration_config: &iteration_config,
                     loop_judge_map: &loop_judge_map,
                     bus: &bus,
                     all_manifests: &mut all_manifests,
@@ -1930,7 +1943,7 @@ pub async fn execute(
                         current_iter_abs,
                         loop_config.agent_ids
                     );
-                    write_irreconcilable_report(
+                    let written = write_irreconcilable_report(
                         &config.workspace_root,
                         loop_config.verdict_output_dir.as_deref(),
                         current_iter_abs,
@@ -1938,6 +1951,7 @@ pub async fn execute(
                         &report,
                         &loop_config.agent_ids,
                     );
+                    claim_run_writes(run_claims.as_ref(), written);
                     loop_terminated = true;
                     break;
                 }
@@ -1980,7 +1994,7 @@ pub async fn execute(
                                 repeat_streak,
                                 loop_config.agent_ids
                             );
-                            write_irreconcilable_report(
+                            let written = write_irreconcilable_report(
                                 &config.workspace_root,
                                 loop_config.verdict_output_dir.as_deref(),
                                 current_iter_abs,
@@ -1990,6 +2004,7 @@ pub async fn execute(
                                 &report,
                                 &loop_config.agent_ids,
                             );
+                            claim_run_writes(run_claims.as_ref(), written);
                             loop_terminated = true;
                             break;
                         }
@@ -2107,7 +2122,7 @@ pub async fn execute(
                     let rm = repo_map.clone();
                     let agent_impact = impact_texts.get(&agent_id).cloned();
                     let router = tier_router.clone();
-                    let iteration_config = plan.iteration_config.clone();
+                    let iteration_config = iteration_config.clone();
                     let pfm = pre_fetched_memory.clone();
                     let swarm_extras = config.swarm_extra_tools.clone();
                     let tool_policy = config.tool_policy.clone();
@@ -2365,7 +2380,7 @@ pub async fn execute(
                             worktree_mgr.as_mut(),
                             &agent_ctx,
                             &tier_router,
-                            &plan.iteration_config,
+                            &iteration_config,
                             make_observer(agent_id),
                             BranchOverride { branch, base_sha },
                         )
@@ -2376,7 +2391,7 @@ pub async fn execute(
                             worktree_mgr.as_mut(),
                             &agent_ctx,
                             &tier_router,
-                            &plan.iteration_config,
+                            &iteration_config,
                             make_observer(agent_id),
                         )
                         .await?
@@ -2441,7 +2456,7 @@ pub async fn execute(
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
                     tier_router: &tier_router,
-                    iteration_config: &plan.iteration_config,
+                    iteration_config: &iteration_config,
                     loop_judge_map: &loop_judge_map,
                     bus: &bus,
                     all_manifests: &mut all_manifests,
@@ -2492,7 +2507,7 @@ pub async fn execute(
                         loop_config.max_iterations,
                         loop_config.agent_ids
                     );
-                    write_irreconcilable_report(
+                    let written = write_irreconcilable_report(
                         &config.workspace_root,
                         loop_config.verdict_output_dir.as_deref(),
                         final_iter_abs,
@@ -2500,6 +2515,7 @@ pub async fn execute(
                         &report,
                         &loop_config.agent_ids,
                     );
+                    claim_run_writes(run_claims.as_ref(), written);
                 }
                 LoopConditionOutcome::Continue(_) => {
                     tracing::warn!(
@@ -2567,7 +2583,7 @@ pub async fn execute(
                     worktree_mgr.as_mut(),
                     &agent_ctx,
                     &tier_router,
-                    &plan.iteration_config,
+                    &iteration_config,
                     make_observer(unit_id),
                 )
                 .await?;
@@ -2641,6 +2657,22 @@ pub async fn execute(
                     tracing::debug!("skipping merge of stacked iteration branch '{}'", branch);
                     continue;
                 }
+                // The files this merge rewrites, hashed before it runs: claims
+                // of the run writer once it succeeds.
+                let merge_claims: Vec<crate::write_claims::FileWrite> = run_claims
+                    .as_ref()
+                    .map(|_| {
+                        crate::git::diff_names(&config.workspace_root, "HEAD", branch)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|rel| {
+                                crate::write_claims::FileWrite::before_now(
+                                    config.workspace_root.join(rel),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let mut result = match merge::merge_branch(&config.workspace_root, branch) {
                     Ok(result) => result,
                     // This run's work still merges; a leftover branch that
@@ -2698,6 +2730,11 @@ pub async fn execute(
                             merge::abort_merge(&config.workspace_root)?;
                         }
                     }
+                }
+                if result.success
+                    && let Some(rc) = &run_claims
+                {
+                    rc.run_writer.record_all(&merge_claims);
                 }
                 all_merges.push(result);
             }
@@ -7235,7 +7272,7 @@ async fn evaluate_agent_condition(
             if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
         {
             if let Some(dir) = ctx.verdict_output_dir {
-                write_consensus_verdict_file(
+                let written = write_consensus_verdict_file(
                     &ctx.config.workspace_root,
                     dir,
                     current_iter_abs,
@@ -7243,6 +7280,7 @@ async fn evaluate_agent_condition(
                     manifest.summary.as_deref().unwrap_or(""),
                     ctx.loop_agent_ids,
                 );
+                claim_run_writes(ctx.iteration_config.claims.as_ref(), written);
             }
             LoopConditionOutcome::Partial
         }
@@ -7376,6 +7414,7 @@ fn blocker_names_agent(blocker_agent: &str, agent_id: &str) -> bool {
 ///
 /// Best-effort: the run has already stopped, and failing to write the report
 /// must not mask the reason it stopped.
+/// Returns the files it wrote (write claims of the run writer).
 fn write_irreconcilable_report(
     workspace_root: &std::path::Path,
     out_dir: Option<&str>,
@@ -7383,14 +7422,14 @@ fn write_irreconcilable_report(
     trigger: &str,
     report: &JudgeReport,
     reviewer_ids: &[String],
-) {
+) -> Vec<PathBuf> {
     let Some(out_dir) = out_dir else {
         tracing::warn!(
             "irreconcilable disagreement at iteration {iter_abs} ({trigger}), but the loop has no \
              verdict output directory — skipping the hand-off document. Reason: {}",
             report.reason
         );
-        return;
+        return Vec::new();
     };
 
     let mut md = String::with_capacity(2048);
@@ -7475,21 +7514,27 @@ fn write_irreconcilable_report(
     let dir = workspace_root.join(out_dir);
     let _ = std::fs::create_dir_all(&dir);
     let md_path = dir.join("consensus-irreconcilable.md");
+    let mut written = Vec::new();
     match std::fs::write(&md_path, md) {
-        Ok(()) => tracing::info!("Wrote irreconcilable report to {}", md_path.display()),
+        Ok(()) => {
+            tracing::info!("Wrote irreconcilable report to {}", md_path.display());
+            written.push(md_path);
+        }
         Err(e) => tracing::warn!("Failed to write {}: {}", md_path.display(), e),
     }
 
-    write_consensus_verdict_file(
+    written.extend(write_consensus_verdict_file(
         workspace_root,
         out_dir,
         iter_abs,
         "irreconcilable",
         &report.reason,
         reviewer_ids,
-    );
+    ));
+    written
 }
 
+/// Returns the file it wrote, if any (a write claim of the run writer).
 fn write_consensus_verdict_file(
     workspace_root: &std::path::Path,
     out_dir: &str,
@@ -7497,7 +7542,7 @@ fn write_consensus_verdict_file(
     verdict: &str,
     reason: &str,
     reviewer_ids: &[String],
-) {
+) -> Vec<PathBuf> {
     let path = workspace_root.join(out_dir).join("consensus-verdict.json");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -7508,8 +7553,23 @@ fn write_consensus_verdict_file(
         "reason": reason,
         "reviewers": reviewer_ids,
     });
-    if let Ok(serialized) = serde_json::to_string_pretty(&body) {
-        let _ = std::fs::write(path, serialized);
+    match serde_json::to_string_pretty(&body) {
+        Ok(serialized) if std::fs::write(&path, &serialized).is_ok() => vec![path],
+        _ => Vec::new(),
+    }
+}
+
+/// Record pipeline-written files as claims of the run writer.
+fn claim_run_writes(run_claims: Option<&crate::write_claims::RunClaims>, paths: Vec<PathBuf>) {
+    if let Some(rc) = run_claims
+        && !paths.is_empty()
+    {
+        rc.run_writer.record_all(
+            &paths
+                .into_iter()
+                .map(crate::write_claims::FileWrite::unknown)
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
