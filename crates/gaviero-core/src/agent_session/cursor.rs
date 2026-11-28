@@ -774,7 +774,10 @@ impl CursorSession {
                 false
             }
             CursorEvent::ToolCallCompleted { id, name, .. } => {
-                pending_writes.remove(&id);
+                if let Some((abs_path, _)) = pending_writes.remove(&id) {
+                    self.observer
+                        .on_files_written(&[crate::write_claims::FileWrite::unknown(abs_path)]);
+                }
                 if is_subagent_tool_name(&tool_display_name(&name)) {
                     finish_pending_bg(pending_bg, "", &id, "completed", "", self.observer.as_ref());
                     if *result_seen && pending_bg.is_empty() {
@@ -885,6 +888,93 @@ impl AgentSession for CursorSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_write_tool_reports_files_written() {
+        use crate::observer::test_support::FilesWrittenRecorder;
+        use crate::swarm::backend::cursor::parse_cursor_event;
+        use crate::write_claims::FileWrite;
+
+        struct Fwd(Arc<FilesWrittenRecorder>);
+        impl AcpObserver for Fwd {
+            fn on_stream_chunk(&self, _: &str) {}
+            fn on_tool_call_started(&self, _: &str) {}
+            fn on_streaming_status(&self, _: &str) {}
+            fn on_message_complete(&self, _: &str, _: &str) {}
+            fn on_proposal_deferred(&self, _: &Path, _: Option<&str>, _: &str) {}
+            fn on_files_written(&self, writes: &[FileWrite]) {
+                self.0.on_files_written(writes);
+            }
+        }
+        struct NoGate;
+        impl crate::observer::WriteGateObserver for NoGate {
+            fn on_proposal_created(&self, _: &crate::types::WriteProposal) {}
+            fn on_proposal_updated(&self, _: u64) {}
+            fn on_proposal_finalized(&self, _: &str) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(FilesWrittenRecorder::default());
+        let mut session = CursorSession::new(SessionConstruction {
+            write_gate: Arc::new(Mutex::new(WriteGatePipeline::new(
+                crate::write_gate::WriteMode::Interactive,
+                Box::new(NoGate),
+            ))),
+            observer: Box::new(Fwd(recorder.clone())),
+            model: "cursor:auto".into(),
+            ollama_base_url: None,
+            workspace_root: dir.path().to_path_buf(),
+            additional_roots: vec![],
+            agent_id: "t".into(),
+            conv_id: None,
+            options: crate::acp::session::AgentOptions {
+                host_capture: true,
+                ..Default::default()
+            },
+            profile: crate::context_planner::build_provider_profile(
+                &crate::context_planner::ModelSpec::parse("cursor:auto"),
+                &crate::context_planner::RuntimeConfig::default(),
+            ),
+            cancel_token: CancellationToken::new(),
+            mcp_server: None,
+        });
+
+        let mut full_text = String::new();
+        let mut last_segment = String::new();
+        let mut in_thinking = false;
+        let mut snapshots = HashMap::new();
+        let mut pending_writes = HashMap::new();
+        let mut error_msg = None;
+        let mut session_id = None;
+        let mut pending_bg = Vec::new();
+        let mut result_seen = false;
+        for line in [
+            r#"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"writeToolCall":{"args":{"path":"w.txt","fileText":"hi"}}}}"#,
+            r#"{"type":"tool_call","subtype":"started","call_id":"c2","tool_call":{"readToolCall":{"args":{"path":"r.txt"}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"c2","tool_call":{"readToolCall":{"result":{}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"writeToolCall":{"result":{}}}}"#,
+        ] {
+            let event = parse_cursor_event(line).unwrap();
+            session
+                .dispatch_event(
+                    event,
+                    &mut full_text,
+                    &mut last_segment,
+                    &mut in_thinking,
+                    &mut snapshots,
+                    &mut pending_writes,
+                    &mut error_msg,
+                    &mut session_id,
+                    &mut pending_bg,
+                    &mut result_seen,
+                )
+                .await;
+        }
+        assert_eq!(
+            recorder.writes(),
+            vec![FileWrite::unknown(dir.path().join("w.txt"))]
+        );
+    }
 
     #[test]
     fn embed_workspace_folders_returns_original_when_no_siblings() {

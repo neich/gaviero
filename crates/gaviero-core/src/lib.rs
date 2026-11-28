@@ -34,6 +34,7 @@ pub mod types;
 pub mod util;
 pub mod validation_gate;
 pub mod workspace;
+pub mod write_claims;
 pub mod write_gate;
 
 // Re-export tree-sitter types for downstream crates

@@ -119,6 +119,8 @@ pub struct AgentOptions {
     /// ([`crate::scope_enforcer::SensitivePolicy::with_session_read_folders`]).
     /// Empty everywhere else (swarm, CLI).
     pub session_read_folders: Vec<PathBuf>,
+    /// Swarm agent's write-claim writer: the dsh/agy git dirty-set reconcile skips paths another writer provably wrote. None in chat.
+    pub claims: Option<crate::write_claims::ClaimHandle>,
 }
 
 /// Edit tools approved without a prompt when the host reviews the turn's
@@ -151,6 +153,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("host_capture", &self.host_capture)
             .field("skip_native_instructions", &self.skip_native_instructions)
             .field("session_read_folders", &self.session_read_folders)
+            .field("claims", &self.claims)
             .finish()
     }
 }
@@ -177,6 +180,7 @@ impl Default for AgentOptions {
             host_capture: false,
             skip_native_instructions: false,
             session_read_folders: Vec::new(),
+            claims: None,
         }
     }
 }
@@ -1200,9 +1204,10 @@ mod tests {
         // Sanity: AgentOptions is cloned per turn. The two new fields
         // (Option<Arc<dyn _>>, Option<String>) plus `agents_json` and
         // `exposed_tools` must not balloon it past a sensible budget.
+        // 320 B + 16 B for `claims: Option<ClaimHandle>` (an `Arc` + a bool).
         assert!(
-            std::mem::size_of::<AgentOptions>() <= 320,
-            "AgentOptions = {} B (budget 320 B)",
+            std::mem::size_of::<AgentOptions>() <= 336,
+            "AgentOptions = {} B (budget 336 B)",
             std::mem::size_of::<AgentOptions>()
         );
     }

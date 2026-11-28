@@ -67,6 +67,10 @@ pub struct IterationConfig {
     pub expensive_model: String,
     /// Switch to expensive model after this many failed attempts.
     pub escalate_after: u32,
+    /// The swarm run's write-claim writers (set by `pipeline::execute`); each
+    /// agent dispatch registers its own writer through it.
+    #[serde(skip)]
+    pub claims: Option<crate::write_claims::RunClaims>,
 }
 
 impl Default for IterationConfig {
@@ -79,6 +83,7 @@ impl Default for IterationConfig {
             cheap_model: "claude-haiku-4-5-20251001".into(),
             expensive_model: "claude-sonnet-4-6".into(),
             escalate_after: 3,
+            claims: None,
         }
     }
 }
@@ -203,6 +208,7 @@ impl IterationEngine {
                 exposed_tools,
                 skip_repo_context,
                 skill_catalog,
+                self.config.claims.as_ref(),
             )
             .await
             {
@@ -361,6 +367,7 @@ impl IterationEngine {
                     exposed_tools,
                     skip_repo_context,
                     skill_catalog,
+                    self.config.claims.as_ref(),
                 )
                 .await
                 {

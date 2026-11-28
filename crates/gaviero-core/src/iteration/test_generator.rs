@@ -120,6 +120,7 @@ impl TestGenerator {
             None, // exposed MCP tools: test generation does not pull
             false,
             None,
+            None, // write claims: test generation is not a swarm agent writer
         )
         .await
         {

@@ -84,6 +84,7 @@ pub async fn complete_to_text(
             UnifiedStreamEvent::ToolCallDelta { .. } => {}
             UnifiedStreamEvent::ToolCallEnd { .. } => {}
             UnifiedStreamEvent::PathsModified(_) => {}
+            UnifiedStreamEvent::FilesWritten(_) => {}
             UnifiedStreamEvent::FileBlock { .. } => {}
             UnifiedStreamEvent::Usage(usage) => {
                 // M0 instrumentation: log provider-reported token usage.
@@ -192,6 +193,7 @@ pub async fn complete_to_write_gate(
             UnifiedStreamEvent::PathsModified(paths) => {
                 modified_files.extend(paths);
             }
+            UnifiedStreamEvent::FilesWritten(writes) => observer.on_files_written(&writes),
             UnifiedStreamEvent::FileBlock { path, content } => {
                 // Capability invariant: backends that advertise
                 // `supports_file_blocks=false` must not emit FileBlock events.
@@ -221,6 +223,8 @@ pub async fn complete_to_write_gate(
                     &workspace_root,
                     &write_gate,
                     observer,
+                    // Chat path: claims flow through the observer.
+                    None,
                 )
                 .await?
                 {

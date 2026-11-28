@@ -237,6 +237,12 @@ pub struct App {
     /// Host-side capture of every file a chat turn changes
     /// (`<root>/.gaviero/turns`). Shared by all conversations.
     pub turn_capture: Arc<gaviero_core::turn_capture::TurnCapture>,
+    /// The machine-local write-claim journal (`GAVIERO_CLAIMS_DIR`, else the
+    /// runtime dir) shared with other gaviero processes: chat turns, the
+    /// SWARM panel and the editor publish what they write, and turn reviews
+    /// leave out what another writer provably wrote. `None` only where no
+    /// runtime dir exists.
+    pub claims_journal: Option<gaviero_core::write_claims::ClaimJournal>,
     /// Turns whose changes await the mandatory review, oldest first. A
     /// conversation listed here cannot send its next prompt.
     pub pending_turn_reviews: Vec<gaviero_core::turn_capture::PendingReview>,
@@ -571,6 +577,13 @@ impl App {
             batch_review: None,
             changes_state: None,
             turn_capture,
+            // Pure: nothing is created until a writer registers. Unit tests
+            // never publish into the machine's journal (their SWARM runs would).
+            claims_journal: if cfg!(test) {
+                None
+            } else {
+                gaviero_core::write_claims::ClaimJournal::machine_default()
+            },
             pending_turn_reviews: Vec::new(),
             turn_review_view: turn_review::TurnReviewView::default(),
             history_undo_armed: None,
@@ -1893,6 +1906,7 @@ mod session_host_tests {
             files: Vec::new(),
             warnings: Vec::new(),
             auto_reverted: Vec::new(),
+            left_out: Vec::new(),
         };
         app.pending_turn_reviews
             .push(gaviero_core::turn_capture::PendingReview::new(set));

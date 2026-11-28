@@ -24,6 +24,7 @@
 
 pub mod agy;
 pub mod dsh;
+mod edits;
 #[cfg(test)]
 pub mod fake;
 pub mod map;
@@ -1310,13 +1311,43 @@ fn resolve_acp_path(session_cwd: &Path, workspace_root: &Path, raw: &str) -> Pat
     from_session
 }
 
-/// Stream one `session/update` and record it for permission lookups.
+/// Stream one `session/update` and record it for permission lookups. A
+/// completed edit tool call is also reported as the files it wrote
+/// ([`UnifiedStreamEvent::FilesWritten`], from the call's stored `tool_call`).
 async fn forward_update(
     notification: &Value,
     workspace_root: &Path,
+    session_cwd: &Path,
     tx: &mpsc::Sender<Result<UnifiedStreamEvent>>,
     tool_calls: &mut ToolCallLog,
 ) {
+    let update = notification
+        .get("params")
+        .and_then(|p| p.get("update"))
+        .unwrap_or(notification);
+    if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update")
+        && update.get("status").and_then(Value::as_str) == Some("completed")
+        && let Some(id) = update
+            .get("toolCallId")
+            .or_else(|| update.get("tool_call_id"))
+            .and_then(Value::as_str)
+        && let Some(stored) = tool_calls.get(id)
+    {
+        let paths = edits::edit_paths(stored);
+        if !paths.is_empty() {
+            let writes = paths
+                .iter()
+                .map(|raw| {
+                    crate::write_claims::FileWrite::unknown(resolve_acp_path(
+                        session_cwd,
+                        workspace_root,
+                        raw,
+                    ))
+                })
+                .collect();
+            let _ = tx.send(Ok(UnifiedStreamEvent::FilesWritten(writes))).await;
+        }
+    }
     tool_calls.observe(notification);
     for ev in map::map_session_update(notification, workspace_root) {
         let _ = tx.send(Ok(ev)).await;
@@ -1827,6 +1858,8 @@ impl AgentSession for AcpClientSession {
         let conv_id = self.conv_id.clone();
         let tool_surface = AgentToolSurface::from_agent_options(&self.options, &self.workspace_root);
         let agent_label = self.agent.label();
+        // Swarm: the reconcile leaves out files other writers provably wrote.
+        let claims = self.options.claims.clone();
 
         // Take the live session so the task can own the RPC child.
         let mut live = self.inner.take().expect("ensure_running");
@@ -1860,7 +1893,7 @@ impl AgentSession for AcpClientSession {
                         // it — drain what is already queued so the permission
                         // policy can see that call.
                         while let Ok(n) = live.rpc.notifications.try_recv() {
-                            forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                            forward_update(&n, &workspace_root, &live.session_cwd, &tx, &mut tool_calls).await;
                         }
                         handle_incoming(
                             req,
@@ -1881,7 +1914,7 @@ impl AgentSession for AcpClientSession {
                         .await;
                     }
                     Some(n) = live.rpc.notifications.recv() => {
-                        forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                        forward_update(&n, &workspace_root, &live.session_cwd, &tx, &mut tool_calls).await;
                     }
                     result = &mut prompt_fut, if prompt_result.is_none() => {
                         prompt_result = Some(result);
@@ -1897,7 +1930,7 @@ impl AgentSession for AcpClientSession {
             // Drain leftovers that raced with prompt completion.
             while let Ok(req) = live.rpc.incoming.try_recv() {
                 while let Ok(n) = live.rpc.notifications.try_recv() {
-                    forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                    forward_update(&n, &workspace_root, &live.session_cwd, &tx, &mut tool_calls).await;
                 }
                 handle_incoming(
                     req,
@@ -1918,7 +1951,7 @@ impl AgentSession for AcpClientSession {
                 .await;
             }
             while let Ok(n) = live.rpc.notifications.try_recv() {
-                forward_update(&n, &workspace_root, &tx, &mut tool_calls).await;
+                forward_update(&n, &workspace_root, &live.session_cwd, &tx, &mut tool_calls).await;
             }
             let reusable = matches!(&prompt_result, Some(Ok(_)));
             match prompt_result {
@@ -1945,6 +1978,11 @@ impl AgentSession for AcpClientSession {
                         .filter(|p| !live.gate_written.contains(*p))
                         .cloned()
                         .collect();
+                    let extra = edits::drop_claimed_elsewhere(
+                        extra,
+                        claims.as_ref(),
+                        crate::turn_capture::now_ns(),
+                    );
                     let mut reported: Vec<PathBuf> = Vec::new();
                     if !extra.is_empty() {
                         tracing::warn!(
@@ -1977,7 +2015,12 @@ impl AgentSession for AcpClientSession {
                             tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_now))
                                 .await
                                 .unwrap_or_default();
-                        for path in now.difference(&before_dirty) {
+                        let new_dirty = edits::drop_claimed_elsewhere(
+                            now.difference(&before_dirty).cloned().collect(),
+                            claims.as_ref(),
+                            crate::turn_capture::now_ns(),
+                        );
+                        for path in &new_dirty {
                             if !live.gate_written.contains(path) && !reported.contains(path) {
                                 reported.push(path.clone());
                             }
@@ -1985,6 +2028,15 @@ impl AgentSession for AcpClientSession {
                     }
                     reported.sort();
                     reported.dedup();
+                    if !live.gate_written.is_empty() {
+                        let writes = live
+                            .gate_written
+                            .iter()
+                            .cloned()
+                            .map(crate::write_claims::FileWrite::unknown)
+                            .collect();
+                        let _ = tx.send(Ok(UnifiedStreamEvent::FilesWritten(writes))).await;
+                    }
                     if !reported.is_empty() {
                         let _ = tx
                             .send(Ok(UnifiedStreamEvent::PathsModified(reported)))

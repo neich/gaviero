@@ -38,9 +38,11 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use anyhow::{Context, Result};
 
 pub use changeset::{
-    BlobRef, ChangeKind, FileChange, FileDecision, PendingReview, ResolvedDecision, ReviewedTurn,
-    TurnChangeSet, TurnOutcome,
+    BlobRef, ChangeKind, FileChange, FileDecision, LeftOut, PendingReview, ResolvedDecision,
+    ReviewedTurn, TurnChangeSet, TurnOutcome,
 };
+
+use crate::write_claims::{Before, ClaimJournal, ClaimWriter, FileWrite, Verdict};
 pub use ledger::HostWriteLedger;
 pub use revert::{RevertOutcome, file_hunks, file_texts, has_drifted, revert_file, revert_hunks};
 pub use walk::CaptureScope;
@@ -75,6 +77,9 @@ pub struct TurnCapture {
     state: Mutex<State>,
     /// Single background thread for review persistence, started on first use.
     io: OnceLock<mpsc::Sender<IoJob>>,
+    /// The host's write-claim writer (`editor`): host writes are published
+    /// so other processes' turns can leave them out too.
+    host_writer: OnceLock<Arc<ClaimWriter>>,
 }
 
 type IoJob = Box<dyn FnOnce() + Send>;
@@ -107,11 +112,53 @@ pub struct TurnHandle {
     /// reviewed. Empty when another turn was running (its writes would be
     /// misattributed).
     pub between_turns: Vec<String>,
+    /// Write-claim attribution ([`Self::attribute`]); `None` = every change
+    /// is the turn's, as without claims.
+    attribution: Option<ClaimAttribution>,
+}
+
+/// The journal a turn is attributed against, and the turn's own writer.
+/// (Named so it does not collide with `history::Attribution`.)
+pub struct ClaimAttribution {
+    pub journal: ClaimJournal,
+    pub writer: Arc<ClaimWriter>,
 }
 
 impl TurnHandle {
     pub fn turn_id(&self) -> &str {
         &self.turn_id
+    }
+
+    /// When the turn's window opened.
+    pub fn started_ns(&self) -> i64 {
+        self.started_ns
+    }
+
+    /// The turn's baseline as write-claim before-states: every captured file
+    /// under the scope roots, keyed by [`crate::write_claims::claim_key`]
+    /// (`Unknown` past the baseline cap). For [`ClaimWriter::set_baseline`].
+    pub fn claim_baseline(&self) -> (Vec<PathBuf>, HashMap<String, Before>) {
+        let mut keys = crate::write_claims::ClaimKeyCache::default();
+        let entries = self
+            .pre
+            .in_scope(&self.scope.roots)
+            .map(|(path, e)| {
+                let before = match &e.sha256 {
+                    Some(h) => Before::Hash(h.clone()),
+                    None => Before::Unknown,
+                };
+                (keys.key(path), before)
+            })
+            .collect();
+        (self.scope.roots.clone(), entries)
+    }
+
+    /// Attribute this turn's changes against `journal` at [`TurnCapture::end`]:
+    /// changes another writer provably made are left out, unclaimed ones made
+    /// while other agents ran are tagged. `writer` is the turn's own.
+    pub fn attribute(mut self, journal: ClaimJournal, writer: Arc<ClaimWriter>) -> Self {
+        self.attribution = Some(ClaimAttribution { journal, writer });
+        self
     }
 }
 
@@ -143,6 +190,7 @@ impl TurnCapture {
             ledger: HostWriteLedger::default(),
             state: Mutex::new(State::default()),
             io: OnceLock::new(),
+            host_writer: OnceLock::new(),
         })
     }
 
@@ -153,6 +201,20 @@ impl TurnCapture {
     /// Host writes (editor saves, reverts) to exclude from attribution.
     pub fn ledger(&self) -> &HostWriteLedger {
         &self.ledger
+    }
+
+    /// Publish host writes through `writer` too. A second call is ignored.
+    pub fn set_host_writer(&self, writer: Arc<ClaimWriter>) {
+        let _ = self.host_writer.set(writer);
+    }
+
+    /// Record a host write (`None` = the host removed the file): in the
+    /// in-process ledger, and as a claim of the host writer when one is set.
+    pub fn record_host_write(&self, path: &Path, content: Option<&[u8]>) {
+        self.ledger.record(path, content);
+        if let Some(w) = self.host_writer.get() {
+            w.record(&FileWrite::unknown(path));
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -250,6 +312,7 @@ impl TurnCapture {
             started_ns,
             warnings,
             between_turns: if others_active { Vec::new() } else { between },
+            attribution: None,
         })
     }
 
@@ -262,6 +325,7 @@ impl TurnCapture {
             pre,
             started_ns,
             mut warnings,
+            attribution,
             ..
         } = handle;
         let scan_ns = now_ns();
@@ -319,6 +383,10 @@ impl TurnCapture {
         }
 
         files.retain(|c| !self.ledger.attributes(&c.path, c.after_hash(), started_ns));
+        let mut left_out = Vec::new();
+        if let Some(a) = &attribution {
+            files = attribute_files(a, files, started_ns, scan_ns, &mut left_out, &mut warnings);
+        }
         for c in &mut files {
             c.binary =
                 self.is_binary_side(c.before.as_ref()) || self.is_binary_side(c.after.as_ref());
@@ -374,17 +442,22 @@ impl TurnCapture {
         if budget.capped {
             warnings.push("files past the baseline cap were tracked without content".into());
         }
+        let set = TurnChangeSet {
+            turn_id,
+            conv_id,
+            started_at_ms: started_ns / 1_000_000,
+            ended_at_ms: scan_ns / 1_000_000,
+            outcome,
+            files,
+            warnings,
+            auto_reverted: Vec::new(),
+            left_out,
+        };
+        if let Some(a) = &attribution {
+            a.writer.finish();
+        }
         Ok(TurnEnd {
-            set: TurnChangeSet {
-                turn_id,
-                conv_id,
-                started_at_ms: started_ns / 1_000_000,
-                ended_at_ms: scan_ns / 1_000_000,
-                outcome,
-                files,
-                warnings,
-                auto_reverted: Vec::new(),
-            },
+            set,
             overlapped_reviews: touched,
         })
     }
@@ -765,6 +838,57 @@ fn pin_set(keep: &mut HashSet<String>, set: &TurnChangeSet) {
     }
 }
 
+/// Apply write-claim attribution to a turn's changes: drop what another
+/// writer provably made (into `left_out`), overlap-mark what both claimed,
+/// tag unclaimed changes made while other agent writers ran.
+fn attribute_files(
+    a: &ClaimAttribution,
+    files: Vec<FileChange>,
+    started_ns: i64,
+    scan_ns: i64,
+    left_out: &mut Vec<LeftOut>,
+    warnings: &mut Vec<String>,
+) -> Vec<FileChange> {
+    let snap = a.journal.snapshot(started_ns);
+    let mut kept = Vec::with_capacity(files.len());
+    for mut c in files {
+        match snap.classify(a.writer.id(), started_ns, scan_ns, &c.path, c.after_hash()) {
+            Verdict::Foreign(writer) => {
+                left_out.push(LeftOut {
+                    rel: c.rel.clone(),
+                    root: c.root.clone(),
+                    writer,
+                });
+                continue;
+            }
+            Verdict::Shared(labels) => {
+                for l in labels {
+                    if !c.overlap_with.contains(&l) {
+                        c.overlap_with.push(l);
+                    }
+                }
+            }
+            Verdict::Unclaimed(labels) if !labels.is_empty() => c.maybe_from = labels,
+            Verdict::Own | Verdict::Unclaimed(_) => {}
+        }
+        kept.push(c);
+    }
+    let shared: Vec<&FileChange> = kept.iter().filter(|c| !c.maybe_from.is_empty()).collect();
+    if !shared.is_empty() {
+        let labels: std::collections::BTreeSet<&str> = shared
+            .iter()
+            .flat_map(|c| c.maybe_from.iter().map(String::as_str))
+            .collect();
+        let n = shared.len();
+        let s = if n == 1 { "" } else { "s" };
+        warnings.push(format!(
+            "{n} file{s} marked ⚠shared changed while {} also ran — they may not come from this agent",
+            labels.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    kept
+}
+
 fn change(
     path: &Path,
     kind: ChangeKind,
@@ -792,6 +916,7 @@ fn change(
         revertible,
         binary: false,
         overlap_with: Vec::new(),
+        maybe_from: Vec::new(),
     }
 }
 

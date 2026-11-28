@@ -804,6 +804,25 @@ fn start_agent_services(
     memory_root: Option<PathBuf>,
     embedder_name: String,
 ) {
+    // The `editor` write-claim writer: host writes (saves, review reverts,
+    // config synthesis) are published so other processes' turn reviews leave
+    // them out too. Lives as long as the turn capture.
+    if let Some(journal) = &app.claims_journal {
+        let started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        match journal.register(
+            &format!("editor-{}-{started_ns}", std::process::id()),
+            gaviero_core::write_claims::WriterKind::Host,
+            "editor",
+            app.workspace.roots().iter().map(|p| p.to_path_buf()).collect(),
+        ) {
+            Ok(writer) => app.turn_capture.set_host_writer(writer),
+            Err(e) => tracing::warn!(error = %e, "write claims: editor writer unavailable"),
+        }
+    }
+
     // Cursor's read policy lives in `.cursor/hooks.json`, agy's in
     // `.agents/hooks.json` (plus the `.gaviero/skills` entry in
     // `.agents/skills.json`). Written here, before any turn starts, so they are

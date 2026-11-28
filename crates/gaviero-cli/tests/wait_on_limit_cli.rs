@@ -145,6 +145,12 @@ fn run(dir: &Path, ollama: &str, extra: &[&str]) -> Output {
             "GAVIERO_CLI_RUNS_DIR",
             std::env::temp_dir().join("gaviero-cli-runs-tests"),
         )
+        .env(
+            "GAVIERO_CLAIMS_DIR",
+            std::env::temp_dir()
+                .join("gaviero-cli-runs-tests")
+                .join("claims"),
+        )
         .output()
         .expect("spawn gaviero-cli")
 }

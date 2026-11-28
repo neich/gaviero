@@ -328,7 +328,7 @@ pub fn confine(arg: &str, workspace_root: &Path, additional_roots: &[PathBuf]) -
 }
 
 /// Resolve `.` and `..` components without touching the filesystem.
-fn normalize_lexically(p: &Path) -> PathBuf {
+pub(crate) fn normalize_lexically(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in p.components() {

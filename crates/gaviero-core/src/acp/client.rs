@@ -162,6 +162,7 @@ impl AcpPipeline {
                 tool_policy: None,
                 exposed_tools: None,
                 write_gate: None,
+                claims: None,
             };
             executor::complete_to_write_gate(
                 &*backend,
@@ -318,10 +319,12 @@ pub(crate) async fn propose_write(
         observer.on_proposal_deferred(&abs_path, old, proposed_content);
     }
 
-    // 5. If AutoAccept mode, perform the disk action outside the lock.
+    // 5. If AutoAccept mode, perform the disk action outside the lock, and
+    // report it as written (hashed before the write: a write claim's proof).
     if let Some(action) = auto_accept_result {
         match action {
             AutoAcceptAction::Write { path, content } => {
+                let claim = crate::write_claims::FileWrite::before_now(&path);
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
@@ -330,12 +333,17 @@ pub(crate) async fn propose_write(
                 tokio::fs::write(&path, &content)
                     .await
                     .context("writing auto-accepted file")?;
+                observer.on_files_written(std::slice::from_ref(&claim));
             }
-            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).context("removing auto-accepted file"),
-            },
+            AutoAcceptAction::Delete { path } => {
+                let claim = crate::write_claims::FileWrite::before_now(&path);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).context("removing auto-accepted file"),
+                }
+                observer.on_files_written(std::slice::from_ref(&claim));
+            }
         }
     }
 
@@ -424,11 +432,15 @@ pub(crate) async fn propose_delete(
 
     if let Some(action) = auto_accept_result {
         match action {
-            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).context("removing auto-accepted file"),
-            },
+            AutoAcceptAction::Delete { path } => {
+                let claim = crate::write_claims::FileWrite::before_now(&path);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).context("removing auto-accepted file"),
+                }
+                observer.on_files_written(std::slice::from_ref(&claim));
+            }
             AutoAcceptAction::Write { .. } => {
                 tracing::error!(
                     "build_delete_proposal returned a Write action for {} — bug",
@@ -534,6 +546,46 @@ pub fn format_tool_summary(
 mod tests {
     use super::*;
     use crate::swarm::backend::AgentBackend;
+
+    #[tokio::test]
+    async fn auto_accept_write_reports_files_written_with_before_hash() {
+        use crate::observer::test_support::FilesWrittenRecorder;
+        use crate::write_claims::{Before, FileWrite};
+
+        struct NoGate;
+        impl crate::observer::WriteGateObserver for NoGate {
+            fn on_proposal_created(&self, _: &crate::types::WriteProposal) {}
+            fn on_proposal_updated(&self, _: u64) {}
+            fn on_proposal_finalized(&self, _: &str) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            crate::write_gate::WriteMode::AutoAccept,
+            Box::new(NoGate),
+        )));
+        let recorder = FilesWrittenRecorder::default();
+        propose_write(
+            &gate,
+            &recorder,
+            dir.path(),
+            "agent",
+            None,
+            Path::new("a.txt"),
+            "new\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert_eq!(
+            recorder.writes(),
+            vec![FileWrite {
+                path: file.clone(),
+                before: Before::Hash(crate::turn_capture::store::hash_bytes(b"old\n")),
+            }]
+        );
+    }
 
     #[test]
     fn test_default_system_prompt_not_empty() {

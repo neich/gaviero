@@ -91,6 +91,7 @@ impl AgentBackend for DshBackend {
             effort: request.effort.clone().unwrap_or_else(|| "off".into()),
             auto_approve: request.auto_approve,
             exposed_tools: request.exposed_tools.clone(),
+            claims: request.claims.clone(),
             ..AgentOptions::default()
         };
         let args = SessionConstruction {

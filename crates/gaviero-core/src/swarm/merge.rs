@@ -234,6 +234,7 @@ async fn resolve_single_file(
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         },
         None,
     )

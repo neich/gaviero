@@ -91,13 +91,33 @@ impl ToolCallTracker {
         );
     }
 
-    /// Report every pending call answered by `results`.
-    fn completed(&mut self, results: &[ToolResultInfo], observer: &dyn AcpObserver) {
+    /// Report every pending call answered by `results`, and the files the
+    /// successful edit-tool calls among them wrote ([`AcpObserver::on_files_written`];
+    /// relative paths are joined to `root`).
+    fn completed(&mut self, results: &[ToolResultInfo], observer: &dyn AcpObserver, root: &Path) {
+        let mut writes = Vec::new();
         for result in results {
             let Some(p) = self.pending.remove(&result.tool_use_id) else {
                 continue;
             };
             self.order.retain(|id| id != &result.tool_use_id);
+            if !result.is_error
+                && crate::acp::session::HOST_CAPTURED_EDIT_TOOLS.contains(&p.name.as_str())
+            {
+                let key = if p.name == "NotebookEdit" {
+                    "notebook_path"
+                } else {
+                    "file_path"
+                };
+                if let Some(fp) = p.input.get(key).and_then(|v| v.as_str()) {
+                    let abs = if Path::new(fp).is_absolute() {
+                        PathBuf::from(fp)
+                    } else {
+                        root.join(fp)
+                    };
+                    writes.push(crate::write_claims::FileWrite::unknown(abs));
+                }
+            }
             observer.on_tool_call_completed(&crate::observer::ToolCallOutcome {
                 name: &p.name,
                 tool_use_id: Some(&result.tool_use_id),
@@ -109,6 +129,9 @@ impl ToolCallTracker {
                 }),
                 duration: Some(p.started.elapsed()),
             });
+        }
+        if !writes.is_empty() {
+            observer.on_files_written(&writes);
         }
     }
 
@@ -753,7 +776,11 @@ impl ClaudeSession {
                                     }
                                 }
                                 StreamEvent::UserToolResults { results } => {
-                                    tool_tracker.completed(&results, self.observer.as_ref());
+                                    tool_tracker.completed(
+                                        &results,
+                                        self.observer.as_ref(),
+                                        &self.workspace_root,
+                                    );
                                     // A background launch's result is only its
                                     // ack; it finishes on `task_notification`.
                                     // A refused launch is no longer tracked by
@@ -1455,6 +1482,7 @@ mod tool_tracker_tests {
     #[derive(Default)]
     struct Capture {
         completed: StdMutex<Vec<Completion>>,
+        written: StdMutex<Vec<crate::write_claims::FileWrite>>,
     }
 
     impl AcpObserver for Capture {
@@ -1476,6 +1504,9 @@ mod tool_tracker_tests {
                 output,
             ));
         }
+        fn on_files_written(&self, writes: &[crate::write_claims::FileWrite]) {
+            self.written.lock().unwrap().extend_from_slice(writes);
+        }
     }
 
     /// Feed recorded stream-json lines through the parser and the tracker
@@ -1490,7 +1521,9 @@ mod tool_tracker_tests {
                         tracker.started(tu, &format!("{} (summary)", tu.name));
                     }
                 }
-                StreamEvent::UserToolResults { results } => tracker.completed(&results, &observer),
+                StreamEvent::UserToolResults { results } => {
+                    tracker.completed(&results, &observer, Path::new("/ws"))
+                }
                 _ => {}
             }
         }
@@ -1514,6 +1547,53 @@ mod tool_tracker_tests {
             &serde_json::json!({"file_path": "src/a.rs", "limit": 20})
         );
         assert_eq!(output, &Some(("fn main() {}\n".to_string(), false)));
+    }
+
+    #[test]
+    fn tracker_claims_successful_edit_tools_only() {
+        use crate::acp::protocol::{ToolResultInfo, ToolUseInfo};
+        use crate::write_claims::FileWrite;
+        let observer = Capture::default();
+        let mut tracker = ToolCallTracker::default();
+        let calls = [
+            ("t1", "Write", serde_json::json!({"file_path": "/abs/w.txt", "content": "x"})),
+            ("t2", "Edit", serde_json::json!({"file_path": "/abs/e.txt"})),
+            ("t3", "Bash", serde_json::json!({"command": "echo > b.txt"})),
+            ("t4", "NotebookEdit", serde_json::json!({"notebook_path": "nb/n.ipynb"})),
+        ];
+        for (id, name, input) in &calls {
+            tracker.started(
+                &ToolUseInfo {
+                    name: name.to_string(),
+                    input: input.clone(),
+                    id: id.to_string(),
+                },
+                name,
+            );
+        }
+        let result = |id: &str, is_error: bool| ToolResultInfo {
+            tool_use_id: id.into(),
+            content: String::new(),
+            is_error,
+        };
+        let root = Path::new("/ws");
+        tracker.completed(
+            &[
+                result("t1", false),
+                result("t2", true),
+                result("t3", false),
+                result("t4", false),
+            ],
+            &observer,
+            root,
+        );
+        assert_eq!(
+            observer.written.into_inner().unwrap(),
+            vec![
+                FileWrite::unknown("/abs/w.txt"),
+                FileWrite::unknown(root.join("nb/n.ipynb")),
+            ]
+        );
     }
 
     #[test]

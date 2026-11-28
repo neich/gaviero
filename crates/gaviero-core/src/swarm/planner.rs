@@ -93,6 +93,7 @@ async fn try_plan(
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         },
         None,
     )

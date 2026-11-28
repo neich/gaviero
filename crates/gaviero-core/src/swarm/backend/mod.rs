@@ -81,6 +81,9 @@ pub enum UnifiedStreamEvent {
     /// Paths written directly on disk by an in-process tool-agent (Option-B).
     /// The runner records these for validation without re-writing through the gate.
     PathsModified(Vec<PathBuf>),
+    /// Files the agent wrote through an edit tool, with the pre-write hash when
+    /// the backend took one. The runner records them as the agent's write claims.
+    FilesWritten(Vec<crate::write_claims::FileWrite>),
     /// Token usage / cost information.
     Usage(TokenUsage),
     /// Non-fatal error during streaming.
@@ -241,6 +244,8 @@ pub struct CompletionRequest {
     /// Write gate for backends that propose mid-stream (`dsh:` ACP fs writes).
     /// `None` for backends that only emit `FileBlock` / `PathsModified`.
     pub write_gate: Option<WriteGateHandle>,
+    /// The agent's write-claim writer (swarm); dsh/agy filter their reconcile by it.
+    pub claims: Option<crate::write_claims::ClaimHandle>,
 }
 
 /// Cloneable write-gate pointer that is `Debug` without dumping pipeline state.
@@ -402,6 +407,7 @@ mod tests {
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -449,6 +455,7 @@ mod tests {
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

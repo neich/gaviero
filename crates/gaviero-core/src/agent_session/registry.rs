@@ -145,9 +145,9 @@ impl ObservedStreamSession {
                     self.observer
                         .on_streaming_status(&format!("Using {name}..."));
                 }
-                UnifiedStreamEvent::ToolCallDelta { .. }
-                | UnifiedStreamEvent::ToolCallEnd { .. }
-                | UnifiedStreamEvent::PathsModified(_) => {}
+                UnifiedStreamEvent::ToolCallDelta { .. } | UnifiedStreamEvent::ToolCallEnd { .. } => {}
+                UnifiedStreamEvent::PathsModified(_) => {}
+                UnifiedStreamEvent::FilesWritten(writes) => self.observer.on_files_written(&writes),
                 UnifiedStreamEvent::FileBlock { path, content } => {
                     crate::acp::client::propose_write(
                         &self.write_gate,

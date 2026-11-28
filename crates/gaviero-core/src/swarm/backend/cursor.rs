@@ -20,6 +20,7 @@
 //! revert them after the stream ends, routing the proposed content through
 //! the Write Gate.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -31,6 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::acp::protocol::is_subagent_tool_name;
+use crate::write_claims::FileWrite;
 
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
 use super::{
@@ -212,12 +214,13 @@ impl AgentBackend for CursorBackend {
         });
 
         let tx_clone = tx.clone();
+        let root = request.workspace_root.clone();
         tokio::spawn(async move {
             // Keep the spilled tempfile on disk until `agent` has exited
             // (NamedTempFile::drop unlinks it).
             let _prompt_tempfile = prompt_tempfile;
             let start = std::time::Instant::now();
-            let result = drive_cursor_stdout_unified(stdout, tx_clone.clone()).await;
+            let result = drive_cursor_stdout_unified(stdout, tx_clone.clone(), root).await;
             let exit_status = child.wait().await;
             let stderr_text = stderr_handle.await.unwrap_or_default();
 
@@ -388,8 +391,11 @@ pub(crate) fn cursor_argv(
 async fn drive_cursor_stdout_unified(
     stdout: tokio::process::ChildStdout,
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
+    root: PathBuf,
 ) -> Result<()> {
     let mut lines = BufReader::new(stdout).lines();
+    // Write/edit tool calls hashed at start, claimed at completion.
+    let mut pending_writes: HashMap<String, FileWrite> = HashMap::new();
     let mut pending_subagents: u32 = 0;
     let mut deferred_result: Option<CursorEvent> = None;
     loop {
@@ -405,6 +411,11 @@ async fn drive_cursor_stdout_unified(
         let Some(event) = parse_cursor_event(&line) else {
             continue;
         };
+        if let Some(written) = track_write(&mut pending_writes, &event, &root)
+            && tx.send(Ok(written)).await.is_err()
+        {
+            return Ok(());
+        }
         match &event {
             CursorEvent::ToolCallStarted { name, .. }
                 if is_subagent_tool_name(&tool_display_name(name)) =>
@@ -448,6 +459,33 @@ async fn drive_cursor_stdout_unified(
         }
     }
     Ok(())
+}
+
+/// Write claims for the swarm path: a write/edit tool call's file is hashed
+/// at `started` (before Cursor writes it) and reported as
+/// [`UnifiedStreamEvent::FilesWritten`] at `completed`.
+fn track_write(
+    pending: &mut HashMap<String, FileWrite>,
+    event: &CursorEvent,
+    root: &Path,
+) -> Option<UnifiedStreamEvent> {
+    match event {
+        CursorEvent::ToolCallStarted {
+            id,
+            name,
+            args_json,
+        } => {
+            if let Some((p, _)) = write_tool_args(name, args_json) {
+                let abs = if p.is_absolute() { p } else { root.join(p) };
+                pending.insert(id.clone(), FileWrite::before_now(abs));
+            }
+            None
+        }
+        CursorEvent::ToolCallCompleted { id, .. } => pending
+            .remove(id)
+            .map(|w| UnifiedStreamEvent::FilesWritten(vec![w])),
+        _ => None,
+    }
 }
 
 /// Map a [`CursorEvent`] into the zero-or-more [`UnifiedStreamEvent`]s the
@@ -824,6 +862,42 @@ pub(crate) fn write_tool_args(name: &str, args_json: &str) -> Option<(PathBuf, S
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn track_write_emits_files_written_on_completed_write_tool() {
+        use crate::write_claims::Before;
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path().join("w.txt");
+        std::fs::write(&w, "old").unwrap();
+        let mut pending = HashMap::new();
+        let ev = |line: &str| parse_cursor_event(line).unwrap();
+
+        let started = ev(
+            r#"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"writeToolCall":{"args":{"path":"w.txt","fileText":"new"}}}}"#,
+        );
+        assert_eq!(track_write(&mut pending, &started, dir.path()), None);
+        let read = ev(
+            r#"{"type":"tool_call","subtype":"started","call_id":"c2","tool_call":{"readToolCall":{"args":{"path":"w.txt"}}}}"#,
+        );
+        assert_eq!(track_write(&mut pending, &read, dir.path()), None);
+        // Cursor writes after the hash was taken.
+        std::fs::write(&w, "new").unwrap();
+        let read_done = ev(
+            r#"{"type":"tool_call","subtype":"completed","call_id":"c2","tool_call":{"readToolCall":{"result":{}}}}"#,
+        );
+        assert_eq!(track_write(&mut pending, &read_done, dir.path()), None);
+        let done = ev(
+            r#"{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"writeToolCall":{"result":{}}}}"#,
+        );
+        assert_eq!(
+            track_write(&mut pending, &done, dir.path()),
+            Some(UnifiedStreamEvent::FilesWritten(vec![FileWrite {
+                path: w.clone(),
+                before: Before::Hash(crate::turn_capture::store::hash_bytes(b"old")),
+            }]))
+        );
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn backend_name_carries_model_prefix() {

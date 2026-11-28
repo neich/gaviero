@@ -183,6 +183,12 @@ pub trait AcpObserver: Send + Sync {
     /// per-file undo is offered (that would break the turn's atomicity).
     fn on_tool_agent_edits(&self, _paths: &[std::path::PathBuf]) {}
 
+    /// Files the agent just wrote, deleted or renamed through an edit tool or the
+    /// Write Gate (not Bash). The host records them as write claims
+    /// (`crate::write_claims`) so concurrent turn reviews can tell whose they are.
+    /// Default no-op.
+    fn on_files_written(&self, _writes: &[crate::write_claims::FileWrite]) {}
+
     /// Fired once per in-process tool-agent turn with the accumulated USD
     /// cost (sum of per-round API usage). Drives the chat status-bar cost
     /// indicator for DeepSeek and future API providers.
@@ -369,4 +375,37 @@ pub trait SwarmObserver: Send + Sync {
 
     /// Called with updated cost estimates during execution.
     fn on_cost_update(&self, _estimate: &CostEstimate) {}
+}
+
+/// Test doubles shared by the claim-emitter tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use super::AcpObserver;
+    use crate::write_claims::FileWrite;
+
+    /// Records [`AcpObserver::on_files_written`]; every other callback is a no-op.
+    #[derive(Default)]
+    pub(crate) struct FilesWrittenRecorder {
+        writes: Mutex<Vec<FileWrite>>,
+    }
+
+    impl FilesWrittenRecorder {
+        pub(crate) fn writes(&self) -> Vec<FileWrite> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl AcpObserver for FilesWrittenRecorder {
+        fn on_stream_chunk(&self, _: &str) {}
+        fn on_tool_call_started(&self, _: &str) {}
+        fn on_streaming_status(&self, _: &str) {}
+        fn on_message_complete(&self, _: &str, _: &str) {}
+        fn on_proposal_deferred(&self, _: &Path, _: Option<&str>, _: &str) {}
+        fn on_files_written(&self, writes: &[FileWrite]) {
+            self.writes.lock().unwrap().extend_from_slice(writes);
+        }
+    }
 }

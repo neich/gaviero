@@ -81,7 +81,7 @@ pub fn revert_file(cap: &TurnCapture, change: &FileChange, force: bool) -> Resul
                     return Err(e).with_context(|| format!("removing {}", change.path.display()));
                 }
             }
-            cap.ledger().record(&change.path, None);
+            cap.record_host_write(&change.path, None);
         }
         Some(b) => {
             let hash = b.sha256.as_deref().expect("revertible implies a hash");
@@ -101,7 +101,7 @@ fn write_back(cap: &TurnCapture, path: &Path, bytes: &[u8], mode: Option<u32>) -
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     restore_write(path, bytes, mode)?;
-    cap.ledger().record(path, Some(bytes));
+    cap.record_host_write(path, Some(bytes));
     Ok(())
 }
 

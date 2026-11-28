@@ -154,6 +154,7 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         skill_catalog: None,
         memory_root: None,
         graph_db_path: None,
+        claims: None,
     }
 }
 

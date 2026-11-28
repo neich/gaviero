@@ -46,7 +46,10 @@ gaviero-core/src/
 │  ├─ mod.rs              TurnCapture begin/end/resolve/gc, pending persistence
 │  ├─ walk.rs / manifest.rs / store.rs   stat walk, baseline, SHA-256 blobs
 │  ├─ changeset.rs / ledger.rs / revert.rs  change set, host writes, file/hunk revert
-├─ observer.rs            WriteGateObserver, AcpObserver (+ on_tool_call_completed), SwarmObserver
+├─ write_claims/          Machine-local write-claim journal (who wrote what, across processes)
+│  ├─ journal.rs / liveness.rs   writer.json + claims.ndjson per writer, pid liveness, TTL gc
+│  ├─ attribution.rs / run.rs    classify (Own | Shared | Foreign | Unclaimed), swarm run/agent writers
+├─ observer.rs            WriteGateObserver, AcpObserver (+ on_tool_call_completed, on_files_written), SwarmObserver
 ├─ history/               Per-turn NDJSON log: record / writer (HistoryRecorder) / reader / tokens
 ├─ scope_enforcer.rs      FileScope checks → path_pattern
 ├─ path_pattern.rs        Glob matcher + patterns_overlap
@@ -199,7 +202,9 @@ TurnCapture::begin   stat walk (.gitignore + files.exclude + include_ignored fol
   session runs       providers write freely (host_capture); host writes → HostWriteLedger
   session closed     (also on cancel: the select drops the session first)
 TurnCapture::end     stat walk → hash suspects → TurnChangeSet {added|modified|deleted, before/after blobs}
-                     − ledger-attributed host writes; overlap marks vs concurrent turns
+                     − ledger-attributed host writes
+                     − changes another writer provably made (write_claims) → left_out; unclaimed while others run → maybe_from
+                     overlap marks vs concurrent turns (kept files only)
   auto_revert_sensitive → save_pending → history files_changed → TURN REVIEW (conversation blocked)
 TurnCapture::resolve keep | revert_file | revert_hunks (byte-exact, drift-guarded) → archive → gc (last 5)
 ```

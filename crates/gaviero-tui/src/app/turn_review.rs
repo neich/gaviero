@@ -161,7 +161,7 @@ pub(super) fn restore_on_startup(app: &mut App) {
 /// bytes back: `Buffer::save` may normalize line endings.
 pub(super) fn note_host_write(app: &App, path: &std::path::Path) {
     let bytes = std::fs::read(path).ok();
-    app.turn_capture.ledger().record(path, bytes.as_deref());
+    app.turn_capture.record_host_write(path, bytes.as_deref());
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -878,6 +878,7 @@ fn recorded_change(app: &App, file: &ChangedFile) -> FileChange {
         revertible: file.revertible,
         binary: false,
         overlap_with: file.overlap_with.clone(),
+        maybe_from: file.maybe_from.clone(),
     }
 }
 
@@ -1242,6 +1243,9 @@ pub(super) fn render_turn_review_list(app: &mut App, frame: &mut Frame, area: Re
         let mut flags = String::new();
         if !c.overlap_with.is_empty() {
             flags.push_str(" ⚠overlap");
+        }
+        if !c.maybe_from.is_empty() {
+            flags.push_str(" ⚠shared");
         }
         if !c.revertible {
             flags.push_str(" ⊘no-revert");
@@ -1762,6 +1766,101 @@ mod tests {
             std::fs::read_to_string(app_root.join("main.rs")).unwrap(),
             "v2\n"
         );
+    }
+
+    /// A turn attributed against `journal` (its own `ChatTurn` writer), whose
+    /// agent does `edit`, handed to the UI as the dispatch task does.
+    fn attributed_turn(
+        f: &mut Fixture,
+        journal: &gaviero_core::write_claims::ClaimJournal,
+        id: &str,
+        edit: impl FnOnce(&Fixture),
+    ) {
+        let scope = CaptureScope {
+            roots: vec![f.root().to_path_buf()],
+            ..CaptureScope::default()
+        };
+        let conv = f.conv();
+        let handle = f.app.turn_capture.begin(id, Some(&conv), scope).unwrap();
+        let writer = journal
+            .register(
+                &format!("chat-test-{id}"),
+                gaviero_core::write_claims::WriterKind::ChatTurn,
+                "chat 'test'",
+                vec![f.root().to_path_buf()],
+            )
+            .unwrap();
+        let (roots, entries) = handle.claim_baseline();
+        writer.set_baseline(roots, entries);
+        let handle = handle.attribute(journal.clone(), writer);
+        edit(f);
+        let end = f
+            .app
+            .turn_capture
+            .end(handle, TurnOutcome::Completed)
+            .unwrap();
+        on_turn_review_pending(&mut f.app, PendingReview::new(end.set), end.overlapped_reviews);
+    }
+
+    #[test]
+    fn a_shared_file_shows_the_shared_flag_and_header_warning() {
+        let mut f = Fixture::new();
+        // The journal lives outside the captured folder.
+        let claims = tempfile::tempdir().unwrap();
+        let journal = gaviero_core::write_claims::ClaimJournal::at(claims.path().join("claims"));
+        let _cli = journal
+            .register(
+                "cli-u1",
+                gaviero_core::write_claims::WriterKind::SwarmAgent,
+                "cli · u1",
+                vec![f.root().to_path_buf()],
+            )
+            .unwrap();
+        f.write("a.txt", "before\n");
+        attributed_turn(&mut f, &journal, "t1", |f| f.write("a.txt", "after\n"));
+
+        let review = &f.app.pending_turn_reviews[0];
+        assert_eq!(review.set.files[0].maybe_from, vec!["cli · u1".to_string()]);
+        // Header lines are cut at the panel's edge (the conversation gets the
+        // full warning as a system line): widen the panel to read it whole.
+        f.app.file_tree_width = 110;
+        let text = render_to_text(&mut f.app);
+        assert!(text.contains("⚠shared"), "{text}");
+        assert!(text.contains("may not come from this agent"), "{text}");
+    }
+
+    #[test]
+    fn a_foreign_claimed_file_never_enters_the_review() {
+        let mut f = Fixture::new();
+        let claims = tempfile::tempdir().unwrap();
+        let journal = gaviero_core::write_claims::ClaimJournal::at(claims.path().join("claims"));
+        // Registered before the turn: its claims prove what it wrote.
+        let cli = journal
+            .register(
+                "cli-u1",
+                gaviero_core::write_claims::WriterKind::SwarmAgent,
+                "gaviero-cli 'x' · u1",
+                vec![f.root().to_path_buf()],
+            )
+            .unwrap();
+        f.write("a.txt", "before\n");
+        f.write("b.txt", "before\n");
+        attributed_turn(&mut f, &journal, "t1", |f| {
+            f.write("a.txt", "mine\n");
+            f.write("b.txt", "theirs\n");
+            cli.record(&gaviero_core::write_claims::FileWrite::unknown(
+                f.root().join("b.txt"),
+            ));
+        });
+
+        let review = &f.app.pending_turn_reviews[0];
+        let rels: Vec<&str> = review.set.files.iter().map(|c| c.rel.as_str()).collect();
+        assert_eq!(rels, vec!["a.txt"]);
+        assert_eq!(review.set.left_out.len(), 1);
+        assert_eq!(review.set.left_out[0].rel, "b.txt");
+        assert_eq!(review.set.left_out[0].writer, "gaviero-cli 'x' · u1");
+        let text = render_to_text(&mut f.app);
+        assert!(!text.contains("b.txt"), "{text}");
     }
 
     /// A turn over two workspace folders, `app` and `lib` (named "library"),

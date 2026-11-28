@@ -33,6 +33,11 @@ pub mod settings {
     /// files the TURN REVIEW captures anyway. Default `[]`: only files no
     /// `.gitignore` hides (plus sensitive paths and `.gaviero/settings.json`).
     pub const TURN_REVIEW_INCLUDE_IGNORED: &str = "turnReview.includeIgnored";
+    /// Leave files other gaviero writers provably wrote out of a turn's
+    /// review, and keep the swarm dsh/agy reconcile from claiming them
+    /// ([`crate::write_claims`]). Default `true`; `false` = every change in
+    /// every review, as before. Writers publish claims either way.
+    pub const TURN_REVIEW_ATTRIBUTION: &str = "turnReview.attribution";
 
     // Agent / Claude settings
     pub const AGENT_MODEL: &str = "agent.model";
@@ -1642,6 +1647,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::FORMAT_ON_SAVE => serde_json::json!(false),
         settings::FILES_EXCLUDE => serde_json::json!({}),
         settings::TURN_REVIEW_INCLUDE_IGNORED => serde_json::json!([]),
+        settings::TURN_REVIEW_ATTRIBUTION => serde_json::json!(true),
         settings::FILE_TREE_WIDTH => serde_json::json!(30),
         settings::SIDE_PANEL_WIDTH => serde_json::json!(40),
         settings::TERMINAL_SPLIT_PERCENT => serde_json::json!(30),

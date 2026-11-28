@@ -4,6 +4,8 @@
 //! its NDJSON [`StreamEvent`](crate::acp::protocol::StreamEvent) output
 //! into the unified [`UnifiedStreamEvent`] stream.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use anyhow::{Context, Result};
@@ -13,6 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::acp::protocol::StreamEvent;
 use crate::acp::session::{AcpSession, AgentOptions};
 use crate::acp::turn::{BG_WAKE_GRACE, TurnCompletion, TurnProgress};
+use crate::write_claims::FileWrite;
 
 use super::shared::request_prompt;
 use super::{
@@ -110,10 +113,11 @@ impl AgentBackend for ClaudeCodeBackend {
         )?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<UnifiedStreamEvent>>(64);
+        let root = request.workspace_root.clone();
 
         // Spawn a task that reads NDJSON events and maps them to unified events.
         tokio::spawn(async move {
-            let result = drive_session(session, tx.clone()).await;
+            let result = drive_session(session, tx.clone(), root).await;
             if let Err(e) = result {
                 let _ = tx
                     .send(Ok(UnifiedStreamEvent::Error(format!("{:#}", e))))
@@ -177,7 +181,10 @@ impl AgentBackend for ClaudeCodeBackend {
 async fn drive_session(
     mut session: AcpSession,
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
+    root: PathBuf,
 ) -> Result<()> {
+    // Edit-tool calls hashed at start, claimed on success.
+    let mut tracker = EditClaimTracker::default();
     // Whether the message currently being assembled arrived as
     // `ContentDelta`s — see `assistant_text_fallback`.
     let mut streamed_text = false;
@@ -251,6 +258,11 @@ async fn drive_session(
                     streamed_text = false;
                 }
 
+                if let Some(ev) = tracker.observe(&event, &root)
+                    && tx.send(Ok(ev)).await.is_err()
+                {
+                    return Ok(());
+                }
                 let mut unified = map_acp_event(&event);
                 if let Some(text) = fallback {
                     unified.insert(0, UnifiedStreamEvent::TextDelta(text));
@@ -454,10 +466,117 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
     out
 }
 
+/// Pairs Claude edit-tool `tool_use`s with their results to emit
+/// [`UnifiedStreamEvent::FilesWritten`]: each file is hashed when the
+/// `tool_use` arrives (before Claude runs the tool) and claimed when its
+/// result reports success.
+#[derive(Default)]
+struct EditClaimTracker {
+    pending: HashMap<String, FileWrite>,
+}
+
+impl EditClaimTracker {
+    fn observe(&mut self, event: &StreamEvent, root: &Path) -> Option<UnifiedStreamEvent> {
+        match event {
+            StreamEvent::AssistantMessage { tool_uses, .. } => {
+                for tu in tool_uses {
+                    if tu.id.is_empty()
+                        || !crate::acp::session::HOST_CAPTURED_EDIT_TOOLS.contains(&tu.name.as_str())
+                    {
+                        continue;
+                    }
+                    let key = if tu.name == "NotebookEdit" {
+                        "notebook_path"
+                    } else {
+                        "file_path"
+                    };
+                    let Some(fp) = tu.input.get(key).and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let abs = if Path::new(fp).is_absolute() {
+                        PathBuf::from(fp)
+                    } else {
+                        root.join(fp)
+                    };
+                    self.pending
+                        .insert(tu.id.clone(), FileWrite::before_now(abs));
+                }
+                None
+            }
+            StreamEvent::UserToolResults { results } => {
+                let mut written = Vec::new();
+                for r in results {
+                    if let Some(w) = self.pending.remove(&r.tool_use_id)
+                        && !r.is_error
+                    {
+                        written.push(w);
+                    }
+                }
+                (!written.is_empty()).then_some(UnifiedStreamEvent::FilesWritten(written))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp::protocol::ToolUseInfo;
+
+    #[test]
+    fn edit_claim_tracker_hashes_at_tool_start_and_emits_on_success() {
+        use crate::acp::protocol::ToolResultInfo;
+        use crate::write_claims::Before;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "old").unwrap();
+        let mut tracker = EditClaimTracker::default();
+        let assistant = |id: &str| StreamEvent::AssistantMessage {
+            text: String::new(),
+            tool_uses: vec![ToolUseInfo {
+                name: "Write".into(),
+                input: serde_json::json!({ "file_path": "a.txt", "content": "new" }),
+                id: id.into(),
+            }],
+            parent_tool_use_id: None,
+        };
+        let results = |id: &str, is_error: bool| StreamEvent::UserToolResults {
+            results: vec![ToolResultInfo {
+                tool_use_id: id.into(),
+                content: String::new(),
+                is_error,
+            }],
+        };
+
+        assert_eq!(tracker.observe(&assistant("t1"), dir.path()), None);
+        // Claude runs the tool after the hash was taken.
+        std::fs::write(&a, "new").unwrap();
+        assert_eq!(
+            tracker.observe(&results("t1", false), dir.path()),
+            Some(UnifiedStreamEvent::FilesWritten(vec![FileWrite {
+                path: a.clone(),
+                before: Before::Hash(crate::turn_capture::store::hash_bytes(b"old")),
+            }]))
+        );
+
+        // A failing result claims nothing (and forgets the call).
+        assert_eq!(tracker.observe(&assistant("t2"), dir.path()), None);
+        assert_eq!(tracker.observe(&results("t2", true), dir.path()), None);
+        assert_eq!(tracker.observe(&results("t2", false), dir.path()), None);
+        // Non-edit tools are ignored.
+        let bash = StreamEvent::AssistantMessage {
+            text: String::new(),
+            tool_uses: vec![ToolUseInfo {
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "echo > a.txt" }),
+                id: "t3".into(),
+            }],
+            parent_tool_use_id: None,
+        };
+        assert_eq!(tracker.observe(&bash, dir.path()), None);
+        assert_eq!(tracker.observe(&results("t3", false), dir.path()), None);
+    }
 
     // Test 6: ACP → Unified event mapping (all variants)
     #[test]
@@ -698,6 +817,7 @@ mod tests {
             tool_policy: None,
             exposed_tools: None,
             write_gate: None,
+            claims: None,
         };
         let mut stream = ClaudeCodeBackend::new("haiku")
             .stream_completion(request)

@@ -915,7 +915,7 @@ async fn route_app_server_line(
             "item/started" if item_type(&value) == Some("fileChange") => {
                 capture_file_change_start(&value, active_turn, review).await;
             }
-            "item/completed" => refresh_file_change_baseline(&value, active_turn).await,
+            "item/completed" => refresh_file_change_baseline(&value, active_turn, review).await,
             _ => {}
         }
         return Ok(());
@@ -936,7 +936,7 @@ async fn route_app_server_line(
             track_codex_subagent_activity(&value, active_turn, review).await;
         }
         "item/completed" => {
-            refresh_file_change_baseline(&value, active_turn).await;
+            refresh_file_change_baseline(&value, active_turn, review).await;
             let (events, _) = parse_rpc_event(line);
             send_to_active(active_turn, events).await;
         }
@@ -1667,8 +1667,13 @@ async fn capture_file_change_start(
 
 /// Codex applies an approved patch only after we answer its approval request,
 /// so the resulting content first becomes observable when the item completes.
-/// Record it as the drift baseline for later approvals touching the same paths.
-async fn refresh_file_change_baseline(value: &serde_json::Value, active_turn: &SharedActiveTurn) {
+/// Record it as the drift baseline for later approvals touching the same paths,
+/// and report the paths as written ([`AcpObserver::on_files_written`]).
+async fn refresh_file_change_baseline(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) {
     let item = value
         .pointer("/params/item")
         .unwrap_or(&serde_json::Value::Null);
@@ -1690,6 +1695,15 @@ async fn refresh_file_change_baseline(value: &serde_json::Value, active_turn: &S
         active.item_paths.get(item_id).cloned().unwrap_or_default()
     };
 
+    if !paths.is_empty() {
+        review.observer.on_files_written(
+            &paths
+                .iter()
+                .cloned()
+                .map(crate::write_claims::FileWrite::unknown)
+                .collect::<Vec<_>>(),
+        );
+    }
     for path in paths {
         let Ok(current) = read_optional_text(&path).await else {
             continue;
@@ -3248,6 +3262,39 @@ url = "https://example/mcp/"
     }
 
     #[tokio::test]
+    async fn item_completed_file_change_reports_files_written() {
+        use crate::observer::test_support::FilesWrittenRecorder;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        tokio::fs::write(&source, "one\n").await.unwrap();
+        let recorder = Arc::new(FilesWrittenRecorder::default());
+        let mut review = review_context(dir.path(), test_write_gate());
+        review.host_capture = true;
+        review.observer = recorder.clone();
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        capture_file_change_start(
+            &file_change_item("item/started", "file-1", &source),
+            &active_turn,
+            &review,
+        )
+        .await;
+        assert!(recorder.writes().is_empty(), "nothing is written at start");
+        tokio::fs::write(&source, "two\n").await.unwrap();
+        refresh_file_change_baseline(
+            &file_change_item("item/completed", "file-1", &source),
+            &active_turn,
+            &review,
+        )
+        .await;
+        let writes = recorder.writes();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].path.ends_with("lib.rs"), "{writes:?}");
+        assert_eq!(writes[0].before, crate::write_claims::Before::Unknown);
+    }
+
+    #[tokio::test]
     async fn repeated_edits_to_one_file_stay_approved() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -3266,6 +3313,7 @@ url = "https://example/mcp/"
         refresh_file_change_baseline(
             &file_change_item("item/completed", "file-1", &source),
             &active_turn,
+            &review,
         )
         .await;
 
