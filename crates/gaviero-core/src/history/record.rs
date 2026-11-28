@@ -148,6 +148,18 @@ pub struct ChangedFile {
     pub revertible: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlap_with: Vec<String>,
+    /// Concurrent agent writers whose activity may explain this unclaimed
+    /// change (`turn_capture::FileChange::maybe_from`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maybe_from: Vec<String>,
+}
+
+/// A change another writer provably made, left out of the turn's review (root-relative path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOutFile {
+    pub path: String,
+    /// The writer's label.
+    pub writer: String,
 }
 
 /// What a turn changed on disk (host-side turn capture), or — with
@@ -165,6 +177,9 @@ pub struct FilesChanged {
     pub between_turns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Changes other writers provably made, left out of the review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_out: Vec<LeftOutFile>,
 }
 
 /// The user's review of a turn's changes, written when it is finalized.

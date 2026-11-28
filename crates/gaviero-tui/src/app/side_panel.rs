@@ -2947,6 +2947,19 @@ pub(crate) fn dispatch_prompt_core(
     // agent loop, so this handle is their only route to the retrieval tools;
     // when it is `None` the session simply advertises no pull stanza.
     let mcp_tool_server = app.mcp_tool_server.clone();
+    // Write claims: the turn registers its own writer, publishes what its
+    // tools write, and (unless `turnReview.attribution` is off) leaves out of
+    // its review what another writer provably wrote.
+    let claims_journal = app.claims_journal.clone();
+    let conv_title = app.chat_state.conversations[conv_idx].title.clone();
+    let attribution_on = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::TURN_REVIEW_ATTRIBUTION,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -3319,6 +3332,30 @@ pub(crate) fn dispatch_prompt_core(
                 }
             }
         };
+        let turn_claims = match (&capture_handle, &claims_journal) {
+            (Some(_), Some(j)) => j
+                .register(
+                    &format!("chat-{}-{}", std::process::id(), turn_id_clone),
+                    gaviero_core::write_claims::WriterKind::ChatTurn,
+                    &format!("chat '{conv_title}'"),
+                    capture_scope.roots.clone(),
+                )
+                .map_err(|e| tracing::warn!("write claims unavailable: {e:#}"))
+                .ok(),
+            _ => None,
+        };
+        let capture_handle = capture_handle.map(|h| match (&turn_claims, &claims_journal) {
+            (Some(w), Some(j)) => {
+                let (roots, entries) = h.claim_baseline();
+                w.set_baseline(roots, entries);
+                if attribution_on {
+                    h.attribute(j.clone(), w.clone())
+                } else {
+                    h
+                }
+            }
+            _ => h,
+        });
         let mut options = options;
         options.host_capture = capture_handle.is_some();
         if options.host_capture {
@@ -3338,6 +3375,7 @@ pub(crate) fn dispatch_prompt_core(
             conv_id: conv_id_clone.clone(),
             turn_id: turn_id_clone.clone(),
             history: history.clone(),
+            claims: turn_claims.clone(),
         };
         let mut session = gaviero_core::agent_session::registry::create_session(
             gaviero_core::agent_session::registry::SessionConstruction {
@@ -3442,6 +3480,13 @@ pub(crate) fn dispatch_prompt_core(
                             between_turns,
                         )),
                     );
+                    if let Some(content) = left_out_notice(&end.set.left_out) {
+                        let _ = tx.send(Event::MessageComplete {
+                            conv_id: conv_id.clone(),
+                            role: "system".to_string(),
+                            content,
+                        });
+                    }
                     for w in &end.set.warnings {
                         let _ = tx.send(Event::MessageComplete {
                             conv_id: conv_id.clone(),
@@ -3470,6 +3515,9 @@ pub(crate) fn dispatch_prompt_core(
                 Err(e) => tracing::error!("turn capture end task failed: {e}"),
             }
         }
+        // The session is gone: the turn's writer finishes here even when the
+        // turn was not attributed (the observer's copy went with the session).
+        drop(turn_claims);
 
         let proposals = {
             let mut gate = wg.lock().await;
@@ -3539,6 +3587,22 @@ pub(crate) fn dispatch_prompt_core(
     Ok(turn_id)
 }
 
+/// The conversation's system line for the changes left out of a turn's
+/// review because another writer provably made them.
+fn left_out_notice(left_out: &[gaviero_core::turn_capture::LeftOut]) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let labels: std::collections::BTreeSet<&str> =
+        left_out.iter().map(|l| l.writer.as_str()).collect();
+    let n = left_out.len();
+    let s = if n == 1 { "" } else { "s" };
+    Some(format!(
+        "{n} file{s} left out of this review — changed by {}",
+        labels.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 /// History form of a turn's change set (`files_changed` record).
 fn files_changed_record(
     set: &gaviero_core::turn_capture::TurnChangeSet,
@@ -3567,11 +3631,20 @@ fn files_changed_record(
                 after_sha256: c.after_hash().map(str::to_string),
                 revertible: c.revertible,
                 overlap_with: c.overlap_with.clone(),
+                maybe_from: c.maybe_from.clone(),
             })
             .collect(),
         auto_reverted: set.auto_reverted.clone(),
         between_turns,
         warnings: set.warnings.clone(),
+        left_out: set
+            .left_out
+            .iter()
+            .map(|l| gaviero_core::history::LeftOutFile {
+                path: l.rel.clone(),
+                writer: l.writer.clone(),
+            })
+            .collect(),
     }
 }
 

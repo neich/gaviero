@@ -35,9 +35,18 @@ pub(super) struct TuiAcpObserver {
     /// never by the conversation.
     pub turn_id: String,
     pub history: Arc<HistoryRecorder>,
+    /// The turn's write-claim writer: edit-tool and gate writes are
+    /// published so concurrent turn reviews can tell whose they are.
+    pub claims: Option<Arc<gaviero_core::write_claims::ClaimWriter>>,
 }
 
 impl AcpObserver for TuiAcpObserver {
+    fn on_files_written(&self, writes: &[gaviero_core::write_claims::FileWrite]) {
+        if let Some(c) = &self.claims {
+            c.record_all(writes);
+        }
+    }
+
     fn on_stream_chunk(&self, text: &str) {
         let _ = self.tx.send(Event::StreamChunk {
             conv_id: self.conv_id.clone(),
@@ -463,6 +472,7 @@ mod tests {
             conv_id: "c1".into(),
             turn_id: "c1-1".into(),
             history: history.clone(),
+            claims: None,
         };
         let input = serde_json::json!({"command": "ls"});
         observer.on_tool_call_started("Bash: ls");

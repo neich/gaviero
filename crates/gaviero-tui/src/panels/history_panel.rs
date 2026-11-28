@@ -1264,6 +1264,9 @@ fn files_lines(
         if !f.overlap_with.is_empty() {
             flags.push_str(&format!("  overlap: {}", f.overlap_with.join(", ")));
         }
+        if !f.maybe_from.is_empty() {
+            flags.push_str(&format!("  maybe from: {}", f.maybe_from.join(", ")));
+        }
         if !f.revertible {
             flags.push_str("  not revertible");
         }
@@ -1295,6 +1298,12 @@ fn files_lines(
         lines.push(Line::from(Span::styled(
             format!("  sensitive  {p}  → auto-reverted"),
             Style::default().fg(COLOR_WARN),
+        )));
+    }
+    for l in &changed.left_out {
+        lines.push(muted(format!(
+            "  left out  {}  → changed by {}",
+            l.path, l.writer
         )));
     }
     if !changed.between_turns.is_empty() {
@@ -2353,6 +2362,14 @@ mod tests {
 
     /// A closed turn whose only interesting record is its `files_changed`.
     fn files_state(files: Vec<ChangedFile>) -> (tempfile::TempDir, HistoryPanelState) {
+        files_state_left_out(files, Vec::new())
+    }
+
+    /// [`files_state`] with changes left out of the review.
+    fn files_state_left_out(
+        files: Vec<ChangedFile>,
+        left_out: Vec<gaviero_core::history::LeftOutFile>,
+    ) -> (tempfile::TempDir, HistoryPanelState) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("turns.ndjson");
         let r = HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
@@ -2365,6 +2382,7 @@ mod tests {
                 auto_reverted: Vec::new(),
                 between_turns: Vec::new(),
                 warnings: Vec::new(),
+                left_out,
             }),
         );
         r.end_turn("c1-1", TurnEnd::new(false, None, 0));
@@ -2382,6 +2400,7 @@ mod tests {
             after_sha256: None,
             revertible: true,
             overlap_with: Vec::new(),
+            maybe_from: Vec::new(),
         }
     }
 
@@ -2468,6 +2487,32 @@ mod tests {
         empty.select_file_by(-FILE_PAGE);
         empty.select_file_to(true);
         assert_eq!(empty.file_selected, 0);
+    }
+
+    #[test]
+    fn files_lines_show_maybe_from_and_left_out() {
+        let mut shared = changed("m.rs", "modified");
+        shared.maybe_from = vec!["gaviero-cli 'fix' · u1".into(), "SWARM 'y' · u2".into()];
+        let (_dir, state) = files_state_left_out(
+            vec![shared, changed("a.rs", "added")],
+            vec![gaviero_core::history::LeftOutFile {
+                path: "b.rs".into(),
+                writer: "gaviero-cli 'fix' · u1".into(),
+            }],
+        );
+        let turn = state.selected_turn().unwrap();
+        let text = section_text(turn, Some(0));
+        assert!(
+            text.contains("m.rs  → pending  maybe from: gaviero-cli 'fix' · u1, SWARM 'y' · u2"),
+            "{text}"
+        );
+        assert!(!text.contains("a.rs  → pending  maybe from"), "{text}");
+        assert!(
+            text.contains("  left out  b.rs  → changed by gaviero-cli 'fix' · u1"),
+            "{text}"
+        );
+        // A left-out file is not a row: the cursor walks the reviewed files only.
+        assert_eq!(state.file_count(), 2);
     }
 
     #[test]

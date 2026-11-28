@@ -465,3 +465,304 @@ fn a_restore_without_a_recorded_mode_is_not_private() {
     store::restore_write(&restored, b"x", None).unwrap();
     assert_eq!(mode_of(&restored), mode_of(&plain));
 }
+
+// ── Write-claim attribution ──────────────────────────────────────────────
+
+use crate::write_claims::{ClaimJournal, ClaimWriter, FileWrite, WriterKind};
+
+fn journal(w: &Ws) -> ClaimJournal {
+    ClaimJournal::at(w._dir.path().join("claims"))
+}
+
+/// Open a turn attributed against `journal`, with its own `ChatTurn` writer.
+fn open_attributed(w: &Ws, journal: &ClaimJournal, id: &str) -> (TurnHandle, Arc<ClaimWriter>) {
+    let h = w.cap.begin(id, Some("conv"), w.scope()).unwrap();
+    let writer = journal
+        .register(
+            &format!("chat-test-{id}"),
+            WriterKind::ChatTurn,
+            "chat 'test'",
+            w.scope().roots,
+        )
+        .unwrap();
+    let (roots, entries) = h.claim_baseline();
+    writer.set_baseline(roots, entries);
+    (h.attribute(journal.clone(), writer.clone()), writer)
+}
+
+fn attributed_turn(
+    w: &Ws,
+    journal: &ClaimJournal,
+    id: &str,
+    edit: impl FnOnce(&Ws, &ClaimWriter),
+) -> TurnChangeSet {
+    let (h, writer) = open_attributed(w, journal, id);
+    edit(w, &writer);
+    w.cap.end(h, TurnOutcome::Completed).unwrap().set
+}
+
+fn file<'a>(set: &'a TurnChangeSet, rel: &str) -> &'a FileChange {
+    set.files
+        .iter()
+        .find(|c| c.rel == rel)
+        .unwrap_or_else(|| panic!("{rel} not in {:?}", kinds(set)))
+}
+
+/// A writer registered from here on starts strictly later.
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(2));
+}
+
+const CLI: &str = "gaviero-cli 'x' · u1";
+
+#[test]
+fn foreign_claimed_change_is_left_out() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    w.write("b.txt", "v1\n");
+    let j = journal(&w);
+    let cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    let set = attributed_turn(&w, &j, "t1", |w, _| {
+        w.write("a.txt", "mine\n");
+        w.write("b.txt", "theirs\n");
+        cli.record(&FileWrite::unknown(w.root.join("b.txt")));
+    });
+    assert_eq!(kinds(&set), vec![("a.txt".into(), ChangeKind::Modified)]);
+    assert_eq!(
+        set.left_out,
+        vec![LeftOut {
+            rel: "b.txt".into(),
+            root: w.root.clone(),
+            writer: CLI.into(),
+        }]
+    );
+    assert_eq!(file(&set, "a.txt").maybe_from, vec![CLI.to_string()]);
+}
+
+#[test]
+fn own_claimed_change_is_kept_without_tags_even_with_others_active() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    let j = journal(&w);
+    let _cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    let set = attributed_turn(&w, &j, "t1", |w, me| {
+        w.write("a.txt", "mine\n");
+        me.record(&FileWrite::unknown(w.root.join("a.txt")));
+    });
+    assert_eq!(kinds(&set), vec![("a.txt".into(), ChangeKind::Modified)]);
+    let a = file(&set, "a.txt");
+    assert!(a.maybe_from.is_empty());
+    assert!(a.overlap_with.is_empty());
+    assert!(set.left_out.is_empty());
+    assert!(!set.warnings.iter().any(|m| m.contains("⚠shared")));
+}
+
+#[test]
+fn both_claimed_change_is_kept_and_overlap_marked_with_label() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    let j = journal(&w);
+    let cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    let set = attributed_turn(&w, &j, "t1", |w, me| {
+        w.write("a.txt", "mine\n");
+        me.record(&FileWrite::unknown(w.root.join("a.txt")));
+        w.write("a.txt", "theirs\n");
+        cli.record(&FileWrite::unknown(w.root.join("a.txt")));
+    });
+    assert_eq!(kinds(&set), vec![("a.txt".into(), ChangeKind::Modified)]);
+    assert_eq!(file(&set, "a.txt").overlap_with, vec![CLI.to_string()]);
+    assert!(set.left_out.is_empty());
+}
+
+#[test]
+fn later_writer_noop_claim_cannot_hide_this_turns_change() {
+    let w = ws();
+    w.write("c.txt", "v1\n");
+    let j = journal(&w);
+    let set = attributed_turn(&w, &j, "t1", |w, _| {
+        // The turn changes c.txt without a claim (Bash, say).
+        w.write("c.txt", "mine\n");
+        tick();
+        // A writer started mid-turn claims a no-op write of those bytes.
+        let late = j
+            .register("late", WriterKind::SwarmAgent, "late", vec![w.root.clone()])
+            .unwrap();
+        let path = w.root.join("c.txt");
+        late.record(&FileWrite {
+            path: path.clone(),
+            before: crate::write_claims::Before::Hash(hash_file(&path).unwrap()),
+        });
+    });
+    assert_eq!(kinds(&set), vec![("c.txt".into(), ChangeKind::Modified)]);
+    assert!(set.left_out.is_empty());
+    assert_eq!(file(&set, "c.txt").maybe_from, vec!["late".to_string()]);
+}
+
+#[test]
+fn host_writer_claim_hides_like_the_ledger() {
+    let w = ws();
+    w.write("editor.txt", "v1\n");
+    w.write("agent.txt", "v1\n");
+    let j = journal(&w);
+    let set = attributed_turn(&w, &j, "t1", |w, _| {
+        tick();
+        // Another TUI's editor (not this capture's ledger), started mid-turn:
+        // the host is trusted without a before-hash.
+        let editor = j
+            .register("editor-9", WriterKind::Host, "editor", vec![w.root.clone()])
+            .unwrap();
+        w.write("editor.txt", "saved by user\n");
+        editor.record(&FileWrite::unknown(w.root.join("editor.txt")));
+        w.write("agent.txt", "v2\n");
+    });
+    assert_eq!(
+        kinds(&set),
+        vec![("agent.txt".into(), ChangeKind::Modified)]
+    );
+    assert_eq!(set.left_out.len(), 1);
+    assert_eq!(set.left_out[0].rel, "editor.txt");
+    assert_eq!(set.left_out[0].writer, "editor");
+    // The editor is never named as a possible source.
+    assert!(file(&set, "agent.txt").maybe_from.is_empty());
+
+    // This capture's own host writes reach the journal as `editor` claims.
+    let host = j
+        .register("editor-1", WriterKind::Host, "editor", vec![w.root.clone()])
+        .unwrap();
+    w.cap.set_host_writer(host);
+    let p = w.root.join("saved.txt");
+    std::fs::write(&p, "x").unwrap();
+    w.cap.record_host_write(&p, Some(b"x"));
+    assert!(w.cap.ledger().attributes(&p, Some(&store::hash_bytes(b"x")), 0));
+    let snap = j.snapshot(0);
+    let rec = snap
+        .writers
+        .iter()
+        .find(|r| r.info.id == "editor-1")
+        .unwrap();
+    assert_eq!(rec.claims.len(), 1);
+    assert_eq!(rec.claims[0].key, crate::write_claims::claim_key(&p));
+}
+
+#[test]
+fn attribution_off_reports_everything_like_today() {
+    let w = ws();
+    w.write("a.txt", "v1\n");
+    w.write("b.txt", "v1\n");
+    let j = journal(&w);
+    let cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    // No `.attribute(..)`.
+    let set = w.turn("t1", |w| {
+        w.write("a.txt", "mine\n");
+        w.write("b.txt", "theirs\n");
+        cli.record(&FileWrite::unknown(w.root.join("b.txt")));
+    });
+    assert_eq!(
+        kinds(&set),
+        vec![
+            ("a.txt".into(), ChangeKind::Modified),
+            ("b.txt".into(), ChangeKind::Modified),
+        ]
+    );
+    assert!(set.files.iter().all(|c| c.maybe_from.is_empty()));
+    assert!(set.left_out.is_empty());
+    assert!(set.warnings.is_empty());
+}
+
+#[test]
+fn shared_warning_names_the_writers() {
+    let w = ws();
+    let j = journal(&w);
+    let _cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    let _swarm = j
+        .register(
+            "swarm-u2",
+            WriterKind::SwarmAgent,
+            "SWARM 'y' · u2",
+            vec![w.root.clone()],
+        )
+        .unwrap();
+    let set = attributed_turn(&w, &j, "t1", |w, _| {
+        w.write("one.txt", "1\n");
+        w.write("two.txt", "2\n");
+    });
+    assert_eq!(set.files.len(), 2);
+    assert!(
+        set.warnings.contains(
+            &"2 files marked ⚠shared changed while SWARM 'y' · u2, gaviero-cli 'x' · u1 also ran — they may not come from this agent"
+                .to_string()
+        ),
+        "{:?}",
+        set.warnings
+    );
+
+    let w = ws();
+    let j = journal(&w);
+    let _cli = j
+        .register("cli-u1", WriterKind::SwarmAgent, CLI, vec![w.root.clone()])
+        .unwrap();
+    let set = attributed_turn(&w, &j, "t1", |w, _| w.write("one.txt", "1\n"));
+    assert!(
+        set.warnings.contains(
+            &format!("1 file marked ⚠shared changed while {CLI} also ran — they may not come from this agent")
+        ),
+        "{:?}",
+        set.warnings
+    );
+}
+
+#[test]
+fn attribution_does_not_affect_in_process_overlap_of_kept_files() {
+    let w = ws();
+    w.write("common.txt", "v1\n");
+    let j = journal(&w);
+    let (a, a_writer) = open_attributed(&w, &j, "turn-a");
+    tick();
+    let (b, b_writer) = open_attributed(&w, &j, "turn-b");
+    w.write("a.txt", "from a\n");
+    a_writer.record(&FileWrite::unknown(w.root.join("a.txt")));
+    w.write("b.txt", "from b\n");
+    b_writer.record(&FileWrite::unknown(w.root.join("b.txt")));
+    // Nobody claims this one (a shell command).
+    w.write("common.txt", "shell\n");
+
+    let a_end = w.cap.end(a, TurnOutcome::Completed).unwrap();
+    w.cap
+        .save_pending(&PendingReview::new(a_end.set.clone()))
+        .unwrap();
+    let b_end = w.cap.end(b, TurnOutcome::Completed).unwrap();
+
+    let rels = |s: &TurnChangeSet| s.files.iter().map(|c| c.rel.clone()).collect::<Vec<_>>();
+    assert_eq!(rels(&a_end.set), vec!["a.txt", "common.txt"]);
+    assert_eq!(rels(&b_end.set), vec!["b.txt", "common.txt"]);
+    assert_eq!(a_end.set.left_out[0].rel, "b.txt");
+    assert_eq!(b_end.set.left_out[0].rel, "a.txt");
+
+    // Only the file both turns kept is overlap-marked.
+    assert!(file(&b_end.set, "b.txt").overlap_with.is_empty());
+    assert_eq!(
+        file(&b_end.set, "common.txt").overlap_with,
+        vec!["turn-a".to_string()]
+    );
+    assert_eq!(b_end.overlapped_reviews, vec!["turn-a".to_string()]);
+    let a_pending = w.cap.load_pending();
+    let a_files = &a_pending[0].set.files;
+    for c in a_files {
+        let want: Vec<String> = if c.rel == "common.txt" {
+            vec!["turn-b".into()]
+        } else {
+            vec![]
+        };
+        assert_eq!(c.overlap_with, want, "{}", c.rel);
+    }
+}

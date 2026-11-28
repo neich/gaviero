@@ -553,6 +553,7 @@ fn prepare_run(
         ollama_base_url,
         mcp_config,
         worktree_context_paths,
+        &label,
     );
     Ok(PreparedRun {
         label,
@@ -1035,6 +1036,7 @@ fn swarm_config(
     ollama_base_url: Option<String>,
     mcp_config: gaviero_core::mcp::McpConfigSynth,
     worktree_context_paths: Vec<String>,
+    writer_label: &str,
 ) -> pipeline::SwarmConfig {
     let workspace = &app.workspace;
     let write_namespace = workspace.resolve_namespace(Some(&root));
@@ -1102,6 +1104,18 @@ fn swarm_config(
         skill_catalog: Some(Arc::clone(&app.skill_catalog)),
         memory_root: owner,
         graph_db_path,
+        // Write claims: the run and each agent publish what they write, so
+        // chat turn reviews (this TUI's and others') leave those files out.
+        claims: app.claims_journal.clone().map(|journal| {
+            gaviero_core::write_claims::SwarmClaimConfig {
+                journal,
+                label: format!("SWARM '{writer_label}'"),
+                consume: workspace
+                    .resolve_setting(S::TURN_REVIEW_ATTRIBUTION, Some(&root))
+                    .as_bool()
+                    .unwrap_or(true),
+            }
+        }),
         workspace_root: root,
     }
 }

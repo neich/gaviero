@@ -56,6 +56,9 @@ pub struct FileChange {
     /// Turn ids whose window overlapped this turn and changed the same path.
     #[serde(default)]
     pub overlap_with: Vec<String>,
+    /// Concurrent agent writers whose activity may explain this unclaimed change (row flag ⚠shared).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maybe_from: Vec<String>,
 }
 
 impl FileChange {
@@ -88,6 +91,19 @@ pub struct TurnChangeSet {
     /// Sensitive paths restored automatically at turn end (root-relative).
     #[serde(default)]
     pub auto_reverted: Vec<String>,
+    /// Changes other writers provably made, left out of `files`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_out: Vec<LeftOut>,
+}
+
+/// A change another writer provably made, left out of this turn's review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    /// Root-relative path, `/`-separated.
+    pub rel: String,
+    pub root: PathBuf,
+    /// The writer's label.
+    pub writer: String,
 }
 
 impl TurnChangeSet {
